@@ -191,12 +191,12 @@ constexpr size_t kMaxCallDepth        = 5000;
     if (v.tag() != Tag::App) return false;
     const Value * cur = &v;
     size_t depth = 0;
-    while (cur->tag() == Tag::App && cur->payload.pair) {
-        ++depth; cur = &cur->payload.pair->left;
+    while (cur->tag() == Tag::App && cur->asPair()) {
+        ++depth; cur = &cur->asPair()->left;
     }
-    return cur->tag() == Tag::Closure && cur->payload.closure
-        && cur->payload.closure->desc
-        && cur->payload.closure->desc->arity > depth;
+    return cur->tag() == Tag::Closure && cur->asClosure()
+        && cur->asClosure()->desc
+        && cur->asClosure()->desc->arity > depth;
 }
 
 // V3_DBG_TRACE_THUNK_X — file-scope thunk-creation registry.  Bumped
@@ -404,15 +404,15 @@ inline void dbgLogForceInsideX(VMState & vm, const Value * forcing)
     // captured rec / lambda-param refs reach us.
     if (!forcing) return;
     Value chased = *forcing;
-    if (chased.tag() == Tag::Slot && chased.payload.slot)
-        chased = *chased.payload.slot;
+    if (chased.tag() == Tag::Slot && chased.asSlot())
+        chased = *chased.asSlot();
     if (chased.tag() != Tag::Thunk && !chased.isAppLike())
         return;
     // Filter: only log Suspended thunks (the FIRST force that flips
     // state to Blackhole).  Already-Evaluated thunks are harmless
     // and just flood the log.  Bridge/Blackhole are also informative.
-    if (chased.tag() == Tag::Thunk && chased.payload.thunk
-        && chased.payload.thunk->state == ThunkState::Evaluated)
+    if (chased.tag() == Tag::Thunk && chased.asThunk()
+        && chased.asThunk()->state == ThunkState::Evaluated)
         return;
     // Identify the forcing site: innermost frame's name + ip.
     const char * outerName = "?";
@@ -434,12 +434,12 @@ inline void dbgLogForceInsideX(VMState & vm, const Value * forcing)
     uint32_t forcedCodeOff = 0;
     void * forcedThunk = nullptr;
     int forcedState = -1;
-    if (chased.tag() == Tag::Thunk && chased.payload.thunk) {
-        forcedThunk = (void *)chased.payload.thunk;
-        forcedState = (int)chased.payload.thunk->state;
-        if (chased.payload.thunk->state == ThunkState::Suspended
-            && chased.payload.thunk->suspended.desc) {
-            const auto * d = chased.payload.thunk->suspended.desc;
+    if (chased.tag() == Tag::Thunk && chased.asThunk()) {
+        forcedThunk = (void *)chased.asThunk();
+        forcedState = (int)chased.asThunk()->state;
+        if (chased.asThunk()->state == ThunkState::Suspended
+            && chased.asThunk()->suspended.desc) {
+            const auto * d = chased.asThunk()->suspended.desc;
             if (!d->name.empty()) forcedName = d->name.c_str();
             forcedCodeOff = d->codeOffset;
         }
@@ -480,12 +480,12 @@ inline void dbgLogForceSite(const CompilationUnit * cu, uint32_t instrIp,
     // slot reads through Tag::Slot first.
     const Value * v = forcing;
     Value chased{};
-    if (v && v->tag() == Tag::Slot && v->payload.slot) {
-        chased = *v->payload.slot;
+    if (v && v->tag() == Tag::Slot && v->asSlot()) {
+        chased = *v->asSlot();
         v = &chased;
     }
-    if (v && v->tag() == Tag::Thunk && v->payload.thunk) {
-        const Thunk * t = v->payload.thunk;
+    if (v && v->tag() == Tag::Thunk && v->asThunk()) {
+        const Thunk * t = v->asThunk();
         uint32_t codeOff = 0;
         const char * tname = "?";
         const void * thunkCu = nullptr;
@@ -581,38 +581,38 @@ inline bool valueEqual(VMState & vm, Value a0, Value b0, bool insideContainer0 =
         }
         if (a.tag() != b.tag()) {
             if (a.isInt() && b.isFloat()) {
-                if (static_cast<double>(a.payload.i) != b.payload.f) return false;
+                if (static_cast<double>(a.asInt()) != b.asFloat()) return false;
                 continue;
             }
             if (a.isFloat() && b.isInt()) {
-                if (a.payload.f != static_cast<double>(b.payload.i)) return false;
+                if (a.asFloat() != static_cast<double>(b.asInt())) return false;
                 continue;
             }
             return false;
         }
         switch (a.tag()) {
         case Tag::Int:
-            if (a.payload.i != b.payload.i) return false;
+            if (a.asInt() != b.asInt()) return false;
             break;
         case Tag::Float:
-            if (a.payload.f != b.payload.f) return false;
+            if (a.asFloat() != b.asFloat()) return false;
             break;
         case Tag::Bool:
-            if (a.payload.i != b.payload.i) return false;
+            if (a.asInt() != b.asInt()) return false;
             break;
         case Tag::Null:
             break;
         case Tag::String:
-            if (std::string_view(a.payload.str) != std::string_view(b.payload.str))
+            if (std::string_view(a.asString()) != std::string_view(b.asString()))
                 return false;
             break;
         case Tag::Path:
-            if (std::string_view(a.payload.path) != std::string_view(b.payload.path))
+            if (std::string_view(a.asPath()) != std::string_view(b.asPath()))
                 return false;
             break;
         case Tag::List: {
-            auto * la = a.payload.list;
-            auto * lb = b.payload.list;
+            auto * la = a.asList();
+            auto * lb = b.asList();
             if (la == lb) break;
             uint32_t na = la ? la->size : 0;
             uint32_t nb = lb ? lb->size : 0;
@@ -644,8 +644,8 @@ inline bool valueEqual(VMState & vm, Value a0, Value b0, bool insideContainer0 =
             break;
         }
         case Tag::Attrs: {
-            auto * aa = a.payload.bindings;
-            auto * bb = b.payload.bindings;
+            auto * aa = a.asAttrs();
+            auto * bb = b.asAttrs();
             if (aa == bb) break;
             // Lever A: this case compares by index (`aa->entries[i]` vs
             // `bb->entries[i]` over `aa->size`).  A Chain's entries[] is
@@ -666,7 +666,7 @@ inline bool valueEqual(VMState & vm, Value a0, Value b0, bool insideContainer0 =
                 const Value * tv = binds->lookup(tyId);
                 if (!tv) return false;
                 Value tf = forceValue(vm, *tv);
-                return tf.isString() && std::string_view(tf.payload.str) == "derivation";
+                return tf.isString() && std::string_view(tf.asString()) == "derivation";
             };
             if (isDrv(aa) && isDrv(bb)) {
                 const Value * pa = aa->lookup(opId);
@@ -711,7 +711,7 @@ inline bool valueEqual(VMState & vm, Value a0, Value b0, bool insideContainer0 =
             // the underlying pointer matches (matches Nix's value-identity
             // optimization for sibling list/attrset entries).
             if (!insideContainer) return false;
-            if (a.payload.closure != b.payload.closure) return false;
+            if (a.asClosure() != b.asClosure()) return false;
             break;
         case Tag::Uninitialized:
         case Tag::Thunk:
@@ -721,7 +721,7 @@ inline bool valueEqual(VMState & vm, Value a0, Value b0, bool insideContainer0 =
         case Tag::External:
         case Tag::Slot:
         default:
-            if (a.payload.raw != b.payload.raw) return false;
+            if (a.asRaw() != b.asRaw()) return false;
             break;
         }
     }
@@ -733,12 +733,12 @@ inline std::string valueRepr(const Value & v, int depth = 0);
 
 inline bool valueLess(VMState & vm, const Value & a, const Value & b)
 {
-    if (a.isInt() && b.isInt())     return a.payload.i < b.payload.i;
-    if (a.isFloat() && b.isFloat()) return a.payload.f < b.payload.f;
-    if (a.isInt() && b.isFloat())   return static_cast<double>(a.payload.i) < b.payload.f;
-    if (a.isFloat() && b.isInt())   return a.payload.f < static_cast<double>(b.payload.i);
+    if (a.isInt() && b.isInt())     return a.asInt() < b.asInt();
+    if (a.isFloat() && b.isFloat()) return a.asFloat() < b.asFloat();
+    if (a.isInt() && b.isFloat())   return static_cast<double>(a.asInt()) < b.asFloat();
+    if (a.isFloat() && b.isInt())   return a.asFloat() < static_cast<double>(b.asInt());
     if (a.isString() && b.isString())
-        return std::string_view(a.payload.str) < std::string_view(b.payload.str);
+        return std::string_view(a.asString()) < std::string_view(b.asString());
     if (a.isList() && b.isList()) {
         // Lexicographic compare; matches tree-walker.  Phase-13
         // review HIGH-3 fix: force lazy elements before recursing.
@@ -748,12 +748,12 @@ inline bool valueLess(VMState & vm, const Value & a, const Value & b)
         // A12 (2026-05-17): force THROUGH the lvalue (writeback) so
         // the resolved WHNF persists in the source list; mirrors the
         // primElem fix.
-        uint32_t na = a.payload.list ? a.payload.list->size : 0;
-        uint32_t nb = b.payload.list ? b.payload.list->size : 0;
+        uint32_t na = a.asList() ? a.asList()->size : 0;
+        uint32_t nb = b.asList() ? b.asList()->size : 0;
         uint32_t n = std::min(na, nb);
         for (uint32_t i = 0; i < n; ++i) {
-            Value & ai = a.payload.list->elems[i];
-            Value & bi = b.payload.list->elems[i];
+            Value & ai = a.asList()->elems[i];
+            Value & bi = b.asList()->elems[i];
             if (ai.tag() == Tag::Thunk || ai.isAppLike()
                 || ai.tag() == Tag::Slot)
                 ai = forceValue(vm, ai);
@@ -819,8 +819,8 @@ inline bool isTrueValue(const Value & v)
     // mirrors the chase op_force_slow already does.
     const Value * cur = &v;
     int hops = 0;
-    while (cur->tag() == Tag::Slot && cur->payload.slot && hops < 32) {
-        cur = cur->payload.slot;
+    while (cur->tag() == Tag::Slot && cur->asSlot() && hops < 32) {
+        cur = cur->asSlot();
         ++hops;
     }
     if (!cur->isBool()) {
@@ -841,7 +841,7 @@ inline bool isTrueValue(const Value & v)
         }
         throw std::runtime_error("v3: expected bool");
     }
-    return cur->payload.i == 1;
+    return cur->asInt() == 1;
 }
 
 /// Coerce a Value to its string representation for OP_STR_CONCAT.
@@ -897,20 +897,20 @@ inline std::string valueRepr(const Value & v, int depth)
     if (depth > kMaxDepth) return "«…»";
     if (t == Tag::Int) {
         char buf[24];
-        std::snprintf(buf, sizeof buf, "%lld", (long long)v.payload.i);
+        std::snprintf(buf, sizeof buf, "%lld", (long long)v.asInt());
         return buf;
     }
     if (t == Tag::Float) {
         // Match TW's `output << double` — default ostream formatting
         // (not %f's fixed 6-decimal).
-        std::ostringstream os; os << v.payload.f;
+        std::ostringstream os; os << v.asFloat();
         return os.str();
     }
-    if (t == Tag::Bool)   return v.payload.i == 1 ? "true" : "false";
+    if (t == Tag::Bool)   return v.asInt() == 1 ? "true" : "false";
     if (t == Tag::Null)   return "null";
     if (t == Tag::String) {
         std::string out = "\"";
-        std::string_view sv = v.payload.str ? std::string_view(v.payload.str)
+        std::string_view sv = v.asString() ? std::string_view(v.asString())
                                             : std::string_view{};
         size_t n = sv.size();
         size_t lim = n > kMaxStrLen ? kMaxStrLen : n;
@@ -936,14 +936,14 @@ inline std::string valueRepr(const Value & v, int depth)
         out += "\"";
         return out;
     }
-    if (t == Tag::Path)   return v.payload.path ? v.payload.path : "/";
+    if (t == Tag::Path)   return v.asPath() ? v.asPath() : "/";
     if (t == Tag::List) {
-        if (!v.payload.list || v.payload.list->size == 0) return "[ ]";
+        if (!v.asList() || v.asList()->size == 0) return "[ ]";
         std::string out = "[ ";
-        uint32_t n = v.payload.list->size;
+        uint32_t n = v.asList()->size;
         uint32_t lim = n > kMaxItems ? kMaxItems : n;
         for (uint32_t i = 0; i < lim; ++i) {
-            out += valueRepr(v.payload.list->elems[i], depth + 1);
+            out += valueRepr(v.asList()->elems[i], depth + 1);
             out += ' ';
         }
         if (n > kMaxItems) {
@@ -955,9 +955,9 @@ inline std::string valueRepr(const Value & v, int depth)
         return out;
     }
     if (t == Tag::Attrs) {
-        if (!v.payload.bindings || v.payload.bindings->size == 0) return "{ }";
+        if (!v.asAttrs() || v.asAttrs()->size == 0) return "{ }";
         std::string out = "{ ";
-        auto * b = v.payload.bindings;
+        auto * b = v.asAttrs();
         const auto & symTab = ir::globalSymbolTable();
         uint32_t n = b->size;
         uint32_t lim = n > kMaxItems ? kMaxItems : n;
@@ -1002,8 +1002,8 @@ inline std::string valueRepr(const Value & v, int depth)
 inline void requireNoStringContextRuntime(const Value & v,
                                           std::string_view siteHint)
 {
-    if (!v.isString() || !v.payload.str) return;
-    auto * raw = lookupStringContextEntries(v.payload.str);
+    if (!v.isString() || !v.asString()) return;
+    auto * raw = lookupStringContextEntries(v.asString());
     if (!raw || raw->empty()) return;
     std::string display = raw->front();
     if (auto * ns = getNixEvalState())
@@ -1015,7 +1015,7 @@ inline void requireNoStringContextRuntime(const Value & v,
         std::fprintf(stderr, "v3 NOCTX-SITE: requireNoStringContextRuntime hint=%.*s\n",
                      (int)siteHint.size(), siteHint.data());
     throw std::runtime_error(
-        std::string("the string '") + v.payload.str
+        std::string("the string '") + v.asString()
         + "' is not allowed to refer to a store path (such as '"
         + display + "')");
 }
@@ -1052,9 +1052,9 @@ inline std::string coerceToString(const Value & v, bool forceString)
     };
 
     switch (v.tag()) {
-    case Tag::String: return std::string(v.payload.str);
+    case Tag::String: return std::string(v.asString());
     case Tag::Path: {
-        std::string p(v.payload.path ? v.payload.path : "");
+        std::string p(v.asPath() ? v.asPath() : "");
         if (forceString) {
             if (auto * ns = getNixEvalState()) {
                 // Let copyPathToStore exceptions propagate — tree-walker
@@ -1442,14 +1442,14 @@ inline Bindings * mergeBindings(const Bindings * a, const Bindings * b,
 // indirect `let b = builtins; in b.storeDir`, etc.
 inline Value autoCallArity0(VMState & vm, const Value & v)
 {
-    if (v.tag() == Tag::PrimOp && v.payload.primop
-        && v.payload.primop->arity == 0)
+    if (v.tag() == Tag::PrimOp && v.asPrimOp()
+        && v.asPrimOp()->arity == 0)
     {
         EvalState evs;
         evs.vm = &vm;
         evs.nixEvalState = getNixEvalState();
         Value out;
-        v.payload.primop->fn(evs, nullptr, out);
+        v.asPrimOp()->fn(evs, nullptr, out);
         return out;
     }
     return v;
@@ -1470,7 +1470,7 @@ inline Value withLookup(VMState & vm, SymbolId name)
         // through the slot here gives us the LATEST value (matches
         // tree-walker's `state.forceValue(*v2)` on slot pointers).
         if (w.tag() == Tag::Slot) {
-            Value * p = w.payload.slot;
+            Value * p = w.asSlot();
             if (!p) continue;
             // 2026-05-18 cc-wrapper bisection: nixpkgs's `lib.fix` /
             // `extends` / `callPackage` machinery can produce a CHAIN
@@ -1508,7 +1508,7 @@ inline Value withLookup(VMState & vm, SymbolId name)
                     catch (const BlackholeError &) { anyBlackholed = true; continue; }
                 }
                 if (!derefed.isAttrs()) continue;
-                if (auto * v = derefed.payload.bindings->lookup(name))
+                if (auto * v = derefed.asAttrs()->lookup(name))
                     return *v;
                 continue;
             }
@@ -1523,7 +1523,7 @@ inline Value withLookup(VMState & vm, SymbolId name)
             bool chase_cycle = false;
             bool chase_overflow = false;
             while (derefed.tag() == Tag::Slot) {
-                Value * q = derefed.payload.slot;
+                Value * q = derefed.asSlot();
                 if (!q) { derefed.mkNull(); break; }
                 bool seen = false;
                 for (Value * v : visitedBuf) {
@@ -1583,7 +1583,7 @@ inline Value withLookup(VMState & vm, SymbolId name)
                 }
             }
             if (!derefed.isAttrs()) continue;
-            if (auto * v = derefed.payload.bindings->lookup(name))
+            if (auto * v = derefed.asAttrs()->lookup(name))
                 return autoCallArity0(vm, *v);
             continue;
         }
@@ -1608,7 +1608,7 @@ inline Value withLookup(VMState & vm, SymbolId name)
             }
         }
         if (!w.isAttrs()) continue;
-        if (auto * v = w.payload.bindings->lookup(name))
+        if (auto * v = w.asAttrs()->lookup(name))
             return autoCallArity0(vm, *v);
     }
     // §2.8: if every enclosing scope blackholed and none defined the
@@ -1647,19 +1647,19 @@ inline Value withLookup(VMState & vm, SymbolId name)
                 Value w = vm.withStack[i];
                 std::fprintf(stderr, "  with[%zu] tag=%u",
                     i, (unsigned)w.tag());
-                if (w.tag() == Tag::Slot && w.payload.slot) {
-                    Value d = *w.payload.slot;
+                if (w.tag() == Tag::Slot && w.asSlot()) {
+                    Value d = *w.asSlot();
                     std::fprintf(stderr, " -> SLOT(%p)=tag=%u",
-                        (void *)w.payload.slot, (unsigned)d.tag());
-                    if (d.isThunk() && d.payload.thunk) {
+                        (void *)w.asSlot(), (unsigned)d.tag());
+                    if (d.isThunk() && d.asThunk()) {
                         std::fprintf(stderr, "(thunk=%p state=%d)",
-                            (void *)d.payload.thunk,
-                            (int)d.payload.thunk->state);
+                            (void *)d.asThunk(),
+                            (int)d.asThunk()->state);
                     }
-                } else if (w.isThunk() && w.payload.thunk) {
+                } else if (w.isThunk() && w.asThunk()) {
                     std::fprintf(stderr, " thunk=%p state=%d",
-                        (void *)w.payload.thunk,
-                        (int)w.payload.thunk->state);
+                        (void *)w.asThunk(),
+                        (int)w.asThunk()->state);
                 }
                 std::fprintf(stderr, "\n");
             }
@@ -1879,7 +1879,7 @@ inline Value withLookup(VMState & vm, SymbolId name)
             nm.c_str(), (unsigned)name, base, vm.withStack.size());
         for (size_t i = vm.withStack.size(); i-- > base; ) {
             Value w = vm.withStack[i];   // copy so we can chase
-            void * orig_thunk = w.isThunk() ? (void *)w.payload.thunk : nullptr;
+            void * orig_thunk = w.isThunk() ? (void *)w.asThunk() : nullptr;
             std::fprintf(stderr, "  with[%zu] tag=%u thunk_ptr=%p",
                 i, (unsigned)w.tag(), orig_thunk);
             // Chase Evaluated thunk chains and Tag::Slot derefs to find
@@ -1888,29 +1888,29 @@ inline Value withLookup(VMState & vm, SymbolId name)
             int chase_lim = 8;
             while (chase_lim-- > 0) {
                 if (w.tag() == Tag::Slot) {
-                    Value * p = w.payload.slot;
+                    Value * p = w.asSlot();
                     std::fprintf(stderr, " -> SLOT(%p)", (void*)p);
                     if (!p) break;
                     w = *p;
                     std::fprintf(stderr, "=tag=%u", (unsigned)w.tag());
                     if (w.isThunk())
                         std::fprintf(stderr, "(ptr=%p,state=%d)",
-                            (void*)w.payload.thunk, (int)w.payload.thunk->state);
+                            (void*)w.asThunk(), (int)w.asThunk()->state);
                     continue;
                 }
                 if (w.isThunk()
-                    && w.payload.thunk->state == ThunkState::Evaluated) {
-                    w = w.payload.thunk->evaluated;
+                    && w.asThunk()->state == ThunkState::Evaluated) {
+                    w = w.asThunk()->evaluated;
                     std::fprintf(stderr, " -> tag=%u", (unsigned)w.tag());
                     if (w.isThunk())
                         std::fprintf(stderr, "(ptr=%p,state=%d)",
-                            (void *)w.payload.thunk, (int)w.payload.thunk->state);
+                            (void *)w.asThunk(), (int)w.asThunk()->state);
                     continue;
                 }
                 break;
             }
-            if (w.isAttrs() && w.payload.bindings) {
-                auto * b = w.payload.bindings;
+            if (w.isAttrs() && w.asAttrs()) {
+                auto * b = w.asAttrs();
                 std::fprintf(stderr, " attrs size=%u {", b->size);
                 for (uint32_t k = 0; k < b->size && k < 30; ++k) {
                     SymbolId s = b->entries[k].name;
@@ -1927,7 +1927,7 @@ inline Value withLookup(VMState & vm, SymbolId name)
                     (void)v;
                 }
             } else if (w.isThunk()) {
-                Thunk * t = w.payload.thunk;
+                Thunk * t = w.asThunk();
                 std::fprintf(stderr, " thunk state=%d nUp=%u",
                     (int)t->state, (unsigned)t->nUpvalues);
                 if (t->state == ThunkState::Suspended) {
@@ -1937,12 +1937,12 @@ inline Value withLookup(VMState & vm, SymbolId name)
                             !d->name.empty() ? d->name.c_str() : "<anon>",
                             d->codeOffset);
                 }
-            } else if (w.isClosure() && w.payload.closure
-                       && w.payload.closure->desc) {
-                auto * d = w.payload.closure->desc;
+            } else if (w.isClosure() && w.asClosure()
+                       && w.asClosure()->desc) {
+                auto * d = w.asClosure()->desc;
                 std::fprintf(stderr, " closure=%s nUp=%u",
                     !d->name.empty() ? d->name.c_str() : "<anon>",
-                    w.payload.closure->nUpvalues);
+                    w.asClosure()->nUpvalues);
             }
             std::fprintf(stderr, "\n");
         }
@@ -2128,8 +2128,8 @@ inline ListVec * internOrAllocSingletonCapWiths(const Value & v) noexcept
         listPostConstructBarrier(lws);
         return lws;
     }
-    const uint64_t tp = v.tag_payload;
-    const uint64_t pr = reinterpret_cast<uint64_t>(v.payload.raw);
+    const uint64_t tp = v.rawWord();
+    const uint64_t pr = reinterpret_cast<uint64_t>(v.asRaw());
     const size_t idx = hashCapWithsKey(tp, pr);
     CapWithsCacheEntry & e = s_capWithsCache[idx];
     if (e.value
@@ -2445,13 +2445,13 @@ static inline std::string v3ValueTypeName(Value v)
     case Tag::List: {
         char b[32];
         std::snprintf(b, sizeof b, "List(%zu)",
-            v.payload.list ? (size_t)v.payload.list->size : (size_t)0);
+            v.asList() ? (size_t)v.asList()->size : (size_t)0);
         return b;
     }
     case Tag::Attrs: {
         char b[32];
         std::snprintf(b, sizeof b, "Attrs(%zu)",
-            v.payload.bindings ? (size_t)v.payload.bindings->size : (size_t)0);
+            v.asAttrs() ? (size_t)v.asAttrs()->size : (size_t)0);
         return b;
     }
     case Tag::Closure:   return "Lambda";
@@ -3136,8 +3136,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     // Fingerprint: pointer values of the first 3 upvalues
                     // — distinguishes different thunks that happen to share
                     // pointer (Boehm GC reuse) by their upvalue contents.
-                    uint64_t fp0 = cur.thunk->tail[0].tag_payload;
-                    uint64_t fp1 = cur.thunk->nUpvalues > 1 ? cur.thunk->tail[1].tag_payload : 0;
+                    uint64_t fp0 = cur.thunk->tail[0].rawWord();
+                    uint64_t fp1 = cur.thunk->nUpvalues > 1 ? cur.thunk->tail[1].rawWord() : 0;
                     std::fprintf(stderr,
                         "  TRACE thunk=%p state=%d ip=%u op=0x%02x operand=%u (cu=%p) fp=[%016llx,%016llx]\n",
                         (void*)cur.thunk, (int)cur.thunk->state, ip, (unsigned)pop_o, pop_n,
@@ -3296,8 +3296,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
         }
         case OP_LIT_PATH: {
             Value v;
-            v.tag_payload = static_cast<uint64_t>(Tag::Path);
-            v.payload.path = cu->stringConstants[operand].c_str();
+            v.mkPath(cu->stringConstants[operand].c_str());
             push(vm, v);
             break;
         }
@@ -3499,32 +3498,32 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                         Value chase = top;
                         int hops = 0;
                         while (hops < 16) {
-                            if (chase.tag() == Tag::Slot && chase.payload.slot)
-                                chase = *chase.payload.slot;
+                            if (chase.tag() == Tag::Slot && chase.asSlot())
+                                chase = *chase.asSlot();
                             else if (chase.tag() == Tag::Thunk
-                                     && chase.payload.thunk
-                                     && chase.payload.thunk->state == ThunkState::Evaluated)
-                                chase = chase.payload.thunk->evaluated;
+                                     && chase.asThunk()
+                                     && chase.asThunk()->state == ThunkState::Evaluated)
+                                chase = chase.asThunk()->evaluated;
                             else break;
                             ++hops;
                         }
                         std::fprintf(stderr,
                             " chase-tag=%u (hops=%d)",
                             (unsigned)chase.tag(), hops);
-                        if (chase.tag() == Tag::Attrs && chase.payload.bindings) {
+                        if (chase.tag() == Tag::Attrs && chase.asAttrs()) {
                             const auto & st = ir::globalSymbolTable();
-                            uint32_t sz = chase.payload.bindings->size;
+                            uint32_t sz = chase.asAttrs()->size;
                             std::fprintf(stderr, " size=%u keys={", sz);
                             for (uint32_t k = 0; k < sz && k < 16; ++k) {
                                 SymbolId nn =
-                                    chase.payload.bindings->entries[k].name;
+                                    chase.asAttrs()->entries[k].name;
                                 std::fprintf(stderr, "%s%s",
                                     k ? "," : "",
                                     nn < st.size() ? st[nn].c_str() : "?");
                             }
                             std::fprintf(stderr, "}");
                             if (const BindingsOrigin * o =
-                                    lookupBindingsOrigin(chase.payload.bindings)) {
+                                    lookupBindingsOrigin(chase.asAttrs())) {
                                 const PosSnapshot * ps =
                                     resolvePosSnapshot(o->posHandle);
                                 std::fprintf(stderr,
@@ -3597,11 +3596,11 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             if (__builtin_expect(top0.isInt() && top1.isInt(), 1)) {
                 int64_t sum;
                 if (__builtin_expect(__builtin_add_overflow(
-                        top0.payload.i, top1.payload.i, &sum), 0))
+                        top0.asInt(), top1.asInt(), &sum), 0))
                     throw std::runtime_error(
                         "integer overflow in adding "
-                        + std::to_string(top0.payload.i) + " + "
-                        + std::to_string(top1.payload.i));
+                        + std::to_string(top0.asInt()) + " + "
+                        + std::to_string(top1.asInt()));
                 vm.valueStack.pop_back();
                 vm.valueStack.back().mkInt(sum);
                 break;
@@ -3609,9 +3608,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // Slow path: Float / mixed Int-Float.
             Value rhs = pop(vm), lhs = pop(vm);
             Value r;
-            if (lhs.isFloat() && rhs.isFloat())      r.mkFloat(lhs.payload.f + rhs.payload.f);
-            else if (lhs.isInt() && rhs.isFloat())   r.mkFloat(static_cast<double>(lhs.payload.i) + rhs.payload.f);
-            else if (lhs.isFloat() && rhs.isInt())   r.mkFloat(lhs.payload.f + static_cast<double>(rhs.payload.i));
+            if (lhs.isFloat() && rhs.isFloat())      r.mkFloat(lhs.asFloat() + rhs.asFloat());
+            else if (lhs.isInt() && rhs.isFloat())   r.mkFloat(static_cast<double>(lhs.asInt()) + rhs.asFloat());
+            else if (lhs.isFloat() && rhs.isInt())   r.mkFloat(lhs.asFloat() + static_cast<double>(rhs.asInt()));
             else throw std::runtime_error("value is not a number");
             push(vm, r);
             break;
@@ -3624,20 +3623,20 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             if (__builtin_expect(top0.isInt() && top1.isInt(), 1)) {
                 int64_t diff;
                 if (__builtin_expect(__builtin_sub_overflow(
-                        top0.payload.i, top1.payload.i, &diff), 0))
+                        top0.asInt(), top1.asInt(), &diff), 0))
                     throw std::runtime_error(
                         "integer overflow in subtracting "
-                        + std::to_string(top0.payload.i) + " - "
-                        + std::to_string(top1.payload.i));
+                        + std::to_string(top0.asInt()) + " - "
+                        + std::to_string(top1.asInt()));
                 vm.valueStack.pop_back();
                 vm.valueStack.back().mkInt(diff);
                 break;
             }
             Value rhs = pop(vm), lhs = pop(vm);
             Value r;
-            if (lhs.isFloat() && rhs.isFloat())      r.mkFloat(lhs.payload.f - rhs.payload.f);
-            else if (lhs.isInt() && rhs.isFloat())   r.mkFloat(static_cast<double>(lhs.payload.i) - rhs.payload.f);
-            else if (lhs.isFloat() && rhs.isInt())   r.mkFloat(lhs.payload.f - static_cast<double>(rhs.payload.i));
+            if (lhs.isFloat() && rhs.isFloat())      r.mkFloat(lhs.asFloat() - rhs.asFloat());
+            else if (lhs.isInt() && rhs.isFloat())   r.mkFloat(static_cast<double>(lhs.asInt()) - rhs.asFloat());
+            else if (lhs.isFloat() && rhs.isInt())   r.mkFloat(lhs.asFloat() - static_cast<double>(rhs.asInt()));
             else throw std::runtime_error("value is not a number");
             push(vm, r);
             break;
@@ -3650,20 +3649,20 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             if (__builtin_expect(top0.isInt() && top1.isInt(), 1)) {
                 int64_t prod;
                 if (__builtin_expect(__builtin_mul_overflow(
-                        top0.payload.i, top1.payload.i, &prod), 0))
+                        top0.asInt(), top1.asInt(), &prod), 0))
                     throw std::runtime_error(
                         "integer overflow in multiplying "
-                        + std::to_string(top0.payload.i) + " * "
-                        + std::to_string(top1.payload.i));
+                        + std::to_string(top0.asInt()) + " * "
+                        + std::to_string(top1.asInt()));
                 vm.valueStack.pop_back();
                 vm.valueStack.back().mkInt(prod);
                 break;
             }
             Value rhs = pop(vm), lhs = pop(vm);
             Value r;
-            if (lhs.isFloat() && rhs.isFloat())      r.mkFloat(lhs.payload.f * rhs.payload.f);
-            else if (lhs.isInt() && rhs.isFloat())   r.mkFloat(static_cast<double>(lhs.payload.i) * rhs.payload.f);
-            else if (lhs.isFloat() && rhs.isInt())   r.mkFloat(lhs.payload.f * static_cast<double>(rhs.payload.i));
+            if (lhs.isFloat() && rhs.isFloat())      r.mkFloat(lhs.asFloat() * rhs.asFloat());
+            else if (lhs.isInt() && rhs.isFloat())   r.mkFloat(static_cast<double>(lhs.asInt()) * rhs.asFloat());
+            else if (lhs.isFloat() && rhs.isInt())   r.mkFloat(lhs.asFloat() * static_cast<double>(rhs.asInt()));
             else throw std::runtime_error("value is not a number");
             push(vm, r);
             break;
@@ -3676,21 +3675,21 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // zero" / "integer overflow".  Drops "v3 OP_DIV:" debug
             // prefix.
             if (lhs.isInt() && rhs.isInt()) {
-                if (rhs.payload.i == 0) throw std::runtime_error("division by zero");
+                if (rhs.asInt() == 0) throw std::runtime_error("division by zero");
                 // INT64_MIN / -1 wraps around (mathematical result is
                 // INT64_MAX + 1).  Match tree-walker by raising.
-                if (lhs.payload.i == std::numeric_limits<int64_t>::min() && rhs.payload.i == -1)
+                if (lhs.asInt() == std::numeric_limits<int64_t>::min() && rhs.asInt() == -1)
                     throw std::runtime_error("integer overflow");
-                r.mkInt(lhs.payload.i / rhs.payload.i);
+                r.mkInt(lhs.asInt() / rhs.asInt());
             } else if (lhs.isFloat() && rhs.isFloat()) {
-                if (rhs.payload.f == 0.0) throw std::runtime_error("division by zero");
-                r.mkFloat(lhs.payload.f / rhs.payload.f);
+                if (rhs.asFloat() == 0.0) throw std::runtime_error("division by zero");
+                r.mkFloat(lhs.asFloat() / rhs.asFloat());
             } else if (lhs.isInt() && rhs.isFloat()) {
-                if (rhs.payload.f == 0.0) throw std::runtime_error("division by zero");
-                r.mkFloat(static_cast<double>(lhs.payload.i) / rhs.payload.f);
+                if (rhs.asFloat() == 0.0) throw std::runtime_error("division by zero");
+                r.mkFloat(static_cast<double>(lhs.asInt()) / rhs.asFloat());
             } else if (lhs.isFloat() && rhs.isInt()) {
-                if (rhs.payload.i == 0) throw std::runtime_error("division by zero");
-                r.mkFloat(lhs.payload.f / static_cast<double>(rhs.payload.i));
+                if (rhs.asInt() == 0) throw std::runtime_error("division by zero");
+                r.mkFloat(lhs.asFloat() / static_cast<double>(rhs.asInt()));
             } else throw std::runtime_error(
                 "value is not a number");
             push(vm, r);
@@ -3709,7 +3708,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             Value & top1 = vm.valueStack.back();
             Value & top0 = vm.valueStack[vm.valueStack.size() - 2];
             if (__builtin_expect(top0.isInt() && top1.isInt(), 1)) {
-                bool eq = top0.payload.i == top1.payload.i;
+                bool eq = top0.asInt() == top1.asInt();
                 vm.valueStack.pop_back();
                 vm.valueStack.back() = eq ? Value::vTrue : Value::vFalse;
                 break;
@@ -3720,7 +3719,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             Value & top1 = vm.valueStack.back();
             Value & top0 = vm.valueStack[vm.valueStack.size() - 2];
             if (__builtin_expect(top0.isInt() && top1.isInt(), 1)) {
-                bool ne = top0.payload.i != top1.payload.i;
+                bool ne = top0.asInt() != top1.asInt();
                 vm.valueStack.pop_back();
                 vm.valueStack.back() = ne ? Value::vTrue : Value::vFalse;
                 break;
@@ -3731,7 +3730,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             Value & top1 = vm.valueStack.back();
             Value & top0 = vm.valueStack[vm.valueStack.size() - 2];
             if (__builtin_expect(top0.isInt() && top1.isInt(), 1)) {
-                bool lt = top0.payload.i < top1.payload.i;
+                bool lt = top0.asInt() < top1.asInt();
                 vm.valueStack.pop_back();
                 vm.valueStack.back() = lt ? Value::vTrue : Value::vFalse;
                 break;
@@ -3775,7 +3774,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 vm.frames.back().flags |= CFF_FORCE_RETRY;
                 goto op_force_slow;
             }
-            if (v.isBool() && v.payload.i == 0) ip = operand;
+            if (v.isBool() && v.asInt() == 0) ip = operand;
             else                                 vm.valueStack.pop_back();
             break;
         }
@@ -3786,7 +3785,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 vm.frames.back().flags |= CFF_FORCE_RETRY;
                 goto op_force_slow;
             }
-            if (v.isBool() && v.payload.i == 1) ip = operand;
+            if (v.isBool() && v.asInt() == 1) ip = operand;
             else                                 vm.valueStack.pop_back();
             break;
         }
@@ -3801,7 +3800,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 goto op_force_slow;
             }
             Value v = pop(vm);
-            if (v.isBool() && v.payload.i == 0) { push(vm, Value::vTrue); ip = operand; }
+            if (v.isBool() && v.asInt() == 0) { push(vm, Value::vTrue); ip = operand; }
             break;
         }
 
@@ -3816,7 +3815,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 goto op_force_slow;
             }
             Value v = pop(vm);
-            if (v.isBool() && v.payload.i == 0) ip = operand;
+            if (v.isBool() && v.asInt() == 0) ip = operand;
             break;
         }
         case OP_R_BRANCH_FALSE: {
@@ -3836,7 +3835,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 goto op_force_slow;
             }
             ip++;                       // consume the cond_slot follow-up
-            if (cval.isBool() && cval.payload.i == 0) ip = operand;
+            if (cval.isBool() && cval.asInt() == 0) ip = operand;
             break;
         }
         case OP_R_CALL: {
@@ -3875,7 +3874,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 Value callee = vm.valueStack[stackBase + calleeSlot];
                 Value argv   = vm.valueStack[stackBase + argSlot];  // lazy, unforced
                 const Closure * cl = callee.tag() == Tag::Closure
-                    ? callee.payload.closure : nullptr;
+                    ? callee.asClosure() : nullptr;
                 if (cl && cl->desc && cl->desc->arity == 1
                     && cl->desc->selectorSym == 0 && !cl->desc->identityLambda) {
                     // Plain single-arg user closure: take the iterative
@@ -4093,19 +4092,19 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                         Value lv = vm.valueStack[fr.stackBaseOffset];
                         Value chase = lv;
                         for (int hops = 0; hops < 4; ++hops) {
-                            if (chase.tag() == Tag::Slot && chase.payload.slot)
-                                chase = *chase.payload.slot;
+                            if (chase.tag() == Tag::Slot && chase.asSlot())
+                                chase = *chase.asSlot();
                             else if (chase.tag() == Tag::Thunk
-                                     && chase.payload.thunk
-                                     && chase.payload.thunk->state == ThunkState::Evaluated)
-                                chase = chase.payload.thunk->evaluated;
+                                     && chase.asThunk()
+                                     && chase.asThunk()->state == ThunkState::Evaluated)
+                                chase = chase.asThunk()->evaluated;
                             else break;
                         }
                         std::fprintf(stderr,
                             "  maker.local[0] tag=%d", (int)lv.tag());
-                        if (chase.tag() == Tag::Attrs && chase.payload.bindings) {
+                        if (chase.tag() == Tag::Attrs && chase.asAttrs()) {
                             std::fprintf(stderr, " -> attrs size=%u",
-                                (unsigned)chase.payload.bindings->size);
+                                (unsigned)chase.asAttrs()->size);
                         } else {
                             std::fprintf(stderr, " -> chased.tag=%d",
                                 (int)chase.tag());
@@ -4125,11 +4124,11 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 && nUp == 4) {
                 auto chase = [](Value v, int hops) -> Value {
                     while (hops-- > 0) {
-                        if (v.tag() == Tag::Slot && v.payload.slot)
-                            v = *v.payload.slot;
-                        else if (v.tag() == Tag::Thunk && v.payload.thunk
-                                 && v.payload.thunk->state == ThunkState::Evaluated)
-                            v = v.payload.thunk->evaluated;
+                        if (v.tag() == Tag::Slot && v.asSlot())
+                            v = *v.asSlot();
+                        else if (v.tag() == Tag::Thunk && v.asThunk()
+                                 && v.asThunk()->state == ThunkState::Evaluated)
+                            v = v.asThunk()->evaluated;
                         else break;
                     }
                     return v;
@@ -4143,9 +4142,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     Value chased = chase(uv, 4);
                     std::fprintf(stderr,
                         "  upvalue[%u]: tag=%d", i, (int)uv.tag());
-                    if (chased.tag() == Tag::Attrs && chased.payload.bindings) {
+                    if (chased.tag() == Tag::Attrs && chased.asAttrs()) {
                         const auto & st = ir::globalSymbolTable();
-                        auto * b = chased.payload.bindings;
+                        auto * b = chased.asAttrs();
                         std::fprintf(stderr,
                             " -> attrs size=%u {", (unsigned)b->size);
                         for (uint32_t k = 0; k < b->size && k < 6; ++k) {
@@ -4231,19 +4230,19 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                         Value lv = vm.valueStack[fr.stackBaseOffset + li];
                         Value chased = lv;
                         for (int hops = 0; hops < 4; ++hops) {
-                            if (chased.tag() == Tag::Slot && chased.payload.slot)
-                                chased = *chased.payload.slot;
+                            if (chased.tag() == Tag::Slot && chased.asSlot())
+                                chased = *chased.asSlot();
                             else if (chased.tag() == Tag::Thunk
-                                     && chased.payload.thunk
-                                     && chased.payload.thunk->state == ThunkState::Evaluated)
-                                chased = chased.payload.thunk->evaluated;
+                                     && chased.asThunk()
+                                     && chased.asThunk()->state == ThunkState::Evaluated)
+                                chased = chased.asThunk()->evaluated;
                             else break;
                         }
                         std::fprintf(stderr,
                             "    local[%u]: tag=%d", li, (int)lv.tag());
-                        if (chased.tag() == Tag::Attrs && chased.payload.bindings) {
+                        if (chased.tag() == Tag::Attrs && chased.asAttrs()) {
                             const auto & st = ir::globalSymbolTable();
-                            auto * b = chased.payload.bindings;
+                            auto * b = chased.asAttrs();
                             std::fprintf(stderr,
                                 " -> attrs size=%u {", (unsigned)b->size);
                             for (uint32_t k = 0; k < b->size && k < 6; ++k) {
@@ -4484,11 +4483,11 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // and conflictingAttrs).
             auto chaseFn = [](Value v, int hops) -> Value {
                 while (hops-- > 0) {
-                    if (v.tag() == Tag::Slot && v.payload.slot)
-                        v = *v.payload.slot;
-                    else if (v.tag() == Tag::Thunk && v.payload.thunk
-                             && v.payload.thunk->state == ThunkState::Evaluated)
-                        v = v.payload.thunk->evaluated;
+                    if (v.tag() == Tag::Slot && v.asSlot())
+                        v = *v.asSlot();
+                    else if (v.tag() == Tag::Thunk && v.asThunk()
+                             && v.asThunk()->state == ThunkState::Evaluated)
+                        v = v.asThunk()->evaluated;
                     else break;
                 }
                 return v;
@@ -4497,9 +4496,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             if (t->suspended.desc && t->suspended.desc->name == "res"
                 && nUp == 4) {
                 Value uv3chased = chaseFn(t->tail[3], 4);
-                if (uv3chased.tag() == Tag::Attrs && uv3chased.payload.bindings
-                    && uv3chased.payload.bindings->size == 2) {
-                    auto * b = uv3chased.payload.bindings;
+                if (uv3chased.tag() == Tag::Attrs && uv3chased.asAttrs()
+                    && uv3chased.asAttrs()->size == 2) {
+                    auto * b = uv3chased.asAttrs();
                     static const SymbolId conflictSym =
                         ir::globalInternSymbol("conflictingAttrs");
                     for (uint32_t k = 0; k < b->size; ++k) {
@@ -4532,9 +4531,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                         desc && !desc->name.empty() ? desc->name.c_str() : "?",
                         (unsigned)(desc ? desc->codeOffset : 0),
                         (int)uv0.tag());
-                    if (chased.tag() == Tag::Attrs && chased.payload.bindings) {
+                    if (chased.tag() == Tag::Attrs && chased.asAttrs()) {
                         const auto & st = ir::globalSymbolTable();
-                        auto * b = chased.payload.bindings;
+                        auto * b = chased.asAttrs();
                         std::fprintf(stderr, " -> attrs size=%u {",
                             (unsigned)b->size);
                         for (uint32_t k = 0; k < b->size && k < 4; ++k) {
@@ -4556,9 +4555,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     Value chased = chaseFn(uv, 4);
                     std::fprintf(stderr,
                         "  upvalue[%u]: tag=%d", i, (int)uv.tag());
-                    if (chased.tag() == Tag::Attrs && chased.payload.bindings) {
+                    if (chased.tag() == Tag::Attrs && chased.asAttrs()) {
                         const auto & st = ir::globalSymbolTable();
-                        auto * b = chased.payload.bindings;
+                        auto * b = chased.asAttrs();
                         std::fprintf(stderr,
                             " -> attrs size=%u {", (unsigned)b->size);
                         for (uint32_t k = 0; k < b->size && k < 6; ++k) {
@@ -4569,10 +4568,10 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                         if (b->size > 6) std::fprintf(stderr, ",...");
                         std::fprintf(stderr, "}");
                     } else if (chased.tag() == Tag::Closure
-                               && chased.payload.closure
-                               && chased.payload.closure->desc) {
+                               && chased.asClosure()
+                               && chased.asClosure()->desc) {
                         std::fprintf(stderr, " -> Closure name=%s",
-                            chased.payload.closure->desc->name.c_str());
+                            chased.asClosure()->desc->name.c_str());
                     } else {
                         std::fprintf(stderr, " -> tag=%d", (int)chased.tag());
                     }
@@ -4592,9 +4591,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     Value chased = chaseFn(uv, 4);
                     std::fprintf(stderr,
                         "  upvalue[%u]: tag=%d", i, (int)uv.tag());
-                    if (chased.tag() == Tag::Attrs && chased.payload.bindings) {
+                    if (chased.tag() == Tag::Attrs && chased.asAttrs()) {
                         const auto & st = ir::globalSymbolTable();
-                        auto * b = chased.payload.bindings;
+                        auto * b = chased.asAttrs();
                         std::fprintf(stderr,
                             " -> attrs size=%u {", (unsigned)b->size);
                         for (uint32_t k = 0; k < b->size && k < 6; ++k) {
@@ -4616,8 +4615,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // suspended.capturedWiths carries nursery payload, dirty-list.
             thunkPostConstructBarrier(t);
             Value v;
-            v.tag_payload = static_cast<uint64_t>(Tag::Thunk);
-            v.payload.thunk = t;
+            v.mkThunk(t);
             push(vm, v);
             break;
         }
@@ -4638,29 +4636,29 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             static const bool s_dbgFinalCall =
                 std::getenv("V3_DBG_FINAL_CALL") != nullptr;
             if (__builtin_expect(s_dbgFinalCall, 0)
-                && fun.tag() == Tag::Closure && fun.payload.closure
-                && fun.payload.closure->desc
-                && (fun.payload.closure->desc->name == "final"
-                    || fun.payload.closure->desc->name == "self"
-                    || fun.payload.closure->desc->name == "rattrs"
-                    || fun.payload.closure->desc->name == "overlay")) {
+                && fun.tag() == Tag::Closure && fun.asClosure()
+                && fun.asClosure()->desc
+                && (fun.asClosure()->desc->name == "final"
+                    || fun.asClosure()->desc->name == "self"
+                    || fun.asClosure()->desc->name == "rattrs"
+                    || fun.asClosure()->desc->name == "overlay")) {
                 Value chase = arg;
                 int hops = 0;
                 while (hops < 4) {
-                    if (chase.tag() == Tag::Slot && chase.payload.slot)
-                        chase = *chase.payload.slot;
-                    else if (chase.tag() == Tag::Thunk && chase.payload.thunk
-                             && chase.payload.thunk->state == ThunkState::Evaluated)
-                        chase = chase.payload.thunk->evaluated;
+                    if (chase.tag() == Tag::Slot && chase.asSlot())
+                        chase = *chase.asSlot();
+                    else if (chase.tag() == Tag::Thunk && chase.asThunk()
+                             && chase.asThunk()->state == ThunkState::Evaluated)
+                        chase = chase.asThunk()->evaluated;
                     else break;
                     ++hops;
                 }
                 std::fprintf(stderr,
                     "v3 OP_CALL %s-lambda: arg.tag=%d",
-                    fun.payload.closure->desc->name.c_str(),
+                    fun.asClosure()->desc->name.c_str(),
                     (int)arg.tag());
-                if (chase.tag() == Tag::Attrs && chase.payload.bindings) {
-                    auto * b = chase.payload.bindings;
+                if (chase.tag() == Tag::Attrs && chase.asAttrs()) {
+                    auto * b = chase.asAttrs();
                     std::fprintf(stderr, " -> attrs size=%u", b->size);
                 } else {
                     std::fprintf(stderr, " -> tag=%d", (int)chase.tag());
@@ -4674,13 +4672,13 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 std::getenv("V3_DBG_OP_CALL") != nullptr;
             if (s_dbgOpCall) {
                 const char * fname = "<?>";
-                if (fun.tag() == Tag::Closure && fun.payload.closure
-                    && fun.payload.closure->desc)
-                    fname = fun.payload.closure->desc->name.c_str();
+                if (fun.tag() == Tag::Closure && fun.asClosure()
+                    && fun.asClosure()->desc)
+                    fname = fun.asClosure()->desc->name.c_str();
                 int arg_tag = (int)arg.tag();
                 int arg_size = -1;
-                if (arg.tag() == Tag::Attrs && arg.payload.bindings)
-                    arg_size = arg.payload.bindings->size;
+                if (arg.tag() == Tag::Attrs && arg.asAttrs())
+                    arg_size = arg.asAttrs()->size;
                 std::fprintf(stderr,
                     "v3 OP_CALL: name=%s fun.tag=%d arg.tag=%d size=%d frames=%zu\n",
                     fname, (int)fun.tag(), arg_tag, arg_size,
@@ -4722,7 +4720,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // pushing fun, arg, dup-of-fun.  The forced value
             // overwrites the original fun-slot on retry.
             if (Tag fT = fun.tag(); fT == Tag::Thunk) {
-                Thunk * t = fun.payload.thunk;
+                Thunk * t = fun.asThunk();
                 if (t->state == ThunkState::Evaluated) {
                     Value e = t->evaluated;
                     Tag eT = e.tag();
@@ -4753,14 +4751,14 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 // fires: arity>1 closures exist only when NIX_V3_EVAL_APPLY
                 // collapsed a curried chain, so `arity > depth` is false for
                 // every ordinary single-arg-closure lazy-app.
-                if (fT == Tag::App && fun.payload.pair) {
+                if (fT == Tag::App && fun.asPair()) {
                     const Value * cur = &fun; size_t d = 0;
-                    while (cur->tag() == Tag::App && cur->payload.pair) {
-                        ++d; cur = &cur->payload.pair->left;
+                    while (cur->tag() == Tag::App && cur->asPair()) {
+                        ++d; cur = &cur->asPair()->left;
                     }
-                    if (cur->tag() == Tag::Closure && cur->payload.closure
-                        && cur->payload.closure->desc
-                        && cur->payload.closure->desc->arity > d)
+                    if (cur->tag() == Tag::Closure && cur->asClosure()
+                        && cur->asClosure()->desc
+                        && cur->asClosure()->desc->arity > d)
                         goto op_call_have_fun;
                 }
                 goto op_call_iter_force;
@@ -4792,10 +4790,10 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 // collect the previously-applied args.
                 Value cur = fun;
                 size_t depth = 0;
-                while (cur.tag() == Tag::PrimOpApp) { ++depth; cur = cur.payload.pair->left; }
+                while (cur.tag() == Tag::PrimOpApp) { ++depth; cur = cur.asPair()->left; }
                 if (!cur.isPrimOp())
                     throw std::runtime_error("v3 OP_CALL: PrimOpApp chain doesn't terminate in a PrimOp");
-                const PrimOp * po = cur.payload.primop;
+                const PrimOp * po = cur.asPrimOp();
                 size_t totalArgs = depth + 1;
                 if (totalArgs < po->arity) {
                     // Build a new PrimOpApp wrapping (fun, arg).
@@ -4804,8 +4802,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     vp->right = arg;
                     pairPostConstructBarrier(vp);  // Phase D
                     Value v;
-                    v.tag_payload = static_cast<uint64_t>(Tag::PrimOpApp);
-                    v.payload.pair = vp;
+                    v.mkPair(Tag::PrimOpApp, vp);
                     push(vm, v);
                     break;
                 }
@@ -4817,8 +4814,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 buf[totalArgs - 1] = arg;
                 Value chain = fun;
                 for (size_t i = totalArgs - 1; i > 0; --i) {
-                    buf[i - 1] = chain.payload.pair->right;
-                    chain = chain.payload.pair->left;
+                    buf[i - 1] = chain.asPair()->right;
+                    chain = chain.asPair()->left;
                 }
                 vm.frames.back().ip = ip;
                 // PrimOpApp accumulates args lazily — primops expect
@@ -4877,15 +4874,15 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             {
                 const Closure * papBase = nullptr;
                 size_t papDepth = 0;
-                if (fun.tag() == Tag::Closure && fun.payload.closure) {
-                    papBase = fun.payload.closure;
-                } else if (fun.tag() == Tag::App && fun.payload.pair) {
+                if (fun.tag() == Tag::Closure && fun.asClosure()) {
+                    papBase = fun.asClosure();
+                } else if (fun.tag() == Tag::App && fun.asPair()) {
                     const Value * cur = &fun;
-                    while (cur->tag() == Tag::App && cur->payload.pair) {
-                        ++papDepth; cur = &cur->payload.pair->left;
+                    while (cur->tag() == Tag::App && cur->asPair()) {
+                        ++papDepth; cur = &cur->asPair()->left;
                     }
-                    if (cur->tag() == Tag::Closure && cur->payload.closure)
-                        papBase = cur->payload.closure;
+                    if (cur->tag() == Tag::Closure && cur->asClosure())
+                        papBase = cur->asClosure();
                 }
                 if (papBase && papBase->desc && papBase->desc->arity > 1) {
                     const uint8_t A = papBase->desc->arity;
@@ -4896,8 +4893,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                         vp->left = fun; vp->right = arg;
                         pairPostConstructBarrier(vp);
                         Value v;
-                        v.tag_payload = static_cast<uint64_t>(Tag::App);
-                        v.payload.pair = vp;
+                        v.mkPair(Tag::App, vp);
                         push(vm, v);
                         break;
                     }
@@ -4909,8 +4905,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     argbuf[total - 1] = arg;
                     Value chain = fun;
                     for (size_t i = total - 1; i > 0; --i) {
-                        argbuf[i - 1] = chain.payload.pair->right;
-                        chain = chain.payload.pair->left;
+                        argbuf[i - 1] = chain.asPair()->right;
+                        chain = chain.asPair()->left;
                     }
                     const LambdaDescriptor * d = papBase->desc;
                     if (__builtin_expect(vm.frames.size() >= kMaxCallDepth, 0))
@@ -4949,9 +4945,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // OP_CALL twice to match the curried call sequence.
             if (fun.isAttrs()) {
                 static const SymbolId functorId = ir::globalInternSymbol("__functor");
-                if (!fun.payload.bindings)
+                if (!fun.asAttrs())
                     throw std::runtime_error("v3 OP_CALL: callee is an attrset without __functor");
-                const Value * fn = fun.payload.bindings->lookup(functorId);
+                const Value * fn = fun.asAttrs()->lookup(functorId);
                 if (!fn)
                     throw std::runtime_error("v3 OP_CALL: callee is an attrset without __functor");
                 Value forced = forceValue(vm, *fn);
@@ -4997,7 +4993,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 }
                 throw std::runtime_error("v3 OP_CALL: callee is not a closure");
             }
-            const Closure * callee = fun.payload.closure;
+            const Closure * callee = fun.asClosure();
             const LambdaDescriptor * desc = callee->desc;
 
             // #495 follow-on bisect: log OP_CALL post-force for
@@ -5016,8 +5012,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             {
                 int arg_tag = (int)arg.tag();
                 int arg_size = -1;
-                if (arg.tag() == Tag::Attrs && arg.payload.bindings)
-                    arg_size = arg.payload.bindings->size;
+                if (arg.tag() == Tag::Attrs && arg.asAttrs())
+                    arg_size = arg.asAttrs()->size;
                 std::fprintf(stderr,
                     "v3 OP_CALL platform: callee=%p desc=%p arg.tag=%d size=%d "
                     "frames=%zu\n",
@@ -5026,16 +5022,16 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 // Dereference Tag::Slot indirections (chase up to 4
                 // hops to handle Slot→Slot rebinding) and print the
                 // ultimate Value's tag + a few attr names.
-                if (arg.tag() == Tag::Slot && arg.payload.slot) {
-                    Value * p = arg.payload.slot;
+                if (arg.tag() == Tag::Slot && arg.asSlot()) {
+                    Value * p = arg.asSlot();
                     int hop = 0;
                     while (p && hop < 4) {
                         std::fprintf(stderr,
                             "  slot[%d] @ %p tag=%d", hop, (void*)p,
                             (int)p->tag());
-                        if (p->tag() == Tag::Attrs && p->payload.bindings) {
+                        if (p->tag() == Tag::Attrs && p->asAttrs()) {
                             const auto & st = ir::globalSymbolTable();
-                            auto * b = p->payload.bindings;
+                            auto * b = p->asAttrs();
                             std::fprintf(stderr, " bindings=%p size=%u present=[",
                                 (void*)b, (unsigned)b->size);
                             for (uint32_t i = 0; i < b->size && i < 10; ++i) {
@@ -5049,13 +5045,13 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                         }
                         if (p->tag() == Tag::Slot) {
                             std::fprintf(stderr, " → @ %p\n",
-                                (void*)p->payload.slot);
-                            p = p->payload.slot;
+                                (void*)p->asSlot());
+                            p = p->asSlot();
                             ++hop;
                             continue;
                         }
-                        if (p->tag() == Tag::Thunk && p->payload.thunk) {
-                            auto * th = p->payload.thunk;
+                        if (p->tag() == Tag::Thunk && p->asThunk()) {
+                            auto * th = p->asThunk();
                             std::fprintf(stderr,
                                 " thunk=%p state=%d",
                                 (void*)th, (int)th->state);
@@ -5066,8 +5062,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                                 Value & ev = th->evaluated;
                                 std::fprintf(stderr,
                                     " evaluated.tag=%d", (int)ev.tag());
-                                if (ev.tag() == Tag::Attrs && ev.payload.bindings) {
-                                    auto * b = ev.payload.bindings;
+                                if (ev.tag() == Tag::Attrs && ev.asAttrs()) {
+                                    auto * b = ev.asAttrs();
                                     const auto & st = ir::globalSymbolTable();
                                     std::fprintf(stderr,
                                         " bindings=%p size=%u present=[",
@@ -5141,11 +5137,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     // location, so the body sees the in-progress result
                     // (TW-style knot-tying).
                     Value * slotStorage = Alloc::allocValue();
-                    slotStorage->tag_payload =
-                        static_cast<uint64_t>(Tag::Uninitialized);
+                    slotStorage->mkUninitialized();
                     Value slotV;
-                    slotV.tag_payload = static_cast<uint64_t>(Tag::Slot);
-                    slotV.payload.slot = slotStorage;
+                    slotV.mkSlot(slotStorage);
                     // Save current ip on this frame so callClosure's
                     // re-entry into the dispatch loop can return cleanly.
                     vm.frames.back().ip = ip;
@@ -5193,7 +5187,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     // prev = f(final); force to attrs WHNF.
                     Value prev = callClosure(vm, f, final_);
                     prev = forceValue(vm, prev);
-                    if (!prev.isAttrs() || !prev.payload.bindings)
+                    if (!prev.isAttrs() || !prev.asAttrs())
                         throw std::runtime_error(
                             "v3 intrinsic ExtendsBody: prev (= f final) didn't reduce to attrs");
                     // overlay_partial = overlay(final), then
@@ -5201,15 +5195,14 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     Value overlay_partial = callClosure(vm, overlay, final_);
                     Value overlay_result  = callClosure(vm, overlay_partial, prev);
                     overlay_result = forceValue(vm, overlay_result);
-                    if (!overlay_result.isAttrs() || !overlay_result.payload.bindings)
+                    if (!overlay_result.isAttrs() || !overlay_result.asAttrs())
                         throw std::runtime_error(
                             "v3 intrinsic ExtendsBody: overlay final prev didn't reduce to attrs");
-                    Bindings * merged = mergeBindings(prev.payload.bindings,
-                                                      overlay_result.payload.bindings,
+                    Bindings * merged = mergeBindings(prev.asAttrs(),
+                                                      overlay_result.asAttrs(),
                                                       MergeBindingsSite::ExtendsCallPrev);
                     Value res;
-                    res.tag_payload = static_cast<uint64_t>(Tag::Attrs);
-                    res.payload.bindings = merged;
+                    res.mkAttrs(merged);
                     push(vm, res);
                     break;
                 }
@@ -5245,34 +5238,32 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     Value f_partial = callClosure(vm, f, final_);
                     Value fApplied  = callClosure(vm, f_partial, prev_);
                     fApplied = forceValue(vm, fApplied);
-                    if (!fApplied.isAttrs() || !fApplied.payload.bindings)
+                    if (!fApplied.isAttrs() || !fApplied.asAttrs())
                         throw std::runtime_error(
                             "v3 intrinsic ComposeBody: f final prev didn't reduce to attrs");
                     // prev' = prev // fApplied (force prev_ to attrs first).
                     Value prevForced = forceValue(vm, prev_);
-                    if (!prevForced.isAttrs() || !prevForced.payload.bindings)
+                    if (!prevForced.isAttrs() || !prevForced.asAttrs())
                         throw std::runtime_error(
                             "v3 intrinsic ComposeBody: prev didn't reduce to attrs");
-                    Bindings * prevPrimeB = mergeBindings(prevForced.payload.bindings,
-                                                          fApplied.payload.bindings,
+                    Bindings * prevPrimeB = mergeBindings(prevForced.asAttrs(),
+                                                          fApplied.asAttrs(),
                                                           MergeBindingsSite::ExtendsCallPrevPrime);
                     Value prevPrime;
-                    prevPrime.tag_payload = static_cast<uint64_t>(Tag::Attrs);
-                    prevPrime.payload.bindings = prevPrimeB;
+                    prevPrime.mkAttrs(prevPrimeB);
                     // gApplied = g final prev'; force to attrs.
                     Value g_partial = callClosure(vm, g, final_);
                     Value gApplied  = callClosure(vm, g_partial, prevPrime);
                     gApplied = forceValue(vm, gApplied);
-                    if (!gApplied.isAttrs() || !gApplied.payload.bindings)
+                    if (!gApplied.isAttrs() || !gApplied.asAttrs())
                         throw std::runtime_error(
                             "v3 intrinsic ComposeBody: g final prev' didn't reduce to attrs");
                     // result = fApplied // gApplied.
-                    Bindings * merged = mergeBindings(fApplied.payload.bindings,
-                                                       gApplied.payload.bindings,
+                    Bindings * merged = mergeBindings(fApplied.asAttrs(),
+                                                       gApplied.asAttrs(),
                                                        MergeBindingsSite::ComposeCallApplied);
                     Value res;
-                    res.tag_payload = static_cast<uint64_t>(Tag::Attrs);
-                    res.payload.bindings = merged;
+                    res.mkAttrs(merged);
                     push(vm, res);
                     break;
                 }
@@ -5298,14 +5289,14 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     vm.frames.back().ip = ip;
                     sArg = forceValue(vm, sArg);
                 }
-                if (!sArg.isAttrs() || !sArg.payload.bindings)
+                if (!sArg.isAttrs() || !sArg.asAttrs())
                     throw std::runtime_error(
                         "v3 selector lambda: arg not an attrset");
                 // Binary-search the attrset (entries sorted ascending
                 // by SymbolId).  Mirrors what OP_ATTRS_SELECT does
                 // post-IC-miss; we don't have an IC slot here since
                 // there's no allocated bytecode site for the projection.
-                const Value * v = sArg.payload.bindings->lookup(
+                const Value * v = sArg.asAttrs()->lookup(
                     desc->selectorSym);
                 if (!v)
                     throw std::runtime_error(
@@ -5378,11 +5369,11 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                         Value chase = arg;
                         Thunk * blackOnFrames = nullptr;
                         for (int hops = 0; hops < 16; ++hops) {
-                            if (chase.tag() == Tag::Slot && chase.payload.slot)
-                                chase = *chase.payload.slot;
+                            if (chase.tag() == Tag::Slot && chase.asSlot())
+                                chase = *chase.asSlot();
                             else if (chase.tag() == Tag::Thunk
-                                     && chase.payload.thunk) {
-                                Thunk * th = chase.payload.thunk;
+                                     && chase.asThunk()) {
+                                Thunk * th = chase.asThunk();
                                 if (th->state == ThunkState::Evaluated) {
                                     chase = th->evaluated;
                                 } else if (th->state == ThunkState::Blackhole) {
@@ -5455,7 +5446,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                         msg += valueRepr(forcedArg);
                         throw std::runtime_error(msg);
                     }
-                    if (forcedArg.payload.bindings) {
+                    if (forcedArg.asAttrs()) {
                         // #680 — emit TW's exact error phrasing
                         // (libexpr/eval.cc:1849 + extra-arg sibling) so
                         // user-visible formals errors don't expose
@@ -5466,7 +5457,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                         std::string lambdaName = desc && !desc->contextualName.empty()
                             ? desc->contextualName
                             : std::string("anonymous lambda");
-                        const Bindings * b = forcedArg.payload.bindings;
+                        const Bindings * b = forcedArg.asAttrs();
                         // #825 Phase C SPIKE: materialise Chain for the
                         // formals destructure loops below — both the
                         // extra-arg scan (a) and the missing-arg scan
@@ -5532,7 +5523,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                                             "unexpected='%s' ellipsis=0 "
                                             "passed_attrs=[",
                                             (const void *)desc,
-                                            (const void *)(fun.payload.closure ? fun.payload.closure->cu : nullptr),
+                                            (const void *)(fun.asClosure() ? fun.asClosure()->cu : nullptr),
                                             desc->name.c_str(),
                                             desc->contextualName.c_str(),
                                             ps ? ps->file.c_str() : "?",
@@ -5650,11 +5641,11 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     Value chase = arg;
                     int hops = 0;
                     while (hops < 4) {
-                        if (chase.tag() == Tag::Slot && chase.payload.slot)
-                            chase = *chase.payload.slot;
-                        else if (chase.tag() == Tag::Thunk && chase.payload.thunk
-                                 && chase.payload.thunk->state == ThunkState::Evaluated)
-                            chase = chase.payload.thunk->evaluated;
+                        if (chase.tag() == Tag::Slot && chase.asSlot())
+                            chase = *chase.asSlot();
+                        else if (chase.tag() == Tag::Thunk && chase.asThunk()
+                                 && chase.asThunk()->state == ThunkState::Evaluated)
+                            chase = chase.asThunk()->evaluated;
                         else break;
                         ++hops;
                     }
@@ -5662,8 +5653,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                         "v3 FRAME_ENTRY OP_CALL %s codeOff=%u: local[0].tag=%d",
                         desc->name.c_str(), (unsigned)desc->codeOffset,
                         (int)arg.tag());
-                    if (chase.tag() == Tag::Attrs && chase.payload.bindings) {
-                        auto * b = chase.payload.bindings;
+                    if (chase.tag() == Tag::Attrs && chase.asAttrs()) {
+                        auto * b = chase.asAttrs();
                         std::fprintf(stderr, " -> attrs size=%u {",
                             b->size);
                         const auto & tbl = ir::globalSymbolTable();
@@ -5812,10 +5803,10 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 Value chase = arg;
                 Thunk * blackOnFrames = nullptr;
                 for (int hops = 0; hops < 16; ++hops) {
-                    if (chase.tag() == Tag::Slot && chase.payload.slot)
-                        chase = *chase.payload.slot;
-                    else if (chase.tag() == Tag::Thunk && chase.payload.thunk) {
-                        Thunk * th = chase.payload.thunk;
+                    if (chase.tag() == Tag::Slot && chase.asSlot())
+                        chase = *chase.asSlot();
+                    else if (chase.tag() == Tag::Thunk && chase.asThunk()) {
+                        Thunk * th = chase.asThunk();
                         if (th->state == ThunkState::Evaluated)
                             chase = th->evaluated;
                         else if (th->state == ThunkState::Blackhole) {
@@ -5834,16 +5825,16 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     int funEllipsis = -1;
                     int funThunkState = -1;
                     const char * thunkName = "";
-                    if (fun.isClosure() && fun.payload.closure
-                        && fun.payload.closure->desc) {
-                        funName = fun.payload.closure->desc->name.c_str();
-                        funHasFormals = (int)fun.payload.closure->desc->hasFormals;
-                        funEllipsis = (int)fun.payload.closure->desc->ellipsis;
-                    } else if (fun.tag() == Tag::Thunk && fun.payload.thunk) {
-                        funThunkState = (int)fun.payload.thunk->state;
-                        if (fun.payload.thunk->state == ThunkState::Suspended
-                            || fun.payload.thunk->state == ThunkState::Blackhole) {
-                            const auto * d = fun.payload.thunk->suspended.desc;
+                    if (fun.isClosure() && fun.asClosure()
+                        && fun.asClosure()->desc) {
+                        funName = fun.asClosure()->desc->name.c_str();
+                        funHasFormals = (int)fun.asClosure()->desc->hasFormals;
+                        funEllipsis = (int)fun.asClosure()->desc->ellipsis;
+                    } else if (fun.tag() == Tag::Thunk && fun.asThunk()) {
+                        funThunkState = (int)fun.asThunk()->state;
+                        if (fun.asThunk()->state == ThunkState::Suspended
+                            || fun.asThunk()->state == ThunkState::Blackhole) {
+                            const auto * d = fun.asThunk()->suspended.desc;
                             if (d) thunkName = d->name.c_str();
                         }
                     }
@@ -5851,7 +5842,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                         "v3 OP_TAIL_CALL pre-dispatch BLACK arg: "
                         "fun.tag=%d ptr=%p isClosure=%d name=%s hasFormals=%d ellipsis=%d "
                         "thunkState=%d thunkName=%s\n",
-                        (int)fun.tag(), fun.payload.thunk,
+                        (int)fun.tag(), fun.asThunk(),
                         funIsClosure, funName,
                         funHasFormals, funEllipsis,
                         funThunkState, thunkName);
@@ -5864,15 +5855,15 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // depth ≥ 1).  Gate-off inert (arity>1 closures don't exist).
             {
                 const Closure * tcBase = nullptr; size_t papDepth = 0;
-                if (fun.tag() == Tag::Closure && fun.payload.closure) {
-                    tcBase = fun.payload.closure;
-                } else if (fun.tag() == Tag::App && fun.payload.pair) {
+                if (fun.tag() == Tag::Closure && fun.asClosure()) {
+                    tcBase = fun.asClosure();
+                } else if (fun.tag() == Tag::App && fun.asPair()) {
                     const Value * c0 = &fun;
-                    while (c0->tag() == Tag::App && c0->payload.pair) {
-                        ++papDepth; c0 = &c0->payload.pair->left;
+                    while (c0->tag() == Tag::App && c0->asPair()) {
+                        ++papDepth; c0 = &c0->asPair()->left;
                     }
-                    if (c0->tag() == Tag::Closure && c0->payload.closure)
-                        tcBase = c0->payload.closure;
+                    if (c0->tag() == Tag::Closure && c0->asClosure())
+                        tcBase = c0->asClosure();
                 }
                 if (tcBase && tcBase->desc && tcBase->desc->arity > 1) {
                     const uint8_t A = tcBase->desc->arity;
@@ -5890,8 +5881,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                         vp->left = fun; vp->right = arg;
                         pairPostConstructBarrier(vp);
                         Value v;
-                        v.tag_payload = static_cast<uint64_t>(Tag::App);
-                        v.payload.pair = vp;
+                        v.mkPair(Tag::App, vp);
                         push(vm, v);
                         break;  // ip already points at the trailing OP_RETURN
                     }
@@ -5906,8 +5896,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     argbuf[total - 1] = arg;
                     Value chain = fun;
                     for (size_t i = total - 1; i > 0; --i) {
-                        argbuf[i - 1] = chain.payload.pair->right;
-                        chain = chain.payload.pair->left;
+                        argbuf[i - 1] = chain.asPair()->right;
+                        chain = chain.asPair()->left;
                     }
                     const LambdaDescriptor * d = tcBase->desc;
                     const CompilationUnit * baseCu = tcBase->cu ? tcBase->cu : cu;
@@ -5934,7 +5924,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 push(vm, arg);
                 goto op_call_dispatch;
             }
-            const Closure * tcCallee = fun.payload.closure;
+            const Closure * tcCallee = fun.asClosure();
             // #705 (2026-05-21): defensive null-desc check (similar to
             // forceValue's STALE THUNK detection).  If tcCallee was a
             // stale nursery closure that got memset, desc reads as 0.
@@ -6027,11 +6017,11 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                         Value chase = arg;
                         Thunk * blackOnFrames = nullptr;
                         for (int hops = 0; hops < 16; ++hops) {
-                            if (chase.tag() == Tag::Slot && chase.payload.slot)
-                                chase = *chase.payload.slot;
+                            if (chase.tag() == Tag::Slot && chase.asSlot())
+                                chase = *chase.asSlot();
                             else if (chase.tag() == Tag::Thunk
-                                     && chase.payload.thunk) {
-                                Thunk * th = chase.payload.thunk;
+                                     && chase.asThunk()) {
+                                Thunk * th = chase.asThunk();
                                 if (th->state == ThunkState::Evaluated) {
                                     chase = th->evaluated;
                                 } else if (th->state == ThunkState::Blackhole) {
@@ -6102,11 +6092,11 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                         msg += valueRepr(forcedArg);
                         throw std::runtime_error(msg);
                     }
-                    if (forcedArg.payload.bindings) {
+                    if (forcedArg.asAttrs()) {
                         std::string lambdaName = tcDesc && !tcDesc->contextualName.empty()
                             ? tcDesc->contextualName
                             : std::string("anonymous lambda");
-                        const Bindings * b = forcedArg.payload.bindings;
+                        const Bindings * b = forcedArg.asAttrs();
                         // #825 Phase C SPIKE: materialise Chain — see
                         // the matching note in the OP_CALL formals path
                         // above (~line 4895).
@@ -6166,11 +6156,11 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     Value chase = arg;
                     int hops = 0;
                     while (hops < 4) {
-                        if (chase.tag() == Tag::Slot && chase.payload.slot)
-                            chase = *chase.payload.slot;
-                        else if (chase.tag() == Tag::Thunk && chase.payload.thunk
-                                 && chase.payload.thunk->state == ThunkState::Evaluated)
-                            chase = chase.payload.thunk->evaluated;
+                        if (chase.tag() == Tag::Slot && chase.asSlot())
+                            chase = *chase.asSlot();
+                        else if (chase.tag() == Tag::Thunk && chase.asThunk()
+                                 && chase.asThunk()->state == ThunkState::Evaluated)
+                            chase = chase.asThunk()->evaluated;
                         else break;
                         ++hops;
                     }
@@ -6178,8 +6168,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                         "v3 FRAME_ENTRY OP_TAIL_CALL %s codeOff=%u: local[0].tag=%d",
                         tcDesc->name.c_str(),
                         (unsigned)tcDesc->codeOffset, (int)arg.tag());
-                    if (chase.tag() == Tag::Attrs && chase.payload.bindings) {
-                        auto * b = chase.payload.bindings;
+                    if (chase.tag() == Tag::Attrs && chase.asAttrs()) {
+                        auto * b = chase.asAttrs();
                         std::fprintf(stderr, " -> attrs size=%u {",
                             b->size);
                         const auto & tbl = ir::globalSymbolTable();
@@ -6280,10 +6270,10 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // the fallback, which accumulates it correctly via callClosure.
             if (fun.tag() == Tag::Slot || fun.tag() == Tag::Thunk)
                 fun = forceValue(vm, fun);
-            if (fun.tag() == Tag::Closure && fun.payload.closure
-                && fun.payload.closure->desc
-                && fun.payload.closure->desc->arity == n) {
-                const Closure * c = fun.payload.closure;
+            if (fun.tag() == Tag::Closure && fun.asClosure()
+                && fun.asClosure()->desc
+                && fun.asClosure()->desc->arity == n) {
+                const Closure * c = fun.asClosure();
                 const LambdaDescriptor * d = c->desc;
                 if (__builtin_expect(vm.frames.size() >= kMaxCallDepth, 0))
                     throw std::runtime_error(
@@ -6344,10 +6334,10 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // deep tail recursion (the whole point of the tail variant).
             if (fun.tag() == Tag::Slot || fun.tag() == Tag::Thunk)
                 fun = forceValue(vm, fun);
-            if (fun.tag() == Tag::Closure && fun.payload.closure
-                && fun.payload.closure->desc
-                && fun.payload.closure->desc->arity == n) {
-                const Closure * c = fun.payload.closure;
+            if (fun.tag() == Tag::Closure && fun.asClosure()
+                && fun.asClosure()->desc
+                && fun.asClosure()->desc->arity == n) {
+                const Closure * c = fun.asClosure();
                 const LambdaDescriptor * d = c->desc;
                 const CompilationUnit * baseCu = c->cu ? c->cu : cu;
                 vm.valueStack.resize(stackBase + d->nLocals);
@@ -6429,9 +6419,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                             ip - 1, (unsigned)retVal.tag(),
                             (unsigned)fr.flags, (const void *)fr.thunk);
                         if (retVal.tag() == Tag::Closure
-                            && retVal.payload.closure
-                            && retVal.payload.closure->desc) {
-                            auto * cd = retVal.payload.closure->desc;
+                            && retVal.asClosure()
+                            && retVal.asClosure()->desc) {
+                            auto * cd = retVal.asClosure()->desc;
                             const PosSnapshot * cps =
                                 resolvePosSnapshot(cd->posHandle);
                             std::fprintf(stderr,
@@ -6440,11 +6430,11 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                                 (cps && !cps->file.empty()) ? cps->file.c_str() : "<no-pos>",
                                 cps ? cps->line : 0u, cps ? cps->column : 0u,
                                 cd->codeOffset,
-                                retVal.payload.closure->nUpvalues);
+                                retVal.asClosure()->nUpvalues);
                         } else if (retVal.tag() == Tag::Attrs
-                                   && retVal.payload.bindings) {
+                                   && retVal.asAttrs()) {
                             std::fprintf(stderr, " retVal-attrs-size=%u",
-                                (unsigned)retVal.payload.bindings->size);
+                                (unsigned)retVal.asAttrs()->size);
                         }
                         std::fprintf(stderr, "\n");
                         // Dump the thunk's body bytecode + descriptor info
@@ -6469,10 +6459,10 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     std::getenv("V3_DBG_RETURN_KEY");
                 if (__builtin_expect(s_dbgRetK != nullptr, 0)
                     && retVal.tag() == Tag::Attrs
-                    && retVal.payload.bindings
-                    && retVal.payload.bindings->size == 1) {
+                    && retVal.asAttrs()
+                    && retVal.asAttrs()->size == 1) {
                     const auto & st = ir::globalSymbolTable();
-                    SymbolId nm = retVal.payload.bindings->entries[0].name;
+                    SymbolId nm = retVal.asAttrs()->entries[0].name;
                     const char * nmStr =
                         nm < st.size() ? st[nm].c_str() : "?";
                     if (std::strcmp(nmStr, s_dbgRetK) == 0) {
@@ -6500,7 +6490,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                             (unsigned)fr.flags,
                             ip - 1);
                         if (const BindingsOrigin * o =
-                                lookupBindingsOrigin(retVal.payload.bindings)) {
+                                lookupBindingsOrigin(retVal.asAttrs())) {
                             const PosSnapshot * ops =
                                 resolvePosSnapshot(o->posHandle);
                             std::fprintf(stderr,
@@ -6599,10 +6589,10 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                         std::fprintf(stderr,
                             "v3 OP_RETURN chase: fr.thunk=%p initial=%p\n",
                             (void *)fr.thunk,
-                            (void *)retVal.payload.thunk);
+                            (void *)retVal.asThunk());
                         int hops = 0;
                         while (chase.isThunk() && hops < 32) {
-                            Thunk * th = chase.payload.thunk;
+                            Thunk * th = chase.asThunk();
                             const auto * d = (th->state == ThunkState::Suspended
                                               || th->state == ThunkState::Blackhole)
                                 ? th->suspended.desc : nullptr;
@@ -6623,8 +6613,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                         std::fflush(stderr);
                     }
                 }
-                while (retVal.isThunk() && retVal.payload.thunk->state == ThunkState::Evaluated)
-                    retVal = retVal.payload.thunk->evaluated;
+                while (retVal.isThunk() && retVal.asThunk()->state == ThunkState::Evaluated)
+                    retVal = retVal.asThunk()->evaluated;
                 // Self-reference detection: `let x = x; in x` makes the
                 // thunk's body return the thunk itself (the chase above
                 // can't catch this since we hit a Blackhole-state thunk
@@ -6632,7 +6622,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 // to assign).  Storing self into evaluated would make
                 // subsequent forceValue calls spin forever in the
                 // chase loop above.  Match tree-walker by raising.
-                if (retVal.isThunk() && retVal.payload.thunk == fr.thunk) {
+                if (retVal.isThunk() && retVal.asThunk() == fr.thunk) {
                     // gate: V3_DBG_RETURN_SELF — log OP_RETURN self-cycle
                     // cases (thunk-body returns its own Thunk*).  Retire
                     // when STG indirect-chain recovery is replaced by
@@ -6707,10 +6697,10 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     static const bool s_dbg_pv =
                         std::getenv("V3_DBG_STORE_PREVSTAGE") != nullptr;
                     if (s_dbg_pv && retVal.tag() == Tag::Closure
-                        && retVal.payload.closure
-                        && retVal.payload.closure->desc
-                        && retVal.payload.closure->nUpvalues == 0
-                        && retVal.payload.closure->desc->name == "prevStage")
+                        && retVal.asClosure()
+                        && retVal.asClosure()->desc
+                        && retVal.asClosure()->nUpvalues == 0
+                        && retVal.asClosure()->desc->name == "prevStage")
                     {
                         const auto * d = fr.thunk->suspended.desc;
                         std::fprintf(stderr,
@@ -6968,11 +6958,11 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     Thunk * retryThunk = nullptr;
                     Thunk * blackHit = nullptr;
                     while (hops < 16) {
-                        if (chase.tag() == Tag::Slot && chase.payload.slot) {
-                            chase = *chase.payload.slot;
+                        if (chase.tag() == Tag::Slot && chase.asSlot()) {
+                            chase = *chase.asSlot();
                         } else if (chase.tag() == Tag::Thunk
-                                   && chase.payload.thunk) {
-                            Thunk * th = chase.payload.thunk;
+                                   && chase.asThunk()) {
+                            Thunk * th = chase.asThunk();
                             if (th->state == ThunkState::Evaluated) {
                                 chase = th->evaluated;
                             } else if (th->state == ThunkState::Blackhole) {
@@ -6985,12 +6975,12 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                         ++hops;
                     }
                     if (retVal.tag() == Tag::Thunk
-                        && retVal.payload.thunk)
-                        retryThunk = retVal.payload.thunk;
+                        && retVal.asThunk())
+                        retryThunk = retVal.asThunk();
                     else if (retVal.tag() == Tag::Slot
-                             && retVal.payload.slot
-                             && retVal.payload.slot->tag() == Tag::Thunk)
-                        retryThunk = retVal.payload.slot->payload.thunk;
+                             && retVal.asSlot()
+                             && retVal.asSlot()->tag() == Tag::Thunk)
+                        retryThunk = retVal.asSlot()->asThunk();
                     bool onlyBlack = s_dbgRetryBlack;
                     if (!onlyBlack || blackHit) {
                         std::fprintf(stderr,
@@ -7108,10 +7098,10 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     void * p = nullptr;
                     int st = -1;
                     if (v.tag() == Tag::Thunk) {
-                        p = v.payload.thunk;
-                        if (v.payload.thunk) st = (int)v.payload.thunk->state;
-                    } else if (v.tag() == Tag::Slot) p = v.payload.slot;
-                    else if (v.isAppLike())         p = v.payload.pair;
+                        p = v.asThunk();
+                        if (v.asThunk()) st = (int)v.asThunk()->state;
+                    } else if (v.tag() == Tag::Slot) p = v.asSlot();
+                    else if (v.isAppLike())         p = v.asPair();
                     opfRingPtr[opfRingIdx % kOpfRingSize] = p;
                     opfRingState[opfRingIdx % kOpfRingSize] = st;
                     opfRingIdx++;
@@ -7157,7 +7147,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     throw std::runtime_error("infinite recursion encountered");
                 }
                 if (v.tag() == Tag::Slot) {
-                    Value * p = v.payload.slot;
+                    Value * p = v.asSlot();
                     if (!p) throw std::runtime_error(
                         "v3 OP_FORCE: null slot pointer");
                     v = *p;
@@ -7195,7 +7185,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     // regression (#696 pattern).  Separating the slots
                     // preserves App-result memo on hot mapAttrs entries.
                     bool outerIsAppLike = v.isAppLike();
-                    ValuePair * outerPair = outerIsAppLike ? v.payload.pair : nullptr;
+                    ValuePair * outerPair = outerIsAppLike ? v.asPair() : nullptr;
                     if (__builtin_expect(outerIsAppLike
                         && outerPair
                         && outerPair->evaluated.tag() != Tag::Uninitialized, 1))
@@ -7206,7 +7196,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     std::vector<Value> rights;
                     rights.reserve(8);
                     while (v.isAppLike()) {
-                        ValuePair * p = v.payload.pair;
+                        ValuePair * p = v.asPair();
                         if (v.tag() == Tag::App3)
                             rights.push_back(p->third);   // arg2 lives in `third` now
                         rights.push_back(p->right);
@@ -7232,9 +7222,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     // inside this OP_FORCE handler.
                     for (size_t i = rights.size(); i > 0; --i) {
                         if (v.tag() == Tag::Closure
-                            && v.payload.closure
-                            && v.payload.closure->desc
-                            && v.payload.closure->desc->identityLambda)
+                            && v.asClosure()
+                            && v.asClosure()->desc
+                            && v.asClosure()->desc->identityLambda)
                         {
                             v = rights[i - 1];
                             continue;
@@ -7255,12 +7245,12 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     continue;
                 }
                 if (!v.isThunk()) break;
-                if (v.payload.thunk->state == ThunkState::Evaluated) {
+                if (v.asThunk()->state == ThunkState::Evaluated) {
                     if (!s_opForceNoCompress
                         && opForceCompressCount < kOpForceCompressMax)
                         opForceCompressChain[opForceCompressCount++] =
-                            v.payload.thunk;
-                    v = v.payload.thunk->evaluated;
+                            v.asThunk();
+                    v = v.asThunk()->evaluated;
                     continue;
                 }
                 break;
@@ -7283,7 +7273,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 applyForceWriteback(vm);
                 break;
             }
-            Thunk * t = v.payload.thunk;
+            Thunk * t = v.asThunk();
             if (t->state == ThunkState::Blackhole) {
                 // WC-17.1 diagnostic: dump the v3 frame stack with
                 // function names + IP deltas when V3_DBG_OPCYCLE=1.
@@ -7754,8 +7744,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             for (uint32_t i = n; i > 0; --i) l->elems[i - 1] = pop(vm);
             listPostConstructBarrier(l);  // Phase D coverage (OP_LIST_INIT)
             Value v;
-            v.tag_payload = static_cast<uint64_t>(Tag::List);
-            v.payload.list = l;
+            v.mkList(l);
             push(vm, v);
             break;
         }
@@ -7792,16 +7781,15 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             Value rhs = pop(vm), lhs = pop(vm);
             if (!lhs.isList() || !rhs.isList())
                 throw std::runtime_error("v3 OP_LIST_CONCAT: not lists");
-            uint32_t n = lhs.payload.list->size + rhs.payload.list->size;
+            uint32_t n = lhs.asList()->size + rhs.asList()->size;
             ListVec * out = Alloc::allocList(n);
             V3_STATS_INC(listsAllocated);
             uint32_t k = 0;
-            for (uint32_t i = 0; i < lhs.payload.list->size; ++i) out->elems[k++] = lhs.payload.list->elems[i];
-            for (uint32_t i = 0; i < rhs.payload.list->size; ++i) out->elems[k++] = rhs.payload.list->elems[i];
+            for (uint32_t i = 0; i < lhs.asList()->size; ++i) out->elems[k++] = lhs.asList()->elems[i];
+            for (uint32_t i = 0; i < rhs.asList()->size; ++i) out->elems[k++] = rhs.asList()->elems[i];
             listPostConstructBarrier(out);  // Phase D coverage (OP_LIST_CONCAT)
             Value v;
-            v.tag_payload = static_cast<uint64_t>(Tag::List);
-            v.payload.list = out;
+            v.mkList(out);
             push(vm, v);
             break;
         }
@@ -7867,8 +7855,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // level, but entry positions are close enough to localize.
             recordBindingsOrigin(b, n > 0 ? entries[0].pos : 0, "OP_ATTRS_INIT");
             Value v;
-            v.tag_payload = static_cast<uint64_t>(Tag::Attrs);
-            v.payload.bindings = b;
+            v.mkAttrs(b);
 
             push(vm, v);
             break;
@@ -7914,7 +7901,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 requireNoStringContextRuntime(nameV, "OP_ATTRS_INIT_DYN");
                 // Use the global symbol table — IDs from any CU stay
                 // consistent so attrset lookups across CUs work.
-                SymbolId id = ir::globalInternSymbol(nameV.payload.str);
+                SymbolId id = ir::globalInternSymbol(nameV.asString());
                 entries.emplace_back(id, valV, dynPoses[i]);
             }
             std::sort(entries.begin(), entries.end(),
@@ -7942,8 +7929,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 entries.empty() ? 0 : std::get<2>(entries[0]),
                 "OP_ATTRS_INIT_DYN");
             Value v;
-            v.tag_payload = static_cast<uint64_t>(Tag::Attrs);
-            v.payload.bindings = b;
+            v.mkAttrs(b);
 
             push(vm, v);
             break;
@@ -7963,20 +7949,20 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     Value chase = v;
                     int hops = 0;
                     while (hops < 4) {
-                        if (chase.tag() == Tag::Slot && chase.payload.slot)
-                            chase = *chase.payload.slot;
-                        else if (chase.tag() == Tag::Thunk && chase.payload.thunk
-                                 && chase.payload.thunk->state == ThunkState::Evaluated)
-                            chase = chase.payload.thunk->evaluated;
+                        if (chase.tag() == Tag::Slot && chase.asSlot())
+                            chase = *chase.asSlot();
+                        else if (chase.tag() == Tag::Thunk && chase.asThunk()
+                                 && chase.asThunk()->state == ThunkState::Evaluated)
+                            chase = chase.asThunk()->evaluated;
                         else break;
                         ++hops;
                     }
                     std::fprintf(stderr,
                         "v3 OP_ATTRS_REC_INIT in final codeOff=%u: local[0].tag=%d",
                         (unsigned)d->codeOffset, (int)v.tag());
-                    if (chase.tag() == Tag::Attrs && chase.payload.bindings) {
+                    if (chase.tag() == Tag::Attrs && chase.asAttrs()) {
                         const auto & st = ir::globalSymbolTable();
-                        auto * b = chase.payload.bindings;
+                        auto * b = chase.asAttrs();
                         std::fprintf(stderr, " -> attrs size=%u {",
                             (unsigned)b->size);
                         for (uint32_t k = 0; k < b->size && k < 4; ++k) {
@@ -8017,8 +8003,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // sequence.
             recordBindingsOrigin(b, firstPos, "OP_ATTRS_REC_INIT");
             Value v;
-            v.tag_payload = static_cast<uint64_t>(Tag::Attrs);
-            v.payload.bindings = b;
+            v.mkAttrs(b);
             // OP_ATTRS_REC_INIT is the ONLY callsite with isRecInit=true.
             // The rec attrset's Bindings* registered here is the same
             // pointer that subsequent OP_ATTRS_REC_SET writes into, so
@@ -8095,8 +8080,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             }
             ip += 2 * n;
             Value v;
-            v.tag_payload = static_cast<uint64_t>(Tag::Attrs);
-            v.payload.bindings = b;
+            v.mkAttrs(b);
             push(vm, v);
             break;
         }
@@ -8140,8 +8124,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // localize which `rec { ... }` is being observed mid-state.
             recordBindingsOrigin(b, firstPosTail, "OP_ATTRS_REC_INIT_TAIL");
             Value v;
-            v.tag_payload = static_cast<uint64_t>(Tag::Attrs);
-            v.payload.bindings = b;
+            v.mkAttrs(b);
 
             // #558 Phase 1.5 (2026-05-12) Cell-Update Everywhere:
             // update ONLY the innermost THUNK_RETURN frame's
@@ -8180,18 +8163,18 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             //     attrset visible to the outer scope contains them.
             //   This matches tree-walker semantics.
             Value & top = vm.valueStack.back();
-            if (!top.isAttrs() || !top.payload.bindings) break;
+            if (!top.isAttrs() || !top.asAttrs()) break;
             static const SymbolId ovId = ir::globalInternSymbol("__overrides");
-            const Value * ovRaw = top.payload.bindings->lookup(ovId);
+            const Value * ovRaw = top.asAttrs()->lookup(ovId);
             if (!ovRaw) break;
             Value ov = forceValue(vm, *ovRaw);
             // Tree-walker raises if __overrides is present but not an
             // attrset; v3 silently ignored.
             if (!ov.isAttrs())
                 throw std::runtime_error("v3 OP_APPLY_OVERRIDES: __overrides must be an attrset");
-            if (!ov.payload.bindings) break;
-            auto * dst = top.payload.bindings;
-            const auto * src = ov.payload.bindings;
+            if (!ov.asAttrs()) break;
+            auto * dst = top.asAttrs();
+            const auto * src = ov.asAttrs();
             // First pass: overwrite existing entries; collect names to add.
             std::vector<std::pair<SymbolId, Value>> toAdd;
             for (uint32_t i = 0; i < src->size; ++i) {
@@ -8220,7 +8203,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     bindingsSetValue(grown, static_cast<uint32_t>(i),
                                      all[i].second);  // Phase D barrier
                 }
-                top.payload.bindings = grown;
+                top.mkAttrs(grown);
             }
             break;
         }
@@ -8269,11 +8252,11 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 int hops = 0;
                 while (hops < 8
                        && chase.isThunk()
-                       && chase.payload.thunk
-                       && chase.payload.thunk->state == ThunkState::Evaluated
-                       && chase.payload.thunk->evaluated.isThunk())
+                       && chase.asThunk()
+                       && chase.asThunk()->state == ThunkState::Evaluated
+                       && chase.asThunk()->evaluated.isThunk())
                 {
-                    chase = chase.payload.thunk->evaluated;
+                    chase = chase.asThunk()->evaluated;
                     ++hops;
                 }
             }
@@ -8288,10 +8271,10 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 static const char * s_dbgSelP =
                     std::getenv("V3_DBG_SELECT_PATTERN");
                 if (__builtin_expect(s_dbgSelP != nullptr, 0)) {
-                    if (attrs.isAttrs() && attrs.payload.bindings
-                        && attrs.payload.bindings->size == 1) {
+                    if (attrs.isAttrs() && attrs.asAttrs()
+                        && attrs.asAttrs()->size == 1) {
                         const auto & st = ir::globalSymbolTable();
-                        SymbolId nm = attrs.payload.bindings->entries[0].name;
+                        SymbolId nm = attrs.asAttrs()->entries[0].name;
                         const char * nmStr =
                             nm < st.size() ? st[nm].c_str() : "?";
                         if (std::strcmp(nmStr, s_dbgSelP) == 0) {
@@ -8302,9 +8285,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                                 "v3 OP_ATTRS_SELECT on {%s} (size=1) "
                                 "selecting '%s' [ptr=%p]",
                                 nmStr, symStr,
-                                (const void *)attrs.payload.bindings);
+                                (const void *)attrs.asAttrs());
                             if (const BindingsOrigin * o =
-                                    lookupBindingsOrigin(attrs.payload.bindings)) {
+                                    lookupBindingsOrigin(attrs.asAttrs())) {
                                 const PosSnapshot * ps =
                                     resolvePosSnapshot(o->posHandle);
                                 std::fprintf(stderr,
@@ -8375,16 +8358,16 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                         // path, recursion is dangerous.
                         char argBuf[128] = "";
                         auto formatValue = [&](const Value & v) {
-                            if (v.tag() == Tag::String && v.payload.str) {
+                            if (v.tag() == Tag::String && v.asString()) {
                                 std::snprintf(argBuf, sizeof(argBuf),
-                                              " arg0=\"%.96s\"", v.payload.str);
+                                              " arg0=\"%.96s\"", v.asString());
                             } else if (v.tag() == Tag::Int) {
                                 std::snprintf(argBuf, sizeof(argBuf),
-                                              " arg0=%lld", (long long)v.payload.i);
+                                              " arg0=%lld", (long long)v.asInt());
                             } else if (v.tag() == Tag::Bool) {
                                 std::snprintf(argBuf, sizeof(argBuf),
                                               " arg0=%s",
-                                              v.payload.i == 1 ? "true" : "false");
+                                              v.asInt() == 1 ? "true" : "false");
                             } else if (v.tag() == Tag::Null) {
                                 std::snprintf(argBuf, sizeof(argBuf), " arg0=null");
                             } else {
@@ -8396,10 +8379,10 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                             && frD.stackBaseOffset < vm.valueStack.size())
                         {
                             const Value & v0 = vm.valueStack[frD.stackBaseOffset];
-                            if (v0.tag() == Tag::Thunk && v0.payload.thunk
-                                && v0.payload.thunk->state == ThunkState::Evaluated)
+                            if (v0.tag() == Tag::Thunk && v0.asThunk()
+                                && v0.asThunk()->state == ThunkState::Evaluated)
                             {
-                                formatValue(v0.payload.thunk->evaluated);
+                                formatValue(v0.asThunk()->evaluated);
                             } else {
                                 formatValue(v0);
                             }
@@ -8436,7 +8419,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // value of a Tag::App entry — mapAttrs et al. install lazy
             // App(App(fn,name),val) entries that, without memoization,
             // re-apply the function on every access.
-            auto * b = attrs.payload.bindings;
+            auto * b = attrs.asAttrs();
 
             // Lever A (MEMORY_REPRESENTATION §6) — chain-aware SELECT,
             // NO materialise().  The IC fast path and the slow-path
@@ -8501,8 +8484,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                             std::fprintf(stderr, "  [%u] %s tag=%u",
                                 i, nm < st.size() ? st[nm].c_str() : "?",
                                 (unsigned)vtag);
-                            if (vtag == Tag::Thunk && vv.payload.thunk) {
-                                Thunk * t = vv.payload.thunk;
+                            if (vtag == Tag::Thunk && vv.asThunk()) {
+                                Thunk * t = vv.asThunk();
                                 const LambdaDescriptor * d = nullptr;
                                 if (t->state == ThunkState::Suspended)
                                     d = t->suspended.desc;
@@ -8558,14 +8541,14 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                                         const Value & uv = t->tail[u];
                                         Tag ut = uv.tag();
                                         std::fprintf(stderr, "      [%u] tag=%u", u, (unsigned)ut);
-                                        if (ut == Tag::Closure && uv.payload.closure
-                                            && uv.payload.closure->desc) {
-                                            auto * cd = uv.payload.closure->desc;
+                                        if (ut == Tag::Closure && uv.asClosure()
+                                            && uv.asClosure()->desc) {
+                                            auto * cd = uv.asClosure()->desc;
                                             std::fprintf(stderr, " closure=%s [%u..) nUp=%u",
                                                 !cd->name.empty() ? cd->name.c_str() : "<anon>",
-                                                cd->codeOffset, uv.payload.closure->nUpvalues);
-                                        } else if (ut == Tag::Thunk && uv.payload.thunk) {
-                                            Thunk * ut2 = uv.payload.thunk;
+                                                cd->codeOffset, uv.asClosure()->nUpvalues);
+                                        } else if (ut == Tag::Thunk && uv.asThunk()) {
+                                            Thunk * ut2 = uv.asThunk();
                                             std::fprintf(stderr, " state=%d nUp=%u",
                                                 (int)ut2->state, (unsigned)ut2->nUpvalues);
                                             if (ut2->state == ThunkState::Suspended) {
@@ -8577,16 +8560,16 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                                             } else if (ut2->state == ThunkState::Evaluated) {
                                                 Tag et = ut2->evaluated.tag();
                                                 std::fprintf(stderr, " EVAL=tag%u", (unsigned)et);
-                                                if (et == Tag::Closure && ut2->evaluated.payload.closure
-                                                    && ut2->evaluated.payload.closure->desc) {
-                                                    auto * cd = ut2->evaluated.payload.closure->desc;
+                                                if (et == Tag::Closure && ut2->evaluated.asClosure()
+                                                    && ut2->evaluated.asClosure()->desc) {
+                                                    auto * cd = ut2->evaluated.asClosure()->desc;
                                                     std::fprintf(stderr, "(%s [%u..) nUp=%u)",
                                                         !cd->name.empty() ? cd->name.c_str() : "<anon>",
-                                                        cd->codeOffset, ut2->evaluated.payload.closure->nUpvalues);
+                                                        cd->codeOffset, ut2->evaluated.asClosure()->nUpvalues);
                                                 }
                                             }
-                                        } else if (ut == Tag::Attrs && uv.payload.bindings) {
-                                            auto * b2 = uv.payload.bindings;
+                                        } else if (ut == Tag::Attrs && uv.asAttrs()) {
+                                            auto * b2 = uv.asAttrs();
                                             std::fprintf(stderr, " attrs size=%u {", b2->size);
                                             const auto & st2 = ir::globalSymbolTable();
                                             for (uint32_t k = 0; k < b2->size && k < 30; ++k) {
@@ -8603,24 +8586,24 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                                 if (t->state == ThunkState::Evaluated) {
                                     Tag etag = t->evaluated.tag();
                                     std::fprintf(stderr, " EVAL=tag%u", (unsigned)etag);
-                                    if (etag == Tag::Closure && t->evaluated.payload.closure
-                                        && t->evaluated.payload.closure->desc) {
-                                        auto * ed = t->evaluated.payload.closure->desc;
+                                    if (etag == Tag::Closure && t->evaluated.asClosure()
+                                        && t->evaluated.asClosure()->desc) {
+                                        auto * ed = t->evaluated.asClosure()->desc;
                                         std::fprintf(stderr, "(%s [%u..) nUp=%u)",
                                             !ed->name.empty() ? ed->name.c_str() : "<anon>",
                                             ed->codeOffset,
-                                            t->evaluated.payload.closure->nUpvalues);
-                                    } else if (etag == Tag::String && t->evaluated.payload.str) {
+                                            t->evaluated.asClosure()->nUpvalues);
+                                    } else if (etag == Tag::String && t->evaluated.asString()) {
                                         std::fprintf(stderr, "(\"%.40s\")",
-                                            t->evaluated.payload.str);
+                                            t->evaluated.asString());
                                     }
                                 }
-                            } else if (vtag == Tag::Closure && vv.payload.closure
-                                && vv.payload.closure->desc) {
-                                auto * d = vv.payload.closure->desc;
+                            } else if (vtag == Tag::Closure && vv.asClosure()
+                                && vv.asClosure()->desc) {
+                                auto * d = vv.asClosure()->desc;
                                 std::fprintf(stderr, " %s [%u..) nUp=%u",
                                     !d->name.empty() ? d->name.c_str() : "<anon>",
-                                    d->codeOffset, vv.payload.closure->nUpvalues);
+                                    d->codeOffset, vv.asClosure()->nUpvalues);
                             }
                             std::fprintf(stderr, "\n");
                         }
@@ -8681,18 +8664,18 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                         Value chase = vm.valueStack.back();
                         int hops = 0;
                         while (hops < 8) {
-                            if (chase.tag() == Tag::Slot && chase.payload.slot) {
-                                chase = *chase.payload.slot;
-                            } else if (chase.tag() == Tag::Thunk && chase.payload.thunk
-                                       && chase.payload.thunk->state == ThunkState::Evaluated) {
-                                chase = chase.payload.thunk->evaluated;
+                            if (chase.tag() == Tag::Slot && chase.asSlot()) {
+                                chase = *chase.asSlot();
+                            } else if (chase.tag() == Tag::Thunk && chase.asThunk()
+                                       && chase.asThunk()->state == ThunkState::Evaluated) {
+                                chase = chase.asThunk()->evaluated;
                             } else break;
                             ++hops;
                         }
-                        if (chase.tag() == Tag::Attrs && chase.payload.bindings
-                            && chase.payload.bindings->size == 1) {
+                        if (chase.tag() == Tag::Attrs && chase.asAttrs()
+                            && chase.asAttrs()->size == 1) {
                             const auto & st = ir::globalSymbolTable();
-                            SymbolId rnm = chase.payload.bindings->entries[0].name;
+                            SymbolId rnm = chase.asAttrs()->entries[0].name;
                             const char * rnmStr = rnm < st.size() ? st[rnm].c_str() : "?";
                             if (std::strcmp(rnmStr, s_dbgSelR) == 0) {
                                 SymbolId selSym = static_cast<SymbolId>(operand);
@@ -8715,7 +8698,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                                         ps ? ps->line : 0u);
                                 }
                                 if (const BindingsOrigin * o2 =
-                                        lookupBindingsOrigin(chase.payload.bindings)) {
+                                        lookupBindingsOrigin(chase.asAttrs())) {
                                     const PosSnapshot * ps =
                                         resolvePosSnapshot(o2->posHandle);
                                     std::fprintf(stderr,
@@ -8856,19 +8839,19 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                         Value chase = vm.valueStack.back();
                         int hops = 0;
                         while (hops < 8) {
-                            if (chase.tag() == Tag::Slot && chase.payload.slot) {
-                                chase = *chase.payload.slot;
+                            if (chase.tag() == Tag::Slot && chase.asSlot()) {
+                                chase = *chase.asSlot();
                             } else if (chase.tag() == Tag::Thunk
-                                       && chase.payload.thunk
-                                       && chase.payload.thunk->state == ThunkState::Evaluated) {
-                                chase = chase.payload.thunk->evaluated;
+                                       && chase.asThunk()
+                                       && chase.asThunk()->state == ThunkState::Evaluated) {
+                                chase = chase.asThunk()->evaluated;
                             } else break;
                             ++hops;
                         }
-                        if (chase.tag() == Tag::Attrs && chase.payload.bindings
-                            && chase.payload.bindings->size == 1) {
+                        if (chase.tag() == Tag::Attrs && chase.asAttrs()
+                            && chase.asAttrs()->size == 1) {
                             const auto & st = ir::globalSymbolTable();
-                            SymbolId rnm = chase.payload.bindings->entries[0].name;
+                            SymbolId rnm = chase.asAttrs()->entries[0].name;
                             const char * rnmStr = rnm < st.size() ? st[rnm].c_str() : "?";
                             if (std::strcmp(rnmStr, s_dbgSelR_chase) == 0) {
                                 SymbolId selSym = static_cast<SymbolId>(operand);
@@ -8890,7 +8873,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                                         ps ? ps->line : 0u);
                                 }
                                 if (const BindingsOrigin * o2 =
-                                        lookupBindingsOrigin(chase.payload.bindings)) {
+                                        lookupBindingsOrigin(chase.asAttrs())) {
                                     const PosSnapshot * ps =
                                         resolvePosSnapshot(o2->posHandle);
                                     std::fprintf(stderr,
@@ -8929,10 +8912,10 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                         std::getenv("V3_DBG_SELECT_RESULT");
                     if (__builtin_expect(s_dbgSelR != nullptr, 0)) {
                         const Value & top_val = vm.valueStack.back();
-                        if (top_val.isAttrs() && top_val.payload.bindings
-                            && top_val.payload.bindings->size == 1) {
+                        if (top_val.isAttrs() && top_val.asAttrs()
+                            && top_val.asAttrs()->size == 1) {
                             const auto & st = ir::globalSymbolTable();
-                            SymbolId rnm = top_val.payload.bindings->entries[0].name;
+                            SymbolId rnm = top_val.asAttrs()->entries[0].name;
                             const char * rnmStr = rnm < st.size() ? st[rnm].c_str() : "?";
                             if (std::strcmp(rnmStr, s_dbgSelR) == 0) {
                                 SymbolId selSym = static_cast<SymbolId>(operand);
@@ -9010,32 +8993,32 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                         Value chase = top;
                         int hops = 0;
                         while (hops < 16) {
-                            if (chase.tag() == Tag::Slot && chase.payload.slot)
-                                chase = *chase.payload.slot;
+                            if (chase.tag() == Tag::Slot && chase.asSlot())
+                                chase = *chase.asSlot();
                             else if (chase.tag() == Tag::Thunk
-                                     && chase.payload.thunk
-                                     && chase.payload.thunk->state == ThunkState::Evaluated)
-                                chase = chase.payload.thunk->evaluated;
+                                     && chase.asThunk()
+                                     && chase.asThunk()->state == ThunkState::Evaluated)
+                                chase = chase.asThunk()->evaluated;
                             else break;
                             ++hops;
                         }
                         std::fprintf(stderr,
                             " chase-tag=%u (hops=%d)",
                             (unsigned)chase.tag(), hops);
-                        if (chase.tag() == Tag::Attrs && chase.payload.bindings) {
+                        if (chase.tag() == Tag::Attrs && chase.asAttrs()) {
                             std::fprintf(stderr, " chase-attrs-size=%u chase-keys={",
-                                chase.payload.bindings->size);
-                            uint32_t sz = chase.payload.bindings->size;
+                                chase.asAttrs()->size);
+                            uint32_t sz = chase.asAttrs()->size;
                             for (uint32_t k = 0; k < sz && k < 16; ++k) {
                                 SymbolId nm =
-                                    chase.payload.bindings->entries[k].name;
+                                    chase.asAttrs()->entries[k].name;
                                 std::fprintf(stderr, "%s%s",
                                     k ? "," : "",
                                     nm < st.size() ? st[nm].c_str() : "?");
                             }
                             std::fprintf(stderr, "}");
                             if (const BindingsOrigin * o2 =
-                                    lookupBindingsOrigin(chase.payload.bindings)) {
+                                    lookupBindingsOrigin(chase.asAttrs())) {
                                 const PosSnapshot * ps =
                                     resolvePosSnapshot(o2->posHandle);
                                 std::fprintf(stderr,
@@ -9046,15 +9029,15 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                                     ps ? ps->line : 0u);
                             }
                         } else if (chase.tag() == Tag::String
-                                   && chase.payload.str) {
+                                   && chase.asString()) {
                             std::fprintf(stderr,
-                                " chase-str=\"%.40s\"", chase.payload.str);
+                                " chase-str=\"%.40s\"", chase.asString());
                         } else if (chase.tag() == Tag::Thunk
-                                   && chase.payload.thunk) {
+                                   && chase.asThunk()) {
                             std::fprintf(stderr,
                                 " chase-thunk=%p state=%d",
-                                (void *)chase.payload.thunk,
-                                (int)chase.payload.thunk->state);
+                                (void *)chase.asThunk(),
+                                (int)chase.asThunk()->state);
                         }
                         if (const BindingsOrigin * o =
                                 lookupBindingsOrigin(b)) {
@@ -9093,8 +9076,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             requireNoStringContextRuntime(name, "OP_ATTRS_SELECT_DYN");
             // Intern via the global table so the SymbolId matches the
             // ones the attrset's bindings were built with.
-            SymbolId id = ir::globalInternSymbol(name.payload.str);
-            Bindings * dynB = attrs.payload.bindings;
+            SymbolId id = ir::globalInternSymbol(name.asString());
+            Bindings * dynB = attrs.asAttrs();
             // Lever A: chain dynamic-select MATERIALISES (same rationale as
             // the static OP_ATTRS_SELECT — a lookup-only path risks the
             // shared-parent writeback contamination documented there).
@@ -9107,7 +9090,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 // missing`.  Use EvalError so it groups with TW's
                 // family.
                 throw std::runtime_error(
-                    "attribute '" + std::string(name.payload.str)
+                    "attribute '" + std::string(name.asString())
                     + "' missing");
             // Phase 13.3 mapAttrs memo (dynamic-name path).  2026-05-17:
             // mirror OP_ATTRS_SELECT_IC's iterative force + memoizing
@@ -9133,7 +9116,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 vm.frames.back().ip = ip;
                 attrs = forceValue(vm, attrs);
             }
-            bool hasIt = (attrs.isAttrs() && attrs.payload.bindings->has(operand));
+            bool hasIt = (attrs.isAttrs() && attrs.asAttrs()->has(operand));
             // #558 (2026-05-12): V3_DBG_ATTRS_HAS_KEY filter — trace
             // every OP_ATTRS_HAS that matches a target SymbolId.  Used
             // to verify the hypothesis that v3's partial-Bindings
@@ -9150,7 +9133,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     const char * nm = (sid < st.size()) ? st[sid].c_str() : "?";
                     if (std::strcmp(nm, s_dbgKey) == 0) {
                         Bindings * b = attrs.isAttrs()
-                            ? attrs.payload.bindings : nullptr;
+                            ? attrs.asAttrs() : nullptr;
                         // Caller frame pos for context.
                         const LambdaDescriptor * dC = nullptr;
                         if (!vm.frames.empty()) {
@@ -9196,8 +9179,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // evalDynamicAttrs path).  We throw rather than return
             // false to match TW.
             requireNoStringContextRuntime(name, "OP_ATTRS_HAS_DYN");
-            SymbolId id = ir::globalInternSymbol(name.payload.str);
-            push(vm, attrs.payload.bindings->has(id)
+            SymbolId id = ir::globalInternSymbol(name.asString());
+            push(vm, attrs.asAttrs()->has(id)
                 ? Value::vTrue : Value::vFalse);
             break;
         }
@@ -9232,12 +9215,11 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // #558 Phase 3.3: Tag::Thunk Blackhole collapse retired.
             if (!lhs.isAttrs() || !rhs.isAttrs())
                 throw std::runtime_error("v3 OP_ATTRS_UPDATE: not attrsets");
-            Bindings * out = mergeBindings(lhs.payload.bindings, rhs.payload.bindings,
+            Bindings * out = mergeBindings(lhs.asAttrs(), rhs.asAttrs(),
                                            MergeBindingsSite::AttrsUpdate);
             V3_STATS_INC(attrsetsAllocated);
             Value v;
-            v.tag_payload = static_cast<uint64_t>(Tag::Attrs);
-            v.payload.bindings = out;
+            v.mkAttrs(out);
 
             push(vm, v);
             break;
@@ -9292,25 +9274,24 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     std::fprintf(stderr,
                         "v3 OP_ATTRS_UPDATE_TAIL: not attrsets lhs.tag=%d rhs.tag=%d\n",
                         (int)lhs.tag(), (int)rhs.tag());
-                    if (lhs.isThunk() && lhs.payload.thunk)
+                    if (lhs.isThunk() && lhs.asThunk())
                         std::fprintf(stderr,
                             "  lhs thunk=%p state=%d\n",
-                            (void *)lhs.payload.thunk,
-                            (int)lhs.payload.thunk->state);
-                    if (rhs.isThunk() && rhs.payload.thunk)
+                            (void *)lhs.asThunk(),
+                            (int)lhs.asThunk()->state);
+                    if (rhs.isThunk() && rhs.asThunk())
                         std::fprintf(stderr,
                             "  rhs thunk=%p state=%d\n",
-                            (void *)rhs.payload.thunk,
-                            (int)rhs.payload.thunk->state);
+                            (void *)rhs.asThunk(),
+                            (int)rhs.asThunk()->state);
                 }
                 throw std::runtime_error("v3 OP_ATTRS_UPDATE_TAIL: not attrsets");
             }
-            Bindings * out = mergeBindings(lhs.payload.bindings, rhs.payload.bindings,
+            Bindings * out = mergeBindings(lhs.asAttrs(), rhs.asAttrs(),
                                            MergeBindingsSite::AttrsUpdateTail);
             V3_STATS_INC(attrsetsAllocated);
             Value v;
-            v.tag_payload = static_cast<uint64_t>(Tag::Attrs);
-            v.payload.bindings = out;
+            v.mkAttrs(out);
 
             // #558 Phase 1.5: tail-position // result.  Update only
             // the innermost THUNK_RETURN frame's shapeCell — STG-
@@ -9346,18 +9327,18 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 Value chase = v;
                 int hops = 0;
                 while (hops < 4) {
-                    if (chase.tag() == Tag::Slot && chase.payload.slot) {
-                        chase = *chase.payload.slot;
+                    if (chase.tag() == Tag::Slot && chase.asSlot()) {
+                        chase = *chase.asSlot();
                     } else if (chase.tag() == Tag::Thunk
-                               && chase.payload.thunk
-                               && chase.payload.thunk->state == ThunkState::Evaluated) {
-                        chase = chase.payload.thunk->evaluated;
+                               && chase.asThunk()
+                               && chase.asThunk()->state == ThunkState::Evaluated) {
+                        chase = chase.asThunk()->evaluated;
                     } else break;
                     ++hops;
                 }
-                if (chase.tag() == Tag::Attrs && chase.payload.bindings
-                    && chase.payload.bindings->size == 1) {
-                    SymbolId nm = chase.payload.bindings->entries[0].name;
+                if (chase.tag() == Tag::Attrs && chase.asAttrs()
+                    && chase.asAttrs()->size == 1) {
+                    SymbolId nm = chase.asAttrs()->entries[0].name;
                     const auto & st = ir::globalSymbolTable();
                     std::string s = nm < st.size() ? st[nm] : "<?>";
                     if (s == "prev") {
@@ -9486,7 +9467,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             }
             Value top = vm.valueStack.back();
             vm.valueStack.pop_back();
-            if (top.tag() != Tag::Thunk || !top.payload.thunk) {
+            if (top.tag() != Tag::Thunk || !top.asThunk()) {
                 throw std::runtime_error(
                     "v3 OP_THUNK_SET_LOCAL_THROUGH_CELL: top of stack is not Tag::Thunk");
             }
@@ -9502,10 +9483,10 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // (e.g., from OP_ATTRS_REC_SET).  Fresh OP_MAKE_THUNK
             // produces Suspended with cell == nullptr by construction
             // (alloc.hh:317-348), so this is the expected branch.
-            if (top.payload.thunk->state == ThunkState::Suspended
-                && top.payload.thunk->cell == nullptr) {
-                top.payload.thunk->cell = cell;
-                cellOwnRecordSet(cell, top.payload.thunk,
+            if (top.asThunk()->state == ThunkState::Suspended
+                && top.asThunk()->cell == nullptr) {
+                top.asThunk()->cell = cell;
+                cellOwnRecordSet(cell, top.asThunk(),
                                   "OP_THUNK_SET_LOCAL_THROUGH_CELL");
             }
             // Slot pointing at cell -- captures see the slot, deref
@@ -9572,7 +9553,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 }
             }
             // A8: force handled at case entry — attrs is WHNF here.
-            if (!attrs.isAttrs() || !attrs.payload.bindings) {
+            if (!attrs.isAttrs() || !attrs.asAttrs()) {
                 throw std::runtime_error(
                     "v3 OP_REC_BINDING_SLOT_REF: source is not a forced attrset");
             }
@@ -9584,7 +9565,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // via OP_APPLY_OVERRIDES which produces a NEW Bindings*,
             // so cache entries can't dangle to stale entries[].
             uint32_t icIdx = cu->code[ip++];
-            Bindings * b = attrs.payload.bindings;
+            Bindings * b = attrs.asAttrs();
             Value * found = nullptr;
             {
                 auto & ic = cu->recSlotCache[icIdx];
@@ -9630,8 +9611,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 if (__builtin_expect(s_dbgSlotRef, 0)) {
                     const auto & tbl = ir::globalSymbolTable();
                     std::string nm = (sym < tbl.size()) ? tbl[sym] : "?";
-                    if (found->isThunk() && found->payload.thunk) {
-                        Thunk * t = found->payload.thunk;
+                    if (found->isThunk() && found->asThunk()) {
+                        Thunk * t = found->asThunk();
                         const auto * d =
                             (t->state == ThunkState::Suspended
                              || t->state == ThunkState::Blackhole)
@@ -9717,31 +9698,31 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                         Value cur = *found;
                         int hops = 0;
                         while (hops < 16) {
-                            if (cur.tag() == Tag::Slot && cur.payload.slot)
-                                cur = *cur.payload.slot;
+                            if (cur.tag() == Tag::Slot && cur.asSlot())
+                                cur = *cur.asSlot();
                             else if (cur.tag() == Tag::Thunk
-                                     && cur.payload.thunk
-                                     && cur.payload.thunk->state == ThunkState::Evaluated)
-                                cur = cur.payload.thunk->evaluated;
+                                     && cur.asThunk()
+                                     && cur.asThunk()->state == ThunkState::Evaluated)
+                                cur = cur.asThunk()->evaluated;
                             else break;
                             ++hops;
                         }
                         std::fprintf(stderr,
                             " chase-tag=%u (hops=%d)",
                             (unsigned)cur.tag(), hops);
-                        if (cur.tag() == Tag::Attrs && cur.payload.bindings) {
-                            uint32_t sz = cur.payload.bindings->size;
+                        if (cur.tag() == Tag::Attrs && cur.asAttrs()) {
+                            uint32_t sz = cur.asAttrs()->size;
                             std::fprintf(stderr, " size=%u keys={", sz);
                             for (uint32_t k = 0; k < sz && k < 16; ++k) {
                                 SymbolId nn =
-                                    cur.payload.bindings->entries[k].name;
+                                    cur.asAttrs()->entries[k].name;
                                 std::fprintf(stderr, "%s%s",
                                     k ? "," : "",
                                     nn < st.size() ? st[nn].c_str() : "?");
                             }
                             std::fprintf(stderr, "}");
                             if (const BindingsOrigin * o2 =
-                                    lookupBindingsOrigin(cur.payload.bindings)) {
+                                    lookupBindingsOrigin(cur.asAttrs())) {
                                 const PosSnapshot * ps =
                                     resolvePosSnapshot(o2->posHandle);
                                 std::fprintf(stderr,
@@ -9751,21 +9732,21 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                                         ? ps->file.c_str() : "?",
                                     ps ? ps->line : 0u);
                             }
-                        } else if (cur.tag() == Tag::String && cur.payload.str) {
+                        } else if (cur.tag() == Tag::String && cur.asString()) {
                             std::fprintf(stderr,
-                                " str=\"%.40s\"", cur.payload.str);
-                        } else if (cur.tag() == Tag::Thunk && cur.payload.thunk) {
+                                " str=\"%.40s\"", cur.asString());
+                        } else if (cur.tag() == Tag::Thunk && cur.asThunk()) {
                             std::fprintf(stderr,
                                 " thunk=%p state=%d",
-                                (void *)cur.payload.thunk,
-                                (int)cur.payload.thunk->state);
+                                (void *)cur.asThunk(),
+                                (int)cur.asThunk()->state);
                             // Dump the thunk's body source position so
                             // we can tell whether the wrapped lambda is
                             // what we expect.  Important for catching
                             // upvalue mis-wires: e.g., the cpuName
                             // thunk's darwinArch slot pointing at the
                             // wrong closure body.
-                            auto * tt = cur.payload.thunk;
+                            auto * tt = cur.asThunk();
                             const LambdaDescriptor * dd =
                                 (tt->state == ThunkState::Suspended
                                  || tt->state == ThunkState::Blackhole)
@@ -9779,20 +9760,20 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                                 pps ? pps->line : 0u, pps ? pps->column : 0u,
                                 dd ? dd->codeOffset : 0u);
                         } else if (cur.tag() == Tag::Closure
-                                   && cur.payload.closure
-                                   && cur.payload.closure->desc) {
-                            auto * dd = cur.payload.closure->desc;
+                                   && cur.asClosure()
+                                   && cur.asClosure()->desc) {
+                            auto * dd = cur.asClosure()->desc;
                             const PosSnapshot * pps =
                                 resolvePosSnapshot(dd->posHandle);
                             std::fprintf(stderr,
                                 " closure-ptr=%p desc=%p closure-body=%s@%s:%u:%u codeOff=%u nUp=%u",
-                                (const void *)cur.payload.closure,
+                                (const void *)cur.asClosure(),
                                 (const void *)dd,
                                 !dd->name.empty() ? dd->name.c_str() : "<?>",
                                 (pps && !pps->file.empty()) ? pps->file.c_str() : "<no-pos>",
                                 pps ? pps->line : 0u, pps ? pps->column : 0u,
                                 dd->codeOffset,
-                                cur.payload.closure->nUpvalues);
+                                cur.asClosure()->nUpvalues);
                         }
                         std::fprintf(stderr, "\n");
                     }
@@ -9827,10 +9808,10 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 || attrs.tag() == Tag::Thunk
                 || attrs.tag() == Tag::Slot)
                 attrs = forceValue(vm, attrs);
-            if (!attrs.isAttrs() || !attrs.payload.bindings)
+            if (!attrs.isAttrs() || !attrs.asAttrs())
                 throw std::runtime_error(
                     "v3 OP_GET_UPVALUE_REC_BINDING: source is not a forced attrset");
-            Bindings * b = attrs.payload.bindings;
+            Bindings * b = attrs.asAttrs();
             Value * found = nullptr;
             {
                 auto & ic = cu->recSlotCache[icIdx];
@@ -9885,10 +9866,10 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 || attrs.tag() == Tag::Thunk
                 || attrs.tag() == Tag::Slot)
                 attrs = forceValue(vm, attrs);
-            if (!attrs.isAttrs() || !attrs.payload.bindings)
+            if (!attrs.isAttrs() || !attrs.asAttrs())
                 throw std::runtime_error(
                     "v3 OP_GET_UPVALUE_REC_BINDING_SLOT: source is not a forced attrset");
-            Bindings * b = attrs.payload.bindings;
+            Bindings * b = attrs.asAttrs();
             Value * found = nullptr;
             {
                 auto & ic = cu->recSlotCache[icIdx];
@@ -9958,11 +9939,11 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     int64_t sum;
                     // #687 — TW phrasing (libexpr/eval.cc:2515):
                     //   `integer overflow in adding <a> + <b>`
-                    if (__builtin_add_overflow(top0.payload.i, top1.payload.i, &sum))
+                    if (__builtin_add_overflow(top0.asInt(), top1.asInt(), &sum))
                         throw std::runtime_error(
                             "integer overflow in adding "
-                            + std::to_string(top0.payload.i) + " + "
-                            + std::to_string(top1.payload.i));
+                            + std::to_string(top0.asInt()) + " + "
+                            + std::to_string(top1.asInt()));
                     vm.valueStack.pop_back();
                     vm.valueStack.back().mkInt(sum);
                     // reg-VM: honour CFF_FORCE_WB inline — can't `goto
@@ -10048,16 +10029,16 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                                     "    upvalue[%u] tag=%u",
                                     i, (unsigned)uvs[i].tag());
                                 if (uvs[i].tag() == Tag::Closure
-                                    && uvs[i].payload.closure
-                                    && uvs[i].payload.closure->desc) {
+                                    && uvs[i].asClosure()
+                                    && uvs[i].asClosure()->desc) {
                                     std::fprintf(stderr, " closure=%s nUp=%u",
-                                        !uvs[i].payload.closure->desc->name.empty()
-                                            ? uvs[i].payload.closure->desc->name.c_str()
+                                        !uvs[i].asClosure()->desc->name.empty()
+                                            ? uvs[i].asClosure()->desc->name.c_str()
                                             : "<anon>",
-                                        uvs[i].payload.closure->nUpvalues);
+                                        uvs[i].asClosure()->nUpvalues);
                                 } else if (uvs[i].tag() == Tag::Attrs
-                                           && uvs[i].payload.bindings) {
-                                    auto * b2 = uvs[i].payload.bindings;
+                                           && uvs[i].asAttrs()) {
+                                    auto * b2 = uvs[i].asAttrs();
                                     std::fprintf(stderr, " attrs size=%u {",
                                         (unsigned)b2->size);
                                     const auto & st2 = ir::globalSymbolTable();
@@ -10079,15 +10060,15 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                                         std::fprintf(stderr,
                                             " preHook=tag%u", (unsigned)pht);
                                         if (pht == Tag::Closure
-                                            && ph->payload.closure
-                                            && ph->payload.closure->desc) {
-                                            auto * d3 = ph->payload.closure->desc;
+                                            && ph->asClosure()
+                                            && ph->asClosure()->desc) {
+                                            auto * d3 = ph->asClosure()->desc;
                                             std::fprintf(stderr, "(%s [%u..) nUp=%u)",
                                                 !d3->name.empty() ? d3->name.c_str() : "<anon>",
                                                 d3->codeOffset,
-                                                ph->payload.closure->nUpvalues);
-                                        } else if (pht == Tag::Thunk && ph->payload.thunk) {
-                                            Thunk * pt = ph->payload.thunk;
+                                                ph->asClosure()->nUpvalues);
+                                        } else if (pht == Tag::Thunk && ph->asThunk()) {
+                                            Thunk * pt = ph->asThunk();
                                             std::fprintf(stderr, "(state=%d nUp=%u",
                                                 (int)pt->state, (unsigned)pt->nUpvalues);
                                             if (pt->state == ThunkState::Suspended) {
@@ -10101,8 +10082,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                                                     (unsigned)pt->evaluated.tag());
                                                 // Recurse one level deep
                                                 if (pt->evaluated.tag() == Tag::Thunk
-                                                    && pt->evaluated.payload.thunk) {
-                                                    Thunk * pt2 = pt->evaluated.payload.thunk;
+                                                    && pt->evaluated.asThunk()) {
+                                                    Thunk * pt2 = pt->evaluated.asThunk();
                                                     std::fprintf(stderr, "(state=%d nUp=%u",
                                                         (int)pt2->state, (unsigned)pt2->nUpvalues);
                                                     if (pt2->state == ThunkState::Suspended) {
@@ -10115,16 +10096,16 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                                                         std::fprintf(stderr, " EVAL=tag%u",
                                                             (unsigned)pt2->evaluated.tag());
                                                         if (pt2->evaluated.tag() == Tag::Closure
-                                                            && pt2->evaluated.payload.closure
-                                                            && pt2->evaluated.payload.closure->desc) {
-                                                            auto * d5 = pt2->evaluated.payload.closure->desc;
+                                                            && pt2->evaluated.asClosure()
+                                                            && pt2->evaluated.asClosure()->desc) {
+                                                            auto * d5 = pt2->evaluated.asClosure()->desc;
                                                             std::fprintf(stderr, "(closure=%s [%u..) nUp=%u)",
                                                                 !d5->name.empty() ? d5->name.c_str() : "<anon>",
                                                                 d5->codeOffset,
-                                                                pt2->evaluated.payload.closure->nUpvalues);
+                                                                pt2->evaluated.asClosure()->nUpvalues);
                                                         } else if (pt2->evaluated.tag() == Tag::Thunk
-                                                            && pt2->evaluated.payload.thunk) {
-                                                            Thunk * pt3 = pt2->evaluated.payload.thunk;
+                                                            && pt2->evaluated.asThunk()) {
+                                                            Thunk * pt3 = pt2->evaluated.asThunk();
                                                             std::fprintf(stderr, "(state=%d nUp=%u",
                                                                 (int)pt3->state, (unsigned)pt3->nUpvalues);
                                                             if (pt3->state == ThunkState::Suspended) {
@@ -10218,7 +10199,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                         // #678 — drop "v3 OP_STR_CONCAT:" debug
                         // prefix; match TW phrasing (libexpr/eval.cc
                         // emits "integer overflow" via primOps add).
-                        if (__builtin_add_overflow(sum, parts[i].payload.i, &sum))
+                        if (__builtin_add_overflow(sum, parts[i].asInt(), &sum))
                             throw std::runtime_error("integer overflow");
                     }
                     r.mkInt(sum);
@@ -10232,8 +10213,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     const bool firstIsFloat = parts[0].isFloat();
                     for (uint32_t i = 0; i < n; ++i) {
                         const Value & p = parts[i];
-                        if (p.isInt())   sum += static_cast<double>(p.payload.i);
-                        else if (p.isFloat()) sum += p.payload.f;
+                        if (p.isInt())   sum += static_cast<double>(p.asInt());
+                        else if (p.isFloat()) sum += p.asFloat();
                         else {
                             auto typeName = [](const Value & v) -> const char * {
                                 if (v.isString()) return "a string";
@@ -10297,12 +10278,12 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 // walker's implicit recursion depth; deeper chains are
                 // pathological and surface a clearer error than a stack
                 // overflow.
-                if (parts[i].isAttrs() && parts[i].payload.bindings) {
+                if (parts[i].isAttrs() && parts[i].asAttrs()) {
                     static const SymbolId tsId  = ir::globalInternSymbol("__toString");
                     static const SymbolId outId = ir::globalInternSymbol("outPath");
                     int depth = 0;
-                    while (parts[i].isAttrs() && parts[i].payload.bindings && depth < 8) {
-                        Bindings * b = parts[i].payload.bindings;
+                    while (parts[i].isAttrs() && parts[i].asAttrs() && depth < 8) {
+                        Bindings * b = parts[i].asAttrs();
                         if (auto * fn = b->lookup(tsId)) {
                             Value forced = forceValue(vm, *fn);
                             parts[i] = callClosure(vm, forced, parts[i]);
@@ -10425,8 +10406,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                                     Tag t = lv.tag();
                                     std::fprintf(stderr,
                                         "    local[%zu]: tag=%u", li, (unsigned)t);
-                                    if (t == Tag::Attrs && lv.payload.bindings) {
-                                        auto * lb = lv.payload.bindings;
+                                    if (t == Tag::Attrs && lv.asAttrs()) {
+                                        auto * lb = lv.asAttrs();
                                         std::fprintf(stderr, " attrs ptr=%p size=%u {",
                                             (const void*)lb, (unsigned)lb->size);
                                         for (uint32_t kk = 0; kk < lb->size && kk < 8; ++kk) {
@@ -10447,17 +10428,17 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                                                     ? ops2->file.c_str() : "?",
                                                 ops2 ? ops2->line : 0u);
                                         }
-                                    } else if (t == Tag::String && lv.payload.str) {
+                                    } else if (t == Tag::String && lv.asString()) {
                                         std::fprintf(stderr, " str=\"%.40s\"",
-                                            lv.payload.str);
-                                    } else if (t == Tag::Slot && lv.payload.slot) {
+                                            lv.asString());
+                                    } else if (t == Tag::Slot && lv.asSlot()) {
                                         std::fprintf(stderr,
                                             " slot->tag=%u",
-                                            (unsigned)lv.payload.slot->tag());
-                                    } else if (t == Tag::Thunk && lv.payload.thunk) {
+                                            (unsigned)lv.asSlot()->tag());
+                                    } else if (t == Tag::Thunk && lv.asThunk()) {
                                         std::fprintf(stderr,
                                             " thunk-state=%d",
-                                            (int)lv.payload.thunk->state);
+                                            (int)lv.asThunk()->state);
                                     }
                                     std::fprintf(stderr, "\n");
                                 }
@@ -10468,7 +10449,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 }
                 const Value & p = parts[i];
                 if (p.isString())
-                    addCtx(lookupStringContextEntries(p.payload.str));
+                    addCtx(lookupStringContextEntries(p.asString()));
                 if (p.isPath() && forceStr) {
                     // coerceToString will copy this path to the store and
                     // produce its `/nix/store/...` representation; tag the
@@ -10480,7 +10461,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     // paths during interpolation, so v3 must too.
                     if (auto * ns = getNixEvalState())
                         ctxAccum.push_back(ffi::coercePathToStoreName(
-                            *ns, p.payload.path ? p.payload.path : ""));
+                            *ns, p.asPath() ? p.asPath() : ""));
                 }
                 out.append(coerceToString(p, forceStr));
             }
@@ -10506,8 +10487,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             buf[out.size()] = '\0';
             Value v;
             if (resultIsPath) {
-                v.tag_payload = static_cast<uint64_t>(Tag::Path);
-                v.payload.path = buf;
+                v.mkPath(buf);
             } else {
                 v.mkString(buf);
                 // De-duplicate context entries (a sorted-unique pass) and
@@ -10599,8 +10579,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 break;
             }
             Value v;
-            v.tag_payload = static_cast<uint64_t>(Tag::PrimOp);
-            v.payload.primop = po;
+            v.mkPrimOp(po);
             push(vm, v);
             break;
         }
@@ -10684,8 +10663,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     for (uint32_t k = resumeK; k < nArgs; ++k) {
                         if (!(po->deepForceList & (1u << k))) continue;
                         Value & a = vm.valueStack[argBase + k];
-                        if (!a.isList() || !a.payload.list) continue;
-                        ListVec * list = a.payload.list;
+                        if (!a.isList() || !a.asList()) continue;
+                        ListVec * list = a.asList();
                         // GC_AUDIT_ROUND_2 Round 1 #6 (LATENT, documented):
                         // `frame.forceWriteTarget = &e` where `e` is
                         // `list->elems[i]` pinches a pointer into a
@@ -10921,10 +10900,10 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // single runtime_error.  For now match the empty-list
             // message exactly (the more common case); type-mismatch
             // falls under the same string.
-            if (!v.isList() || !v.payload.list || v.payload.list->size == 0)
+            if (!v.isList() || !v.asList() || v.asList()->size == 0)
                 throw std::runtime_error(
                     "'builtins.head' called on an empty list");
-            push(vm, v.payload.list->elems[0]);
+            push(vm, v.asList()->elems[0]);
             break;
         }
 
@@ -10942,18 +10921,17 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             }
             Value v = pop(vm);
             // #678 — match TW phrasing (libexpr/primops.cc:3919).
-            if (!v.isList() || !v.payload.list || v.payload.list->size == 0)
+            if (!v.isList() || !v.asList() || v.asList()->size == 0)
                 throw std::runtime_error(
                     "'builtins.tail' called on an empty list");
-            uint32_t n = v.payload.list->size;
+            uint32_t n = v.asList()->size;
             ListVec * out_l = Alloc::allocList(n - 1);
             V3_STATS_INC(listsAllocated);
             for (uint32_t i = 1; i < n; ++i)
-                out_l->elems[i - 1] = v.payload.list->elems[i];
+                out_l->elems[i - 1] = v.asList()->elems[i];
             listPostConstructBarrier(out_l);  // Phase D coverage (OP_TAIL)
             Value r;
-            r.tag_payload = static_cast<uint64_t>(Tag::List);
-            r.payload.list = out_l;
+            r.mkList(out_l);
             push(vm, r);
             break;
         }
@@ -10998,7 +10976,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 msg += valueRepr(v);
                 throw std::runtime_error(msg);
             }
-            Value r; r.mkInt(v.payload.list ? v.payload.list->size : 0);
+            Value r; r.mkInt(v.asList() ? v.asList()->size : 0);
             push(vm, r);
             break;
         }
@@ -11037,15 +11015,15 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             if (!lst.isList() || !idx.isInt())
                 throw std::runtime_error(
                     "value is not a list while a list was expected");
-            uint32_t n = lst.payload.list ? lst.payload.list->size : 0;
-            if (idx.payload.i < 0 || static_cast<uint64_t>(idx.payload.i) >= n)
+            uint32_t n = lst.asList() ? lst.asList()->size : 0;
+            if (idx.asInt() < 0 || static_cast<uint64_t>(idx.asInt()) >= n)
                 // #678 — match TW phrasing
                 // (libexpr/primops.cc:3869).
                 throw std::runtime_error(
                     "'builtins.elemAt' called with index "
-                    + std::to_string(idx.payload.i)
+                    + std::to_string(idx.asInt())
                     + " on a list of size " + std::to_string(n));
-            push(vm, lst.payload.list->elems[idx.payload.i]);
+            push(vm, lst.asList()->elems[idx.asInt()]);
             break;
         }
 
@@ -11056,7 +11034,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             Value & recAttrs = top(vm);
             if (!recAttrs.isAttrs())
                 throw std::runtime_error("v3 OP_ATTRS_REC_SET: top is not an attrset");
-            if (!recAttrs.payload.bindings || i >= recAttrs.payload.bindings->size)
+            if (!recAttrs.asAttrs() || i >= recAttrs.asAttrs()->size)
                 throw std::runtime_error("v3 OP_ATTRS_REC_SET: index out of range");
             // Phase A3 (RCA 2026-05-11): trace SETs that write into a
             // slot whose name matches V3_DBG_REC_SET_NAME.  Used to
@@ -11067,7 +11045,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 static const char * s_dbgRecSetName =
                     std::getenv("V3_DBG_REC_SET_NAME");
                 if (__builtin_expect(s_dbgRecSetName != nullptr, 0)) {
-                    auto * b = recAttrs.payload.bindings;
+                    auto * b = recAttrs.asAttrs();
                     SymbolId nm = b->entries[i].name;
                     const auto & st = ir::globalSymbolTable();
                     const char * nmStr =
@@ -11079,11 +11057,11 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                             i, nmStr, (const void *)b,
                             (const void *)&b->entries[i].value,
                             (unsigned)b->size, (unsigned)v.tag());
-                        if (v.isThunk() && v.payload.thunk)
+                        if (v.isThunk() && v.asThunk())
                             std::fprintf(stderr, " thunk-ptr=%p",
-                                (const void *)v.payload.thunk);
-                        if (v.isAttrs() && v.payload.bindings) {
-                            auto * vb = v.payload.bindings;
+                                (const void *)v.asThunk());
+                        if (v.isAttrs() && v.asAttrs()) {
+                            auto * vb = v.asAttrs();
                             std::fprintf(stderr, " attrs size=%u {",
                                 (unsigned)vb->size);
                             for (uint32_t k = 0; k < vb->size && k < 6; ++k) {
@@ -11102,8 +11080,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                                     (ps && !ps->file.empty()) ? ps->file.c_str() : "?",
                                     ps ? ps->line : 0u);
                             }
-                        } else if (v.isThunk() && v.payload.thunk) {
-                            Thunk * t = v.payload.thunk;
+                        } else if (v.isThunk() && v.asThunk()) {
+                            Thunk * t = v.asThunk();
                             const LambdaDescriptor * td =
                                 t->state == ThunkState::Suspended
                                     ? t->suspended.desc : nullptr;
@@ -11125,8 +11103,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                                 const Value & uv = t->tail[ui];
                                 std::fprintf(stderr, "\n      up[%u] tag=%u",
                                     ui, (unsigned)uv.tag());
-                                if (uv.tag() == Tag::Attrs && uv.payload.bindings) {
-                                    auto * ub = uv.payload.bindings;
+                                if (uv.tag() == Tag::Attrs && uv.asAttrs()) {
+                                    auto * ub = uv.asAttrs();
                                     std::fprintf(stderr, " ptr=%p size=%u {",
                                         (const void *)ub, (unsigned)ub->size);
                                     for (uint32_t k = 0; k < ub->size && k < 6; ++k) {
@@ -11145,19 +11123,19 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                                             (ps && !ps->file.empty()) ? ps->file.c_str() : "?",
                                             ps ? ps->line : 0u);
                                     }
-                                } else if (uv.tag() == Tag::Slot && uv.payload.slot) {
+                                } else if (uv.tag() == Tag::Slot && uv.asSlot()) {
                                     std::fprintf(stderr, " slot->tag=%u",
-                                        (unsigned)uv.payload.slot->tag());
-                                } else if (uv.tag() == Tag::Thunk && uv.payload.thunk) {
+                                        (unsigned)uv.asSlot()->tag());
+                                } else if (uv.tag() == Tag::Thunk && uv.asThunk()) {
                                     std::fprintf(stderr,
-                                        " thunk-state=%d", (int)uv.payload.thunk->state);
+                                        " thunk-state=%d", (int)uv.asThunk()->state);
                                 } else if (uv.isString()) {
-                                    std::fprintf(stderr, " str=\"%.20s\"", uv.payload.str);
+                                    std::fprintf(stderr, " str=\"%.20s\"", uv.asString());
                                 }
                             }
                         } else if (v.isString()) {
                             std::fprintf(stderr, " str=\"%.40s\"",
-                                v.payload.str);
+                                v.asString());
                         }
                         // Current frame's position.
                         if (!vm.frames.empty()) {
@@ -11180,7 +11158,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     }
                 }
             }
-            bindingsSetValue(recAttrs.payload.bindings, i, v);  // Phase D barrier
+            bindingsSetValue(recAttrs.asAttrs(), i, v);  // Phase D barrier
             // STG-8 (#498): if this entry's value is a Suspended thunk
             // (the common case from the LetRec emit's per-attr thunks),
             // record &entries[i].value as the thunk's heap-stable cell.
@@ -11197,20 +11175,20 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // We only set cell when the entry IS a fresh Suspended
             // thunk (avoid clobbering a previously-set cell from a
             // shared thunk, and skip non-thunk entries entirely).
-            if (v.isThunk() && v.payload.thunk
-                && v.payload.thunk->state == ThunkState::Suspended
-                && v.payload.thunk->cell == nullptr)
+            if (v.isThunk() && v.asThunk()
+                && v.asThunk()->state == ThunkState::Suspended
+                && v.asThunk()->cell == nullptr)
             {
                 Value * cellTarget =
-                    &recAttrs.payload.bindings->entries[i].value;
-                v.payload.thunk->cell = cellTarget;
+                    &recAttrs.asAttrs()->entries[i].value;
+                v.asThunk()->cell = cellTarget;
                 // Phase D Step 4: record the owning Bindings so the
                 // cell-write barrier at OP_RETURN can dirty-mark the
                 // correct container.  cellTarget points INTO
                 // recAttrs's entries[], so the container is the
                 // recAttrs Bindings itself.
-                v.payload.thunk->cellContainer = recAttrs.payload.bindings;
-                cellOwnRecordSet(cellTarget, v.payload.thunk,
+                v.asThunk()->cellContainer = recAttrs.asAttrs();
+                cellOwnRecordSet(cellTarget, v.asThunk(),
                                   "OP_ATTRS_REC_SET");
             }
             break;
@@ -11418,12 +11396,10 @@ Value getBuiltinsValue() noexcept
                     // (e.g. `nixPath` if NIX_PATH is unset).  Fall back
                     // to the raw primop value; user-level access still
                     // gets the proper exception when actually used.
-                    v.tag_payload = static_cast<uint64_t>(Tag::PrimOp);
-                    v.payload.primop = &po;
+                    v.mkPrimOp(&po);
                 }
             } else {
-                v.tag_payload = static_cast<uint64_t>(Tag::PrimOp);
-                v.payload.primop = &po;
+                v.mkPrimOp(&po);
             }
             SymbolId sid = ir::globalInternSymbol(poName);
             bindingsSetEntry(b, i, { sid, 0, v });  // Phase D
@@ -11433,8 +11409,7 @@ Value getBuiltinsValue() noexcept
         std::sort(&b->entries[0], &b->entries[b->size],
             [](const auto & a, const auto & b){ return a.name < b.name; });
         Value v;
-        v.tag_payload = static_cast<uint64_t>(Tag::Attrs);
-        v.payload.bindings = b;
+        v.mkAttrs(b);
         return v;
     }();
     g_vBuiltinsInitialized = true;
@@ -11768,10 +11743,10 @@ Value runLambda(const CompilationUnit & cu, uint32_t funcIdx,
                 clearBlackMarksOnException(forceVm, 0);
             }
         }
-        if (!sArg.isAttrs() || !sArg.payload.bindings)
+        if (!sArg.isAttrs() || !sArg.asAttrs())
             throw std::runtime_error(
                 "v3 selector lambda: arg not an attrset");
-        const Value * v = sArg.payload.bindings->lookup(desc.selectorSym);
+        const Value * v = sArg.asAttrs()->lookup(desc.selectorSym);
         if (!v)
             throw std::runtime_error(
                 "v3 selector lambda: missing attr");
@@ -11928,18 +11903,18 @@ Value forceValue(VMState & vm, Value v)
         auto recordHop = [&](Value val) {
             if (traceCount < kTraceMax) {
                 traceTag[traceCount] = val.tag();
-                tracePtr[traceCount] = val.payload.thunk;  // any pointer
+                tracePtr[traceCount] = val.asThunk();  // any pointer
                 ++traceCount;
             }
         };
         recordHop(chase);
         for (int hops = 0; hops < 16; ++hops) {
-            if (chase.tag() == Tag::Slot && chase.payload.slot) {
-                chase = *chase.payload.slot;
+            if (chase.tag() == Tag::Slot && chase.asSlot()) {
+                chase = *chase.asSlot();
                 recordHop(chase);
             } else if (chase.tag() == Tag::Thunk
-                       && chase.payload.thunk) {
-                Thunk * th = chase.payload.thunk;
+                       && chase.asThunk()) {
+                Thunk * th = chase.asThunk();
                 if (th->state == ThunkState::Evaluated) {
                     chase = th->evaluated;
                     recordHop(chase);
@@ -12164,9 +12139,9 @@ Value forceValue(VMState & vm, Value v)
         if (__builtin_expect(s_dbg_chase, 0)) {
             ringTag[ringIdx % kRingSize] = v.tag();
             void * p = nullptr;
-            if (v.tag() == Tag::Thunk) p = v.payload.thunk;
-            else if (v.tag() == Tag::Slot) p = v.payload.slot;
-            else if (v.isAppLike()) p = v.payload.pair;
+            if (v.tag() == Tag::Thunk) p = v.asThunk();
+            else if (v.tag() == Tag::Slot) p = v.asSlot();
+            else if (v.isAppLike()) p = v.asPair();
             ringPtr[ringIdx % kRingSize] = p;
             ringIdx++;
         }
@@ -12214,7 +12189,7 @@ Value forceValue(VMState & vm, Value v)
         // must observe the latest slot contents at force time, not a
         // snapshot from when the with-stack was pushed.
         if (v.tag() == Tag::Slot) {
-            Value * p = v.payload.slot;
+            Value * p = v.asSlot();
             if (!p) throw std::runtime_error("v3 forceValue: null slot pointer");
             // Remember the OUTERMOST slot for memoization.  If we
             // pass through multiple Tag::Slot indirections (chained),
@@ -12268,7 +12243,7 @@ Value forceValue(VMState & vm, Value v)
             static const bool s_noAppMemo =
                 std::getenv("NIX_V3_NO_APP_MEMO") != nullptr;
             bool outerIsAppLike = v.isAppLike();
-            ValuePair * outerPair = outerIsAppLike ? v.payload.pair : nullptr;
+            ValuePair * outerPair = outerIsAppLike ? v.asPair() : nullptr;
             // Memo-hit fast path: outerPair->evaluated holds the
             // previously-resolved result.  Tag::Uninitialized (== 0)
             // is the sentinel meaning "not yet resolved".  2026-05-30:
@@ -12291,7 +12266,7 @@ Value forceValue(VMState & vm, Value v)
             // then arg1, so arg1 is applied before arg2 (the curried
             // semantics).
             while (v.isAppLike()) {
-                ValuePair * p = v.payload.pair;
+                ValuePair * p = v.asPair();
                 if (v.tag() == Tag::App3)
                     rights.push_back(p->third);   // arg2 (separate slot from `evaluated`)
                 rights.push_back(p->right);
@@ -12316,7 +12291,7 @@ Value forceValue(VMState & vm, Value v)
             continue;
         }
         if (!v.isThunk()) break;
-        Thunk * t = v.payload.thunk;
+        Thunk * t = v.asThunk();
         if (t->state == ThunkState::Evaluated) {
             // #558 Phase 4 follow-up: record this thunk for path
             // compression below.  After the chase resolves to a final
@@ -12637,7 +12612,7 @@ Value forceValue(VMState & vm, Value v)
                     {
                         Value shapeVal = *t->shapeCell;
                         if (!(shapeVal.tag() == Tag::Thunk
-                              && shapeVal.payload.thunk == t)) {
+                              && shapeVal.asThunk() == t)) {
                             static const bool s_dbgCell =
                                 std::getenv("V3_DBG_CELL_EVERYWHERE") != nullptr;
                             if (__builtin_expect(s_dbgCell, 0)) {
@@ -12785,7 +12760,7 @@ Value forceValue(VMState & vm, Value v)
                         for (size_t i = 0; i < vmp->valueStack.size(); ++i) {
                             const Value & sv = vmp->valueStack[i];
                             if (sv.tag() != Tag::Thunk) continue;
-                            if ((uintptr_t)sv.payload.thunk != target) continue;
+                            if ((uintptr_t)sv.asThunk() != target) continue;
                             if (vhits++ < 4)
                                 std::fprintf(stderr,
                                     "  %s.valueStack[%zu] = Tag::Thunk(stale)\n",
@@ -12794,7 +12769,7 @@ Value forceValue(VMState & vm, Value v)
                         for (size_t i = 0; i < vmp->withStack.size(); ++i) {
                             const Value & sv = vmp->withStack[i];
                             if (sv.tag() != Tag::Thunk) continue;
-                            if ((uintptr_t)sv.payload.thunk != target) continue;
+                            if ((uintptr_t)sv.asThunk() != target) continue;
                             std::fprintf(stderr,
                                 "  %s.withStack[%zu] = Tag::Thunk(stale)\n",
                                 label, i);
@@ -12938,13 +12913,13 @@ Value forceValue(VMState & vm, Value v)
                 const Value & sv = vm.valueStack[i];
                 if (sv.tag() == Tag::Uninitialized) continue;
                 const void * sp =
-                    sv.tag() == Tag::Thunk   ? (const void*)sv.payload.thunk
-                    : sv.tag() == Tag::Closure ? (const void*)sv.payload.closure
-                    : sv.tag() == Tag::Attrs   ? (const void*)sv.payload.bindings
-                    : sv.tag() == Tag::List    ? (const void*)sv.payload.list
+                    sv.tag() == Tag::Thunk   ? (const void*)sv.asThunk()
+                    : sv.tag() == Tag::Closure ? (const void*)sv.asClosure()
+                    : sv.tag() == Tag::Attrs   ? (const void*)sv.asAttrs()
+                    : sv.tag() == Tag::List    ? (const void*)sv.asList()
                     : sv.isAppLike() || sv.tag() == Tag::PrimOpApp
-                                              ? (const void*)sv.payload.pair
-                    : sv.tag() == Tag::Slot   ? (const void*)sv.payload.slot
+                                              ? (const void*)sv.asPair()
+                    : sv.tag() == Tag::Slot   ? (const void*)sv.asSlot()
                     : nullptr;
                 std::fprintf(stderr,
                     "    [%zu] tag=%d ptr=%p%s\n",
@@ -13150,10 +13125,10 @@ Value callClosure2(VMState & vm, Value fun, Value arg1, Value arg2)
         // (Intrinsics are arity-1 / handled in the curried path below; the
         // arity>1 eval/apply block in callClosure likewise skips the intrinsic
         // check, so matching `arity == 2` here is byte-identical.)
-        if (fun.tag() == Tag::Closure && fun.payload.closure
-            && fun.payload.closure->desc
-            && fun.payload.closure->desc->arity == 2) {
-            const Closure * c = fun.payload.closure;
+        if (fun.tag() == Tag::Closure && fun.asClosure()
+            && fun.asClosure()->desc
+            && fun.asClosure()->desc->arity == 2) {
+            const Closure * c = fun.asClosure();
             const LambdaDescriptor * d = c->desc;
             const CompilationUnit * ccu = c->cu ? c->cu : vm.frames.back().cu;
             size_t exitDepth = vm.frames.size();
@@ -13214,13 +13189,13 @@ Value callClosure(VMState & vm, Value fun, Value arg)
         std::getenv("V3_DBG_CALL_CLOSURE") != nullptr;
     if (s_dbgCallClosure) {
         const char * nm = "<?>";
-        if (fun.tag() == Tag::Closure && fun.payload.closure
-            && fun.payload.closure->desc)
-            nm = fun.payload.closure->desc->name.c_str();
+        if (fun.tag() == Tag::Closure && fun.asClosure()
+            && fun.asClosure()->desc)
+            nm = fun.asClosure()->desc->name.c_str();
         int arg_tag = (int)arg.tag();
         int arg_size = -1;
-        if (arg.tag() == Tag::Attrs && arg.payload.bindings)
-            arg_size = arg.payload.bindings->size;
+        if (arg.tag() == Tag::Attrs && arg.asAttrs())
+            arg_size = arg.asAttrs()->size;
         std::fprintf(stderr,
             "v3 callClosure: fun.tag=%d name=%s arg.tag=%d size=%d\n",
             (int)fun.tag(), nm, arg_tag, arg_size);
@@ -13230,10 +13205,10 @@ Value callClosure(VMState & vm, Value fun, Value arg)
     if (fun.isPrimOp() || fun.tag() == Tag::PrimOpApp) {
         Value cur = fun;
         size_t depth = 0;
-        while (cur.tag() == Tag::PrimOpApp) { ++depth; cur = cur.payload.pair->left; }
+        while (cur.tag() == Tag::PrimOpApp) { ++depth; cur = cur.asPair()->left; }
         if (!cur.isPrimOp())
             throw std::runtime_error("v3 callClosure: PrimOpApp chain doesn't terminate in a PrimOp");
-        const PrimOp * po = cur.payload.primop;
+        const PrimOp * po = cur.asPrimOp();
         size_t totalArgs = depth + 1;
         if (totalArgs < po->arity) {
             ValuePair * vp = Alloc::allocPair();
@@ -13241,8 +13216,7 @@ Value callClosure(VMState & vm, Value fun, Value arg)
             vp->right = arg;
             pairPostConstructBarrier(vp);  // Phase D
             Value v;
-            v.tag_payload = static_cast<uint64_t>(Tag::PrimOpApp);
-            v.payload.pair = vp;
+            v.mkPair(Tag::PrimOpApp, vp);
             return v;
         }
         if (totalArgs > po->arity)
@@ -13252,8 +13226,8 @@ Value callClosure(VMState & vm, Value fun, Value arg)
         buf[totalArgs - 1] = arg;
         Value chain = fun;
         for (size_t i = totalArgs - 1; i > 0; --i) {
-            buf[i - 1] = chain.payload.pair->right;
-            chain = chain.payload.pair->left;
+            buf[i - 1] = chain.asPair()->right;
+            chain = chain.asPair()->left;
         }
         // Phase 1.2 (action plan): mirror OP_CALL's primop-arg force loop
         // (vm.cc:2708-2715) — fast-path the WHNF case inline so that
@@ -13291,15 +13265,15 @@ Value callClosure(VMState & vm, Value fun, Value arg)
     {
         const Closure * papBase = nullptr;
         size_t papDepth = 0;
-        if (fun.tag() == Tag::Closure && fun.payload.closure) {
-            papBase = fun.payload.closure;
-        } else if (fun.tag() == Tag::App && fun.payload.pair) {
+        if (fun.tag() == Tag::Closure && fun.asClosure()) {
+            papBase = fun.asClosure();
+        } else if (fun.tag() == Tag::App && fun.asPair()) {
             const Value * cur = &fun;
-            while (cur->tag() == Tag::App && cur->payload.pair) {
-                ++papDepth; cur = &cur->payload.pair->left;
+            while (cur->tag() == Tag::App && cur->asPair()) {
+                ++papDepth; cur = &cur->asPair()->left;
             }
-            if (cur->tag() == Tag::Closure && cur->payload.closure)
-                papBase = cur->payload.closure;
+            if (cur->tag() == Tag::Closure && cur->asClosure())
+                papBase = cur->asClosure();
         }
         if (papBase && papBase->desc && papBase->desc->arity > 1) {
             const uint8_t A = papBase->desc->arity;
@@ -13309,8 +13283,7 @@ Value callClosure(VMState & vm, Value fun, Value arg)
                 vp->left = fun; vp->right = arg;
                 pairPostConstructBarrier(vp);
                 Value v;
-                v.tag_payload = static_cast<uint64_t>(Tag::App);
-                v.payload.pair = vp;
+                v.mkPair(Tag::App, vp);
                 return v;
             }
             if (A > 16) throw std::runtime_error("v3 callClosure: arity > 16");
@@ -13318,8 +13291,8 @@ Value callClosure(VMState & vm, Value fun, Value arg)
             argbuf[total - 1] = arg;
             Value chain = fun;
             for (size_t i = total - 1; i > 0; --i) {
-                argbuf[i - 1] = chain.payload.pair->right;
-                chain = chain.payload.pair->left;
+                argbuf[i - 1] = chain.asPair()->right;
+                chain = chain.asPair()->left;
             }
             const LambdaDescriptor * d = papBase->desc;
             const CompilationUnit * ccu =
@@ -13345,9 +13318,9 @@ Value callClosure(VMState & vm, Value fun, Value arg)
     }
 
     // Attrset with __functor: apply functor self arg.
-    if (fun.isAttrs() && fun.payload.bindings) {
+    if (fun.isAttrs() && fun.asAttrs()) {
         static const SymbolId functorId = ir::globalInternSymbol("__functor");
-        if (auto * fn = fun.payload.bindings->lookup(functorId)) {
+        if (auto * fn = fun.asAttrs()->lookup(functorId)) {
             Value forced = forceValue(vm, *fn);
             Value firstStep = callClosure(vm, forced, fun);
             return callClosure(vm, firstStep, arg);
@@ -13383,7 +13356,7 @@ Value callClosure(VMState & vm, Value fun, Value arg)
         throw std::runtime_error("v3 callClosure: not callable");
     }
 
-    const Closure * callee = fun.payload.closure;
+    const Closure * callee = fun.asClosure();
     const LambdaDescriptor * desc = callee->desc;
 
     // #495: native fix-point intrinsic -- mirrored from OP_CALL.
@@ -13406,11 +13379,9 @@ Value callClosure(VMState & vm, Value fun, Value arg)
                     (unsigned long long)allocStats().intrinsicFixCalls,
                     (int)arg.tag());
                 Value * slotStorage = Alloc::allocValue();
-                slotStorage->tag_payload =
-                    static_cast<uint64_t>(Tag::Uninitialized);
+                slotStorage->mkUninitialized();
                 Value slotV;
-                slotV.tag_payload = static_cast<uint64_t>(Tag::Slot);
-                slotV.payload.slot = slotStorage;
+                slotV.mkSlot(slotStorage);
                 Value res = callClosure(vm, arg, slotV);
                 *slotStorage = res;
                 return res;
@@ -13432,21 +13403,20 @@ Value callClosure(VMState & vm, Value fun, Value arg)
             Value final_  = arg;
             Value prev = callClosure(vm, f, final_);
             prev = forceValue(vm, prev);
-            if (!prev.isAttrs() || !prev.payload.bindings)
+            if (!prev.isAttrs() || !prev.asAttrs())
                 throw std::runtime_error(
                     "v3 callClosure intrinsic ExtendsBody: prev not attrs");
             Value overlay_partial = callClosure(vm, overlay, final_);
             Value overlay_result  = callClosure(vm, overlay_partial, prev);
             overlay_result = forceValue(vm, overlay_result);
-            if (!overlay_result.isAttrs() || !overlay_result.payload.bindings)
+            if (!overlay_result.isAttrs() || !overlay_result.asAttrs())
                 throw std::runtime_error(
                     "v3 callClosure intrinsic ExtendsBody: overlay-result not attrs");
-            Bindings * merged = mergeBindings(prev.payload.bindings,
-                                               overlay_result.payload.bindings,
+            Bindings * merged = mergeBindings(prev.asAttrs(),
+                                               overlay_result.asAttrs(),
                                                MergeBindingsSite::ExtendsTailPrev);
             Value res;
-            res.tag_payload = static_cast<uint64_t>(Tag::Attrs);
-            res.payload.bindings = merged;
+            res.mkAttrs(merged);
             return res;
         }
 
@@ -13465,31 +13435,29 @@ Value callClosure(VMState & vm, Value fun, Value arg)
             Value f_partial = callClosure(vm, f, final_);
             Value fApplied  = callClosure(vm, f_partial, prev_);
             fApplied = forceValue(vm, fApplied);
-            if (!fApplied.isAttrs() || !fApplied.payload.bindings)
+            if (!fApplied.isAttrs() || !fApplied.asAttrs())
                 throw std::runtime_error(
                     "v3 callClosure intrinsic ComposeBody: fApplied not attrs");
             Value prevForced = forceValue(vm, prev_);
-            if (!prevForced.isAttrs() || !prevForced.payload.bindings)
+            if (!prevForced.isAttrs() || !prevForced.asAttrs())
                 throw std::runtime_error(
                     "v3 callClosure intrinsic ComposeBody: prev not attrs");
-            Bindings * prevPrimeB = mergeBindings(prevForced.payload.bindings,
-                                                   fApplied.payload.bindings,
+            Bindings * prevPrimeB = mergeBindings(prevForced.asAttrs(),
+                                                   fApplied.asAttrs(),
                                                    MergeBindingsSite::ExtendsTailPrevPrime);
             Value prevPrime;
-            prevPrime.tag_payload = static_cast<uint64_t>(Tag::Attrs);
-            prevPrime.payload.bindings = prevPrimeB;
+            prevPrime.mkAttrs(prevPrimeB);
             Value g_partial = callClosure(vm, g, final_);
             Value gApplied  = callClosure(vm, g_partial, prevPrime);
             gApplied = forceValue(vm, gApplied);
-            if (!gApplied.isAttrs() || !gApplied.payload.bindings)
+            if (!gApplied.isAttrs() || !gApplied.asAttrs())
                 throw std::runtime_error(
                     "v3 callClosure intrinsic ComposeBody: gApplied not attrs");
-            Bindings * merged = mergeBindings(fApplied.payload.bindings,
-                                               gApplied.payload.bindings,
+            Bindings * merged = mergeBindings(fApplied.asAttrs(),
+                                               gApplied.asAttrs(),
                                                MergeBindingsSite::ComposeTailApplied);
             Value res;
-            res.tag_payload = static_cast<uint64_t>(Tag::Attrs);
-            res.payload.bindings = merged;
+            res.mkAttrs(merged);
             return res;
         }
     }
@@ -13505,10 +13473,10 @@ Value callClosure(VMState & vm, Value fun, Value arg)
             || sArg.tag() == Tag::Slot) {
             sArg = forceValue(vm, sArg);
         }
-        if (!sArg.isAttrs() || !sArg.payload.bindings)
+        if (!sArg.isAttrs() || !sArg.asAttrs())
             throw std::runtime_error(
                 "v3 selector lambda: arg not an attrset");
-        const Value * v = sArg.payload.bindings->lookup(desc->selectorSym);
+        const Value * v = sArg.asAttrs()->lookup(desc->selectorSym);
         if (!v)
             throw std::runtime_error(
                 "v3 selector lambda: missing attr");
@@ -13539,11 +13507,11 @@ Value callClosure(VMState & vm, Value fun, Value arg)
             Value chase = arg;
             int hops = 0;
             while (hops < 4) {
-                if (chase.tag() == Tag::Slot && chase.payload.slot)
-                    chase = *chase.payload.slot;
-                else if (chase.tag() == Tag::Thunk && chase.payload.thunk
-                         && chase.payload.thunk->state == ThunkState::Evaluated)
-                    chase = chase.payload.thunk->evaluated;
+                if (chase.tag() == Tag::Slot && chase.asSlot())
+                    chase = *chase.asSlot();
+                else if (chase.tag() == Tag::Thunk && chase.asThunk()
+                         && chase.asThunk()->state == ThunkState::Evaluated)
+                    chase = chase.asThunk()->evaluated;
                 else break;
                 ++hops;
             }
@@ -13551,8 +13519,8 @@ Value callClosure(VMState & vm, Value fun, Value arg)
                 "v3 FRAME_ENTRY callClosure %s codeOff=%u: local[0].tag=%d",
                 desc->name.c_str(), (unsigned)desc->codeOffset,
                 (int)arg.tag());
-            if (chase.tag() == Tag::Attrs && chase.payload.bindings) {
-                auto * b = chase.payload.bindings;
+            if (chase.tag() == Tag::Attrs && chase.asAttrs()) {
+                auto * b = chase.asAttrs();
                 std::fprintf(stderr, " -> attrs size=%u {", b->size);
                 const auto & tbl = ir::globalSymbolTable();
                 for (uint32_t i = 0; i < b->size && i < 4; ++i) {

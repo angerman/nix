@@ -318,7 +318,7 @@ static void requireNoStringContext(EvalState & state, const Value & v,
                                     std::string_view primopName)
 {
     if (!v.isString()) return;
-    auto * raw = lookupStringContextEntries(v.payload.str);
+    auto * raw = lookupStringContextEntries(v.asString());
     if (!raw || raw->empty()) return;
     std::string display;
     if (state.nixEvalState) {
@@ -344,7 +344,7 @@ static void requireNoStringContext(EvalState & state, const Value & v,
         std::fprintf(stderr, "v3 NOCTX-SITE: requireNoStringContext primop=%.*s\n",
                      (int)primopName.size(), primopName.data());
     std::string buf = "the string '";
-    if (v.payload.str) buf.append(v.payload.str);
+    if (v.asString()) buf.append(v.asString());
     buf += "' is not allowed to refer to a store path (such as '";
     buf += display;
     buf += "')";
@@ -431,37 +431,37 @@ inline bool valueEqual(VMState & vm, Value a0, Value b0)
         }
         if (a.tag() != b.tag()) {
             if (a.isInt() && b.isFloat()) {
-                if (static_cast<double>(a.payload.i) != b.payload.f) return false;
+                if (static_cast<double>(a.asInt()) != b.asFloat()) return false;
                 continue;
             }
             if (a.isFloat() && b.isInt()) {
-                if (a.payload.f != static_cast<double>(b.payload.i)) return false;
+                if (a.asFloat() != static_cast<double>(b.asInt())) return false;
                 continue;
             }
             return false;
         }
         switch (a.tag()) {
         case Tag::Int:
-            if (a.payload.i != b.payload.i) return false;
+            if (a.asInt() != b.asInt()) return false;
             break;
         case Tag::Float:
-            if (a.payload.f != b.payload.f) return false;
+            if (a.asFloat() != b.asFloat()) return false;
             break;
         case Tag::Bool:
-            if (a.payload.i != b.payload.i) return false;
+            if (a.asInt() != b.asInt()) return false;
             break;
         case Tag::Null:
             break;
         case Tag::String:
-            if (std::string_view(a.payload.str) != std::string_view(b.payload.str))
+            if (std::string_view(a.asString()) != std::string_view(b.asString()))
                 return false;
             break;
         case Tag::Path:
-            if (std::string_view(a.payload.path) != std::string_view(b.payload.path))
+            if (std::string_view(a.asPath()) != std::string_view(b.asPath()))
                 return false;
             break;
         case Tag::List: {
-            auto * la = a.payload.list; auto * lb = b.payload.list;
+            auto * la = a.asList(); auto * lb = b.asList();
             if (la == lb) break;
             uint32_t na = la ? la->size : 0; uint32_t nb = lb ? lb->size : 0;
             if (na != nb) return false;
@@ -475,7 +475,7 @@ inline bool valueEqual(VMState & vm, Value a0, Value b0)
             break;
         }
         case Tag::Attrs: {
-            auto * aa = a.payload.bindings; auto * bb = b.payload.bindings;
+            auto * aa = a.asAttrs(); auto * bb = b.asAttrs();
             if (aa == bb) break;
             // Lever A: index-wise comparison below assumes Sorted; a Chain's
             // entries[] is the overlay only.  Materialise both first (no-op
@@ -496,8 +496,8 @@ inline bool valueEqual(VMState & vm, Value a0, Value b0)
                 if (!b) return false;
                 if (const Value * tv = b->lookup(sType)) {
                     Value f = forceValue(vm, *tv);
-                    return f.isString() && f.payload.str
-                        && std::string_view(f.payload.str) == "derivation";
+                    return f.isString() && f.asString()
+                        && std::string_view(f.asString()) == "derivation";
                 }
                 return false;
             };
@@ -539,7 +539,7 @@ inline bool valueEqual(VMState & vm, Value a0, Value b0)
         case Tag::External:
         case Tag::Slot:
         default:
-            if (a.payload.raw != b.payload.raw) return false;
+            if (a.asRaw() != b.asRaw()) return false;
             break;
         }
     }
@@ -575,32 +575,31 @@ void primLength(EvalState &, Value * args, Value & out)
     // returned 3 in v3, errored in TW).  Use `stringLength` for
     // strings.
     if (!v.isList()) typeError("length", "list");
-    out.mkInt(v.payload.list ? v.payload.list->size : 0);
+    out.mkInt(v.asList() ? v.asList()->size : 0);
 }
 
 void primHead(EvalState &, Value * args, Value & out)
 {
     const Value & v = args[0];
     // #678 — match TW phrasing (libexpr/primops.cc:3892).
-    if (!v.isList() || !v.payload.list || v.payload.list->size == 0)
+    if (!v.isList() || !v.asList() || v.asList()->size == 0)
         throw std::runtime_error("'builtins.head' called on an empty list");
-    out = v.payload.list->elems[0];
+    out = v.asList()->elems[0];
 }
 
 void primTail(EvalState &, Value * args, Value & out)
 {
     const Value & v = args[0];
     // #678 — match TW phrasing (libexpr/primops.cc:3919).
-    if (!v.isList() || !v.payload.list || v.payload.list->size == 0)
+    if (!v.isList() || !v.asList() || v.asList()->size == 0)
         throw std::runtime_error("'builtins.tail' called on an empty list");
-    uint32_t n = v.payload.list->size;
+    uint32_t n = v.asList()->size;
     ListVec * out_l = Alloc::allocList(n - 1);
     V3_STATS_INC(listsAllocated);
     for (uint32_t i = 1; i < n; ++i)
-        out_l->elems[i - 1] = v.payload.list->elems[i];
+        out_l->elems[i - 1] = v.asList()->elems[i];
     listPostConstructBarrier(out_l);  // Phase D
-    out.tag_payload = static_cast<uint64_t>(Tag::List);
-    out.payload.list = out_l;
+    out.mkList(out_l);
 }
 
 void primElemAt(EvalState &, Value * args, Value & out)
@@ -608,27 +607,27 @@ void primElemAt(EvalState &, Value * args, Value & out)
     const Value & lst = args[0];
     const Value & idx = args[1];
     if (!lst.isList() || !idx.isInt()) typeError("elemAt", "list and int");
-    uint32_t n = lst.payload.list ? lst.payload.list->size : 0;
+    uint32_t n = lst.asList() ? lst.asList()->size : 0;
     // #678 — match TW phrasing (libexpr/primops.cc:3869).
-    if (idx.payload.i < 0 || static_cast<uint64_t>(idx.payload.i) >= n)
+    if (idx.asInt() < 0 || static_cast<uint64_t>(idx.asInt()) >= n)
         throw std::runtime_error(
             "'builtins.elemAt' called with index "
-            + std::to_string(idx.payload.i)
+            + std::to_string(idx.asInt())
             + " on a list of size " + std::to_string(n));
-    out = lst.payload.list->elems[idx.payload.i];
+    out = lst.asList()->elems[idx.asInt()];
 }
 
 void primAttrNames(EvalState &, Value * args, Value & out)
 {
     const Value & a = args[0];
-    if (!a.isAttrs() || !a.payload.bindings) typeError("attrNames", "attrset");
+    if (!a.isAttrs() || !a.asAttrs()) typeError("attrNames", "attrset");
     // Lever A (MEMORY_REPRESENTATION §6): stream the chain via Cursor
     // instead of materialise()-copying the whole base.  `totalSize()`
     // gives the distinct-name count to size the list; `forEach`
     // yields each distinct name once (overlay-wins).  The result is
     // re-sorted lexicographically below, so the cursor's SymbolId
     // order is irrelevant to output.
-    const Bindings * src = a.payload.bindings;
+    const Bindings * src = a.asAttrs();
     uint32_t n = src->totalSize();
     ListVec * lv = Alloc::allocList(n);
     V3_STATS_INC(listsAllocated);
@@ -645,20 +644,19 @@ void primAttrNames(EvalState &, Value * args, Value & out)
     // insertion order.
     std::sort(lv->elems, lv->elems + n,
         [](const Value & x, const Value & y) {
-            return std::string_view(x.payload.str) < std::string_view(y.payload.str);
+            return std::string_view(x.asString()) < std::string_view(y.asString());
         });
-    out.tag_payload = static_cast<uint64_t>(Tag::List);
-    out.payload.list = lv;
+    out.mkList(lv);
 }
 
 void primAttrValues(EvalState &, Value * args, Value & out)
 {
     const Value & a = args[0];
     // #693 — match TW phrasing (libexpr/primops.cc forceAttrs).
-    if (!a.isAttrs() || !a.payload.bindings)
+    if (!a.isAttrs() || !a.asAttrs())
         throw std::runtime_error(expectedTypeButFound("a set", a));
     // Lever A: stream the chain via Cursor (see primAttrNames above).
-    const Bindings * src = a.payload.bindings;
+    const Bindings * src = a.asAttrs();
     uint32_t n = src->totalSize();
     // Build (name, value) pairs, sort by name, then drop the name.
     auto & symTab = ir::globalSymbolTable();
@@ -675,8 +673,7 @@ void primAttrValues(EvalState &, Value * args, Value & out)
     ListVec * lv = Alloc::allocList(n);
     V3_STATS_INC(listsAllocated);
     for (uint32_t i = 0; i < n; ++i) lv->elems[i] = pairs[i].second;
-    out.tag_payload = static_cast<uint64_t>(Tag::List);
-    out.payload.list = lv;
+    out.mkList(lv);
 }
 
 void primIsAttrs   (EvalState &, Value * args, Value & out) { out = args[0].isAttrs()    ? Value::vTrue : Value::vFalse; }
@@ -706,8 +703,8 @@ void primIsFunction(EvalState &, Value * args, Value & out)
     // can only be such a PAP (ordinary lazy apps force to their result).
     if (!isfn && args[0].tag() == Tag::App) {
         const Value * cur = &args[0];
-        while (cur->tag() == Tag::App && cur->payload.pair)
-            cur = &cur->payload.pair->left;
+        while (cur->tag() == Tag::App && cur->asPair())
+            cur = &cur->asPair()->left;
         isfn = (cur->tag() == Tag::Closure);
     }
     if (s_dbg) std::fprintf(stderr,
@@ -750,8 +747,8 @@ static std::string toStringCoerceCtx(EvalState & state, Value v,
     };
     v = forceValue(*state.vm, v);
     switch (v.tag()) {
-    case Tag::String: absorbCtx(v.payload.str);
-                      return std::string(v.payload.str ? v.payload.str : "");
+    case Tag::String: absorbCtx(v.asString());
+                      return std::string(v.asString() ? v.asString() : "");
     case Tag::Path: {
         // TW splits this into TWO behaviours via the `copyToStore` flag
         // of `EvalState::coerceToString` (libexpr/eval.cc:2880-2902):
@@ -779,13 +776,13 @@ static std::string toStringCoerceCtx(EvalState & state, Value v,
         // passes false (TW-compatible toString).  The bytecode-wrapper
         // path coercion (via the new __derivCoerce primop) passes true
         // so derivation args/builder/env retain the store-copy.
-        if (!v.payload.path) return std::string();
+        if (!v.asPath()) return std::string();
         if (!copyPathsToStore || !state.nixEvalState)
-            return std::string(v.payload.path);
+            return std::string(v.asPath());
         try {
             auto & ns = *state.nixEvalState;
             nix::SourcePath sp = ns.rootPath(
-                nix::CanonPath(v.payload.path));
+                nix::CanonPath(v.asPath()));
             nix::NixStringContext twCtx;
             nix::StorePath sPath = ns.copyPathToStore(twCtx, sp);
             // Insert the copy's context (an Opaque element pointing
@@ -797,23 +794,23 @@ static std::string toStringCoerceCtx(EvalState & state, Value v,
             // Path doesn't exist on disk or store-copy refused
             // (e.g. /no-cert-file.crt that TW also can't copy).
             // Fall back to raw path; downstream may handle it.
-            return std::string(v.payload.path);
+            return std::string(v.asPath());
         }
     }
-    case Tag::Int:    return std::to_string(v.payload.i);
-    case Tag::Float:  return std::to_string(v.payload.f);
-    case Tag::Bool:   return v.payload.i == 1 ? "1" : "";
+    case Tag::Int:    return std::to_string(v.asInt());
+    case Tag::Float:  return std::to_string(v.asFloat());
+    case Tag::Bool:   return v.asInt() == 1 ? "1" : "";
     case Tag::Null:   return "";
     case Tag::List: {
         std::string out;
-        auto * lv = v.payload.list;
+        auto * lv = v.asList();
         if (!lv) return out;
         for (uint32_t i = 0; i < lv->size; ++i) {
             Value el = forceValue(*state.vm, lv->elems[i]);
             out += toStringCoerceCtx(state, el, ctx, copyPathsToStore);
             if (i + 1 < lv->size) {
                 bool elIsEmptyList = el.isList()
-                    && (!el.payload.list || el.payload.list->size == 0);
+                    && (!el.asList() || el.asList()->size == 0);
                 if (!elIsEmptyList) out += ' ';
             }
         }
@@ -822,7 +819,7 @@ static std::string toStringCoerceCtx(EvalState & state, Value v,
     case Tag::Attrs: {
         // TW behaviour: try __toString first (call it on the attrset),
         // then fall through to outPath.  See libexpr/eval.cc:2865.
-        if (v.payload.bindings) {
+        if (v.asAttrs()) {
             static const SymbolId sToString =
                 ir::globalInternSymbol("__toString");
             static const SymbolId sOutPath =
@@ -830,7 +827,7 @@ static std::string toStringCoerceCtx(EvalState & state, Value v,
             // __toString: call it with `self` as the single arg, then
             // recursively coerce the result.  Only fires for callable
             // shapes; non-callable falls through to outPath.
-            if (auto * tsRaw = v.payload.bindings->lookup(sToString)) {
+            if (auto * tsRaw = v.asAttrs()->lookup(sToString)) {
                 Value tsFn = forceValue(*state.vm, *tsRaw);
                 if (tsFn.isClosure() || tsFn.isPrimOp()
                     || tsFn.tag() == Tag::PrimOpApp) {
@@ -840,7 +837,7 @@ static std::string toStringCoerceCtx(EvalState & state, Value v,
                 }
                 // non-callable: fall through to outPath
             }
-            if (auto * outV = v.payload.bindings->lookup(sOutPath)) {
+            if (auto * outV = v.asAttrs()->lookup(sOutPath)) {
                 Value forced = forceValue(*state.vm, *outV);
                 return toStringCoerceCtx(state, forced, ctx, copyPathsToStore);
             }
@@ -889,19 +886,19 @@ static std::string toStringCoerceCtx(EvalState & state, Value v,
         char buf[256];
         const char * extra = "";
         std::string nameInfo;
-        if (v.tag() == Tag::PrimOp && v.payload.primop) {
+        if (v.tag() == Tag::PrimOp && v.asPrimOp()) {
             nameInfo = std::string(" name='")
-                + (v.payload.primop->name.empty()
-                       ? "<anon>" : std::string(v.payload.primop->name))
+                + (v.asPrimOp()->name.empty()
+                       ? "<anon>" : std::string(v.asPrimOp()->name))
                 + "' arity="
-                + std::to_string(v.payload.primop->arity);
+                + std::to_string(v.asPrimOp()->arity);
             extra = nameInfo.c_str();
         } else if (v.tag() == Tag::Closure
-                   && v.payload.closure
-                   && v.payload.closure->desc) {
+                   && v.asClosure()
+                   && v.asClosure()->desc) {
             nameInfo = std::string(" closure-name='")
-                + (v.payload.closure->desc->name.empty()
-                       ? "<anon>" : v.payload.closure->desc->name)
+                + (v.asClosure()->desc->name.empty()
+                       ? "<anon>" : v.asClosure()->desc->name)
                 + "'";
             extra = nameInfo.c_str();
         }
@@ -932,7 +929,7 @@ void primToString(EvalState & state, Value * args, Value & out)
                                        /*copyPathsToStore=*/false);
     out = mkStringValueOwned(std::move(s));
     if (!ctx.empty())
-        setStringContextEntries(out.payload.str, std::move(ctx));
+        setStringContextEntries(out.asString(), std::move(ctx));
 }
 
 /// Internal `__derivCoerce` primop: like `builtins.toString` but
@@ -954,7 +951,7 @@ void primDerivCoerce(EvalState & state, Value * args, Value & out)
                                        /*copyPathsToStore=*/true);
     out = mkStringValueOwned(std::move(s));
     if (!ctx.empty())
-        setStringContextEntries(out.payload.str, std::move(ctx));
+        setStringContextEntries(out.asString(), std::move(ctx));
 }
 
 void primTypeOf(EvalState &, Value * args, Value & out)
@@ -988,7 +985,7 @@ void primTypeOf(EvalState &, Value * args, Value & out)
 void primStringLength(EvalState &, Value * args, Value & out)
 {
     if (!args[0].isString()) typeError("stringLength", "string");
-    out.mkInt(static_cast<int64_t>(std::strlen(args[0].payload.str)));
+    out.mkInt(static_cast<int64_t>(std::strlen(args[0].asString())));
 }
 
 void primAdd(EvalState &, Value * args, Value & out)
@@ -1000,16 +997,16 @@ void primAdd(EvalState &, Value * args, Value & out)
     // mask integer-arithmetic bugs in nixpkgs builders.
     if (a.isInt() && b.isInt()) {
         int64_t sum;
-        if (__builtin_add_overflow(a.payload.i, b.payload.i, &sum))
+        if (__builtin_add_overflow(a.asInt(), b.asInt(), &sum))
             throw std::runtime_error(
                 "integer overflow in adding "
-                + std::to_string(a.payload.i) + " + "
-                + std::to_string(b.payload.i));
+                + std::to_string(a.asInt()) + " + "
+                + std::to_string(b.asInt()));
         out.mkInt(sum);
     }
-    else if (a.isFloat() && b.isFloat()) out.mkFloat(a.payload.f + b.payload.f);
-    else if (a.isInt() && b.isFloat())   out.mkFloat(static_cast<double>(a.payload.i) + b.payload.f);
-    else if (a.isFloat() && b.isInt())   out.mkFloat(a.payload.f + static_cast<double>(b.payload.i));
+    else if (a.isFloat() && b.isFloat()) out.mkFloat(a.asFloat() + b.asFloat());
+    else if (a.isInt() && b.isFloat())   out.mkFloat(static_cast<double>(a.asInt()) + b.asFloat());
+    else if (a.isFloat() && b.isInt())   out.mkFloat(a.asFloat() + static_cast<double>(b.asInt()));
     else typeError("add", "numeric");
 }
 
@@ -1019,16 +1016,16 @@ void primSub(EvalState &, Value * args, Value & out)
     // #687 — primSub overflow guard, mirror of primAdd.
     if (a.isInt() && b.isInt()) {
         int64_t diff;
-        if (__builtin_sub_overflow(a.payload.i, b.payload.i, &diff))
+        if (__builtin_sub_overflow(a.asInt(), b.asInt(), &diff))
             throw std::runtime_error(
                 "integer overflow in subtracting "
-                + std::to_string(a.payload.i) + " - "
-                + std::to_string(b.payload.i));
+                + std::to_string(a.asInt()) + " - "
+                + std::to_string(b.asInt()));
         out.mkInt(diff);
     }
-    else if (a.isFloat() && b.isFloat()) out.mkFloat(a.payload.f - b.payload.f);
-    else if (a.isInt() && b.isFloat())   out.mkFloat(static_cast<double>(a.payload.i) - b.payload.f);
-    else if (a.isFloat() && b.isInt())   out.mkFloat(a.payload.f - static_cast<double>(b.payload.i));
+    else if (a.isFloat() && b.isFloat()) out.mkFloat(a.asFloat() - b.asFloat());
+    else if (a.isInt() && b.isFloat())   out.mkFloat(static_cast<double>(a.asInt()) - b.asFloat());
+    else if (a.isFloat() && b.isInt())   out.mkFloat(a.asFloat() - static_cast<double>(b.asInt()));
     else typeError("sub", "numeric");
 }
 
@@ -1038,16 +1035,16 @@ void primMul(EvalState &, Value * args, Value & out)
     // #687 — primMul overflow guard, mirror of primAdd.
     if (a.isInt() && b.isInt()) {
         int64_t prod;
-        if (__builtin_mul_overflow(a.payload.i, b.payload.i, &prod))
+        if (__builtin_mul_overflow(a.asInt(), b.asInt(), &prod))
             throw std::runtime_error(
                 "integer overflow in multiplying "
-                + std::to_string(a.payload.i) + " * "
-                + std::to_string(b.payload.i));
+                + std::to_string(a.asInt()) + " * "
+                + std::to_string(b.asInt()));
         out.mkInt(prod);
     }
-    else if (a.isFloat() && b.isFloat()) out.mkFloat(a.payload.f * b.payload.f);
-    else if (a.isInt() && b.isFloat())   out.mkFloat(static_cast<double>(a.payload.i) * b.payload.f);
-    else if (a.isFloat() && b.isInt())   out.mkFloat(a.payload.f * static_cast<double>(b.payload.i));
+    else if (a.isFloat() && b.isFloat()) out.mkFloat(a.asFloat() * b.asFloat());
+    else if (a.isInt() && b.isFloat())   out.mkFloat(static_cast<double>(a.asInt()) * b.asFloat());
+    else if (a.isFloat() && b.isInt())   out.mkFloat(a.asFloat() * static_cast<double>(b.asInt()));
     else typeError("mul", "numeric");
 }
 
@@ -1060,17 +1057,17 @@ void primDiv(EvalState &, Value * args, Value & out)
     // ±inf / NaN silently — a SEMANTIC divergence on numeric code that
     // could mask divide-by-zero bugs in nixpkgs builders.
     if (a.isInt() && b.isInt()) {
-        if (b.payload.i == 0) throw std::runtime_error("division by zero");
-        out.mkInt(a.payload.i / b.payload.i);
+        if (b.asInt() == 0) throw std::runtime_error("division by zero");
+        out.mkInt(a.asInt() / b.asInt());
     } else if (a.isFloat() && b.isFloat()) {
-        if (b.payload.f == 0.0) throw std::runtime_error("division by zero");
-        out.mkFloat(a.payload.f / b.payload.f);
+        if (b.asFloat() == 0.0) throw std::runtime_error("division by zero");
+        out.mkFloat(a.asFloat() / b.asFloat());
     } else if (a.isInt() && b.isFloat()) {
-        if (b.payload.f == 0.0) throw std::runtime_error("division by zero");
-        out.mkFloat(static_cast<double>(a.payload.i) / b.payload.f);
+        if (b.asFloat() == 0.0) throw std::runtime_error("division by zero");
+        out.mkFloat(static_cast<double>(a.asInt()) / b.asFloat());
     } else if (a.isFloat() && b.isInt()) {
-        if (b.payload.i == 0) throw std::runtime_error("division by zero");
-        out.mkFloat(a.payload.f / static_cast<double>(b.payload.i));
+        if (b.asInt() == 0) throw std::runtime_error("division by zero");
+        out.mkFloat(a.asFloat() / static_cast<double>(b.asInt()));
     } else typeError("div", "numeric");
 }
 
@@ -1082,7 +1079,7 @@ void primThrow(EvalState &, Value * args, Value &)
     // (no "v3 throw:" prefix) so default-mode `nix eval` byte-matches
     // TW's `«error: <msg>»` form (libexpr/primops.cc:1167 throws
     // `ThrownError(s)` with no prefix).
-    throw ThrownError(std::string(args[0].payload.str));
+    throw ThrownError(std::string(args[0].asString()));
 }
 
 void primConcatLists(EvalState & state, Value * args, Value & out)
@@ -1098,36 +1095,35 @@ void primConcatLists(EvalState & state, Value * args, Value & out)
     // `concatLists (map f xs)` where map returns Apps that downstream
     // forces have already resolved).  Skip the forceValue function-call
     // cost for those.
-    for (uint32_t i = 0; i < outer.payload.list->size; ++i) {
-        Value & e = outer.payload.list->elems[i];
+    for (uint32_t i = 0; i < outer.asList()->size; ++i) {
+        Value & e = outer.asList()->elems[i];
         Tag et = e.tag();
         if (__builtin_expect(et == Tag::Thunk
                              || et == Tag::App || et == Tag::App3
                              || et == Tag::Slot, 0))
             e = forceValue(*state.vm, e);
         if (!e.isList()) typeError("concatLists", "list of lists");
-        total += e.payload.list ? e.payload.list->size : 0;
+        total += e.asList() ? e.asList()->size : 0;
     }
     ListVec * result = Alloc::allocList(total);
     V3_STATS_INC(listsAllocated);
     uint32_t k = 0;
-    for (uint32_t i = 0; i < outer.payload.list->size; ++i) {
-        const Value & el = outer.payload.list->elems[i];
-        if (!el.payload.list) continue;
-        for (uint32_t j = 0; j < el.payload.list->size; ++j)
-            result->elems[k++] = el.payload.list->elems[j];
+    for (uint32_t i = 0; i < outer.asList()->size; ++i) {
+        const Value & el = outer.asList()->elems[i];
+        if (!el.asList()) continue;
+        for (uint32_t j = 0; j < el.asList()->size; ++j)
+            result->elems[k++] = el.asList()->elems[j];
     }
-    out.tag_payload = static_cast<uint64_t>(Tag::List);
-    out.payload.list = result;
+    out.mkList(result);
 }
 
 void primConcatStringsSep(EvalState & state, Value * args, Value & out)
 {
     if (!args[0].isString()) typeError("concatStringsSep", "separator string");
     if (!args[1].isList())   typeError("concatStringsSep", "list of strings");
-    std::string sep(args[0].payload.str);
+    std::string sep(args[0].asString());
     std::string result;
-    auto * list = args[1].payload.list;
+    auto * list = args[1].asList();
     // 2026-05-19 #665: accumulate string context from the separator
     // and every list element.  TW's prim_concatStringsSep
     // (libexpr/primops.cc:prim_concatStringsSep) calls coerceToString
@@ -1144,7 +1140,7 @@ void primConcatStringsSep(EvalState & state, Value * args, Value & out)
         if (auto * raw = lookupStringContextEntries(s))
             ctx.insert(ctx.end(), raw->begin(), raw->end());
     };
-    absorb(args[0].payload.str);
+    absorb(args[0].asString());
     // Phase 1.2 step 2 (action plan): inline WHNF skip — most
     // concatStringsSep arguments are already-forced strings (the
     // common idiom is `concatStringsSep ":" (map toString xs)` where
@@ -1173,14 +1169,14 @@ void primConcatStringsSep(EvalState & state, Value * args, Value & out)
             result += coerced;
             continue;
         }
-        absorb(el.payload.str);
-        result += el.payload.str;
+        absorb(el.asString());
+        result += el.asString();
     }
     out = mkStringValueOwned(result);
     if (!ctx.empty()) {
         std::sort(ctx.begin(), ctx.end());
         ctx.erase(std::unique(ctx.begin(), ctx.end()), ctx.end());
-        setStringContextEntries(out.payload.str, std::move(ctx));
+        setStringContextEntries(out.asString(), std::move(ctx));
     }
 }
 
@@ -1188,15 +1184,15 @@ void primSubstring(EvalState &, Value * args, Value & out)
 {
     if (!args[0].isInt() || !args[1].isInt() || !args[2].isString())
         typeError("substring", "(int, int, string)");
-    int64_t start = args[0].payload.i;
-    int64_t len = args[1].payload.i;
+    int64_t start = args[0].asInt();
+    int64_t len = args[1].asInt();
     // Match tree-walker: negative start is rejected; negative len is
     // a "to end" sentinel.
     if (start < 0)
         // #693 — match TW phrasing (libexpr/primops.cc:substring).
         throw std::runtime_error("negative start position in 'substring'");
-    std::string_view src(args[2].payload.str);
-    const char * srcPtr = args[2].payload.str;
+    std::string_view src(args[2].asString());
+    const char * srcPtr = args[2].asString();
     if (static_cast<size_t>(start) >= src.size()) {
         out = mkStringValueOwned("");
     } else {
@@ -1215,7 +1211,7 @@ void primSubstring(EvalState &, Value * args, Value & out)
     if (srcPtr) {
         if (auto * raw = lookupStringContextEntries(srcPtr)) {
             std::vector<std::string> copy(raw->begin(), raw->end());
-            setStringContextEntries(out.payload.str, std::move(copy));
+            setStringContextEntries(out.asString(), std::move(copy));
         }
     }
 }
@@ -1235,10 +1231,9 @@ void primMap(EvalState & state, Value * args, Value & out)
     if (lst.isAppLike() || lst.tag() == Tag::Thunk || lst.tag() == Tag::Slot)
         lst = forceValue(*state.vm, lst);
     if (!lst.isList()) typeError("map", "list");
-    auto * src = lst.payload.list;
+    auto * src = lst.asList();
     if (!src || src->size == 0) {
-        out.tag_payload = static_cast<uint64_t>(Tag::List);
-        out.payload.list = Alloc::allocList(0);
+        out.mkList(Alloc::allocList(0));
         V3_STATS_INC(listsAllocated);
         return;
     }
@@ -1252,22 +1247,19 @@ void primMap(EvalState & state, Value * args, Value & out)
         pp->right = src->elems[i];
         pairPostConstructBarrier(pp);  // Phase D
         Value v;
-        v.tag_payload = static_cast<uint64_t>(Tag::App);
-        v.payload.pair = pp;
+        v.mkPair(Tag::App, pp);
         result->elems[i] = v;
     }
     listPostConstructBarrier(result);  // Phase D
-    out.tag_payload = static_cast<uint64_t>(Tag::List);
-    out.payload.list = result;
+    out.mkList(result);
 }
 
 void primFilter(EvalState & state, Value * args, Value & out)
 {
     if (!args[1].isList()) typeError("filter", "list");
-    auto * src = args[1].payload.list;
+    auto * src = args[1].asList();
     if (!src || src->size == 0) {
-        out.tag_payload = static_cast<uint64_t>(Tag::List);
-        out.payload.list = Alloc::allocList(0);
+        out.mkList(Alloc::allocList(0));
         V3_STATS_INC(listsAllocated);
         return;
     }
@@ -1285,13 +1277,12 @@ void primFilter(EvalState & state, Value * args, Value & out)
                 r = forceValue(*state.vm, r);
         }
         if (!r.isBool()) typeError("filter", "predicate returning bool");
-        if (r.payload.i == 1) kept.push_back(src->elems[i]);
+        if (r.asInt() == 1) kept.push_back(src->elems[i]);
     }
     ListVec * result = Alloc::allocList(static_cast<uint32_t>(kept.size()));
     V3_STATS_INC(listsAllocated);
     for (size_t i = 0; i < kept.size(); ++i) result->elems[i] = kept[i];
-    out.tag_payload = static_cast<uint64_t>(Tag::List);
-    out.payload.list = result;
+    out.mkList(result);
 }
 
 void primFoldl(EvalState & state, Value * args, Value & out)
@@ -1300,7 +1291,7 @@ void primFoldl(EvalState & state, Value * args, Value & out)
     if (!args[2].isList()) typeError("foldl'", "list");
     Value op = args[0];
     Value acc = args[1];
-    auto * src = args[2].payload.list;
+    auto * src = args[2].asList();
     if (src) {
         for (uint32_t i = 0; i < src->size; ++i) {
             // Apply `op acc elem`.  T1: callClosure2 enters the arity-2
@@ -1347,7 +1338,7 @@ void primFoldlMap(EvalState & state, Value * args, Value & out)
     Value op   = args[0];
     Value acc  = args[1];
     Value f    = args[2];
-    auto * src = args[3].payload.list;
+    auto * src = args[3].asList();
     if (src) {
         for (uint32_t i = 0; i < src->size; ++i) {
             // Compute f(elem); force the result before passing to op.
@@ -1376,7 +1367,7 @@ void primGenList(EvalState & state, Value * args, Value & out)
     if (len.isAppLike() || len.tag() == Tag::Thunk || len.tag() == Tag::Slot)
         len = forceValue(*state.vm, len);
     if (!len.isInt()) typeError("genList", "int length");
-    int64_t n = len.payload.i;
+    int64_t n = len.asInt();
     // #693 — match TW phrasing (libexpr/primops.cc:genList).
     if (n < 0) throw std::runtime_error("cannot create list of size " + std::to_string(n));
     Value gen = args[0];
@@ -1390,18 +1381,16 @@ void primGenList(EvalState & state, Value * args, Value & out)
         pp->right = idx;
         pairPostConstructBarrier(pp);  // Phase D
         Value v;
-        v.tag_payload = static_cast<uint64_t>(Tag::App);
-        v.payload.pair = pp;
+        v.mkPair(Tag::App, pp);
         result->elems[i] = v;
     }
-    out.tag_payload = static_cast<uint64_t>(Tag::List);
-    out.payload.list = result;
+    out.mkList(result);
 }
 
 void primAll(EvalState & state, Value * args, Value & out)
 {
     if (!args[1].isList()) typeError("all", "list");
-    auto * src = args[1].payload.list;
+    auto * src = args[1].asList();
     Value pred = args[0];
     bool all = true;
     if (src) {
@@ -1415,7 +1404,7 @@ void primAll(EvalState & state, Value * args, Value & out)
                     r = forceValue(*state.vm, r);
             }
             if (!r.isBool()) typeError("all", "bool from predicate");
-            if (r.payload.i == 0) { all = false; break; }
+            if (r.asInt() == 0) { all = false; break; }
         }
     }
     out = all ? Value::vTrue : Value::vFalse;
@@ -1424,7 +1413,7 @@ void primAll(EvalState & state, Value * args, Value & out)
 void primAny(EvalState & state, Value * args, Value & out)
 {
     if (!args[1].isList()) typeError("any", "list");
-    auto * src = args[1].payload.list;
+    auto * src = args[1].asList();
     Value pred = args[0];
     bool any = false;
     if (src) {
@@ -1438,7 +1427,7 @@ void primAny(EvalState & state, Value * args, Value & out)
                     r = forceValue(*state.vm, r);
             }
             if (!r.isBool()) typeError("any", "bool from predicate");
-            if (r.payload.i == 1) { any = true; break; }
+            if (r.asInt() == 1) { any = true; break; }
         }
     }
     out = any ? Value::vTrue : Value::vFalse;
@@ -1451,7 +1440,7 @@ void primGetEnv(EvalState & state, Value * args, Value & out)
     // contexted strings can't be used as env-var names (would mask
     // accidental drv references in callers).
     requireNoStringContext(state, args[0], "getEnv");
-    const char * e = std::getenv(args[0].payload.str);
+    const char * e = std::getenv(args[0].asString());
     out = mkStringValueOwned(e ? e : "");
 }
 
@@ -1510,8 +1499,8 @@ void primCompareVersions(EvalState & state, Value * args, Value & out)
     // args (libexpr/primops.cc:1463-area).
     requireNoStringContext(state, args[0], "compareVersions");
     requireNoStringContext(state, args[1], "compareVersions");
-    std::string_view v1(args[0].payload.str);
-    std::string_view v2(args[1].payload.str);
+    std::string_view v1(args[0].asString());
+    std::string_view v2(args[1].asString());
     auto p1 = v1.begin();
     auto p2 = v2.begin();
     while (p1 != v1.end() || p2 != v2.end()) {
@@ -1529,7 +1518,7 @@ void primConcatMap(EvalState & state, Value * args, Value & out)
     if (lst.isAppLike() || lst.tag() == Tag::Thunk || lst.tag() == Tag::Slot)
         lst = forceValue(*state.vm, lst);
     if (!lst.isList()) typeError("concatMap", "list");
-    auto * src = lst.payload.list;
+    auto * src = lst.asList();
     Value fn = args[0];
     std::vector<Value> all;
     if (src) {
@@ -1550,22 +1539,21 @@ void primConcatMap(EvalState & state, Value * args, Value & out)
                     r = forceValue(*state.vm, r);
             }
             if (!r.isList()) typeError("concatMap", "function returning list");
-            if (r.payload.list)
-                for (uint32_t j = 0; j < r.payload.list->size; ++j)
-                    all.push_back(r.payload.list->elems[j]);
+            if (r.asList())
+                for (uint32_t j = 0; j < r.asList()->size; ++j)
+                    all.push_back(r.asList()->elems[j]);
         }
     }
     ListVec * result = Alloc::allocList(static_cast<uint32_t>(all.size()));
     V3_STATS_INC(listsAllocated);
     for (size_t i = 0; i < all.size(); ++i) result->elems[i] = all[i];
-    out.tag_payload = static_cast<uint64_t>(Tag::List);
-    out.payload.list = result;
+    out.mkList(result);
 }
 
 void primPartition(EvalState & state, Value * args, Value & out)
 {
     if (!args[1].isList()) typeError("partition", "list");
-    auto * src = args[1].payload.list;
+    auto * src = args[1].asList();
     Value pred = args[0];
     std::vector<Value> right_, wrong_;
     if (src) {
@@ -1581,7 +1569,7 @@ void primPartition(EvalState & state, Value * args, Value & out)
                     r = forceValue(*state.vm, r);
             }
             if (!r.isBool()) typeError("partition", "predicate returning bool");
-            if (r.payload.i == 1) right_.push_back(src->elems[i]);
+            if (r.asInt() == 1) right_.push_back(src->elems[i]);
             else                  wrong_.push_back(src->elems[i]);
         }
     }
@@ -1590,8 +1578,7 @@ void primPartition(EvalState & state, Value * args, Value & out)
         V3_STATS_INC(listsAllocated);
         for (size_t i = 0; i < v.size(); ++i) l->elems[i] = v[i];
         Value out;
-        out.tag_payload = static_cast<uint64_t>(Tag::List);
-        out.payload.list = l;
+        out.mkList(l);
         return out;
     };
     Value rightV = mkList(right_);
@@ -1611,8 +1598,7 @@ void primPartition(EvalState & state, Value * args, Value & out)
         bindingsSetEntry(b, 0, {sWrong, 0, wrongV});  // Phase D
         bindingsSetEntry(b, 1, {sRight, 0, rightV});
     }
-    out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
-    out.payload.bindings = b;
+    out.mkAttrs(b);
 }
 
 /// Helper: intern a string into the global symbol table so the
@@ -1634,12 +1620,11 @@ inline std::string_view vmSymName(EvalState & /*state*/, SymbolId id)
 void primListToAttrs(EvalState & state, Value * args, Value & out)
 {
     if (!args[0].isList()) typeError("listToAttrs", "list");
-    auto * src = args[0].payload.list;
+    auto * src = args[0].asList();
     if (!src || src->size == 0) {
         Bindings * b = Alloc::allocBindings(0);
         V3_STATS_INC(attrsetsAllocated);
-        out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
-        out.payload.bindings = b;
+        out.mkAttrs(b);
         return;
     }
     SymbolId nameSym  = vmIntern(state, "name");
@@ -1648,16 +1633,16 @@ void primListToAttrs(EvalState & state, Value * args, Value & out)
     entries.reserve(src->size);
     for (uint32_t i = 0; i < src->size; ++i) {
         Value el = forceValue(*state.vm, src->elems[i]);
-        if (!el.isAttrs() || !el.payload.bindings)
+        if (!el.isAttrs() || !el.asAttrs())
             typeError("listToAttrs", "list of attrsets");
-        const Value * nvRaw = el.payload.bindings->lookup(nameSym);
-        const Value * vvRaw = el.payload.bindings->lookup(valueSym);
+        const Value * nvRaw = el.asAttrs()->lookup(nameSym);
+        const Value * vvRaw = el.asAttrs()->lookup(valueSym);
         if (!nvRaw || !vvRaw)
             typeError("listToAttrs", "{ name = string; value = ...; }");
         Value nv = forceValue(*state.vm, *nvRaw);
         if (!nv.isString())
             typeError("listToAttrs", "{ name = string; value = ...; }");
-        SymbolId k = vmIntern(state, nv.payload.str);
+        SymbolId k = vmIntern(state, nv.asString());
         // value stays lazy on purpose
         entries.emplace_back(k, *vvRaw);
     }
@@ -1680,8 +1665,7 @@ void primListToAttrs(EvalState & state, Value * args, Value & out)
         b->entries[i].name  = dedup[i].first;
         bindingsSetValue(b, static_cast<uint32_t>(i), dedup[i].second);  // Phase D
     }
-    out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
-    out.payload.bindings = b;
+    out.mkAttrs(b);
 }
 
 // #693 — TW phrasing for `expected a set/list but found <type>: <value>` errors.
@@ -1702,14 +1686,14 @@ static std::string expectedTypeButFound(const char * expected,
     else if (t == Tag::Closure || t == Tag::PrimOp || t == Tag::PrimOpApp)
                               { art = "a";  name = "function"; }
     auto valRepr = [&]() -> std::string {
-        if (t == Tag::Int)    return std::to_string(v.payload.i);
-        if (t == Tag::Float)  { std::ostringstream os; os << v.payload.f; return os.str(); }
-        if (t == Tag::Bool)   return v.payload.i == 1 ? "true" : "false";
+        if (t == Tag::Int)    return std::to_string(v.asInt());
+        if (t == Tag::Float)  { std::ostringstream os; os << v.asFloat(); return os.str(); }
+        if (t == Tag::Bool)   return v.asInt() == 1 ? "true" : "false";
         if (t == Tag::Null)   return "null";
-        if (t == Tag::String) return v.payload.str ? std::string("\"") + v.payload.str + "\"" : "\"\"";
-        if (t == Tag::Path)   return v.payload.path ? std::string(v.payload.path) : "/";
-        if (t == Tag::List)   return v.payload.list && v.payload.list->size > 0 ? "[ ... ]" : "[ ]";
-        if (t == Tag::Attrs)  return v.payload.bindings && v.payload.bindings->size > 0 ? "{ ... }" : "{ }";
+        if (t == Tag::String) return v.asString() ? std::string("\"") + v.asString() + "\"" : "\"\"";
+        if (t == Tag::Path)   return v.asPath() ? std::string(v.asPath()) : "/";
+        if (t == Tag::List)   return v.asList() && v.asList()->size > 0 ? "[ ... ]" : "[ ]";
+        if (t == Tag::Attrs)  return v.asAttrs() && v.asAttrs()->size > 0 ? "{ ... }" : "{ }";
         // #820 (2026-05-26): TW's printFunction emits `«lambda <name>? @
         // <file>:<line>:<col>»` (eval.cc:1245 cites `ValuePrinter` which
         // delegates to `printFunction` in libexpr/print.cc).  Mirror
@@ -1717,9 +1701,9 @@ static std::string expectedTypeButFound(const char * expected,
         // function: «lambda @ p6b.nix:1:43»" match TW byte-for-byte.
         // Without this match, run-inherit-from-laziness-tests' p6b
         // assertion fails on cosmetic-but-load-bearing string equality.
-        if (t == Tag::Closure && v.payload.closure && v.payload.closure->desc) {
+        if (t == Tag::Closure && v.asClosure() && v.asClosure()->desc) {
             std::string tok = "«lambda";
-            const auto & d = *v.payload.closure->desc;
+            const auto & d = *v.asClosure()->desc;
             if (!d.contextualName.empty()) {
                 tok += ' ';
                 tok += d.contextualName;
@@ -1762,8 +1746,8 @@ void primRemoveAttrs(EvalState & state, Value * args, Value & out)
         throw std::runtime_error(expectedTypeButFound("a set", args[0]));
     if (!args[1].isList())
         throw std::runtime_error(expectedTypeButFound("a list", args[1]));
-    const Bindings * src = args[0].payload.bindings;
-    auto * names = args[1].payload.list;
+    const Bindings * src = args[0].asAttrs();
+    auto * names = args[1].asList();
     if (!src || !names || names->size == 0) { out = args[0]; return; }
     // #825 Phase C SPIKE: iterating src->entries[] directly on a
     // Chain would only see the overlay.  Materialise once at entry.
@@ -1784,7 +1768,7 @@ void primRemoveAttrs(EvalState & state, Value * args, Value & out)
         // #734: TW's prim_removeAttrs iterates with forceStringNoCtx per
         // element (libexpr/primops.cc).  Reject contexted names here too.
         requireNoStringContext(state, el, "removeAttrs");
-        toRemove.insert(vmIntern(state, el.payload.str));
+        toRemove.insert(vmIntern(state, el.asString()));
     }
     // #747 two-pass to avoid arena slack: pass 1 counts kept
     // entries, pass 2 allocates exact and fills.  Without this, the
@@ -1804,21 +1788,19 @@ void primRemoveAttrs(EvalState & state, Value * args, Value & out)
         }
     }
     // k == kExact by construction; allocBindings already set the size.
-    out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
-    out.payload.bindings = result;
+    out.mkAttrs(result);
 }
 
 void primIntersectAttrs(EvalState &, Value * args, Value & out)
 {
     if (!args[0].isAttrs() || !args[1].isAttrs())
         typeError("intersectAttrs", "two attrsets");
-    const Bindings * keep = args[0].payload.bindings;
-    const Bindings * src  = args[1].payload.bindings;
+    const Bindings * keep = args[0].asAttrs();
+    const Bindings * src  = args[1].asAttrs();
     if (!keep || !src) {
         Bindings * b = Alloc::allocBindings(0);
         V3_STATS_INC(attrsetsAllocated);
-        out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
-        out.payload.bindings = b;
+        out.mkAttrs(b);
         return;
     }
     // #825 Phase C SPIKE: the sorted-merge below indexes `keep->entries[]`
@@ -1862,15 +1844,14 @@ void primIntersectAttrs(EvalState &, Value * args, Value & out)
             bindingsSetEntry(result, k++, src->entries[i]);  // Phase D
     }
     // k == kExact by construction; allocBindings already set the size.
-    out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
-    out.payload.bindings = result;
+    out.mkAttrs(result);
 }
 
 void primMapAttrs(EvalState & state, Value * args, Value & out)
 {
     Value fn = args[0];
     if (!args[1].isAttrs()) typeError("mapAttrs", "attrset");
-    auto * src = args[1].payload.bindings;
+    auto * src = args[1].asAttrs();
     if (!src) { out = args[1]; return; }
     // ChainBindings (NIX_V3_CHAIN_BINDINGS): this loop walks src->entries[]
     // directly over src->size, which for a Chain is the OVERLAY ONLY — it would
@@ -1911,18 +1892,17 @@ void primMapAttrs(EvalState & state, Value * args, Value & out)
         // `evaluated` stays Tag::Uninitialized (default-constructed)
         // — populated by App3 force-path memoization on first demand.
         pairPostConstructBarrier(pp);  // Phase D
-        Value app3; app3.tag_payload = static_cast<uint64_t>(Tag::App3); app3.payload.pair = pp;
+        Value app3; app3.mkPair(Tag::App3, pp);
         result->entries[i].name = sym;
         bindingsSetValue(result, i, app3);  // Phase D
     }
-    out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
-    out.payload.bindings = result;
+    out.mkAttrs(result);
 }
 
 void primElem(EvalState & state, Value * args, Value & out)
 {
     if (!args[1].isList()) typeError("elem", "list");
-    auto * src = args[1].payload.list;
+    auto * src = args[1].asList();
     Value x = args[0];
     bool found = false;
     if (src) {
@@ -1959,15 +1939,15 @@ void primGetAttr(EvalState & state, Value * args, Value & out)
     // #734: TW's prim_getAttr calls forceStringNoCtx on the name arg
     // (libexpr/primops.cc).  v3 must reject contexted names.
     requireNoStringContext(state, args[0], "getAttr");
-    SymbolId k = vmIntern(state, args[0].payload.str);
-    auto * b = args[1].payload.bindings;
+    SymbolId k = vmIntern(state, args[0].asString());
+    auto * b = args[1].asAttrs();
     // #678 — match TW's `attribute '<name>' missing`
     // (libexpr/eval.cc:2766) instead of v3-specific phrasing.
     if (!b) throw std::runtime_error(
-        "attribute '" + std::string(args[0].payload.str) + "' missing");
+        "attribute '" + std::string(args[0].asString()) + "' missing");
     const Value * v = b->lookup(k);
     if (!v) throw std::runtime_error(
-        "attribute '" + std::string(args[0].payload.str) + "' missing");
+        "attribute '" + std::string(args[0].asString()) + "' missing");
     out = *v;
 }
 
@@ -1977,8 +1957,8 @@ void primHasAttr(EvalState & state, Value * args, Value & out)
     if (!args[1].isAttrs())  typeError("hasAttr", "attrset");
     // #734: TW's prim_hasAttr calls forceStringNoCtx on the name arg.
     requireNoStringContext(state, args[0], "hasAttr");
-    SymbolId k = vmIntern(state, args[0].payload.str);
-    auto * b = args[1].payload.bindings;
+    SymbolId k = vmIntern(state, args[0].asString());
+    auto * b = args[1].asAttrs();
     out = (b && b->has(k)) ? Value::vTrue : Value::vFalse;
 }
 
@@ -1986,30 +1966,29 @@ void primCatAttrs(EvalState & state, Value * args, Value & out)
 {
     if (!args[0].isString()) typeError("catAttrs", "string");
     if (!args[1].isList())   typeError("catAttrs", "list");
-    SymbolId k = vmIntern(state, args[0].payload.str);
-    auto * lst = args[1].payload.list;
+    SymbolId k = vmIntern(state, args[0].asString());
+    auto * lst = args[1].asList();
     std::vector<Value> kept;
     if (lst) {
         for (uint32_t i = 0; i < lst->size; ++i) {
             Value el = forceValue(*state.vm, lst->elems[i]);
-            if (!el.isAttrs() || !el.payload.bindings) continue;
-            const Value * v = el.payload.bindings->lookup(k);
+            if (!el.isAttrs() || !el.asAttrs()) continue;
+            const Value * v = el.asAttrs()->lookup(k);
             if (v) kept.push_back(*v);
         }
     }
     ListVec * result = Alloc::allocList(static_cast<uint32_t>(kept.size()));
     V3_STATS_INC(listsAllocated);
     for (size_t i = 0; i < kept.size(); ++i) result->elems[i] = kept[i];
-    out.tag_payload = static_cast<uint64_t>(Tag::List);
-    out.payload.list = result;
+    out.mkList(result);
 }
 
 void primReplaceStrings(EvalState & state, Value * args, Value & out)
 {
     if (!args[0].isList() || !args[1].isList() || !args[2].isString())
         typeError("replaceStrings", "(list, list, string)");
-    auto * froms = args[0].payload.list;
-    auto * tos   = args[1].payload.list;
+    auto * froms = args[0].asList();
+    auto * tos   = args[1].asList();
     if (!froms || !tos || froms->size != tos->size)
         // #689 — TW phrasing (libexpr/primops.cc:replaceStrings).
         throw std::runtime_error(
@@ -2028,7 +2007,7 @@ void primReplaceStrings(EvalState & state, Value * args, Value & out)
         if (auto * raw = lookupStringContextEntries(s))
             ctxAccum.insert(ctxAccum.end(), raw->begin(), raw->end());
     };
-    absorb(args[2].payload.str);
+    absorb(args[2].asString());
     // Force `from` elements upfront -- every iteration of the outer
     // loop reads them, and they're lazy by default.  `to` elements
     // stay lazy and are forced inside the match branch (matches
@@ -2050,20 +2029,20 @@ void primReplaceStrings(EvalState & state, Value * args, Value & out)
     //    (including end-of-string), inserting `to` between each character
     //    (and at the start and end).  E.g. `replaceStrings [""] ["X"] "abc"`
     //    yields `"XaXbXcX"`.
-    std::string s(args[2].payload.str);
+    std::string s(args[2].asString());
     std::string result;
     size_t i = 0;
     auto tryReplaceAt = [&](size_t pos) -> int {
         for (uint32_t j = 0; j < froms->size; ++j) {
-            std::string_view fv(froms->elems[j].payload.str);
+            std::string_view fv(froms->elems[j].asString());
             bool match = fv.empty()
                 ? true
                 : (pos + fv.size() <= s.size() && s.compare(pos, fv.size(), fv) == 0);
             if (!match) continue;
             Value t = forceValue(*state.vm, tos->elems[j]);
             if (!t.isString()) typeError("replaceStrings", "list of strings");
-            result.append(t.payload.str);
-            absorb(t.payload.str);
+            result.append(t.asString());
+            absorb(t.asString());
             return static_cast<int>(fv.size());
         }
         return -1;
@@ -2080,7 +2059,7 @@ void primReplaceStrings(EvalState & state, Value * args, Value & out)
     if (!ctxAccum.empty()) {
         std::sort(ctxAccum.begin(), ctxAccum.end());
         ctxAccum.erase(std::unique(ctxAccum.begin(), ctxAccum.end()), ctxAccum.end());
-        setStringContextEntries(out.payload.str, std::move(ctxAccum));
+        setStringContextEntries(out.asString(), std::move(ctxAccum));
     }
 }
 
@@ -2096,7 +2075,7 @@ void primAbort(EvalState &, Value * args, Value &)
     // prefix so default-mode `nix eval` byte-matches TW.
     throw AbortError(
         std::string("evaluation aborted with the following error message: '")
-        + args[0].payload.str + "'");
+        + args[0].asString() + "'");
 }
 
 void primSeq(EvalState &, Value * args, Value & out)
@@ -2115,27 +2094,27 @@ void primSeq(EvalState &, Value * args, Value & out)
 static Value forceDeepRec(VMState & vm, Value v, std::unordered_set<const void *> & seen)
 {
     v = forceValue(vm, v);
-    if (v.isList() && v.payload.list) {
-        if (!seen.insert(v.payload.list).second) return v;
-        for (uint32_t i = 0; i < v.payload.list->size; ++i)
-            v.payload.list->elems[i] = forceDeepRec(vm, v.payload.list->elems[i], seen);
-    } else if (v.isAttrs() && v.payload.bindings) {
+    if (v.isList() && v.asList()) {
+        if (!seen.insert(v.asList()).second) return v;
+        for (uint32_t i = 0; i < v.asList()->size; ++i)
+            v.asList()->elems[i] = forceDeepRec(vm, v.asList()->elems[i], seen);
+    } else if (v.isAttrs() && v.asAttrs()) {
         // ChainBindings: deep-force every value in the WHOLE chain (overlay +
         // parent), else a `throw` in a parent value would escape deepSeq.
         // Force-iterate the materialised view (forEach materialises a Chain);
         // for Sorted this is the same in-place walk.  We can't write back into
         // a materialised copy, so for a Chain we force via the merged view
         // (forcing is idempotent + the chain shares the parent's cells).
-        const Bindings * b = v.payload.bindings;
+        const Bindings * b = v.asAttrs();
         if (b->isChain()) {
             b->forEach([&](const Bindings::Entry & e) {
                 forceDeepRec(vm, e.value, seen);
             });
         } else {
-            if (!seen.insert(v.payload.bindings).second) return v;
-            for (uint32_t i = 0; i < v.payload.bindings->size; ++i)
-                bindingsSetValue(v.payload.bindings, i,  // Phase D
-                    forceDeepRec(vm, v.payload.bindings->entries[i].value, seen));
+            if (!seen.insert(v.asAttrs()).second) return v;
+            for (uint32_t i = 0; i < v.asAttrs()->size; ++i)
+                bindingsSetValue(v.asAttrs(), i,  // Phase D
+                    forceDeepRec(vm, v.asAttrs()->entries[i].value, seen));
         }
     }
     return v;
@@ -2173,12 +2152,12 @@ void primUnsafeGetAttrPos(EvalState & state, Value * args, Value & out)
         out.mkNull();
         return;
     }
-    if (!args[1].isAttrs() || !args[1].payload.bindings) {
+    if (!args[1].isAttrs() || !args[1].asAttrs()) {
         out.mkNull();
         return;
     }
-    SymbolId nameId = ir::globalInternSymbol(args[0].payload.str);
-    uint32_t handle = lookupAttrPos(args[1].payload.bindings, nameId);
+    SymbolId nameId = ir::globalInternSymbol(args[0].asString());
+    uint32_t handle = lookupAttrPos(args[1].asAttrs(), nameId);
     const PosSnapshot * snap = resolvePosSnapshot(handle);
     if (!snap) { out.mkNull(); return; }
     // TW behavior (libexpr/eval.cc:1007 mkPos): return null when the
@@ -2214,8 +2193,7 @@ void primUnsafeGetAttrPos(EvalState & state, Value * args, Value & out)
         b->entries[i].name  = entries[i].first;
         bindingsSetValue(b, static_cast<uint32_t>(i), entries[i].second);  // Phase D
     }
-    out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
-    out.payload.bindings = b;
+    out.mkAttrs(b);
 }
 
 /// builtins.toPath path-or-string -> path.
@@ -2245,24 +2223,23 @@ void primToPath(EvalState & state, Value * args, Value & out)
         char * buf = Alloc::allocChars(n);
         std::memcpy(buf, canon.data(), canon.size());
         buf[canon.size()] = '\0';
-        out.tag_payload = static_cast<uint64_t>(Tag::Path);
-        out.payload.path = buf;
+        out.mkPath(buf);
     };
     Value v = forceValue(*state.vm, args[0]);
     if (v.isPath())   { out = v; return; }
-    if (v.isString()) { fromString(v.payload.str); return; }
-    if (v.isAttrs() && v.payload.bindings) {
+    if (v.isString()) { fromString(v.asString()); return; }
+    if (v.isAttrs() && v.asAttrs()) {
         static const SymbolId tsId  = ir::globalInternSymbol("__toString");
         static const SymbolId outId = ir::globalInternSymbol("outPath");
-        if (auto * fn = v.payload.bindings->lookup(tsId)) {
+        if (auto * fn = v.asAttrs()->lookup(tsId)) {
             Value forced = forceValue(*state.vm, *fn);
             Value s = callClosure(*state.vm, forced, v);
             s = forceValue(*state.vm, s);
-            if (s.isString()) { fromString(s.payload.str); return; }
+            if (s.isString()) { fromString(s.asString()); return; }
         }
-        if (auto * op = v.payload.bindings->lookup(outId)) {
+        if (auto * op = v.asAttrs()->lookup(outId)) {
             Value forced = forceValue(*state.vm, *op);
-            if (forced.isString()) { fromString(forced.payload.str); return; }
+            if (forced.isString()) { fromString(forced.asString()); return; }
             if (forced.isPath())   { out = forced; return; }
         }
     }
@@ -2282,12 +2259,12 @@ void primToPath(EvalState & state, Value * args, Value & out)
     else if (t == Tag::Closure || t == Tag::PrimOp || t == Tag::PrimOpApp)
                               { art = "a";  name = "function"; }
     auto val = [&]() -> std::string {
-        if (t == Tag::Int)   return std::to_string(v.payload.i);
-        if (t == Tag::Float) { std::ostringstream os; os << v.payload.f; return os.str(); }
-        if (t == Tag::Bool)  return v.payload.i == 1 ? "true" : "false";
+        if (t == Tag::Int)   return std::to_string(v.asInt());
+        if (t == Tag::Float) { std::ostringstream os; os << v.asFloat(); return os.str(); }
+        if (t == Tag::Bool)  return v.asInt() == 1 ? "true" : "false";
         if (t == Tag::Null)  return "null";
-        if (t == Tag::List)  return v.payload.list && v.payload.list->size > 0 ? "[ ... ]" : "[ ]";
-        if (t == Tag::Attrs) return v.payload.bindings && v.payload.bindings->size > 0 ? "{ ... }" : "{ }";
+        if (t == Tag::List)  return v.asList() && v.asList()->size > 0 ? "[ ... ]" : "[ ]";
+        if (t == Tag::Attrs) return v.asAttrs() && v.asAttrs()->size > 0 ? "{ ... }" : "{ }";
         return "<value>";
     }();
     std::string msg = "cannot coerce ";
@@ -2317,7 +2294,7 @@ void primSplitVersion(EvalState & state, Value * args, Value & out)
     // #674: TW's prim_splitVersion uses forceStringNoCtx; v3 must
     // reject contexted strings to match.
     requireNoStringContext(state, args[0], "splitVersion");
-    std::string_view s(args[0].payload.str);
+    std::string_view s(args[0].asString());
     std::vector<std::string_view> parts;
     auto isSep = [](char c) { return c == '.' || c == '-'; };
     auto p = s.begin();
@@ -2340,8 +2317,7 @@ void primSplitVersion(EvalState & state, Value * args, Value & out)
     V3_STATS_INC(listsAllocated);
     for (size_t i = 0; i < parts.size(); ++i)
         lv->elems[i] = mkStringValueOwned(std::string(parts[i]));
-    out.tag_payload = static_cast<uint64_t>(Tag::List);
-    out.payload.list = lv;
+    out.mkList(lv);
 }
 
 /// Helper: clone a v3 string with the same contents but a fresh
@@ -2363,7 +2339,7 @@ void primUnsafeDiscardStringContext(EvalState & state, Value * args, Value & out
     // pattern (where the inside isn't WHNF-string).
     if (args[0].isString()) {
         // Fast path: string in → string out, context-stripped.
-        out = cloneString(args[0].payload.str);
+        out = cloneString(args[0].asString());
         return;
     }
     // Slow path: coerce + drop context.
@@ -2378,18 +2354,17 @@ void primUnsafeDiscardStringContext(EvalState & state, Value * args, Value & out
 void primHasContext(EvalState &, Value * args, Value & out)
 {
     if (!args[0].isString()) typeError("hasContext", "string");
-    out = lookupStringContextEntries(args[0].payload.str)
+    out = lookupStringContextEntries(args[0].asString())
         ? Value::vTrue : Value::vFalse;
 }
 
 void primGetContext(EvalState & state, Value * args, Value & out)
 {
     if (!args[0].isString()) typeError("getContext", "string");
-    auto * raw = lookupStringContextEntries(args[0].payload.str);
+    auto * raw = lookupStringContextEntries(args[0].asString());
     if (!raw) {
         Bindings * b = Alloc::allocBindings(0);
-        out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
-        out.payload.bindings = b;
+        out.mkAttrs(b);
         return;
     }
     auto ctx = decodeStringContext(*raw);
@@ -2402,8 +2377,7 @@ void primGetContext(EvalState & state, Value * args, Value & out)
     SymbolId sAllOutputs = vmIntern(state, "allOutputs");
     if (!state.nixEvalState) {
         Bindings * b = Alloc::allocBindings(0);
-        out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
-        out.payload.bindings = b;
+        out.mkAttrs(b);
         return;
     }
     auto & ns = *state.nixEvalState;
@@ -2436,8 +2410,7 @@ void primGetContext(EvalState & state, Value * args, Value & out)
             for (size_t i = 0; i < g.outputs.size(); ++i)
                 lv->elems[i] = mkStringValueOwned(g.outputs[i]);
             Value lvVal;
-            lvVal.tag_payload = static_cast<uint64_t>(Tag::List);
-            lvVal.payload.list = lv;
+            lvVal.mkList(lv);
             subEntries.emplace_back(sOutputs, lvVal);
         }
         std::sort(subEntries.begin(), subEntries.end(),
@@ -2449,8 +2422,7 @@ void primGetContext(EvalState & state, Value * args, Value & out)
             bindingsSetValue(sb, static_cast<uint32_t>(i), subEntries[i].second);  // Phase D
         }
         Value subVal;
-        subVal.tag_payload = static_cast<uint64_t>(Tag::Attrs);
-        subVal.payload.bindings = sb;
+        subVal.mkAttrs(sb);
         entries.emplace_back(vmIntern(state, path), subVal);
     }
     std::sort(entries.begin(), entries.end(),
@@ -2461,8 +2433,7 @@ void primGetContext(EvalState & state, Value * args, Value & out)
         bb->entries[i].name  = entries[i].first;
         bindingsSetValue(bb, static_cast<uint32_t>(i), entries[i].second);  // Phase D
     }
-    out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
-    out.payload.bindings = bb;
+    out.mkAttrs(bb);
 }
 
 /// builtins.appendContext s ctx — add `ctx`'s entries to `s`'s context.
@@ -2472,15 +2443,15 @@ void primAppendContext(EvalState & state, Value * args, Value & out)
     if (!args[0].isString())
         typeError("appendContext", "(string, attrset)");
     Value ctxV = forceValue(*state.vm, args[1]);
-    if (!ctxV.isAttrs() || !ctxV.payload.bindings)
+    if (!ctxV.isAttrs() || !ctxV.asAttrs())
         typeError("appendContext", "second arg attrset");
     // Start with the existing context.
     auto & symTab = ir::globalSymbolTable();
-    auto existing = lookupStringContext(args[0].payload.str);
+    auto existing = lookupStringContext(args[0].asString());
     nix::NixStringContext ctx = existing;
-    auto * ctxB = ctxV.payload.bindings;
+    auto * ctxB = ctxV.asAttrs();
     if (!state.nixEvalState) {
-        out = cloneString(args[0].payload.str);
+        out = cloneString(args[0].asString());
         return;
     }
     auto & ns = *state.nixEvalState;
@@ -2491,37 +2462,37 @@ void primAppendContext(EvalState & state, Value * args, Value & out)
         SymbolId k = ctxB->entries[i].name;
         std::string pathStr(k < symTab.size() ? symTab[k] : "");
         Value sub = forceValue(*state.vm, ctxB->entries[i].value);
-        if (!sub.isAttrs() || !sub.payload.bindings) continue;
+        if (!sub.isAttrs() || !sub.asAttrs()) continue;
         nix::StorePath storePath = ns.store->parseStorePath(pathStr);
-        if (auto * pp = sub.payload.bindings->lookup(sPath)) {
+        if (auto * pp = sub.asAttrs()->lookup(sPath)) {
             Value pv = forceValue(*state.vm, *pp);
-            if (pv.isBool() && pv.payload.i == 1)
+            if (pv.isBool() && pv.asInt() == 1)
                 ctx.insert(nix::NixStringContextElem{nix::NixStringContextElem::Opaque{.path = storePath}});
         }
-        if (auto * ao = sub.payload.bindings->lookup(sAllOutputs)) {
+        if (auto * ao = sub.asAttrs()->lookup(sAllOutputs)) {
             Value av = forceValue(*state.vm, *ao);
-            if (av.isBool() && av.payload.i == 1)
+            if (av.isBool() && av.asInt() == 1)
                 ctx.insert(nix::NixStringContextElem{nix::NixStringContextElem::DrvDeep{.drvPath = storePath}});
         }
-        if (auto * outsRaw = sub.payload.bindings->lookup(sOutputs)) {
+        if (auto * outsRaw = sub.asAttrs()->lookup(sOutputs)) {
             Value ov = forceValue(*state.vm, *outsRaw);
-            if (ov.isList() && ov.payload.list) {
-                for (uint32_t j = 0; j < ov.payload.list->size; ++j) {
-                    Value e = forceValue(*state.vm, ov.payload.list->elems[j]);
+            if (ov.isList() && ov.asList()) {
+                for (uint32_t j = 0; j < ov.asList()->size; ++j) {
+                    Value e = forceValue(*state.vm, ov.asList()->elems[j]);
                     if (!e.isString()) continue;
                     nix::SingleDerivedPath dp{nix::SingleDerivedPath::Opaque{.path = storePath}};
                     nix::ref<nix::SingleDerivedPath> drvRef =
                         nix::make_ref<nix::SingleDerivedPath>(dp);
                     ctx.insert(nix::NixStringContextElem{
                         nix::NixStringContextElem::Built{
-                            .drvPath = drvRef, .output = e.payload.str}});
+                            .drvPath = drvRef, .output = e.asString()}});
                 }
             }
         }
     }
-    out = cloneString(args[0].payload.str);
+    out = cloneString(args[0].asString());
     if (!ctx.empty())
-        setStringContext(out.payload.str, ctx);
+        setStringContext(out.asString(), ctx);
 }
 
 /// builtins.addDrvOutputDependencies — turn each Opaque entry in the
@@ -2532,7 +2503,7 @@ void primAddDrvOutputDependencies(EvalState & state, Value * args, Value & out)
 {
     if (!args[0].isString())
         typeError("addDrvOutputDependencies", "string");
-    auto existing = lookupStringContext(args[0].payload.str);
+    auto existing = lookupStringContext(args[0].asString());
     // Tree-walker requires exactly one context entry which must be a
     // single .drv path (Opaque or DrvDeep).  v3 must mirror that.
     // #692 — match TW's exact error phrasing
@@ -2542,18 +2513,18 @@ void primAddDrvOutputDependencies(EvalState & state, Value * args, Value & out)
     // pattern.  The trailing ", but has 0/N" carries the actual count.
     if (existing.empty())
         throw std::runtime_error(
-            "context of string '" + std::string(args[0].payload.str)
+            "context of string '" + std::string(args[0].asString())
             + "' must have exactly one element, but has 0");
     if (existing.size() > 1)
         throw std::runtime_error(
-            "context of string '" + std::string(args[0].payload.str)
+            "context of string '" + std::string(args[0].asString())
             + "' must have exactly one element, but has "
             + std::to_string(existing.size()));
     const auto & e = *existing.begin();
     if (!std::holds_alternative<nix::NixStringContextElem::Opaque>(e.raw) &&
         !std::holds_alternative<nix::NixStringContextElem::DrvDeep>(e.raw))
         throw std::runtime_error(
-            "context entry of string '" + std::string(args[0].payload.str)
+            "context entry of string '" + std::string(args[0].asString())
             + "' is not a derivation path");
     nix::NixStringContext ctx;
     if (auto * o = std::get_if<nix::NixStringContextElem::Opaque>(&e.raw)) {
@@ -2561,14 +2532,14 @@ void primAddDrvOutputDependencies(EvalState & state, Value * args, Value & out)
         // tree-walker requires the path be a derivation.
         if (!o->path.name().ends_with(".drv"))
             throw std::runtime_error(
-                "context entry of string '" + std::string(args[0].payload.str)
+                "context entry of string '" + std::string(args[0].asString())
                 + "' is not a derivation path");
         ctx.insert(nix::NixStringContextElem{nix::NixStringContextElem::DrvDeep{.drvPath = o->path}});
     } else {
         ctx.insert(e);
     }
-    out = cloneString(args[0].payload.str);
-    if (!ctx.empty()) setStringContext(out.payload.str, ctx);
+    out = cloneString(args[0].asString());
+    if (!ctx.empty()) setStringContext(out.asString(), ctx);
     (void)state;
 }
 
@@ -2579,7 +2550,7 @@ void primUnsafeDiscardOutputDependency(EvalState & state, Value * args, Value & 
 {
     if (!args[0].isString())
         typeError("unsafeDiscardOutputDependency", "string");
-    auto existing = lookupStringContext(args[0].payload.str);
+    auto existing = lookupStringContext(args[0].asString());
     nix::NixStringContext ctx;
     for (auto & e : existing) {
         if (auto * d = std::get_if<nix::NixStringContextElem::DrvDeep>(&e.raw)) {
@@ -2588,8 +2559,8 @@ void primUnsafeDiscardOutputDependency(EvalState & state, Value * args, Value & 
             ctx.insert(e);
         }
     }
-    out = cloneString(args[0].payload.str);
-    if (!ctx.empty()) setStringContext(out.payload.str, ctx);
+    out = cloneString(args[0].asString());
+    if (!ctx.empty()) setStringContext(out.asString(), ctx);
     (void)state;
 }
 
@@ -2599,8 +2570,7 @@ void primNixPath(EvalState & state, Value *, Value & out)
 {
     if (!state.nixEvalState) {
         ListVec * empty = Alloc::allocList(0);
-        out.tag_payload = static_cast<uint64_t>(Tag::List);
-        out.payload.list = empty;
+        out.mkList(empty);
         return;
     }
     auto lookupPath = state.nixEvalState->getLookupPath();
@@ -2623,12 +2593,10 @@ void primNixPath(EvalState & state, Value *, Value & out)
             bindingsSetEntry(b, 1, {nA, 0, vA});
         }
         Value v;
-        v.tag_payload = static_cast<uint64_t>(Tag::Attrs);
-        v.payload.bindings = b;
+        v.mkAttrs(b);
         lv->elems[i++] = v;
     }
-    out.tag_payload = static_cast<uint64_t>(Tag::List);
-    out.payload.list = lv;
+    out.mkList(lv);
 }
 
 /// builtins.__findFile : list-of-{prefix, path} → name → resolved path.
@@ -2644,38 +2612,37 @@ void primFindFile(EvalState & state, Value * args, Value & out)
     // Build a LookupPath from the v3 list.  Each element is an attrset
     // with `path` (string-or-path) and `prefix` (string).
     nix::LookupPath lp;
-    auto * lst = args[0].payload.list;
+    auto * lst = args[0].asList();
     if (lst) {
         SymbolId sPath   = vmIntern(state, "path");
         SymbolId sPrefix = vmIntern(state, "prefix");
         for (uint32_t i = 0; i < lst->size; ++i) {
             Value el = forceValue(*state.vm, lst->elems[i]);
-            if (!el.isAttrs() || !el.payload.bindings) continue;
-            const Value * pV = el.payload.bindings->lookup(sPath);
-            const Value * prV = el.payload.bindings->lookup(sPrefix);
+            if (!el.isAttrs() || !el.asAttrs()) continue;
+            const Value * pV = el.asAttrs()->lookup(sPath);
+            const Value * prV = el.asAttrs()->lookup(sPrefix);
             std::string p, prefix;
             if (pV) {
                 Value f = forceValue(*state.vm, *pV);
-                if (f.isString()) p = f.payload.str;
-                else if (f.isPath()) p = f.payload.path;
+                if (f.isString()) p = f.asString();
+                else if (f.isPath()) p = f.asPath();
             }
             if (prV) {
                 Value f = forceValue(*state.vm, *prV);
-                if (f.isString()) prefix = f.payload.str;
+                if (f.isString()) prefix = f.asString();
             }
             if (p.empty()) continue;
             lp.elements.push_back({nix::LookupPath::Prefix{prefix},
                                    nix::LookupPath::Path{p}});
         }
     }
-    auto sp = state.nixEvalState->findFile(lp, args[1].payload.str);
+    auto sp = state.nixEvalState->findFile(lp, args[1].asString());
     // CRIT-4: arena allocation.
     const std::string & abs = sp.path.abs();
     char * buf = Alloc::allocChars(abs.size() + 1);
     std::memcpy(buf, abs.data(), abs.size());
     buf[abs.size()] = '\0';
-    out.tag_payload = static_cast<uint64_t>(Tag::Path);
-    out.payload.path = buf;
+    out.mkPath(buf);
 }
 
 /// builtins.zipAttrsWith fn list-of-attrsets:
@@ -2700,7 +2667,7 @@ void primZipAttrsWith(EvalState & state, Value * args, Value & out)
     // resolution.
     Value fn = args[0];
     if (!args[1].isList()) typeError("zipAttrsWith", "list of attrsets");
-    auto * lst = args[1].payload.list;
+    auto * lst = args[1].asList();
     // Group by symbol id, preserving value order.  Forcing each list
     // entry to attrset shape is required to enumerate names — same
     // strictness tree-walker has.
@@ -2708,9 +2675,9 @@ void primZipAttrsWith(EvalState & state, Value * args, Value & out)
     if (lst) {
         for (uint32_t i = 0; i < lst->size; ++i) {
             Value attrs = forceValue(*state.vm, lst->elems[i]);
-            if (!attrs.isAttrs() || !attrs.payload.bindings) continue;
-            for (uint32_t j = 0; j < attrs.payload.bindings->size; ++j) {
-                auto & en = attrs.payload.bindings->entries[j];
+            if (!attrs.isAttrs() || !attrs.asAttrs()) continue;
+            for (uint32_t j = 0; j < attrs.asAttrs()->size; ++j) {
+                auto & en = attrs.asAttrs()->entries[j];
                 byName[en.name].push_back(en.value);
             }
         }
@@ -2725,8 +2692,7 @@ void primZipAttrsWith(EvalState & state, Value * args, Value & out)
         V3_STATS_INC(listsAllocated);
         for (size_t i = 0; i < vs.size(); ++i) vl->elems[i] = vs[i];
         Value lv;
-        lv.tag_payload = static_cast<uint64_t>(Tag::List);
-        lv.payload.list = vl;
+        lv.mkList(vl);
         // Build name string.
         std::string nm = sid < symTab.size() ? symTab[sid] : std::to_string(sid);
         Value nameV = mkStringValueOwned(nm);
@@ -2745,7 +2711,7 @@ void primZipAttrsWith(EvalState & state, Value * args, Value & out)
         pp->right  = nameV;
         pp->third  = lv;
         pairPostConstructBarrier(pp);  // Phase D
-        Value app3; app3.tag_payload = static_cast<uint64_t>(Tag::App3); app3.payload.pair = pp;
+        Value app3; app3.mkPair(Tag::App3, pp);
         entries.emplace_back(sid, app3);
     }
     std::sort(entries.begin(), entries.end(),
@@ -2756,8 +2722,7 @@ void primZipAttrsWith(EvalState & state, Value * args, Value & out)
         b->entries[i].name = entries[i].first;
         bindingsSetValue(b, static_cast<uint32_t>(i), entries[i].second);  // Phase D
     }
-    out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
-    out.payload.bindings = b;
+    out.mkAttrs(b);
 }
 
 /// builtins.trace msg val: print msg to stderr, return val unchanged.
@@ -2770,12 +2735,12 @@ void primTrace(EvalState & state, Value * args, Value & out)
 {
     Value v = args[0];
     // Fast paths for primitives.
-    if (v.isString())   std::fprintf(stderr, "trace: %s\n", v.payload.str);
-    else if (v.isInt()) std::fprintf(stderr, "trace: %lld\n", (long long)v.payload.i);
-    else if (v.isFloat()) std::fprintf(stderr, "trace: %g\n", v.payload.f);
-    else if (v.isBool()) std::fprintf(stderr, "trace: %s\n", v.payload.i == 1 ? "true" : "false");
+    if (v.isString())   std::fprintf(stderr, "trace: %s\n", v.asString());
+    else if (v.isInt()) std::fprintf(stderr, "trace: %lld\n", (long long)v.asInt());
+    else if (v.isFloat()) std::fprintf(stderr, "trace: %g\n", v.asFloat());
+    else if (v.isBool()) std::fprintf(stderr, "trace: %s\n", v.asInt() == 1 ? "true" : "false");
     else if (v.isNull()) std::fprintf(stderr, "trace: null\n");
-    else if (v.isPath()) std::fprintf(stderr, "trace: %s\n", v.payload.path);
+    else if (v.isPath()) std::fprintf(stderr, "trace: %s\n", v.asPath());
     else {
         // FFI_KILL_TODO T1.3 (2026-06-01): v3-native trace printer.
         //
@@ -2826,8 +2791,8 @@ void primBaseNameOf(EvalState &, Value * args, Value & out)
     // `eval-okay-baseNameOf.nix` pins down).
     std::string_view s;
     bool inputIsString = args[0].isString();
-    if (inputIsString) s = args[0].payload.str;
-    else if (args[0].isPath()) s = args[0].payload.path;
+    if (inputIsString) s = args[0].asString();
+    else if (args[0].isPath()) s = args[0].asPath();
     else typeError("baseNameOf", "string or path");
     if (s.empty()) { out = mkStringValueOwned(""); return; }
     size_t last = s.size() - 1;
@@ -2842,9 +2807,9 @@ void primBaseNameOf(EvalState &, Value * args, Value & out)
     // a store path lose the underlying drv reference.  Paths have no
     // context to propagate.
     if (inputIsString) {
-        if (auto * raw = lookupStringContextEntries(args[0].payload.str)) {
+        if (auto * raw = lookupStringContextEntries(args[0].asString())) {
             std::vector<std::string> copy = *raw;
-            setStringContextEntries(out.payload.str, std::move(copy));
+            setStringContextEntries(out.asString(), std::move(copy));
         }
     }
 }
@@ -2853,8 +2818,8 @@ void primDirOf(EvalState &, Value * args, Value & out)
 {
     std::string s;
     bool isPathV = false;
-    if (args[0].isString()) s = args[0].payload.str;
-    else if (args[0].isPath()) { s = args[0].payload.path; isPathV = true; }
+    if (args[0].isString()) s = args[0].asString();
+    else if (args[0].isPath()) { s = args[0].asPath(); isPathV = true; }
     else typeError("dirOf", "string or path");
     auto pos = s.find_last_of('/');
     std::string dir = (pos == std::string::npos) ? "." :
@@ -2864,16 +2829,15 @@ void primDirOf(EvalState &, Value * args, Value & out)
         // CRIT-4: arena allocation for long-lived path payload.
         char * buf = Alloc::allocChars(dir.size() + 1);
         std::memcpy(buf, dir.data(), dir.size()); buf[dir.size()] = '\0';
-        v.tag_payload = static_cast<uint64_t>(Tag::Path);
-        v.payload.path = buf;
+        v.mkPath(buf);
         out = v;
     } else {
         out = mkStringValueOwned(dir);
         // #672 follow-up: propagate input string context (same
         // reasoning as primBaseNameOf — Path inputs have no context).
-        if (auto * raw = lookupStringContextEntries(args[0].payload.str)) {
+        if (auto * raw = lookupStringContextEntries(args[0].asString())) {
             std::vector<std::string> copy = *raw;
-            setStringContextEntries(out.payload.str, std::move(copy));
+            setStringContextEntries(out.asString(), std::move(copy));
         }
     }
 }
@@ -2887,12 +2851,12 @@ void primPathExists(EvalState & state, Value * args, Value & out)
         // TW's primPathExists doesn't realisePath, so v3 likely
         // matches — but the context presence is still the right
         // discriminator for "could need a build".
-        auto * ctxEntries = lookupStringContextEntries(args[0].payload.str);
+        auto * ctxEntries = lookupStringContextEntries(args[0].asString());
         if (ctxEntries && !ctxEntries->empty())
             ++allocStats().ifdProbeWithCtx[kIfdPathExists];
-        s = args[0].payload.str;
+        s = args[0].asString();
     }
-    else if (args[0].isPath()) s = args[0].payload.path;
+    else if (args[0].isPath()) s = args[0].asPath();
     else {
         // #692 — TW (libexpr/primops.cc:prim_pathExists) uses
         // `state.coerceToString(..., coerceMore=false, copyToStore=false)`
@@ -2915,20 +2879,20 @@ void primPathExists(EvalState & state, Value * args, Value & out)
         // ones truncated).  Matches vm.cc:valueRepr behavior.
         auto val = [&](const Value & v) -> std::string {
             Tag tt = v.tag();
-            if (tt == Tag::Int)   return std::to_string(v.payload.i);
-            if (tt == Tag::Float) { std::ostringstream os; os << v.payload.f; return os.str(); }
-            if (tt == Tag::Bool)  return v.payload.i == 1 ? "true" : "false";
+            if (tt == Tag::Int)   return std::to_string(v.asInt());
+            if (tt == Tag::Float) { std::ostringstream os; os << v.asFloat(); return os.str(); }
+            if (tt == Tag::Bool)  return v.asInt() == 1 ? "true" : "false";
             if (tt == Tag::Null)  return "null";
             if (tt == Tag::List) {
-                if (!v.payload.list || v.payload.list->size == 0) return "[ ]";
+                if (!v.asList() || v.asList()->size == 0) return "[ ]";
                 // Truncated for brevity at one-level (no recursion to
                 // avoid pulling in vm.cc's valueRepr).
                 return "[ ... ]";
             }
             if (tt == Tag::Attrs) {
-                if (!v.payload.bindings || v.payload.bindings->size == 0) return "{ }";
+                if (!v.asAttrs() || v.asAttrs()->size == 0) return "{ }";
                 // Render small attrsets fully matching TW.
-                auto * b = v.payload.bindings;
+                auto * b = v.asAttrs();
                 const auto & symTab = ir::globalSymbolTable();
                 std::string out = "{ ";
                 uint32_t n = b->size;
@@ -2942,11 +2906,11 @@ void primPathExists(EvalState & state, Value * args, Value & out)
                     // One-level only — leaf scalars rendered; deeper
                     // containers truncated to keep error message tight.
                     const Value & e = b->entries[i].value;
-                    if (e.isInt())   out += std::to_string(e.payload.i);
-                    else if (e.isString() && e.payload.str) {
-                        out += "\""; out += e.payload.str; out += "\"";
+                    if (e.isInt())   out += std::to_string(e.asInt());
+                    else if (e.isString() && e.asString()) {
+                        out += "\""; out += e.asString(); out += "\"";
                     }
-                    else if (e.isBool()) out += e.payload.i == 1 ? "true" : "false";
+                    else if (e.isBool()) out += e.asInt() == 1 ? "true" : "false";
                     else if (e.isNull()) out += "null";
                     else if (e.isList())  out += "[ ... ]";
                     else if (e.isAttrs()) out += "{ ... }";
@@ -3014,8 +2978,8 @@ void primSplitString(EvalState &, Value * args, Value & out)
 {
     if (!args[0].isString() || !args[1].isString())
         typeError("splitString", "(separator, string)");
-    std::string_view sep(args[0].payload.str);
-    std::string_view s(args[1].payload.str);
+    std::string_view sep(args[0].asString());
+    std::string_view s(args[1].asString());
     std::vector<Value> parts;
     if (sep.empty()) {
         // Empty separator: split into per-character strings.
@@ -3038,21 +3002,20 @@ void primSplitString(EvalState &, Value * args, Value & out)
     ListVec * lv = Alloc::allocList(static_cast<uint32_t>(parts.size()));
     V3_STATS_INC(listsAllocated);
     for (size_t i = 0; i < parts.size(); ++i) lv->elems[i] = parts[i];
-    out.tag_payload = static_cast<uint64_t>(Tag::List);
-    out.payload.list = lv;
+    out.mkList(lv);
 }
 
 /// builtins.genericClosure { startSet, operator } -- BFS closure of
 /// startSet under operator.  Items are deduplicated by their "key" attr.
 void primGenericClosure(EvalState & state, Value * args, Value & out)
 {
-    if (!args[0].isAttrs() || !args[0].payload.bindings)
+    if (!args[0].isAttrs() || !args[0].asAttrs())
         typeError("genericClosure", "attrset");
     SymbolId sStart = vmIntern(state, "startSet");
     SymbolId sOp    = vmIntern(state, "operator");
     SymbolId sKey   = vmIntern(state, "key");
-    const Value * startVRaw = args[0].payload.bindings->lookup(sStart);
-    const Value * opVRaw    = args[0].payload.bindings->lookup(sOp);
+    const Value * startVRaw = args[0].asAttrs()->lookup(sStart);
+    const Value * opVRaw    = args[0].asAttrs()->lookup(sOp);
     if (!startVRaw || !opVRaw)
         typeError("genericClosure", "{ startSet, operator }");
     // Attrset entries are lazy thunks; force before structural use.
@@ -3065,9 +3028,9 @@ void primGenericClosure(EvalState & state, Value * args, Value & out)
     // different surviving item per key.
     std::vector<Value> result;
     std::deque<Value> work;
-    if (startV.payload.list) {
-        for (uint32_t i = 0; i < startV.payload.list->size; ++i)
-            work.push_back(startV.payload.list->elems[i]);
+    if (startV.asList()) {
+        for (uint32_t i = 0; i < startV.asList()->size; ++i)
+            work.push_back(startV.asList()->elems[i]);
     }
     std::unordered_set<std::string> seen;
 
@@ -3079,11 +3042,11 @@ void primGenericClosure(EvalState & state, Value * args, Value & out)
 
     auto keyOf = [&](Value & it) -> std::string {
         it = forceValue(*state.vm, it);
-        if (!it.isAttrs() || !it.payload.bindings)
+        if (!it.isAttrs() || !it.asAttrs())
             // #693 — match TW's `expected a set but found <type>: <value>`
             // phrasing via forceAttrs.
             throw std::runtime_error(expectedTypeButFound("a set", it));
-        const Value * kRaw = it.payload.bindings->lookup(sKey);
+        const Value * kRaw = it.asAttrs()->lookup(sKey);
         // #693 — TW (libexpr/primops.cc:genericClosure) checks
         // `state.getAttr(state.s.key, ...)` which raises the
         // standard "attribute 'key' missing" on absence.
@@ -3096,18 +3059,18 @@ void primGenericClosure(EvalState & state, Value * args, Value & out)
         if (firstKeyTag == Tag::Uninitialized) firstKeyTag = t;
         else if (firstKeyTag != t)
             throw std::runtime_error("cannot compare keys of incompatible types");
-        if (t == Tag::String) return std::string(k.payload.str);
-        if (t == Tag::Int)    return std::to_string(k.payload.i);
+        if (t == Tag::String) return std::string(k.asString());
+        if (t == Tag::Int)    return std::to_string(k.asInt());
         if (t == Tag::Float) {
             // REVIEW §3: reject NaN explicitly -- two NaN values
             // round-trip through std::to_string identically and would
             // collide as duplicate keys.  Tree-walker rejects too.
-            if (std::isnan(k.payload.f))
+            if (std::isnan(k.asFloat()))
                 throw std::runtime_error("NaN key is not orderable");
-            return std::to_string(k.payload.f);
+            return std::to_string(k.asFloat());
         }
-        if (t == Tag::Path)   return std::string(k.payload.path ? k.payload.path : "");
-        return k.payload.i ? "true" : "false";
+        if (t == Tag::Path)   return std::string(k.asPath() ? k.asPath() : "");
+        return k.asInt() ? "true" : "false";
     };
 
     while (!work.empty()) {
@@ -3132,17 +3095,16 @@ void primGenericClosure(EvalState & state, Value * args, Value & out)
         if (!next.isList())
             // #693 — match TW's `expected a list but found ...` phrasing.
             throw std::runtime_error(expectedTypeButFound("a list", next));
-        if (next.payload.list) {
-            for (uint32_t i = 0; i < next.payload.list->size; ++i)
-                work.push_back(next.payload.list->elems[i]);
+        if (next.asList()) {
+            for (uint32_t i = 0; i < next.asList()->size; ++i)
+                work.push_back(next.asList()->elems[i]);
         }
     }
 
     ListVec * lv = Alloc::allocList(static_cast<uint32_t>(result.size()));
     V3_STATS_INC(listsAllocated);
     for (size_t i = 0; i < result.size(); ++i) lv->elems[i] = result[i];
-    out.tag_payload = static_cast<uint64_t>(Tag::List);
-    out.payload.list = lv;
+    out.mkList(lv);
 }
 
 /// REVIEW §2.4: thread-local regex cache for primMatch / primSplit.
@@ -3194,9 +3156,9 @@ void primMatch(EvalState & state, Value * args, Value & out)
     try {
         // Match tree-walker: POSIX extended regex (`.` matches newline,
         // POSIX bracket classes like [[:alnum:]] work).
-        const std::regex & re = getCachedRegex(args[0].payload.str);
+        const std::regex & re = getCachedRegex(args[0].asString());
         std::cmatch m;
-        if (!std::regex_match(args[1].payload.str, m, re)) {
+        if (!std::regex_match(args[1].asString(), m, re)) {
             out = Value::vNull;
             return;
         }
@@ -3210,15 +3172,14 @@ void primMatch(EvalState & state, Value * args, Value & out)
             else
                 lv->elems[i] = Value::vNull;
         }
-        out.tag_payload = static_cast<uint64_t>(Tag::List);
-        out.payload.list = lv;
+        out.mkList(lv);
     } catch (const std::regex_error &) {
         // #689 — TW phrasing (libexpr/primops.cc): `invalid regular
         // expression '<regex>'`.  The std::regex_error message is
         // implementation-defined; TW just emits the pattern.
         throw std::runtime_error(
             std::string("invalid regular expression '")
-            + (args[0].payload.str ? args[0].payload.str : "") + "'");
+            + (args[0].asString() ? args[0].asString() : "") + "'");
     }
 }
 
@@ -3232,8 +3193,8 @@ void primSplit(EvalState & state, Value * args, Value & out)
     // regex only.  The subject is allowed to carry context.
     requireNoStringContext(state, args[0], "split");
     try {
-        const std::regex & re = getCachedRegex(args[0].payload.str);
-        std::string_view s(args[1].payload.str);
+        const std::regex & re = getCachedRegex(args[0].asString());
+        std::string_view s(args[1].asString());
         std::vector<Value> parts;
         // REVIEW §1.8 note: std::cregex_iterator advances past zero-
         // length matches automatically (libc++ + libstdc++ both
@@ -3259,8 +3220,7 @@ void primSplit(EvalState & state, Value * args, Value & out)
                     caps->elems[i] = Value::vNull;
             }
             Value capsV;
-            capsV.tag_payload = static_cast<uint64_t>(Tag::List);
-            capsV.payload.list = caps;
+            capsV.mkList(caps);
             parts.push_back(capsV);
             pos = match.position(0) + match.length(0);
         }
@@ -3270,13 +3230,12 @@ void primSplit(EvalState & state, Value * args, Value & out)
         ListVec * lv = Alloc::allocList(static_cast<uint32_t>(parts.size()));
         V3_STATS_INC(listsAllocated);
         for (size_t i = 0; i < parts.size(); ++i) lv->elems[i] = parts[i];
-        out.tag_payload = static_cast<uint64_t>(Tag::List);
-        out.payload.list = lv;
+        out.mkList(lv);
     } catch (const std::regex_error &) {
         // #689 — TW phrasing (mirror of #689 fix in primMatch).
         throw std::runtime_error(
             std::string("invalid regular expression '")
-            + (args[0].payload.str ? args[0].payload.str : "") + "'");
+            + (args[0].asString() ? args[0].asString() : "") + "'");
     }
 }
 
@@ -3306,8 +3265,8 @@ void primHashString(EvalState & state, Value * args, Value & out)
     // only.  The input string is forceString with a discarded context
     // accumulator — context-carrying inputs are permitted.
     requireNoStringContext(state, args[0], "hashString");
-    auto algo = parseHashAlgo(args[0].payload.str);
-    auto h = nix::hashString(algo, args[1].payload.str);
+    auto algo = parseHashAlgo(args[0].asString());
+    auto h = nix::hashString(algo, args[1].asString());
     out = mkStringValueOwned(h.to_string(nix::HashFormat::Base16, false));
 }
 
@@ -3321,10 +3280,10 @@ void primHashFile(EvalState & state, Value * args, Value & out)
     // do not require NoCtx there.
     requireNoStringContext(state, args[0], "hashFile");
     std::string path;
-    if (args[1].isString())     path = args[1].payload.str;
-    else if (args[1].isPath())  path = args[1].payload.path;
+    if (args[1].isString())     path = args[1].asString();
+    else if (args[1].isPath())  path = args[1].asPath();
     else throw std::runtime_error(expectedTypeButFound("a string", args[1]));
-    auto algo = parseHashAlgo(args[0].payload.str);
+    auto algo = parseHashAlgo(args[0].asString());
     // #693 — TW raises `path 'X' does not exist` for missing files.
     if (!std::filesystem::exists(path))
         throw std::runtime_error("path '" + path + "' does not exist");
@@ -3336,14 +3295,14 @@ void primConvertHash(EvalState & state, Value * args, Value & out)
 {
     // builtins.convertHash { hash; hashAlgo?; toHashFormat; } -> string
     // hashAlgo is optional when hash is in `algo:body` or SRI form.
-    if (!args[0].isAttrs() || !args[0].payload.bindings)
+    if (!args[0].isAttrs() || !args[0].asAttrs())
         typeError("convertHash", "attrset");
     SymbolId sHash = vmIntern(state, "hash");
     SymbolId sAlgo = vmIntern(state, "hashAlgo");
     SymbolId sFmt  = vmIntern(state, "toHashFormat");
-    const Value * vhRaw = args[0].payload.bindings->lookup(sHash);
-    const Value * vaRaw = args[0].payload.bindings->lookup(sAlgo);
-    const Value * vfRaw = args[0].payload.bindings->lookup(sFmt);
+    const Value * vhRaw = args[0].asAttrs()->lookup(sHash);
+    const Value * vaRaw = args[0].asAttrs()->lookup(sAlgo);
+    const Value * vfRaw = args[0].asAttrs()->lookup(sFmt);
     if (!vhRaw || !vfRaw)
         typeError("convertHash", "{ hash; hashAlgo?; toHashFormat; }");
     Value vh = forceValue(*state.vm, *vhRaw);
@@ -3352,7 +3311,7 @@ void primConvertHash(EvalState & state, Value * args, Value & out)
         typeError("convertHash", "{ hash; hashAlgo?; toHashFormat; }");
 
     nix::HashFormat fmt;
-    std::string_view fs(vf.payload.str);
+    std::string_view fs(vf.asString());
     if (fs == "base16")        fmt = nix::HashFormat::Base16;
     else if (fs == "nix32")    fmt = nix::HashFormat::Nix32;
     else if (fs == "base32")   fmt = nix::HashFormat::Nix32;  // alias
@@ -3368,10 +3327,10 @@ void primConvertHash(EvalState & state, Value * args, Value & out)
         Value va = forceValue(*state.vm, *vaRaw);
         if (!va.isString())
             typeError("convertHash", "{ hash; hashAlgo?; toHashFormat; }");
-        parsed = nix::Hash::parseAny(vh.payload.str, parseHashAlgo(va.payload.str));
+        parsed = nix::Hash::parseAny(vh.asString(), parseHashAlgo(va.asString()));
     } else {
         // No hashAlgo — infer from `algo:body` or SRI prefix.
-        parsed = nix::Hash::parseAny(vh.payload.str, std::nullopt);
+        parsed = nix::Hash::parseAny(vh.asString(), std::nullopt);
     }
     out = mkStringValueOwned(parsed.to_string(fmt, false));
 }
@@ -3447,12 +3406,12 @@ void primReadFile(EvalState & state, Value * args, Value & out)
         // #741 Phase 4 measurement: ctx-bearing readFile path goes
         // through realisePath below (the TW-wired branch), which
         // CAN trigger a build for un-realised DrvDeep/Built entries.
-        auto * ctxEntries = lookupStringContextEntries(args[0].payload.str);
+        auto * ctxEntries = lookupStringContextEntries(args[0].asString());
         if (ctxEntries && !ctxEntries->empty())
             ++allocStats().ifdProbeWithCtx[kIfdReadFile];
-        path = args[0].payload.str;
+        path = args[0].asString();
     }
-    else if (args[0].isPath()) path = args[0].payload.path;
+    else if (args[0].isPath()) path = args[0].asPath();
     else typeError("readFile", "string or path");
 
     // REVIEW §1.7-style routing: when a TW EvalState is wired, defer
@@ -3519,7 +3478,7 @@ void primReadFile(EvalState & state, Value * args, Value & out)
         // path-references.hh).  Returns the Opaque context-elem strings.
         auto ctx = ffi::storeRefsContextFor(*state.nixEvalState, path, content);
         if (!ctx.empty())
-            setStringContextEntries(out.payload.str, std::move(ctx));
+            setStringContextEntries(out.asString(), std::move(ctx));
     }
 }
 
@@ -3536,7 +3495,7 @@ void primReadDir(EvalState & state, Value * args, Value & out)
         // may reference a derivation output that must be realised before
         // we can scandir it.  Empty context = literal path = fast path,
         // matching primImport's discriminator.
-        auto * ctxEntries = lookupStringContextEntries(args[0].payload.str);
+        auto * ctxEntries = lookupStringContextEntries(args[0].asString());
         if (ctxEntries && !ctxEntries->empty() && state.nixEvalState) {
             ++allocStats().ifdProbeWithCtx[kIfdReadDir];
             auto & ns = *state.nixEvalState;
@@ -3548,7 +3507,7 @@ void primReadDir(EvalState & state, Value * args, Value & out)
             // outPath path right below for primReadDir attrset case.
             nix::Value * tw = ffi::allocValue(ns);
             nix::NixStringContext twCtx = decodeStringContext(*ctxEntries);
-            tw->mkString(args[0].payload.str, twCtx, ns.mem);
+            tw->mkString(args[0].asString(), twCtx, ns.mem);
             try {
                 auto resolved = ns.realisePath(nix::noPos, *tw);
                 path = resolved.path.abs();
@@ -3556,10 +3515,10 @@ void primReadDir(EvalState & state, Value * args, Value & out)
                 throw;  // surface TW's error verbatim
             }
         } else {
-            path = args[0].payload.str;
+            path = args[0].asString();
         }
     }
-    else if (args[0].isPath()) path = args[0].payload.path;
+    else if (args[0].isPath()) path = args[0].asPath();
     else if (args[0].isAttrs()) {
         // #793 (2026-05-24): derivation/attrset arg — mirror TW's
         // prim_readDir, which routes the arg through realisePath →
@@ -3621,8 +3580,7 @@ void primReadDir(EvalState & state, Value * args, Value & out)
         b->entries[i].name  = entries[i].first;
         bindingsSetValue(b, static_cast<uint32_t>(i), entries[i].second);  // Phase D
     }
-    out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
-    out.payload.bindings = b;
+    out.mkAttrs(b);
 }
 
 /// builtins.parseDrvName "name-1.2.3" -> { name = "name"; version = "1.2.3"; }
@@ -3641,7 +3599,7 @@ void primParseDrvName(EvalState & state, Value * args, Value & out)
     // match the rejection so contexted derivation-name strings can't
     // sneak through (e.g. callers that accidentally pass `"${drv}"`).
     requireNoStringContext(state, args[0], "parseDrvName");
-    std::string s(args[0].payload.str);
+    std::string s(args[0].asString());
     size_t cut = std::string::npos;
     for (size_t i = 0; i + 1 < s.size(); ++i) {
         unsigned char nxt = static_cast<unsigned char>(s[i + 1]);
@@ -3661,15 +3619,14 @@ void primParseDrvName(EvalState & state, Value * args, Value & out)
     Value vv = mkStringValueOwned(version);
     if (sName < sVersion) { bindingsSetEntry(b, 0, {sName, 0, vn}); bindingsSetEntry(b, 1, {sVersion, 0, vv}); }  // Phase D
     else                  { bindingsSetEntry(b, 0, {sVersion, 0, vv}); bindingsSetEntry(b, 1, {sName, 0, vn}); }
-    out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
-    out.payload.bindings = b;
+    out.mkAttrs(b);
 }
 
 /// builtins.groupBy keyFn list -> { key = [items with that key]; }
 void primGroupBy(EvalState & state, Value * args, Value & out)
 {
     if (!args[1].isList()) typeError("groupBy", "list");
-    auto * src = args[1].payload.list;
+    auto * src = args[1].asList();
     Value keyFn = args[0];
     std::unordered_map<std::string, std::vector<Value>> groups;
     if (src) {
@@ -3683,7 +3640,7 @@ void primGroupBy(EvalState & state, Value * args, Value & out)
                                  || k.tag() == Tag::Slot, 0))
                 k = forceValue(*state.vm, k);
             if (!k.isString()) typeError("groupBy", "key fn returning string");
-            groups[std::string(k.payload.str)].push_back(src->elems[i]);
+            groups[std::string(k.asString())].push_back(src->elems[i]);
         }
     }
     std::vector<std::pair<SymbolId, Value>> entries;
@@ -3693,8 +3650,7 @@ void primGroupBy(EvalState & state, Value * args, Value & out)
         V3_STATS_INC(listsAllocated);
         for (size_t i = 0; i < items.size(); ++i) lv->elems[i] = items[i];
         Value lstV;
-        lstV.tag_payload = static_cast<uint64_t>(Tag::List);
-        lstV.payload.list = lv;
+        lstV.mkList(lv);
         entries.emplace_back(vmIntern(state, name), lstV);
     }
     std::sort(entries.begin(), entries.end(),
@@ -3705,15 +3661,14 @@ void primGroupBy(EvalState & state, Value * args, Value & out)
         b->entries[i].name  = entries[i].first;
         bindingsSetValue(b, static_cast<uint32_t>(i), entries[i].second);  // Phase D
     }
-    out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
-    out.payload.bindings = b;
+    out.mkAttrs(b);
 }
 
 void primReadFileType(EvalState &, Value * args, Value & out)
 {
     std::string path;
-    if (args[0].isString()) path = args[0].payload.str;
-    else if (args[0].isPath()) path = args[0].payload.path;
+    if (args[0].isString()) path = args[0].asString();
+    else if (args[0].isPath()) path = args[0].asPath();
     else typeError("readFileType", "string or path");
     std::error_code ec;
     auto status = std::filesystem::symlink_status(path, ec);
@@ -4022,8 +3977,8 @@ static std::optional<std::string> v3TryAttrsToString(
     std::string_view errorCtx)
 {
     const auto & sym = drvStrictSymbols();
-    if (!v.isAttrs() || !v.payload.bindings) return std::nullopt;
-    const Value * tsRaw = v.payload.bindings->lookup(sym.toString);
+    if (!v.isAttrs() || !v.asAttrs()) return std::nullopt;
+    const Value * tsRaw = v.asAttrs()->lookup(sym.toString);
     if (!tsRaw) return std::nullopt;
     Value tsFn = forceValue(*state.vm, *tsRaw);
     // Only attempt the call for callable shapes — TW's coerceToString
@@ -4049,7 +4004,7 @@ static std::string v3CoerceToString(
         // Forward any side-table context from the v3 string into the
         // accumulator.  Strings without context (most string
         // literals) skip the lookup entirely.
-        const char * buf = v.payload.str ? v.payload.str : "";
+        const char * buf = v.asString() ? v.asString() : "";
         if (auto * raw = lookupStringContextEntries(buf)) {
             for (auto & e : *raw) {
                 try { context.insert(nix::NixStringContextElem::parse(e)); }
@@ -4066,7 +4021,7 @@ static std::string v3CoerceToString(
         }
         auto & ns = *state.nixEvalState;
         nix::SourcePath sp(ns.rootFS,
-            nix::CanonPath(v.payload.path ? v.payload.path : ""));
+            nix::CanonPath(v.asPath() ? v.asPath() : ""));
         // copyPathToStore inserts the Opaque context entry on `context`
         // for us (eval.cc:2961).
         nix::StorePath dst = ns.copyPathToStore(context, sp);
@@ -4076,14 +4031,14 @@ static std::string v3CoerceToString(
     if (v.isAttrs()) {
         const auto & sym = drvStrictSymbols();
         // Try __toString first.  If absent, fall through to outPath.
-        if (v.payload.bindings && v.payload.bindings->lookup(sym.toString)) {
+        if (v.asAttrs() && v.asAttrs()->lookup(sym.toString)) {
             if (auto s = v3TryAttrsToString(state, v, context, errorCtx))
                 return std::move(*s);
         }
         // outPath fallback — common case for derivations and any
         // attrset that string-coerces to its primary output.
-        if (v.payload.bindings) {
-            if (auto * outV = v.payload.bindings->lookup(sym.outPath)) {
+        if (v.asAttrs()) {
+            if (auto * outV = v.asAttrs()->lookup(sym.outPath)) {
                 Value forced = forceValue(*state.vm, *outV);
                 return v3CoerceToString(state, forced, context, errorCtx);
             }
@@ -4094,16 +4049,16 @@ static std::string v3CoerceToString(
         // bloat on huge attrsets.
         std::string msg = "v3 BR-3 coerceToString: attrset has neither "
                           "__toString nor outPath; keys=[";
-        if (v.payload.bindings) {
+        if (v.asAttrs()) {
             const auto & symTab = ir::globalSymbolTable();
-            uint32_t lim = std::min<uint32_t>(v.payload.bindings->size, 12u);
+            uint32_t lim = std::min<uint32_t>(v.asAttrs()->size, 12u);
             for (uint32_t i = 0; i < lim; ++i) {
-                SymbolId sid = v.payload.bindings->entries[i].name;
+                SymbolId sid = v.asAttrs()->entries[i].name;
                 if (i) msg += ",";
                 msg += (sid < symTab.size())
                     ? symTab[sid] : std::string("<sid?>");
             }
-            if (v.payload.bindings->size > lim) msg += ",...";
+            if (v.asAttrs()->size > lim) msg += ",...";
         } else msg += "<no bindings>";
         msg += "]";
         throw std::runtime_error(msg);
@@ -4112,21 +4067,21 @@ static std::string v3CoerceToString(
     // coerceMore = true cases (matching tree-walker's behaviour for
     // derivationStrict's per-attr coerce):
     if (v.isBool()) {
-        return v.payload.i == 1 ? std::string("1") : std::string("");
+        return v.asInt() == 1 ? std::string("1") : std::string("");
     }
     if (v.isInt()) {
-        return std::to_string(v.payload.i);
+        return std::to_string(v.asInt());
     }
     if (v.tag() == Tag::Float) {
         // Match tree-walker's std::to_string(double).
-        return std::to_string(v.payload.f);
+        return std::to_string(v.asFloat());
     }
     if (v.tag() == Tag::Null) {
         return std::string("");
     }
     if (v.isList()) {
         std::string out;
-        auto * lv = v.payload.list;
+        auto * lv = v.asList();
         if (!lv) return out;
         for (uint32_t i = 0; i < lv->size; ++i) {
             Value el = forceValue(*state.vm, lv->elems[i]);
@@ -4137,7 +4092,7 @@ static std::string v3CoerceToString(
             out += v3CoerceToString(state, el, context, errorCtx);
             if (i + 1 < lv->size) {
                 bool elIsEmptyList = el.isList()
-                    && (!el.payload.list || el.payload.list->size == 0);
+                    && (!el.asList() || el.asList()->size == 0);
                 if (!elIsEmptyList) out += ' ';
             }
         }
@@ -4290,13 +4245,13 @@ void primDerivationStrict(EvalState & state, Value * args, Value & out)
             const auto & syms = drvStrictSymbols();
             std::string drvName = "<no-name>";
             const void * bindingsPtr = nullptr;
-            if (args[0].isAttrs() && args[0].payload.bindings) {
-                auto * b = args[0].payload.bindings;
+            if (args[0].isAttrs() && args[0].asAttrs()) {
+                auto * b = args[0].asAttrs();
                 bindingsPtr = b;
                 if (auto * nv = b->lookup(syms.name)) {
                     Value forced = forceValue(*state.vm, *nv);
-                    if (forced.isString() && forced.payload.str)
-                        drvName = forced.payload.str;
+                    if (forced.isString() && forced.asString())
+                        drvName = forced.asString();
                     else
                         drvName = std::string("<name-tag-")
                                 + std::to_string((int)forced.tag()) + ">";
@@ -4332,8 +4287,8 @@ void primDerivationStrict(EvalState & state, Value * args, Value & out)
     static const bool nativeDisabled =
         std::getenv("V3_DRV_NO_NATIVE") != nullptr;
     if (!nativeDisabled
-        && state.nixEvalState && args[0].isAttrs() && args[0].payload.bindings
-        && isSimpleDerivationAttrs(args[0].payload.bindings))
+        && state.nixEvalState && args[0].isAttrs() && args[0].asAttrs()
+        && isSimpleDerivationAttrs(args[0].asAttrs()))
     {
         try {
             primDerivationStrictNative(state, args, out);
@@ -4357,7 +4312,7 @@ void primDerivationStrict(EvalState & state, Value * args, Value & out)
             if (__builtin_expect(s_drvDebug, 0)) {
                 std::string drvName = "<unknown>";
                 const auto & syms = drvStrictSymbols();
-                if (auto * nv = args[0].payload.bindings->lookup(syms.name)) {
+                if (auto * nv = args[0].asAttrs()->lookup(syms.name)) {
                     // Force the name attr (it may still be a Thunk
                     // when the native path throws — eg if name comes
                     // alphabetically after the attr that triggered
@@ -4366,8 +4321,8 @@ void primDerivationStrict(EvalState & state, Value * args, Value & out)
                     // diagnostic doesn't itself blow up.
                     try {
                         Value forced = forceValue(*state.vm, *nv);
-                        if (forced.isString() && forced.payload.str)
-                            drvName = forced.payload.str;
+                        if (forced.isString() && forced.asString())
+                            drvName = forced.asString();
                     } catch (...) { drvName = "<force-failed>"; }
                 }
                 std::fprintf(stderr,
@@ -4376,12 +4331,12 @@ void primDerivationStrict(EvalState & state, Value * args, Value & out)
                 // Also dump args attrNames for forensics.  Helps
                 // determine whether the failing args truly belong to
                 // the named derivation or some inner wrapper layer.
-                if (args[0].payload.bindings) {
+                if (args[0].asAttrs()) {
                     std::fprintf(stderr,
                                  "  args attrNames (%u): ",
-                                 args[0].payload.bindings->size);
+                                 args[0].asAttrs()->size);
                     const auto & symTab = ir::globalSymbolTable();
-                    const Bindings * b = args[0].payload.bindings;
+                    const Bindings * b = args[0].asAttrs();
                     for (uint32_t i = 0; i < b->size && i < 40; ++i) {
                         SymbolId sid = b->entries[i].name;
                         std::fprintf(stderr, "%s ",
@@ -4409,11 +4364,11 @@ void primDerivationStrict(EvalState & state, Value * args, Value & out)
         // If it threw, the catch above swallowed it and we're here
         // — re-throw a generic error that includes the drv name.
         std::string drvName = "<unknown>";
-        if (args[0].isAttrs() && args[0].payload.bindings) {
+        if (args[0].isAttrs() && args[0].asAttrs()) {
             const auto & syms = drvStrictSymbols();
-            if (auto * nv = args[0].payload.bindings->lookup(syms.name)) {
-                if (nv->isString() && nv->payload.str)
-                    drvName = nv->payload.str;
+            if (auto * nv = args[0].asAttrs()->lookup(syms.name)) {
+                if (nv->isString() && nv->asString())
+                    drvName = nv->asString();
             }
         }
         throw std::runtime_error(
@@ -4432,18 +4387,18 @@ void primDerivationStrict(EvalState & state, Value * args, Value & out)
     // same arc).  Native-path errors now propagate / reach the no-store path
     // below exactly as they already did by default (the gate never fired by
     // default, so this is a zero-default-behavior-change deletion).
-    if (!args[0].isAttrs() || !args[0].payload.bindings)
+    if (!args[0].isAttrs() || !args[0].asAttrs())
         typeError("derivationStrict", "attrset");
     const auto & sym = drvStrictSymbols();
 
-    auto * src = args[0].payload.bindings;
+    auto * src = args[0].asAttrs();
     const Value * nameVRaw = src->lookup(sym.name);
     if (!nameVRaw)
         typeError("derivationStrict", "attrset with `name` string");
     Value nameV = forceValue(*state.vm, *nameVRaw);
     if (!nameV.isString())
         typeError("derivationStrict", "attrset with `name` string");
-    std::string name(nameV.payload.str);
+    std::string name(nameV.asString());
 
     // Tree-walker rejects derivation names containing characters
     // that aren't allowed in a Nix store path: only [A-Za-z0-9+\-._?=]
@@ -4471,10 +4426,10 @@ void primDerivationStrict(EvalState & state, Value * args, Value & out)
     std::vector<std::string> outputs;
     if (auto * outV = src->lookup(sym.outputs)) {
         Value f = forceValue(*state.vm, *outV);
-        if (f.isList() && f.payload.list) {
-            for (uint32_t i = 0; i < f.payload.list->size; ++i) {
-                Value el = forceValue(*state.vm, f.payload.list->elems[i]);
-                if (el.isString()) outputs.push_back(el.payload.str);
+        if (f.isList() && f.asList()) {
+            for (uint32_t i = 0; i < f.asList()->size; ++i) {
+                Value el = forceValue(*state.vm, f.asList()->elems[i]);
+                if (el.isString()) outputs.push_back(el.asString());
             }
         }
     }
@@ -4490,16 +4445,16 @@ void primDerivationStrict(EvalState & state, Value * args, Value & out)
     auto attrToString = [&](const Value * v) -> std::string {
         if (!v) return "";
         Value f = forceValue(*state.vm, *v);
-        if (f.isString()) return f.payload.str;
-        if (f.isPath())   return f.payload.path;
-        if (f.isInt())    return std::to_string(f.payload.i);
-        if (f.isBool())   return f.payload.i == 1 ? "1" : "";
-        if (f.isList() && f.payload.list) {
+        if (f.isString()) return f.asString();
+        if (f.isPath())   return f.asPath();
+        if (f.isInt())    return std::to_string(f.asInt());
+        if (f.isBool())   return f.asInt() == 1 ? "1" : "";
+        if (f.isList() && f.asList()) {
             std::string s;
-            for (uint32_t i = 0; i < f.payload.list->size; ++i) {
-                Value el = forceValue(*state.vm, f.payload.list->elems[i]);
-                if (el.isString()) s += el.payload.str;
-                else if (el.isPath()) s += el.payload.path;
+            for (uint32_t i = 0; i < f.asList()->size; ++i) {
+                Value el = forceValue(*state.vm, f.asList()->elems[i]);
+                if (el.isString()) s += el.asString();
+                else if (el.isPath()) s += el.asPath();
                 s += ',';
             }
             return s;
@@ -4538,8 +4493,7 @@ void primDerivationStrict(EvalState & state, Value * args, Value & out)
         b->entries[i].name  = entries[i].first;
         bindingsSetValue(b, static_cast<uint32_t>(i), entries[i].second);  // Phase D
     }
-    out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
-    out.payload.bindings = b;
+    out.mkAttrs(b);
 }
 
 // BR-3.5: Phase A native attr-loop.  Reads args[0] (a v3 Bindings*
@@ -4760,7 +4714,7 @@ static void buildAndWriteDrvNative(
         drvCtx.insert(
             nix::NixStringContextElem{nix::NixStringContextElem::DrvDeep{
                 .drvPath = drvPath}});
-        setStringContext(v3DrvPath.payload.str, drvCtx);
+        setStringContext(v3DrvPath.asString(), drvCtx);
         entries.emplace_back(sym.drvPath, v3DrvPath);
     }
 
@@ -4782,7 +4736,7 @@ static void buildAndWriteDrvNative(
                 .drvPath = nix::makeConstantStorePathRef(drvPath),
                 .output  = outName,
             }});
-        setStringContext(v3OutPath.payload.str, outCtx);
+        setStringContext(v3OutPath.asString(), outCtx);
         entries.emplace_back(outSid, v3OutPath);
     }
 
@@ -4795,8 +4749,7 @@ static void buildAndWriteDrvNative(
         resultB->entries[i].name  = entries[i].first;
         bindingsSetValue(resultB, static_cast<uint32_t>(i), entries[i].second);  // Phase D
     }
-    out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
-    out.payload.bindings = resultB;
+    out.mkAttrs(resultB);
 
     // #741 Phase 1: round-trip-test the result Value through the
     // value-serialiser when NIX_V3_TEST_DRV_RESULT_SERIALIZE=1.
@@ -4866,7 +4819,7 @@ static void primDerivationFromPreprocessed(EvalState & state, Value * args, Valu
                 (unsigned long long)calls);
         }
     }
-    if (!args[0].isAttrs() || !args[0].payload.bindings)
+    if (!args[0].isAttrs() || !args[0].asAttrs())
         typeError("__derivationFromPreprocessed", "attrset");
 
     // #741 Phase 3a SHADOW / #885 PRODUCTION cache.  SHADOW: body
@@ -4903,7 +4856,7 @@ static void primDerivationFromPreprocessed(EvalState & state, Value * args, Valu
         }
     };
 
-    auto * pp = args[0].payload.bindings;
+    auto * pp = args[0].asAttrs();
 
     // Symbol IDs we'll look up.  Cache by static-local for reuse.
     static const SymbolId sName            = ir::globalInternSymbol("name");
@@ -4934,7 +4887,7 @@ static void primDerivationFromPreprocessed(EvalState & state, Value * args, Valu
             throw std::runtime_error(
                 "v3 __derivationFromPreprocessed: field '" + label +
                 "' is not a string (tag=" + std::to_string((int)f.tag()) + ")");
-        return std::string(f.payload.str ? f.payload.str : "");
+        return std::string(f.asString() ? f.asString() : "");
     };
 
     auto getOptString = [&](SymbolId sid) -> std::optional<std::string> {
@@ -4943,7 +4896,7 @@ static void primDerivationFromPreprocessed(EvalState & state, Value * args, Valu
         Value f = forceField(v);
         if (f.tag() == Tag::Null) return std::nullopt;
         if (!f.isString()) return std::nullopt;
-        return std::string(f.payload.str ? f.payload.str : "");
+        return std::string(f.asString() ? f.asString() : "");
     };
 
     auto getBool = [&](SymbolId sid, bool defaultV) -> bool {
@@ -4951,7 +4904,7 @@ static void primDerivationFromPreprocessed(EvalState & state, Value * args, Valu
         if (!v) return defaultV;
         Value f = forceField(v);
         if (!f.isBool()) return defaultV;
-        return f.payload.i == 1;
+        return f.asInt() == 1;
     };
 
     // Absorb string-context entries (v3 side-table) into a
@@ -4990,12 +4943,12 @@ static void primDerivationFromPreprocessed(EvalState & state, Value * args, Valu
         const Value * bV = pp->lookup(sBuilder);
         if (bV) {
             Value f = forceField(bV);
-            if (f.isString()) absorbCtx(f.payload.str, context);
+            if (f.isString()) absorbCtx(f.asString(), context);
         }
         const Value * sV = pp->lookup(sSystem);
         if (sV) {
             Value f = forceField(sV);
-            if (f.isString()) absorbCtx(f.payload.str, context);
+            if (f.isString()) absorbCtx(f.asString(), context);
         }
     }
 
@@ -5028,14 +4981,14 @@ static void primDerivationFromPreprocessed(EvalState & state, Value * args, Valu
         const Value * v = pp->lookup(sOutputs);
         if (v) {
             Value f = forceField(v);
-            if (f.isList() && f.payload.list) {
-                for (uint32_t i = 0; i < f.payload.list->size; ++i) {
-                    Value el = forceValue(*state.vm, f.payload.list->elems[i]);
+            if (f.isList() && f.asList()) {
+                for (uint32_t i = 0; i < f.asList()->size; ++i) {
+                    Value el = forceValue(*state.vm, f.asList()->elems[i]);
                     if (!el.isString())
                         throw std::runtime_error(
                             "v3 __derivationFromPreprocessed: outputs[*] "
                             "is not a string");
-                    std::string s(el.payload.str ? el.payload.str : "");
+                    std::string s(el.asString() ? el.asString() : "");
                     if (s.empty() || s == "drvPath")
                         throw std::runtime_error(
                             "v3 __derivationFromPreprocessed: invalid "
@@ -5052,15 +5005,15 @@ static void primDerivationFromPreprocessed(EvalState & state, Value * args, Valu
         const Value * v = pp->lookup(sArgs);
         if (v) {
             Value f = forceField(v);
-            if (f.isList() && f.payload.list) {
-                for (uint32_t i = 0; i < f.payload.list->size; ++i) {
-                    Value el = forceValue(*state.vm, f.payload.list->elems[i]);
+            if (f.isList() && f.asList()) {
+                for (uint32_t i = 0; i < f.asList()->size; ++i) {
+                    Value el = forceValue(*state.vm, f.asList()->elems[i]);
                     if (!el.isString())
                         throw std::runtime_error(
                             "v3 __derivationFromPreprocessed: args[*] "
                             "is not a string");
-                    drv.args.push_back(el.payload.str ? el.payload.str : "");
-                    absorbCtx(el.payload.str, context);
+                    drv.args.push_back(el.asString() ? el.asString() : "");
+                    absorbCtx(el.asString(), context);
                 }
             }
         }
@@ -5074,9 +5027,9 @@ static void primDerivationFromPreprocessed(EvalState & state, Value * args, Valu
             if (!f.isAttrs())
                 throw std::runtime_error(
                     "v3 __derivationFromPreprocessed: `env` is not an attrset");
-            if (f.payload.bindings) {
+            if (f.asAttrs()) {
                 const auto & st = ir::globalSymbolTable();
-                auto * b = f.payload.bindings;
+                auto * b = f.asAttrs();
                 // ChainBindings: the bytecode `derivation` wrapper builds this
                 // `env` attrset by merging the args (na≥16) → a Chain whose
                 // entries[] is the OVERLAY ONLY.  Iterating it directly here
@@ -5093,8 +5046,8 @@ static void primDerivationFromPreprocessed(EvalState & state, Value * args, Valu
                             "for an attr is not a string");
                     std::string keyStr(nm < st.size() ? st[nm] : "");
                     drv.env.emplace(keyStr,
-                        elv.payload.str ? elv.payload.str : "");
-                    absorbCtx(elv.payload.str, context);
+                        elv.asString() ? elv.asString() : "");
+                    absorbCtx(elv.asString(), context);
                 }
             }
         }
@@ -5113,7 +5066,7 @@ static void primDerivationStrictNative(
     EvalState & state, Value * args, Value & out)
 {
     auto & ns = *state.nixEvalState;
-    auto * src = args[0].payload.bindings;
+    auto * src = args[0].asAttrs();
     // ChainBindings: the whole derivation is computed by iterating src in lex
     // order (lexicographicAttrOrder + src->entries[order[i]] reads below).  For
     // a Chain that is the OVERLAY ONLY → the drv is built from a partial attr
@@ -5195,7 +5148,7 @@ static void primDerivationStrictNative(
     if (!nameV.isString())
         throw std::runtime_error(
             "v3 BR-3 native: `name` attr is not a string");
-    std::string drvName(nameV.payload.str ? nameV.payload.str : "");
+    std::string drvName(nameV.asString() ? nameV.asString() : "");
     // libstore validates the name shape — throws on bad chars / empty
     // / leading dot / etc.  Same validation tree-walker does.
     nix::checkName(drvName);
@@ -5219,7 +5172,7 @@ static void primDerivationStrictNative(
         if (!v) return false;
         Value f = forceValue(*state.vm, *v);
         if (!f.isBool()) return false;
-        return f.payload.i == 1;
+        return f.asInt() == 1;
     };
     ignoreNulls         = readFlagBool(sym.ignoreNulls);
     contentAddressed    = readFlagBool(sym.contentAddressed);
@@ -5320,9 +5273,9 @@ static void primDerivationStrictNative(
                 if (!listV.isList())
                     throw std::runtime_error(
                         "v3 BR-3 native: `args` attr is not a list");
-                if (listV.payload.list) {
-                    for (uint32_t i = 0; i < listV.payload.list->size; ++i) {
-                        Value el = forceValue(*state.vm, listV.payload.list->elems[i]);
+                if (listV.asList()) {
+                    for (uint32_t i = 0; i < listV.asList()->size; ++i) {
+                        Value el = forceValue(*state.vm, listV.asList()->elems[i]);
                         drv.args.push_back(v3CoerceToString(
                             state, el, context,
                             "while evaluating an element of `args`"));
@@ -5340,13 +5293,13 @@ static void primDerivationStrictNative(
                 if (!listV.isList())
                     throw std::runtime_error(
                         "v3 BR-3 native: `outputs` attr is not a list");
-                if (listV.payload.list) {
-                    for (uint32_t i = 0; i < listV.payload.list->size; ++i) {
-                        Value el = forceValue(*state.vm, listV.payload.list->elems[i]);
+                if (listV.asList()) {
+                    for (uint32_t i = 0; i < listV.asList()->size; ++i) {
+                        Value el = forceValue(*state.vm, listV.asList()->elems[i]);
                         if (!el.isString())
                             throw std::runtime_error(
                                 "v3 BR-3 native: `outputs` element is not a string");
-                        std::string s(el.payload.str ? el.payload.str : "");
+                        std::string s(el.asString() ? el.asString() : "");
                         if (s.empty() || s == "drvPath")
                             throw std::runtime_error(
                                 "v3 BR-3 native: invalid output name");
@@ -5392,9 +5345,9 @@ static void primDerivationStrictNative(
             if (!listV.isList())
                 throw std::runtime_error(
                     "v3 BR-3 native: `args` attr is not a list");
-            if (listV.payload.list) {
-                for (uint32_t i = 0; i < listV.payload.list->size; ++i) {
-                    Value el = forceValue(*state.vm, listV.payload.list->elems[i]);
+            if (listV.asList()) {
+                for (uint32_t i = 0; i < listV.asList()->size; ++i) {
+                    Value el = forceValue(*state.vm, listV.asList()->elems[i]);
                     drv.args.push_back(v3CoerceToString(
                         state, el, context,
                         "while evaluating an element of `args`"));
@@ -5414,13 +5367,13 @@ static void primDerivationStrictNative(
                 throw std::runtime_error(
                     "v3 BR-3 native: `outputs` attr is not a list");
             std::string joined;
-            if (listV.payload.list) {
-                for (uint32_t i = 0; i < listV.payload.list->size; ++i) {
-                    Value el = forceValue(*state.vm, listV.payload.list->elems[i]);
+            if (listV.asList()) {
+                for (uint32_t i = 0; i < listV.asList()->size; ++i) {
+                    Value el = forceValue(*state.vm, listV.asList()->elems[i]);
                     if (!el.isString())
                         throw std::runtime_error(
                             "v3 BR-3 native: `outputs` element is not a string");
-                    std::string s(el.payload.str ? el.payload.str : "");
+                    std::string s(el.asString() ? el.asString() : "");
                     if (s.empty())
                         throw std::runtime_error(
                             "v3 BR-3 native: empty output name");
@@ -5676,7 +5629,7 @@ static void primDerivationStrictNative_phases_4_7_legacy_ref(
         drvCtx.insert(
             nix::NixStringContextElem{nix::NixStringContextElem::DrvDeep{
                 .drvPath = drvPath}});
-        setStringContext(v3DrvPath.payload.str, drvCtx);
+        setStringContext(v3DrvPath.asString(), drvCtx);
         entries.emplace_back(sym.drvPath, v3DrvPath);
     }
 
@@ -5708,7 +5661,7 @@ static void primDerivationStrictNative_phases_4_7_legacy_ref(
                 .drvPath = nix::makeConstantStorePathRef(drvPath),
                 .output  = outName,
             }});
-        setStringContext(v3OutPath.payload.str, outCtx);
+        setStringContext(v3OutPath.asString(), outCtx);
         entries.emplace_back(outSid, v3OutPath);
     }
 
@@ -5722,33 +5675,32 @@ static void primDerivationStrictNative_phases_4_7_legacy_ref(
         resultB->entries[i].name  = entries[i].first;
         bindingsSetValue(resultB, static_cast<uint32_t>(i), entries[i].second);  // Phase D
     }
-    out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
-    out.payload.bindings = resultB;
+    out.mkAttrs(resultB);
 }
 #endif // legacy phase-4-7 inline reference
 
 void primDerivation(EvalState & state, Value * args, Value & out)
 {
-    if (!args[0].isAttrs() || !args[0].payload.bindings)
+    if (!args[0].isAttrs() || !args[0].asAttrs())
         typeError("derivation", "attrset");
-    auto * src = args[0].payload.bindings;
+    auto * src = args[0].asAttrs();
 
     // 1. Run derivationStrict to get per-output paths + drvPath.
     Value strict;
     primDerivationStrict(state, args, strict);
-    if (!strict.isAttrs() || !strict.payload.bindings)
+    if (!strict.isAttrs() || !strict.asAttrs())
         throw std::runtime_error("v3 derivation: derivationStrict didn't return an attrset");
-    auto * strictB = strict.payload.bindings;
+    auto * strictB = strict.asAttrs();
 
     // 2. Read `outputs` (default ["out"]).
     std::vector<std::string> outputs;
     SymbolId sOutputs = vmIntern(state, "outputs");
     if (auto * outV = src->lookup(sOutputs)) {
         Value f = forceValue(*state.vm, *outV);
-        if (f.isList() && f.payload.list) {
-            for (uint32_t i = 0; i < f.payload.list->size; ++i) {
-                Value el = forceValue(*state.vm, f.payload.list->elems[i]);
-                if (el.isString()) outputs.push_back(el.payload.str);
+        if (f.isList() && f.asList()) {
+            for (uint32_t i = 0; i < f.asList()->size; ++i) {
+                Value el = forceValue(*state.vm, f.asList()->elems[i]);
+                if (el.isString()) outputs.push_back(el.asString());
             }
         }
     }
@@ -5796,8 +5748,7 @@ void primDerivation(EvalState & state, Value * args, Value & out)
             bindingsSetValue(ob, static_cast<uint32_t>(i), oEntries[i].second);  // Phase D
         }
         Value v;
-        v.tag_payload = static_cast<uint64_t>(Tag::Attrs);
-        v.payload.bindings = ob;
+        v.mkAttrs(ob);
         return v;
     };
 
@@ -5833,8 +5784,7 @@ void primDerivation(EvalState & state, Value * args, Value & out)
         for (size_t i = 0; i < allOutputs.size(); ++i)
             lv->elems[i] = allOutputs[i];
         Value vAll;
-        vAll.tag_payload = static_cast<uint64_t>(Tag::List);
-        vAll.payload.list = lv;
+        vAll.mkList(lv);
         entries.emplace_back(sAll, vAll);
     }
     std::sort(entries.begin(), entries.end(),
@@ -5851,8 +5801,7 @@ void primDerivation(EvalState & state, Value * args, Value & out)
         b->entries[i].name  = dedup[i].first;
         bindingsSetValue(b, static_cast<uint32_t>(i), dedup[i].second);  // Phase D
     }
-    out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
-    out.payload.bindings = b;
+    out.mkAttrs(b);
 
     // REVIEW §3 NOTE: tree-walker stores `all = [<self>]` for single-
     // output drvs (self-referential).  v3 deliberately stores the
@@ -6131,7 +6080,7 @@ void primImport(EvalState & state, Value * args, Value & out)
         //
         // For plain strings without context (the common case — plain
         // file paths), skip the bridge to keep the fast-path cheap.
-        auto * ctxEntries = lookupStringContextEntries(args[0].payload.str);
+        auto * ctxEntries = lookupStringContextEntries(args[0].asString());
         if (ctxEntries && !ctxEntries->empty()) {
             // #741 Phase 4 measurement: this is the discriminator for
             // potentially-real-IFD imports.  Empty context = literal
@@ -6153,7 +6102,7 @@ void primImport(EvalState & state, Value * args, Value & out)
             static const bool s_dbgIfd = std::getenv("V3_DBG_IFD") != nullptr;
             if (s_dbgIfd) {
                 std::fprintf(stderr, "v3 IFD-IMPORT-STR-CTX path=%s ctxN=%zu\n",
-                    args[0].payload.str, ctxEntries->size());
+                    args[0].asString(), ctxEntries->size());
                 for (auto it = ctxEntries->begin();
                      it != ctxEntries->end() && std::distance(ctxEntries->begin(), it) < 4;
                      ++it)
@@ -6176,9 +6125,9 @@ void primImport(EvalState & state, Value * args, Value & out)
             nix::Value * tw = ffi::allocValue(ns);
             if (ctxEntries && !ctxEntries->empty()) {
                 nix::NixStringContext twCtx = decodeStringContext(*ctxEntries);
-                tw->mkString(args[0].payload.str, twCtx, ns.mem);
+                tw->mkString(args[0].asString(), twCtx, ns.mem);
             } else {
-                tw->mkString(args[0].payload.str, ns.mem);
+                tw->mkString(args[0].asString(), ns.mem);
             }
             try {
                 auto resolved = ns.realisePath(nix::noPos, *tw);
@@ -6187,10 +6136,10 @@ void primImport(EvalState & state, Value * args, Value & out)
                 throw;  // surface TW's error verbatim
             }
         } else {
-            path = args[0].payload.str;
+            path = args[0].asString();
         }
     }
-    else if (args[0].isPath()) path = args[0].payload.path;
+    else if (args[0].isPath()) path = args[0].asPath();
     else if (args[0].isAttrs()) {
         // #741 Phase 4 measurement: attrset arg (typically a
         // derivation) → DEFINITELY goes through realisePath →
@@ -7338,40 +7287,40 @@ static void valueToXml(EvalState & state, std::string & out, Value v, int indent
         // the caller's accumulator so the resulting XML string carries
         // every referenced drv/path forward (matches TW's
         // printValueAsXML, libexpr/eval-xml.cc).
-        if (auto * raw = lookupStringContextEntries(v.payload.str)) {
+        if (auto * raw = lookupStringContextEntries(v.asString())) {
             for (auto & e : *raw) {
                 try { context.insert(nix::NixStringContextElem::parse(e)); }
                 catch (...) { /* skip un-parseable */ }
             }
         }
-        out += "<string value=\""; out += xmlEscape(v.payload.str); out += "\" />\n";
+        out += "<string value=\""; out += xmlEscape(v.asString()); out += "\" />\n";
         return;
     case Tag::Int:
-        out += "<int value=\""; out += std::to_string(v.payload.i); out += "\" />\n";
+        out += "<int value=\""; out += std::to_string(v.asInt()); out += "\" />\n";
         return;
     case Tag::Float:
-        out += "<float value=\""; out += std::to_string(v.payload.f); out += "\" />\n";
+        out += "<float value=\""; out += std::to_string(v.asFloat()); out += "\" />\n";
         return;
     case Tag::Bool:
-        out += "<bool value=\""; out += v.payload.i == 1 ? "true" : "false"; out += "\" />\n";
+        out += "<bool value=\""; out += v.asInt() == 1 ? "true" : "false"; out += "\" />\n";
         return;
     case Tag::Null:
         out += "<null />\n";
         return;
     case Tag::Path:
-        out += "<path value=\""; out += xmlEscape(v.payload.path); out += "\" />\n";
+        out += "<path value=\""; out += xmlEscape(v.asPath()); out += "\" />\n";
         return;
     case Tag::List:
         out += "<list>\n";
-        if (v.payload.list)
-            for (uint32_t i = 0; i < v.payload.list->size; ++i)
-                valueToXml(state, out, v.payload.list->elems[i], indent + 1, context);
+        if (v.asList())
+            for (uint32_t i = 0; i < v.asList()->size; ++i)
+                valueToXml(state, out, v.asList()->elems[i], indent + 1, context);
         pad(indent);
         out += "</list>\n";
         return;
     case Tag::Attrs: {
         out += "<attrs>\n";
-        if (v.payload.bindings) {
+        if (v.asAttrs()) {
             // Sort by name for stable output.
             // #670/#671 follow-on: store names as OWNING std::string,
             // not string_view, because the recursive valueToXml call
@@ -7381,13 +7330,13 @@ static void valueToXml(EvalState & state, std::string & out, Value v, int indent
             // structuredAttrs branch (commit bcc8d6cf1).
             auto & symTab = ir::globalSymbolTable();
             std::vector<std::pair<std::string, Value>> entries;
-            entries.reserve(v.payload.bindings->size);
-            for (uint32_t i = 0; i < v.payload.bindings->size; ++i) {
-                SymbolId sid = v.payload.bindings->entries[i].name;
+            entries.reserve(v.asAttrs()->size);
+            for (uint32_t i = 0; i < v.asAttrs()->size; ++i) {
+                SymbolId sid = v.asAttrs()->entries[i].name;
                 std::string nm = sid < symTab.size()
                     ? std::string(symTab[sid]) : std::string();
                 entries.emplace_back(std::move(nm),
-                    v.payload.bindings->entries[i].value);
+                    v.asAttrs()->entries[i].value);
             }
             std::sort(entries.begin(), entries.end(),
                 [](auto & a, auto & b) { return a.first < b.first; });
@@ -7433,7 +7382,7 @@ void primToXML(EvalState & state, Value * args, Value & out)
     s += "</expr>\n";
     out = mkStringValueOwned(s);
     if (!context.empty())
-        setStringContext(out.payload.str, context);
+        setStringContext(out.asString(), context);
 }
 
 /// builtins.parseFlakeRef "github:NixOS/nixpkgs/23.05?dir=lib"
@@ -7453,7 +7402,7 @@ static void splitOnce(std::string_view s, char sep, std::string_view & lhs, std:
 void primParseFlakeRef(EvalState & state, Value * args, Value & out)
 {
     if (!args[0].isString()) typeError("parseFlakeRef", "string");
-    std::string_view s(args[0].payload.str);
+    std::string_view s(args[0].asString());
     // Split off any `?key=value&...` query string.
     std::string_view base = s, query;
     splitOnce(s, '?', base, query);
@@ -7508,28 +7457,27 @@ void primParseFlakeRef(EvalState & state, Value * args, Value & out)
     V3_STATS_INC(attrsetsAllocated);
     for (size_t i = 0; i < entries.size(); ++i)  // Phase D
         bindingsSetEntry(b, static_cast<uint32_t>(i), {entries[i].first, 0, entries[i].second});
-    out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
-    out.payload.bindings = b;
+    out.mkAttrs(b);
 }
 
 void primFlakeRefToString(EvalState & state, Value * args, Value & out)
 {
-    if (!args[0].isAttrs() || !args[0].payload.bindings)
+    if (!args[0].isAttrs() || !args[0].asAttrs())
         typeError("flakeRefToString", "attrset");
-    auto * src = args[0].payload.bindings;
+    auto * src = args[0].asAttrs();
     auto getStr = [&](const char * name) -> std::string {
         SymbolId id = vmIntern(state, name);
         auto * v = src->lookup(id);
         if (!v) return {};
         Value f = forceValue(*state.vm, *v);
-        if (f.isString()) return std::string(f.payload.str);
+        if (f.isString()) return std::string(f.asString());
         // Match tree-walker: negative-int attrs raise; non-string,
         // non-int attrs would too (we just reject all non-strings).
         if (f.isInt()) {
-            if (f.payload.i < 0)
+            if (f.asInt() < 0)
                 throw std::runtime_error("v3 flakeRefToString: negative value given for flake ref attr " +
-                                          std::string(name) + ": " + std::to_string(f.payload.i));
-            return std::to_string(f.payload.i);
+                                          std::string(name) + ": " + std::to_string(f.asInt()));
+            return std::to_string(f.asInt());
         }
         throw std::runtime_error("v3 flakeRefToString: flake ref attr '" +
                                   std::string(name) + "' is not a string");
@@ -7584,8 +7532,7 @@ static Value tomlToValue(EvalState & state, const toml::value & t)
             b->entries[i].name  = entries[i].first;
             bindingsSetValue(b, static_cast<uint32_t>(i), entries[i].second);  // Phase D
         }
-        v.tag_payload = static_cast<uint64_t>(Tag::Attrs);
-        v.payload.bindings = b;
+        v.mkAttrs(b);
         return v;
     }
     case toml::value_t::array: {
@@ -7594,8 +7541,7 @@ static Value tomlToValue(EvalState & state, const toml::value & t)
         V3_STATS_INC(listsAllocated);
         for (size_t i = 0; i < arr.size(); ++i)
             lv->elems[i] = tomlToValue(state, arr[i]);
-        v.tag_payload = static_cast<uint64_t>(Tag::List);
-        v.payload.list = lv;
+        v.mkList(lv);
         return v;
     }
     case toml::value_t::boolean: v = t.as_boolean() ? Value::vTrue : Value::vFalse; return v;
@@ -7663,8 +7609,7 @@ static Value tomlToValue(EvalState & state, const toml::value & t)
         Value valV  = mkStringValueOwned(str);
         if (sType < sVal) { bindingsSetEntry(b, 0, {sType, 0, typeV}); bindingsSetEntry(b, 1, {sVal, 0, valV}); }  // Phase D
         else              { bindingsSetEntry(b, 0, {sVal, 0, valV}); bindingsSetEntry(b, 1, {sType, 0, typeV}); }
-        v.tag_payload = static_cast<uint64_t>(Tag::Attrs);
-        v.payload.bindings = b;
+        v.mkAttrs(b);
         return v;
     }
     case toml::value_t::empty: v.mkNull(); return v;
@@ -7677,7 +7622,7 @@ static Value tomlToValue(EvalState & state, const toml::value & t)
 void primFromTOML(EvalState & state, Value * args, Value & out)
 {
     if (!args[0].isString()) typeError("fromTOML", "string");
-    std::istringstream stream{std::string(args[0].payload.str)};
+    std::istringstream stream{std::string(args[0].asString())};
     try {
         out = tomlToValue(state, toml::parse(stream, "fromTOML"));
     } catch (std::exception & e) {
@@ -7718,7 +7663,7 @@ static void primPathFilteredNative(EvalState & state, Value * args, Value & out)
 /// VM on every fs entry — left to a follow-up).
 void primPath(EvalState & state, Value * args, Value & out)
 {
-    if (!args[0].isAttrs() || !args[0].payload.bindings)
+    if (!args[0].isAttrs() || !args[0].asAttrs())
         typeError("path", "attrset");
     // V3-NATIVE builtins.path (TW_VALUE_ERADICATION F3/F4): primPathNative /
     // primPathFilteredNative fully transcribe TW's prim_path + addPath
@@ -7733,7 +7678,7 @@ void primPath(EvalState & state, Value * args, Value & out)
     // filter cases — all with bridge tables = 0.
     if (state.nixEvalState) {
         SymbolId sFilter = ir::globalInternSymbol("filter");
-        if (!args[0].payload.bindings->lookup(sFilter))
+        if (!args[0].asAttrs()->lookup(sFilter))
             primPathNative(state, args, out);
         else
             primPathFilteredNative(state, args, out);
@@ -7743,19 +7688,19 @@ void primPath(EvalState & state, Value * args, Value & out)
     // so pure AST evaluation still proceeds without a store.
     SymbolId sPath = vmIntern(state, "path");
     SymbolId sName = vmIntern(state, "name");
-    auto * src = args[0].payload.bindings;
+    auto * src = args[0].asAttrs();
     const Value * pathV = src->lookup(sPath);
     if (!pathV)
         typeError("path", "attrset with `path`");
     Value forcedPath = forceValue(*state.vm, *pathV);
     std::string p;
-    if (forcedPath.isString())     p = forcedPath.payload.str;
-    else if (forcedPath.isPath())  p = forcedPath.payload.path;
+    if (forcedPath.isString())     p = forcedPath.asString();
+    else if (forcedPath.isPath())  p = forcedPath.asPath();
     else typeError("path", "{ path = string-or-path; ... }");
     std::string name;
     if (auto * nameV = src->lookup(sName)) {
         Value f = forceValue(*state.vm, *nameV);
-        if (f.isString()) name = f.payload.str;
+        if (f.isString()) name = f.asString();
     }
     if (name.empty()) {
         auto pos = p.find_last_of('/');
@@ -7768,8 +7713,7 @@ void primPath(EvalState & state, Value * args, Value & out)
     char * buf = Alloc::allocChars(outPath.size() + 1);
     std::memcpy(buf, outPath.data(), outPath.size());
     buf[outPath.size()] = '\0';
-    out.tag_payload = static_cast<uint64_t>(Tag::Path);
-    out.payload.path = buf;
+    out.mkPath(buf);
 }
 
 // BR-4 native builtins.path body (gated on filter being absent —
@@ -7777,7 +7721,7 @@ void primPath(EvalState & state, Value * args, Value & out)
 static void primPathNative(EvalState & state, Value * args, Value & out)
 {
     auto & ns = *state.nixEvalState;
-    auto * src = args[0].payload.bindings;
+    auto * src = args[0].asAttrs();
 
     // Use SymbolIds.  The names here are not in drvStrictSymbols
     // because builtins.path uses different attr names (path, name,
@@ -7807,7 +7751,7 @@ static void primPathNative(EvalState & state, Value * args, Value & out)
         if (!f.isString())
             throw std::runtime_error(
                 "v3 BR-4 native: `name` is not a string");
-        name = f.payload.str ? f.payload.str : "";
+        name = f.asString() ? f.asString() : "";
     }
 
     // Read `recursive` (optional, default true → NixArchive).
@@ -7817,7 +7761,7 @@ static void primPathNative(EvalState & state, Value * args, Value & out)
         if (!f.isBool())
             throw std::runtime_error(
                 "v3 BR-4 native: `recursive` is not a bool");
-        recursive = (f.payload.i == 1);
+        recursive = (f.asInt() == 1);
     }
 
     // Read `sha256` (optional).
@@ -7827,14 +7771,14 @@ static void primPathNative(EvalState & state, Value * args, Value & out)
         if (!f.isString())
             throw std::runtime_error(
                 "v3 BR-4 native: `sha256` is not a string");
-        sha256 = std::string(f.payload.str ? f.payload.str : "");
+        sha256 = std::string(f.asString() ? f.asString() : "");
     }
 
     ffi::FetchUrlResult r = ffi::addPathFull(
         ns, pathStr, pathCtx, name, recursive, sha256, /*v3filter=*/nullptr);
     Value v3Out = mkStringValueOwned(r.printedStorePath);
     std::vector<std::string> ctx{ r.opaqueContextElem };
-    setStringContextEntries(v3Out.payload.str, std::move(ctx));
+    setStringContextEntries(v3Out.asString(), std::move(ctx));
     out = v3Out;
 }
 
@@ -7848,7 +7792,7 @@ static void primPathNative(EvalState & state, Value * args, Value & out)
 static void primPathFilteredNative(EvalState & state, Value * args, Value & out)
 {
     auto & ns = *state.nixEvalState;
-    auto * src = args[0].payload.bindings;
+    auto * src = args[0].asAttrs();
 
     static const SymbolId sPath      = ir::globalInternSymbol("path");
     static const SymbolId sName      = ir::globalInternSymbol("name");
@@ -7873,7 +7817,7 @@ static void primPathFilteredNative(EvalState & state, Value * args, Value & out)
         if (!f.isString())
             throw std::runtime_error(
                 "v3 builtins.path (filtered): `name` is not a string");
-        name = f.payload.str ? f.payload.str : "";
+        name = f.asString() ? f.asString() : "";
     }
 
     // recursive (optional, default true → NixArchive).
@@ -7883,7 +7827,7 @@ static void primPathFilteredNative(EvalState & state, Value * args, Value & out)
         if (!f.isBool())
             throw std::runtime_error(
                 "v3 builtins.path (filtered): `recursive` is not a bool");
-        recursive = (f.payload.i == 1);
+        recursive = (f.asInt() == 1);
     }
 
     // sha256 (optional).
@@ -7893,7 +7837,7 @@ static void primPathFilteredNative(EvalState & state, Value * args, Value & out)
         if (!f.isString())
             throw std::runtime_error(
                 "v3 builtins.path (filtered): `sha256` is not a string");
-        sha256 = std::string(f.payload.str ? f.payload.str : "");
+        sha256 = std::string(f.asString() ? f.asString() : "");
     }
 
     // filter (required here — caller only routes us when present).
@@ -7915,14 +7859,14 @@ static void primPathFilteredNative(EvalState & state, Value * args, Value & out)
             throw std::runtime_error(
                 "while evaluating the return value of the path filter function: "
                 "expected a Boolean");
-        return r2.payload.i == 1;
+        return r2.asInt() == 1;
     };
 
     ffi::FetchUrlResult r =
         ffi::addPathFull(ns, pathStr, pathCtx, name, recursive, sha256, &v3filter);
     Value v3Out = mkStringValueOwned(r.printedStorePath);
     std::vector<std::string> ctx{ r.opaqueContextElem };
-    setStringContextEntries(v3Out.payload.str, std::move(ctx));
+    setStringContextEntries(v3Out.asString(), std::move(ctx));
     out = v3Out;
 }
 
@@ -7941,11 +7885,11 @@ void primScopedImport(EvalState & state, Value * args, Value & out)
         throw std::runtime_error("v3 primop scopedImport: no nix EvalState wired");
     Value scope = forceValue(*state.vm, args[0]);
     // #693 — match TW's forceAttrs / forceString-or-path phrasings.
-    if (!scope.isAttrs() || !scope.payload.bindings)
+    if (!scope.isAttrs() || !scope.asAttrs())
         throw std::runtime_error(expectedTypeButFound("a set", scope));
     std::string path;
-    if (args[1].isString()) path = args[1].payload.str;
-    else if (args[1].isPath()) path = args[1].payload.path;
+    if (args[1].isString()) path = args[1].asString();
+    else if (args[1].isPath()) path = args[1].asPath();
     else throw std::runtime_error(expectedTypeButFound("a string", args[1]));
 
     auto & ns = *state.nixEvalState;
@@ -7963,7 +7907,7 @@ void primScopedImport(EvalState & state, Value * args, Value & out)
     std::string src = sp.resolveSymlinks().readFile();
     std::string wrapped;
     wrapped += "__scope__: let ";
-    auto * sb = scope.payload.bindings;
+    auto * sb = scope.asAttrs();
     // ChainBindings: the scope is built by iterating sb->entries[] into the
     // lowering scope; a Chain = overlay only would drop the parent's names
     // (e.g. `range` from `overrides // import ./lib.nix`) → lower-time
@@ -8034,13 +7978,12 @@ void primFunctionArgs(EvalState & state, Value * args, Value & out)
     // arguments hit the typeError path.
     // (#493 step 3 Bridge-lambda formals peek retired — TW_VALUE_ERADICATION
     //  F4, 2026-06-02; no Bridge thunks exist.)
-    if (v.tag() == Tag::Closure && v.payload.closure && v.payload.closure->desc) {
-        const LambdaDescriptor * desc = v.payload.closure->desc;
+    if (v.tag() == Tag::Closure && v.asClosure() && v.asClosure()->desc) {
+        const LambdaDescriptor * desc = v.asClosure()->desc;
         if (!desc->hasFormals) {
             Bindings * b = Alloc::allocBindings(0);
             V3_STATS_INC(attrsetsAllocated);
-            out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
-            out.payload.bindings = b;
+            out.mkAttrs(b);
             return;
         }
         // Build sorted entries; carry pos handle so we can populate
@@ -8088,16 +8031,14 @@ void primFunctionArgs(EvalState & state, Value * args, Value & out)
                 std::fflush(stderr);
             }
         }
-        out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
-        out.payload.bindings = b;
+        out.mkAttrs(b);
         return;
     }
     if (v.tag() == Tag::PrimOp || v.tag() == Tag::PrimOpApp) {
         // PrimOps don't have introspectable formals; return empty.
         Bindings * b = Alloc::allocBindings(0);
         V3_STATS_INC(attrsetsAllocated);
-        out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
-        out.payload.bindings = b;
+        out.mkAttrs(b);
         return;
     }
     typeError("functionArgs", "lambda");
@@ -8135,8 +8076,7 @@ Value jsonToValue(EvalState & state, const nlohmann::json & j)
         ListVec * lv = Alloc::allocList(static_cast<uint32_t>(j.size()));
         V3_STATS_INC(listsAllocated);
         for (size_t i = 0; i < j.size(); ++i) lv->elems[i] = jsonToValue(state, j[i]);
-        out.tag_payload = static_cast<uint64_t>(Tag::List);
-        out.payload.list = lv;
+        out.mkList(lv);
         return out;
     }
     if (j.is_object()) {
@@ -8157,8 +8097,7 @@ Value jsonToValue(EvalState & state, const nlohmann::json & j)
             b->entries[i].name = entries[i].first;
             bindingsSetValue(b, static_cast<uint32_t>(i), entries[i].second);  // Phase D
         }
-        out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
-        out.payload.bindings = b;
+        out.mkAttrs(b);
         return out;
     }
     throw std::runtime_error("v3 jsonToValue: unsupported JSON type");
@@ -8173,44 +8112,44 @@ nlohmann::json valueToJson(EvalState & state, const Value & vRaw)
     Value v = forceValue(*state.vm, vRaw);
     switch (v.tag()) {
     case Tag::Null:   return json(nullptr);
-    case Tag::Bool:   return json(v.payload.i == 1);
-    case Tag::Int:    return json(v.payload.i);
-    case Tag::Float:  return json(v.payload.f);
-    case Tag::String: return json(std::string(v.payload.str));
-    case Tag::Path:   return json(std::string(v.payload.path));
+    case Tag::Bool:   return json(v.asInt() == 1);
+    case Tag::Int:    return json(v.asInt());
+    case Tag::Float:  return json(v.asFloat());
+    case Tag::String: return json(std::string(v.asString()));
+    case Tag::Path:   return json(std::string(v.asPath()));
     case Tag::List: {
         json arr = json::array();
-        if (v.payload.list)
-            for (uint32_t i = 0; i < v.payload.list->size; ++i)
-                arr.push_back(valueToJson(state, v.payload.list->elems[i]));
+        if (v.asList())
+            for (uint32_t i = 0; i < v.asList()->size; ++i)
+                arr.push_back(valueToJson(state, v.asList()->elems[i]));
         return arr;
     }
     case Tag::Attrs: {
         // `__toString self` overrides JSON serialization — call it
         // and use the resulting string.  Standard Nix coercion.
-        if (v.payload.bindings) {
+        if (v.asAttrs()) {
             static const SymbolId tsId = ir::globalInternSymbol("__toString");
-            if (auto * fn = v.payload.bindings->lookup(tsId)) {
+            if (auto * fn = v.asAttrs()->lookup(tsId)) {
                 Value forced = forceValue(*state.vm, *fn);
                 Value s = callClosure(*state.vm, forced, v);
                 s = forceValue(*state.vm, s);
-                if (s.isString()) return json(std::string(s.payload.str));
+                if (s.isString()) return json(std::string(s.asString()));
             }
             // `outPath` (a derivation-like value) — serialize as the
             // path string.
             static const SymbolId outId = ir::globalInternSymbol("outPath");
-            if (auto * op = v.payload.bindings->lookup(outId)) {
+            if (auto * op = v.asAttrs()->lookup(outId)) {
                 Value forced = forceValue(*state.vm, *op);
-                if (forced.isString()) return json(std::string(forced.payload.str));
-                if (forced.isPath())   return json(std::string(forced.payload.path));
+                if (forced.isString()) return json(std::string(forced.asString()));
+                if (forced.isPath())   return json(std::string(forced.asPath()));
             }
         }
         json obj = json::object();
-        if (v.payload.bindings) {
+        if (v.asAttrs()) {
             // Lever A: chain guard (same as valueToJsonWithContext).  A
             // Chain's entries[] is the overlay only; materialise to the
             // full sorted view so JSON includes the whole attrset.
-            const Bindings * jb = v.payload.bindings;
+            const Bindings * jb = v.asAttrs();
             if (jb->isChain()) jb = jb->materialize();
             for (uint32_t i = 0; i < jb->size; ++i) {
                 auto & en = jb->entries[i];
@@ -8249,7 +8188,7 @@ void primFromJSON(EvalState & state, Value * args, Value & out)
     if (!args[0].isString()) typeError("fromJSON", "string");
     // #734: TW's prim_fromJSON calls forceStringNoCtx on the input.
     requireNoStringContext(state, args[0], "fromJSON");
-    auto j = nlohmann::json::parse(std::string(args[0].payload.str), nullptr, /*allow_exceptions=*/true);
+    auto j = nlohmann::json::parse(std::string(args[0].asString()), nullptr, /*allow_exceptions=*/true);
     out = jsonToValue(state, j);
 }
 
@@ -8269,7 +8208,7 @@ void primToJSON(EvalState & state, Value * args, Value & out)
     auto j = valueToJsonWithContext(state, args[0], context);
     out = mkStringValueOwned(j.dump());
     if (!context.empty())
-        setStringContext(out.payload.str, context);
+        setStringContext(out.asString(), context);
 }
 
 // BR-3.12: context-tracking JSON serialization.  Mirrors
@@ -8284,11 +8223,11 @@ nlohmann::json valueToJsonWithContext(
     Value v = forceValue(*state.vm, vRaw);
     switch (v.tag()) {
     case Tag::Null:   return json(nullptr);
-    case Tag::Bool:   return json(v.payload.i == 1);
-    case Tag::Int:    return json(v.payload.i);
-    case Tag::Float:  return json(v.payload.f);
+    case Tag::Bool:   return json(v.asInt() == 1);
+    case Tag::Int:    return json(v.asInt());
+    case Tag::Float:  return json(v.asFloat());
     case Tag::String: {
-        const char * buf = v.payload.str ? v.payload.str : "";
+        const char * buf = v.asString() ? v.asString() : "";
         if (auto * raw = lookupStringContextEntries(buf)) {
             for (auto & e : *raw) {
                 try { context.insert(nix::NixStringContextElem::parse(e)); }
@@ -8303,16 +8242,16 @@ nlohmann::json valueToJsonWithContext(
                 "v3 BR-3 valueToJsonWithContext: path requires nixEvalState");
         auto & ns = *state.nixEvalState;
         nix::SourcePath sp(ns.rootFS,
-            nix::CanonPath(v.payload.path ? v.payload.path : ""));
+            nix::CanonPath(v.asPath() ? v.asPath() : ""));
         nix::StorePath dst = ns.copyPathToStore(context, sp);
         return json(ns.store->printStorePath(dst));
     }
     case Tag::List: {
         json arr = json::array();
-        if (v.payload.list)
-            for (uint32_t i = 0; i < v.payload.list->size; ++i)
+        if (v.asList())
+            for (uint32_t i = 0; i < v.asList()->size; ++i)
                 arr.push_back(valueToJsonWithContext(
-                    state, v.payload.list->elems[i], context));
+                    state, v.asList()->elems[i], context));
         return arr;
     }
     case Tag::Attrs: {
@@ -8322,9 +8261,9 @@ nlohmann::json valueToJsonWithContext(
         // (2026-05-19): used by builtins.toJSON via primToJSON, which
         // previously bypassed __toString — eval-okay-tojson exercises
         // this with `k = { __toString = self: self.a; a = "foo"; }`.
-        if (v.payload.bindings) {
+        if (v.asAttrs()) {
             static const SymbolId tsId = ir::globalInternSymbol("__toString");
-            if (auto * fn = v.payload.bindings->lookup(tsId)) {
+            if (auto * fn = v.asAttrs()->lookup(tsId)) {
                 Value forced = forceValue(*state.vm, *fn);
                 Value s = callClosure(*state.vm, forced, v);
                 s = forceValue(*state.vm, s);
@@ -8332,7 +8271,7 @@ nlohmann::json valueToJsonWithContext(
             }
             const auto & sym = drvStrictSymbols();
             // outPath fallback for derivations.
-            if (auto * op = v.payload.bindings->lookup(sym.outPath)) {
+            if (auto * op = v.asAttrs()->lookup(sym.outPath)) {
                 Value forced = forceValue(*state.vm, *op);
                 if (forced.isString() || forced.isPath()) {
                     return valueToJsonWithContext(state, forced, context);
@@ -8340,7 +8279,7 @@ nlohmann::json valueToJsonWithContext(
             }
         }
         json obj = json::object();
-        if (v.payload.bindings) {
+        if (v.asAttrs()) {
             // Lever A: store-hash-critical chain guard.  This serializer
             // feeds the native derivationStrict __structuredAttrs path
             // (the `env`/`manifest` JSON).  A Chain's `entries[]` is the
@@ -8351,7 +8290,7 @@ nlohmann::json valueToJsonWithContext(
             // Materialise to the full sorted view first (no-op for Sorted;
             // memoised so it shares derivationStrict's own materialise of
             // the same attrset).
-            const Bindings * jb = v.payload.bindings;
+            const Bindings * jb = v.asAttrs();
             if (jb->isChain()) jb = jb->materialize();
             for (uint32_t i = 0; i < jb->size; ++i) {
                 auto & en = jb->entries[i];
@@ -8391,7 +8330,7 @@ nlohmann::json valueToJsonWithContext(
 void primSort(EvalState & state, Value * args, Value & out)
 {
     if (!args[1].isList()) typeError("sort", "list");
-    auto * src = args[1].payload.list;
+    auto * src = args[1].asList();
     Value cmp = args[0];
     if (!src || src->size <= 1) { out = args[1]; return; }
     ListVec * result = Alloc::allocList(src->size);
@@ -8408,27 +8347,26 @@ void primSort(EvalState & state, Value * args, Value & out)
                                  || r.tag() == Tag::Slot, 0))
                 r = forceValue(*state.vm, r);
             if (!r.isBool()) typeError("sort", "comparator returning bool");
-            return r.payload.i == 1;
+            return r.asInt() == 1;
         });
-    out.tag_payload = static_cast<uint64_t>(Tag::List);
-    out.payload.list = result;
+    out.mkList(result);
 }
 
 /// builtins.bitAnd / bitOr / bitXor on int.
 void primBitAnd(EvalState &, Value * args, Value & out)
 {
     if (!args[0].isInt() || !args[1].isInt()) typeError("bitAnd", "two ints");
-    out.mkInt(args[0].payload.i & args[1].payload.i);
+    out.mkInt(args[0].asInt() & args[1].asInt());
 }
 void primBitOr(EvalState &, Value * args, Value & out)
 {
     if (!args[0].isInt() || !args[1].isInt()) typeError("bitOr", "two ints");
-    out.mkInt(args[0].payload.i | args[1].payload.i);
+    out.mkInt(args[0].asInt() | args[1].asInt());
 }
 void primBitXor(EvalState &, Value * args, Value & out)
 {
     if (!args[0].isInt() || !args[1].isInt()) typeError("bitXor", "two ints");
-    out.mkInt(args[0].payload.i ^ args[1].payload.i);
+    out.mkInt(args[0].asInt() ^ args[1].asInt());
 }
 
 /// floor / ceil for floats.
@@ -8436,13 +8374,13 @@ void primFloor(EvalState &, Value * args, Value & out)
 {
     if (args[0].isInt())   { out = args[0]; return; }
     if (!args[0].isFloat()) typeError("floor", "float or int");
-    out.mkInt(static_cast<int64_t>(std::floor(args[0].payload.f)));
+    out.mkInt(static_cast<int64_t>(std::floor(args[0].asFloat())));
 }
 void primCeil(EvalState &, Value * args, Value & out)
 {
     if (args[0].isInt())   { out = args[0]; return; }
     if (!args[0].isFloat()) typeError("ceil", "float or int");
-    out.mkInt(static_cast<int64_t>(std::ceil(args[0].payload.f)));
+    out.mkInt(static_cast<int64_t>(std::ceil(args[0].asFloat())));
 }
 
 /// stringLength has a 1-arg version; stringToInt would be nice but
@@ -8451,7 +8389,7 @@ void primParseInt(EvalState &, Value * args, Value & out)
 {
     if (!args[0].isString()) typeError("parseInt", "string");
     try {
-        int64_t v = std::stoll(args[0].payload.str);
+        int64_t v = std::stoll(args[0].asString());
         out.mkInt(v);
     } catch (...) {
         throw std::runtime_error("v3 parseInt: invalid integer");
@@ -8492,8 +8430,7 @@ void primTryEval(EvalState & state, Value * args, Value & out)
         bindingsSetEntry(b, 0, {sValue, 0, valueV});  // Phase D
         bindingsSetEntry(b, 1, {sSuccess, 0, successV});
     }
-    out.tag_payload = static_cast<uint64_t>(Tag::Attrs);
-    out.payload.bindings = b;
+    out.mkAttrs(b);
 }
 
 /// Forward-declared so primLessThan can recurse through list elements.
@@ -8507,20 +8444,20 @@ void primLessThan(EvalState & state, Value * args, Value & out)
 
 static bool valueLessHelper(VMState & vm, const Value & a, const Value & b)
 {
-    if      (a.isInt() && b.isInt())     return a.payload.i < b.payload.i;
-    else if (a.isFloat() && b.isFloat()) return a.payload.f < b.payload.f;
-    else if (a.isInt() && b.isFloat())   return static_cast<double>(a.payload.i) < b.payload.f;
-    else if (a.isFloat() && b.isInt())   return a.payload.f < static_cast<double>(b.payload.i);
+    if      (a.isInt() && b.isInt())     return a.asInt() < b.asInt();
+    else if (a.isFloat() && b.isFloat()) return a.asFloat() < b.asFloat();
+    else if (a.isInt() && b.isFloat())   return static_cast<double>(a.asInt()) < b.asFloat();
+    else if (a.isFloat() && b.isInt())   return a.asFloat() < static_cast<double>(b.asInt());
     else if (a.isString() && b.isString())
-        return std::string_view(a.payload.str) < std::string_view(b.payload.str);
+        return std::string_view(a.asString()) < std::string_view(b.asString());
     else if (a.isList() && b.isList()) {
         // Lexicographic compare; force lazy elements as we go.
-        uint32_t na = a.payload.list ? a.payload.list->size : 0;
-        uint32_t nb = b.payload.list ? b.payload.list->size : 0;
+        uint32_t na = a.asList() ? a.asList()->size : 0;
+        uint32_t nb = b.asList() ? b.asList()->size : 0;
         uint32_t n = std::min(na, nb);
         for (uint32_t i = 0; i < n; ++i) {
-            Value ai = forceValue(vm, a.payload.list->elems[i]);
-            Value bi = forceValue(vm, b.payload.list->elems[i]);
+            Value ai = forceValue(vm, a.asList()->elems[i]);
+            Value bi = forceValue(vm, b.asList()->elems[i]);
             if (valueLessHelper(vm, ai, bi)) return true;
             if (valueLessHelper(vm, bi, ai)) return false;
         }
@@ -8802,7 +8739,7 @@ void primPlaceholder(EvalState & state, Value * args, Value & out)
 {
     (void)state;
     if (!args[0].isString()) typeError("placeholder", "string");
-    auto ph = nix::hashPlaceholder(std::string_view(args[0].payload.str));
+    auto ph = nix::hashPlaceholder(std::string_view(args[0].asString()));
     out = mkStringValueOwned(std::move(ph));
 }
 
@@ -8813,7 +8750,7 @@ void primPlaceholder(EvalState & state, Value * args, Value & out)
 void primWarn(EvalState &, Value * args, Value & out)
 {
     if (!args[0].isString()) typeError("warn", "string");
-    std::fprintf(stderr, "warning: %s\n", args[0].payload.str);
+    std::fprintf(stderr, "warning: %s\n", args[0].asString());
     out = args[1];
 }
 
@@ -8841,8 +8778,8 @@ void primStorePath(EvalState & state, Value * args, Value & out)
     } else {
         typeError("storePath", "path or string");
     }
-    std::string pathStr = v.isPath() ? std::string(v.payload.path)
-                                      : std::string(v.payload.str);
+    std::string pathStr = v.isPath() ? std::string(v.asPath())
+                                      : std::string(v.asString());
     nix::CanonPath path(pathStr);
     if (!ns->store->isStorePath(path.abs()))
         path = nix::CanonPath(nix::canonPath(path.abs(), true).string());
@@ -8857,7 +8794,7 @@ void primStorePath(EvalState & state, Value * args, Value & out)
     out = mkStringValueOwned(path.abs());
     std::vector<std::string> ctx{
         nix::NixStringContextElem{nix::NixStringContextElem::Opaque{.path = path2}}.to_string()};
-    setStringContextEntries(out.payload.str, std::move(ctx));
+    setStringContextEntries(out.asString(), std::move(ctx));
 }
 
 /// builtins.__toFile name s → write s to store, return path.
@@ -8883,11 +8820,11 @@ void primToFile(EvalState & state, Value * args, Value & out)
     // drvPath than TW would, breaking any downstream derivation that
     // depended on the toFile output.
     requireNoStringContext(state, args[0], "toFile name");
-    std::string name(args[0].payload.str);
-    std::string contents(args[1].payload.str);
+    std::string name(args[0].asString());
+    std::string contents(args[1].asString());
     nix::StorePathSet refs;
-    if (args[1].payload.str) {
-        nix::NixStringContext ctx = lookupStringContext(args[1].payload.str);
+    if (args[1].asString()) {
+        nix::NixStringContext ctx = lookupStringContext(args[1].asString());
         for (auto & c : ctx) {
             if (auto p = std::get_if<nix::NixStringContextElem::Opaque>(&c.raw)) {
                 refs.insert(p->path);
@@ -8906,7 +8843,7 @@ void primToFile(EvalState & state, Value * args, Value & out)
     ffi::FetchUrlResult r = ffi::addTextToStore(*ns, name, contents, std::move(refs), ffi::readOnlyMode());
     out = mkStringValueOwned(r.printedStorePath);
     std::vector<std::string> ctx{ r.opaqueContextElem };
-    setStringContextEntries(out.payload.str, std::move(ctx));
+    setStringContextEntries(out.asString(), std::move(ctx));
 }
 
 /// builtins.__outputOf drvRef outputName → input placeholder for that
@@ -8931,18 +8868,18 @@ void primOutputOf(EvalState & state, Value * args, Value & out)
     Value drvRefV = forceValue(*state.vm, args[0]);
     Value outNameV = forceValue(*state.vm, args[1]);
     if (!outNameV.isString()) typeError("outputOf", "string output name");
-    std::string drvRef = drvRefV.isString() && drvRefV.payload.str
-        ? std::string(drvRefV.payload.str) : std::string();
+    std::string drvRef = drvRefV.isString() && drvRefV.asString()
+        ? std::string(drvRefV.asString()) : std::string();
     std::vector<std::string> drvRefCtx;
-    if (drvRefV.isString() && drvRefV.payload.str) {
-        if (auto * raw = lookupStringContextEntries(drvRefV.payload.str))
+    if (drvRefV.isString() && drvRefV.asString()) {
+        if (auto * raw = lookupStringContextEntries(drvRefV.asString()))
             drvRefCtx = *raw;
     }
     ffi::StringWithContext r = ffi::outputOf(
-        *state.nixEvalState, drvRef, drvRefCtx, std::string(outNameV.payload.str));
+        *state.nixEvalState, drvRef, drvRefCtx, std::string(outNameV.asString()));
     out = mkStringValueOwned(r.value);
     if (!r.contextElems.empty())
-        setStringContextEntries(out.payload.str, std::move(r.contextElems));
+        setStringContextEntries(out.asString(), std::move(r.contextElems));
 }
 
 // ---------------------------------------------------------------------------
@@ -8986,10 +8923,10 @@ static ffi::FetchTreeInput extractFetchTreeInput(
         return false;
     };
 
-    if (a.isAttrs() && a.payload.bindings) {
+    if (a.isAttrs() && a.asAttrs()) {
         // Materialise Chain overlays so we iterate the FULL attrset (matches
         // TW's flat `for (auto & attr : *args[0]->attrs())`; see primAttrNames).
-        const Bindings * b = a.payload.bindings;
+        const Bindings * b = a.asAttrs();
         if (b->isChain()) b = b->materialize();
         static const SymbolId sidType = ir::globalInternSymbol("type");
 
@@ -8997,13 +8934,13 @@ static ffi::FetchTreeInput extractFetchTreeInput(
             if (type)
                 throw std::runtime_error("unexpected argument 'type'");
             Value t = forceValue(*state.vm, *tv);
-            if (t.tag() != Tag::String || !t.payload.str)
+            if (t.tag() != Tag::String || !t.asString())
                 throw std::runtime_error(std::string(
                     "while evaluating the `type` argument passed to '") + fetcher + "': expected a string");
-            if (auto * raw = lookupStringContextEntries(t.payload.str); raw && !raw->empty())
+            if (auto * raw = lookupStringContextEntries(t.asString()); raw && !raw->empty())
                 throw std::runtime_error(std::string(
                     "the string argument passed as `type` to '") + fetcher + "' is not allowed to refer to a store path");
-            type = std::string(t.payload.str);
+            type = std::string(t.asString());
         } else if (!type)
             throw std::runtime_error(std::string("argument 'type' is missing in call to '") + fetcher + "'");
 
@@ -9017,14 +8954,14 @@ static ffi::FetchTreeInput extractFetchTreeInput(
             Tag t = v.tag();
             if (t == Tag::String || t == Tag::Path) {
                 std::string s = (t == Tag::String)
-                    ? std::string(v.payload.str ? v.payload.str : "")
-                    : std::string(v.payload.path ? v.payload.path : "");
+                    ? std::string(v.asString() ? v.asString() : "")
+                    : std::string(v.asPath() ? v.asPath() : "");
                 if (isFetchGit && name == "url") s = ffi::fixGitURL(s);
                 in.attrs.push_back({name, std::move(s)});
             } else if (t == Tag::Bool) {
-                in.attrs.push_back({name, v.payload.i == 1});
+                in.attrs.push_back({name, v.asInt() == 1});
             } else if (t == Tag::Int) {
-                int64_t iv = v.payload.i;
+                int64_t iv = v.asInt();
                 if (iv < 0)
                     throw std::runtime_error(
                         "negative value given for '" + std::string(fetcher) + "' argument '" + name
@@ -9053,8 +8990,8 @@ static ffi::FetchTreeInput extractFetchTreeInput(
             throw std::runtime_error(std::string(
                 "while evaluating the first argument passed to '") + fetcher + "': expected a string or attrset");
         std::string url = (a.tag() == Tag::String)
-            ? std::string(a.payload.str ? a.payload.str : "")
-            : std::string(a.payload.path ? a.payload.path : "");
+            ? std::string(a.asString() ? a.asString() : "")
+            : std::string(a.asPath() ? a.asPath() : "");
         if (isFetchGit) {
             in.attrs.push_back({"type", std::string("git")});
             in.attrs.push_back({"url", ffi::fixGitURL(url)});
@@ -9090,12 +9027,12 @@ static void v3FetchTree(EvalState & s, Value * a, Value & o,
 static std::string v3ForceStringNoCtx(EvalState & state, const Value & vIn, const char * what)
 {
     Value v = forceValue(*state.vm, vIn);
-    if (v.tag() != Tag::String || !v.payload.str)
+    if (v.tag() != Tag::String || !v.asString())
         throw std::runtime_error(std::string(what) + ": expected a string");
-    if (auto * raw = lookupStringContextEntries(v.payload.str); raw && !raw->empty())
+    if (auto * raw = lookupStringContextEntries(v.asString()); raw && !raw->empty())
         throw std::runtime_error(
             std::string(what) + ": the string is not allowed to refer to a store path");
-    return std::string(v.payload.str);
+    return std::string(v.asString());
 }
 
 // TW-VALUE ERADICATION F2: native fetchurl/fetchTarball (the `fetch()`
@@ -9113,8 +9050,8 @@ static void v3Fetch(EvalState & s, Value * a, Value & o,
     std::optional<std::string> url, sha256;
     std::string name = defaultName;
 
-    if (arg.isAttrs() && arg.payload.bindings) {
-        const Bindings * b = arg.payload.bindings;
+    if (arg.isAttrs() && arg.asAttrs()) {
+        const Bindings * b = arg.asAttrs();
         if (b->isChain()) b = b->materialize();
         auto & symTab = ir::globalSymbolTable();
         for (uint32_t i = 0; i < b->size; ++i) {
@@ -9138,7 +9075,7 @@ static void v3Fetch(EvalState & s, Value * a, Value & o,
     ffi::FetchUrlResult r = ffi::fetchUrl(ns, *url, sha256, name, unpack, who);
     o = mkStringValueOwned(r.printedStorePath);
     std::vector<std::string> ctx{ r.opaqueContextElem };
-    setStringContextEntries(o.payload.str, std::move(ctx));
+    setStringContextEntries(o.asString(), std::move(ctx));
 }
 
 void primFetchurl    (EvalState & s, Value * a, Value & o) { v3Fetch(s, a, o, "fetchurl",     false, ""); }
@@ -9176,16 +9113,16 @@ void primFetchMercurial(EvalState & s, Value * a, Value & o) {
 
     Value arg = forceValue(*s.vm, a[0]);
     auto readUrl = [&](const Value & v, const char * what) -> std::string {
-        if (v.tag() == Tag::String) return std::string(v.payload.str ? v.payload.str : "");
-        if (v.tag() == Tag::Path)   return std::string(v.payload.path ? v.payload.path : "");
+        if (v.tag() == Tag::String) return std::string(v.asString() ? v.asString() : "");
+        if (v.tag() == Tag::Path)   return std::string(v.asPath() ? v.asPath() : "");
         throw std::runtime_error(std::string(what) + ": expected a string or path");
     };
     std::string url;
     std::optional<std::string> revOrRef;
     std::string name = "source";
 
-    if (arg.isAttrs() && arg.payload.bindings) {
-        const Bindings * b = arg.payload.bindings;
+    if (arg.isAttrs() && arg.asAttrs()) {
+        const Bindings * b = arg.asAttrs();
         if (b->isChain()) b = b->materialize();
         auto & symTab = ir::globalSymbolTable();
         for (uint32_t i = 0; i < b->size; ++i) {
@@ -9215,7 +9152,7 @@ void primFetchMercurial(EvalState & s, Value * a, Value & o) {
     {
         Value v = mkStringValueOwned(r.outPath);
         std::vector<std::string> c{ r.opaqueContextElem };
-        setStringContextEntries(v.payload.str, std::move(c));
+        setStringContextEntries(v.asString(), std::move(c));
         entries.emplace_back(ir::globalInternSymbol("outPath"), v);
     }
     if (r.branch)
@@ -9232,8 +9169,7 @@ void primFetchMercurial(EvalState & s, Value * a, Value & o) {
     V3_STATS_INC(attrsetsAllocated);
     for (size_t i = 0; i < entries.size(); ++i)
         bindingsSetEntry(bb, static_cast<uint32_t>(i), {entries[i].first, 0, entries[i].second});
-    o.tag_payload = static_cast<uint64_t>(Tag::Attrs);
-    o.payload.bindings = bb;
+    o.mkAttrs(bb);
 }
 // F2 (eradication): native fetchClosure — extract the 4 args V3-NATIVE,
 // ffi::fetchClosure (openStore + copyClosure/makeContentAddressed dispatch),
@@ -9244,17 +9180,17 @@ void primFetchClosure(EvalState & s, Value * a, Value & o) {
     auto & ns = *s.nixEvalState;
 
     Value arg = forceValue(*s.vm, a[0]);
-    if (!arg.isAttrs() || !arg.payload.bindings)
+    if (!arg.isAttrs() || !arg.asAttrs())
         throw std::runtime_error(
             "while evaluating the argument passed to builtins.fetchClosure: expected an attribute set");
-    const Bindings * b = arg.payload.bindings;
+    const Bindings * b = arg.asAttrs();
     if (b->isChain()) b = b->materialize();
     auto & symTab = ir::globalSymbolTable();
 
     auto strOf = [&](const Value & vIn) -> std::string {
         Value fv = forceValue(*s.vm, vIn);
-        if (fv.tag() == Tag::String) return std::string(fv.payload.str ? fv.payload.str : "");
-        if (fv.tag() == Tag::Path)   return std::string(fv.payload.path ? fv.payload.path : "");
+        if (fv.tag() == Tag::String) return std::string(fv.asString() ? fv.asString() : "");
+        if (fv.tag() == Tag::Path)   return std::string(fv.asPath() ? fv.asPath() : "");
         throw std::runtime_error("fetchClosure: expected a string or path attribute");
     };
 
@@ -9274,7 +9210,7 @@ void primFetchClosure(EvalState & s, Value * a, Value & o) {
             Value fv = forceValue(*s.vm, b->entries[i].value);
             if (fv.tag() != Tag::Bool)
                 throw std::runtime_error("fetchClosure: 'inputAddressed' must be a Boolean");
-            inputAddressed = (fv.payload.i == 1);
+            inputAddressed = (fv.asInt() == 1);
         } else
             throw std::runtime_error("attribute '" + n + "' isn't supported in call to 'fetchClosure'");
     }
@@ -9287,7 +9223,7 @@ void primFetchClosure(EvalState & s, Value * a, Value & o) {
                                               inputAddressed.value_or(false));
     o = mkStringValueOwned(r.printedStorePath);
     std::vector<std::string> ctx{ r.opaqueContextElem };
-    setStringContextEntries(o.payload.str, std::move(ctx));
+    setStringContextEntries(o.asString(), std::move(ctx));
 }
 // F3 (eradication): native filterSource — copy the path to the store with a
 // PathFilter that RE-ENTERS v3's VM (callClosure) per directory entry.  No
@@ -9302,9 +9238,9 @@ void primFilterSource(EvalState & s, Value * a, Value & o) {
     Value pathV = forceValue(*s.vm, a[1]);
     std::string pathStr;
     if (pathV.tag() == Tag::Path)
-        pathStr = pathV.payload.path ? pathV.payload.path : "";
+        pathStr = pathV.asPath() ? pathV.asPath() : "";
     else if (pathV.tag() == Tag::String)
-        pathStr = pathV.payload.str ? pathV.payload.str : "";
+        pathStr = pathV.asString() ? pathV.asString() : "";
     else
         throw std::runtime_error(
             "while evaluating the second argument (the path to filter) passed to "
@@ -9321,7 +9257,7 @@ void primFilterSource(EvalState & s, Value * a, Value & o) {
             throw std::runtime_error(
                 "while evaluating the return value of the path filter function: "
                 "expected a Boolean");
-        return r2.payload.i == 1;
+        return r2.asInt() == 1;
     };
 
     // filterSource: name defaults to baseName, recursive (NixArchive), no sha256.
@@ -9330,7 +9266,7 @@ void primFilterSource(EvalState & s, Value * a, Value & o) {
                              /*sha256=*/std::nullopt, v3filter);
     o = mkStringValueOwned(r.printedStorePath);
     std::vector<std::string> ctx{ r.opaqueContextElem };
-    setStringContextEntries(o.payload.str, std::move(ctx));
+    setStringContextEntries(o.asString(), std::move(ctx));
 }
 // Path B M3: getFlake is registered into TW via evalSettings.extraPrimOps
 // (libflake/settings.cc:14).  bridgeBuiltin resolves it by name from
@@ -9377,7 +9313,7 @@ void primGetFlake(EvalState & s, Value * a, Value & o) {
     auto & ns = *s.nixEvalState;
 
     if (!a[0].isString()) typeError("getFlake", "string");
-    std::string flakeRefS = a[0].payload.str;
+    std::string flakeRefS = a[0].asString();
 
     // (1) FFI leaf: parseFlakeRef + the unlocked-in-pure-eval guard +
     //     lockFlake + read the locked flake into plain data — all behind
