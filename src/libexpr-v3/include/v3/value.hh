@@ -18,6 +18,17 @@
 #include <cstddef>
 #include <cassert>
 
+// Lever B L4 (2026-06-10): the tagged 8-byte Value (NaN-box) is now the DEFAULT
+// layout — lode/LEVER_B_IMPL_PLAN_2026-06-10.md. Gates met: −18–24% peak RSS
+// (synthetic attrset-of-attrsets + the real firefox.drvPath), wall ≤5% on darwin-4
+// (+1–4%), byte-identical (v3 lang 142/143; firefox.drvPath 16B↔8B identical), and
+// #455 fixed so v3-direct completes real nixpkgs. Opt OUT to the legacy 16-byte
+// layout during the soak window with -DV3_VALUE_16B_LEGACY; the 16B `#else` path and
+// this valve retire once 8B has baked on the cutover-parity corpus + M5/HNE.
+#if !defined(V3_VALUE_8B) && !defined(V3_VALUE_16B_LEGACY)
+#  define V3_VALUE_8B 1
+#endif
+
 namespace nix::v3 {
 
 struct Closure;
