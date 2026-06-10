@@ -24,11 +24,11 @@
 
 namespace {
 
-// --- mirror of v3 nix::v3::Tag (value.hh) ---
+// --- mirror of v3 nix::v3::Tag (value.hh) — 18 tags, 0..17 incl. App3=17 ---
 enum class Tag : uint8_t {
     Uninitialized=0, Int=1, Float=2, Bool=3, Null=4, String=5, Path=6,
     Attrs=7, List=8, Closure=9, Thunk=10, PrimOp=11, PrimOpApp=12, App=13,
-    Blackhole=14, External=15, Slot=16,
+    Blackhole=14, External=15, Slot=16, App3=17,
 };
 
 // 5-bit tag CODES.  A boxed value must stay a NaN (exp=0x7FF, mantissa!=0), never
@@ -36,10 +36,14 @@ enum class Tag : uint8_t {
 // bits.  Mantissa tag bits = the LOW NIBBLE (bits[48..51]); the 5th tag bit is the
 // sign, which is NOT a mantissa bit.  ⇒ any code whose low nibble is 0 (codes 0 and
 // 16) is forbidden (a zero-payload boxed value there would be ±inf).  Map Tag t ->
-// 1.. skipping 16; FLOATNAN is the reserved float-NaN code.
+// 1.. skipping 16: tags 0..14 → codes 1..15, then 15/16/17 → 17/18/19.  FLOATNAN is
+// the reserved float-NaN code; it MUST avoid every tag code — with App3=17 the tag
+// codes run up to 19, so FLOATNAN=20 (low-nibble 4, nonzero, ≤31).  (The earlier
+// FLOATNAN=19 was correct ONLY for the 17-tag enum without App3 — codeOf(App3)=19
+// collides; this is the corrected value for the real 18-tag enum.)
 constexpr uint8_t  codeOf(Tag t)    { uint8_t c = (uint8_t)t + 1; return c >= 16 ? c + 1 : c; }
 constexpr Tag      tagFromCode(uint8_t c) { return (Tag)(c > 16 ? c - 2 : c - 1); }
-constexpr uint8_t  FLOATNAN = 19;
+constexpr uint8_t  FLOATNAN = 20;
 
 constexpr uint64_t EXP   = 0x7FFULL << 52;            // exponent all ones
 constexpr uint64_t MANT  = (1ULL << 52) - 1;          // mantissa bits [0..51]
@@ -99,7 +103,8 @@ int failures = 0;
 void testTags() {
     // pointer tags: distinct tag, pointer round-trips (use 16-aligned + 8-aligned + odd)
     const Tag ptrTags[] = { Tag::String, Tag::Path, Tag::Attrs, Tag::List, Tag::Closure,
-                            Tag::Thunk, Tag::PrimOp, Tag::PrimOpApp, Tag::App, Tag::External, Tag::Slot };
+                            Tag::Thunk, Tag::PrimOp, Tag::PrimOpApp, Tag::App, Tag::App3,
+                            Tag::External, Tag::Slot };
     // a few representative 48-bit pointers incl. non-16-aligned (PrimOp) and odd (char*)
     const uintptr_t ptrs[] = { 0x10, 0x1000, 0x7ffeed00, 0xabcdef012340ULL, 0x123ULL /*8-unaligned*/, 0x1ULL };
     for (Tag t : ptrTags) {
@@ -153,9 +158,17 @@ void testFloats() {
 
 void testNoCollision() {
     // Every tag code we ACTUALLY use must, with a zero payload, still be a NaN
-    // (exp=0x7FF, mantissa!=0) — never ±inf.  Iterate the real codes (all 17
-    // Tags + FLOATNAN), worst case payload==0.
-    for (int ti = 0; ti <= 16; ++ti) {
+    // (exp=0x7FF, mantissa!=0) — never ±inf.  Iterate the real codes (all 18
+    // Tags 0..17 incl. App3 + FLOATNAN), worst case payload==0.  This also
+    // proves no tag code collides with FLOATNAN.
+    int seen[64] = {0};
+    for (int ti = 0; ti <= 17; ++ti) {
+        uint8_t c = codeOf((Tag)ti);
+        CHECK(c != FLOATNAN, "tag code must not collide with FLOATNAN");
+        CHECK(!seen[c], "tag codes must be distinct");
+        seen[c] = 1;
+    }
+    for (int ti = 0; ti <= 17; ++ti) {
         uint8_t c = codeOf((Tag)ti);
         CHECK((c & 0xF) != 0, "tag code low-nibble nonzero (zero-payload stays NaN)");
         CHECK(isBoxed(box(c, 0)), "boxed-zero-payload stays NaN (not inf)");
