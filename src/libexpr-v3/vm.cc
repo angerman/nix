@@ -601,10 +601,21 @@ inline bool valueEqual(VMState & vm, Value a0, Value b0, bool insideContainer0 =
     // (#A12); derivation outPath short-circuit (eval-okay-eq-
     // derivations); pointer-identity short-circuit on same list/
     // attrset; closure pointer-equality inside containers.
-    struct Task { Value a, b; bool insideContainer; };
+    // C-16 (CODEBASE_REVIEW_2026-06-11): aSlot/bSlot are the source
+    // list/attrs slots for container ELEMENTS (null for the top-level pair and
+    // for looked-up values).  We push element pairs WITHOUT forcing them and
+    // force at POP time, writing the WHNF back through the slot.  This keeps
+    // A12's memoization (resolved Tag::App entries persist in the source — the
+    // 583 cache tests rely on this) AND short-circuits: on an early mismatch we
+    // return immediately, so later elements that are still on the stack are
+    // never popped/forced (`[1 (throw)] == [2 3]` is `false` in TW, not a
+    // throw).  GC-safety: the major GC is non-moving (evacuation default-off),
+    // and the source containers stay reachable via a0/b0 for the whole loop, so
+    // these raw slot pointers remain valid across the forceValue calls below.
+    struct Task { Value a, b; bool insideContainer; Value * aSlot; Value * bSlot; };
     std::vector<Task> stack;
     stack.reserve(16);
-    stack.push_back({a0, b0, insideContainer0});
+    stack.push_back({a0, b0, insideContainer0, nullptr, nullptr});
 
     static const SymbolId tyId = ir::globalInternSymbol("type");
     static const SymbolId opId = ir::globalInternSymbol("outPath");
@@ -623,13 +634,17 @@ inline bool valueEqual(VMState & vm, Value a0, Value b0, bool insideContainer0 =
             Tag at = a.tag();
             if (__builtin_expect(at == Tag::Thunk
                                  || at == Tag::App || at == Tag::App3
-                                 || at == Tag::Slot, 0))
+                                 || at == Tag::Slot, 0)) {
                 a = forceValue(vm, a);
+                if (t.aSlot) *t.aSlot = a;  // C-16: A12 memoization writeback
+            }
             Tag bt = b.tag();
             if (__builtin_expect(bt == Tag::Thunk
                                  || bt == Tag::App || bt == Tag::App3
-                                 || bt == Tag::Slot, 0))
+                                 || bt == Tag::Slot, 0)) {
                 b = forceValue(vm, b);
+                if (t.bSlot) *t.bSlot = b;  // C-16: A12 memoization writeback
+            }
         }
         if (a.tag() != b.tag()) {
             if (a.isInt() && b.isFloat()) {
@@ -679,19 +694,14 @@ inline bool valueEqual(VMState & vm, Value a0, Value b0, bool insideContainer0 =
             // A12b: push pairs in REVERSE so index [0] sits on top
             // of the stack and is processed first (left-to-right
             // semantics + short-circuit on first mismatch).
+            // C-16: push element pairs UNFORCED with their source slots; the
+            // pop-time force (above) resolves + writes back, and an earlier
+            // mismatch short-circuits before later elements are ever popped.
             for (uint32_t i = na; i > 0; --i) {
                 uint32_t idx = i - 1;
-                Value & ae = la->elems[idx];
-                Value & be = lb->elems[idx];
-                if (ae.isAppLike()
-                    || ae.tag() == Tag::Thunk
-                    || ae.tag() == Tag::Slot)
-                    ae = forceValue(vm, ae);
-                if (be.isAppLike()
-                    || be.tag() == Tag::Thunk
-                    || be.tag() == Tag::Slot)
-                    be = forceValue(vm, be);
-                stack.push_back({ae, be, /*insideContainer=*/true});
+                stack.push_back({la->elems[idx], lb->elems[idx],
+                                 /*insideContainer=*/true,
+                                 &la->elems[idx], &lb->elems[idx]});
             }
             break;
         }
@@ -724,7 +734,8 @@ inline bool valueEqual(VMState & vm, Value a0, Value b0, bool insideContainer0 =
                 const Value * pa = aa->lookup(opId);
                 const Value * pb = bb->lookup(opId);
                 if (pa && pb) {
-                    stack.push_back({*pa, *pb, /*insideContainer=*/true});
+                    stack.push_back({*pa, *pb, /*insideContainer=*/true,
+                                     nullptr, nullptr});
                     break;
                 }
             }
@@ -740,35 +751,35 @@ inline bool valueEqual(VMState & vm, Value a0, Value b0, bool insideContainer0 =
             // tasks in REVERSE for left-to-right processing.
             for (uint32_t i = 0; i < na; ++i)
                 if (aa->entries[i].name != bb->entries[i].name) return false;
+            // C-16: push entry-value pairs UNFORCED with their source slots
+            // (pop-time force + writeback + short-circuit; see the List case).
             for (uint32_t i = na; i > 0; --i) {
                 uint32_t idx = i - 1;
-                Value & av = aa->entries[idx].value;
-                Value & bv = bb->entries[idx].value;
-                if (av.isAppLike()
-                    || av.tag() == Tag::Thunk
-                    || av.tag() == Tag::Slot)
-                    av = forceValue(vm, av);
-                if (bv.isAppLike()
-                    || bv.tag() == Tag::Thunk
-                    || bv.tag() == Tag::Slot)
-                    bv = forceValue(vm, bv);
-                stack.push_back({av, bv, /*insideContainer=*/true});
+                stack.push_back({aa->entries[idx].value, bb->entries[idx].value,
+                                 /*insideContainer=*/true,
+                                 &aa->entries[idx].value, &bb->entries[idx].value});
             }
             break;
         }
         case Tag::Closure:
         case Tag::PrimOp:
         case Tag::PrimOpApp:
+        // C-16 (CODEBASE_REVIEW_2026-06-11): a Tag::App/App3 reaching here has
+        // already been through the pop-time force above, so it is an
+        // under-applied closure-PAP (forceValue returns a PAP unchanged) — a
+        // FUNCTION value.  Compare it like a Closure (never equal by direct ==;
+        // pointer-identity inside a container) instead of falling to the
+        // default raw-pointer arm, which compared PAPs even outside a container.
+        case Tag::App:
+        case Tag::App3:
             // Direct comparison: never equal.  Inside a container: equal iff
             // the underlying pointer matches (matches Nix's value-identity
             // optimization for sibling list/attrset entries).
             if (!insideContainer) return false;
-            if (a.asClosure() != b.asClosure()) return false;
+            if (a.asRaw() != b.asRaw()) return false;
             break;
         case Tag::Uninitialized:
         case Tag::Thunk:
-        case Tag::App:
-        case Tag::App3:
         case Tag::Blackhole:
         case Tag::External:
         case Tag::Slot:
