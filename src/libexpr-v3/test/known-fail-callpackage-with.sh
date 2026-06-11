@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 # Known-fail regression marker for the v3-direct callPackage with-scope bug.
 #
+# PROMOTED 2026-06-12: the blocker is FIXED (full-nixpkgs hello.name under
+# v3-direct is byte-identical to TW, v3 engaged) — unblocked by C-8/C-10's
+# App3 PAP-callee saturation (0fc563570, CODEBASE_REVIEW_2026-06-11). The
+# positive regression guard now lives in run-callpackage-with-parity.sh. This
+# tripwire is retained for history; it now exits 1 ("FIXED — promote me!") by
+# design.
+#
 # As of 2026-05-09, full nixpkgs eval under NIX_V3_DIRECT_EVAL=1 fails
 # with:
 #
