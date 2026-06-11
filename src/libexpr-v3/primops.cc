@@ -6179,6 +6179,49 @@ inline std::pair<int64_t, int64_t> importStat(const std::string & path)
     return {mtimeNs, (int64_t)st.st_size};
 }
 
+/// T-1 (CODEBASE_REVIEW_2026-06-11): deterministic fingerprint of the env gates
+/// that change EMITTED BYTECODE.  The CU disk-cache key keys only on
+/// (path, content, schema); a bisect run with e.g. NIX_V3_NO_DEFER=1 would
+/// otherwise write CUs under the SAME key as a default run, so a later warm run
+/// reads a wrong-codegen CU (and vice versa) — silently measuring the wrong
+/// arm, which can retroactively explain "irreproducible" bisect results.  Mixing
+/// this fingerprint into the key namespaces the cache per gate-config.  In
+/// production (no gates set) the fingerprint is EMPTY, so existing warm caches
+/// are unchanged.  Keep this list in sync with the getenv() reads in emit.cc /
+/// opt_*.cc / cli/lower_v3.hh / ir.cc (test/lint-cache-coherence.sh enforces).
+static const std::string & codegenGateFingerprint()
+{
+    static const std::string fp = []() {
+        // Sorted canonical list of codegen-affecting gates (see header).
+        static const char * const kGates[] = {
+            "NIX_V3_DBG_OPT_STRICT", "NIX_V3_DBG_STRICTNESS",
+            "NIX_V3_DBG_STRICT_CALL_UNTHUNK", "NIX_V3_NO_APP_SPINE_FOLD",
+            "NIX_V3_NO_BETA_REDUCE", "NIX_V3_NO_CALL_N", "NIX_V3_NO_CONST_REMAT",
+            "NIX_V3_NO_CROSS_FN_STRICTNESS", "NIX_V3_NO_DAG_DEMOTE",
+            "NIX_V3_NO_DEFER", "NIX_V3_NO_DETHUNK_STRICT",
+            "NIX_V3_NO_EAGER_FORCED_LET", "NIX_V3_NO_EVAL_APPLY",
+            "NIX_V3_NO_FORMALS_DEMOTE", "NIX_V3_NO_FUNC_STRICTNESS",
+            "NIX_V3_NO_FUSE_RECBIND", "NIX_V3_NO_FUSE_SETGET",
+            "NIX_V3_NO_GENLIST_UNROLL", "NIX_V3_NO_GET_LOCAL2",
+            "NIX_V3_NO_IF_FOLD", "NIX_V3_NO_LETREC_DEMOTE", "NIX_V3_NO_OPT",
+            "NIX_V3_NO_OPT_STRICT", "NIX_V3_NO_PRIMOP_FOLD", "NIX_V3_NO_RBSR_SLOT",
+            "NIX_V3_NO_R_BRANCH", "NIX_V3_NO_R_CALL", "NIX_V3_NO_R_IF",
+            "NIX_V3_NO_R_RETURN", "NIX_V3_NO_R_STRCONCAT2", "NIX_V3_NO_REC_UNTHUNK",
+            "NIX_V3_NO_REG_PRIMOP2", "NIX_V3_NO_SELECTOR_LAMBDA",
+            "NIX_V3_NO_SEQ_FORCE", "NIX_V3_NO_STRICT_CALL_UNTHUNK",
+            "NIX_V3_OCCUR_DCE", "NIX_V3_OPT_PHASE_LIMIT", "NIX_V3_SKIP_FORCE_LINES",
+            "NIX_V3_STAGE4_ALL_MODULES", "NIX_V3_STREAM_FUSION",
+        };
+        std::string s;
+        for (const char * g : kGates) {
+            const char * v = std::getenv(g);
+            if (v) { s += g; s += '='; s += v; s += ';'; }
+        }
+        return s;
+    }();
+    return fp;
+}
+
 /// builtins.import path -- read the file at `path`, parse, lower, run.
 /// Returns the resulting v3 Value.  Requires state.nixEvalState to be
 /// set (the host EvalState providing parser + symbol table).
@@ -6597,6 +6640,12 @@ void primImport(EvalState & state, Value * args, Value & out)
                             sizeof(pathLen));
             keyBytes.append(pathStr);
             keyBytes.append(content);
+            // T-1 (CODEBASE_REVIEW_2026-06-11): mix in the codegen env-gate
+            // fingerprint so a CU compiled under e.g. NIX_V3_NO_DEFER=1 lands in
+            // a SEPARATE cache namespace from a default-codegen CU (empty
+            // fingerprint in production → key unchanged).  Without this a bisect
+            // gate poisons every later warm run and vice versa.
+            keyBytes.append(codegenGateFingerprint());
             // PARSER_PROJECT_PLAN §5.3: native lowering is now the ONLY
             // path, so the CU disk cache is consistent again (all CUs are
             // native-lowered) and re-enabled.  The key is SOURCE content +

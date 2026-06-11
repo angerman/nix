@@ -1870,13 +1870,20 @@ void runMajorMarkSweep(VMState & vm) noexcept
 
     const auto tMarkEnd = clock::now();
     {
-        auto ms = [](clock::time_point a, clock::time_point b) {
-            return std::chrono::duration<double, std::milli>(b - a).count();
-        };
-        std::fprintf(stderr,
-            "v3 mark-split: preciseWalk=%.0fms drainConservative=%.0fms "
-            "cStackConservative=%.0fms\n",
-            ms(tm0, tm1), ms(tm1, tm2), ms(tm2, tMarkEnd));
+        // T-4 (CODEBASE_REVIEW_2026-06-11): gate this per-GC timing line behind
+        // NIX_VM_STATS.  It used to fire unconditionally on every major GC,
+        // polluting stderr-capturing byte-identity harnesses (the measurement
+        // gate compares stderr) and any tool that diffs v3 vs TW output.
+        static const bool s_markStats = std::getenv("NIX_VM_STATS") != nullptr;
+        if (__builtin_expect(s_markStats, 0)) {
+            auto ms = [](clock::time_point a, clock::time_point b) {
+                return std::chrono::duration<double, std::milli>(b - a).count();
+            };
+            std::fprintf(stderr,
+                "v3 mark-split: preciseWalk=%.0fms drainConservative=%.0fms "
+                "cStackConservative=%.0fms\n",
+                ms(tm0, tm1), ms(tm1, tm2), ms(tm2, tMarkEnd));
+        }
     }
 
     // -- Phase 2 step 2: sweep (measurement-only; no free yet) ------

@@ -210,7 +210,18 @@ static void serializeString(const Value & v, std::string & out)
     uint32_t ctxCount = ctx ? static_cast<uint32_t>(ctx->size()) : 0;
     writeU32(out, ctxCount);
     if (ctx) {
-        for (const auto & e : *ctx) {
+        // T-6 (CODEBASE_REVIEW_2026-06-11): the string-context side-table
+        // stores entries in INSERTION order, not sorted (the "std::set backing
+        // NixStringContext" claim on canonicalHash is inaccurate — it is a
+        // std::vector).  Serialising in insertion order makes a Value's
+        // canonical hash depend on the order context was accumulated, so two
+        // structurally-identical values hash differently → spurious
+        // cross-process eval-result cache MISSES.  Sort here so the serialised
+        // form (and thus canonicalHash) is order-independent — matching
+        // valuesEqual, which already compares sorted copies.
+        std::vector<std::string> sortedCtx(*ctx);
+        std::sort(sortedCtx.begin(), sortedCtx.end());
+        for (const auto & e : sortedCtx) {
             if (e.size() > 0x7FFFFFFFu)
                 throw SerializeError("context entry too large to serialise");
             writeU32(out, static_cast<uint32_t>(e.size()));

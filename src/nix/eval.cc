@@ -316,6 +316,25 @@ struct CmdEval : MixJSON, InstallableValueCommand, MixReadOnlyOption
                 return;
             }
             nix::evalTrace::mark("eval.cc:CmdEval::run v3-direct returned false, falling back");
+            // T-2 (CODEBASE_REVIEW_2026-06-11): with NIX_V3_DIRECT_EVAL=1 set,
+            // the v3-direct path silently ran the tree-walker for shapes it
+            // doesn't handle (flake installables like `nixpkgs#hello`,
+            // --write-to, --arg/--argstr). That made measurement A/Bs compare
+            // TW-vs-TW while believing v3 was engaged. Surface the fallback;
+            // NIX_V3_REQUIRE=1 turns it into a hard error — baking the
+            // measurement gate's ENGAGED check into the binary.
+            static const bool s_v3Require =
+                std::getenv("NIX_V3_REQUIRE") != nullptr;
+            if (s_v3Require)
+                throw Error(
+                    "NIX_V3_REQUIRE=1: the v3-direct evaluator does not handle "
+                    "this `nix eval` invocation (a flake installable, --write-to, "
+                    "or --arg/--argstr) and would silently fall back to the "
+                    "tree-walker. Use `nix eval --expr`/`--file` (plain, with no "
+                    "--arg) or the standalone v3-eval binary to engage v3.");
+            warn("NIX_V3_DIRECT_EVAL=1: this `nix eval` invocation is not handled "
+                 "by v3-direct (flake installable / --write-to / --arg); falling "
+                 "back to the tree-walker. Set NIX_V3_REQUIRE=1 to fail instead.");
         }
 
         nix::evalTrace::mark("eval.cc:CmdEval::run TW installable->toValue");
