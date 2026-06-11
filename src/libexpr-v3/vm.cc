@@ -211,6 +211,28 @@ constexpr size_t kMaxCallDepth        = 5000;
         && cur->asClosure()->desc->arity > depth;
 }
 
+// C-1 falsifier (CODEBASE_REVIEW_2026-06-11): counts how many times the
+// CFF_FORCE_WB_PTR_KEEP branch in applyForceWriteback disarms on an
+// under-applied closure-PAP top — the case that previously left the KEEP
+// permanently armed (a PAP is permanently App-tagged) and produced the firefox
+// getLib="21" cross-write.  Reported at process exit under V3_DBG_KEEP_PAP=1.
+// Single-threaded eval, so a plain counter is sufficient.  Retirement
+// criterion: delete once the firefox getLib residual is closed and
+// byte-identical to TW — this counter exists only to confirm the mechanism is
+// live on that workload.
+static uint64_t g_keepPapDisarmCount = 0;
+namespace {
+struct KeepPapStatsAtExit {
+    ~KeepPapStatsAtExit() {
+        static const bool s_on = std::getenv("V3_DBG_KEEP_PAP") != nullptr;
+        if (s_on)
+            std::fprintf(stderr, "v3 C-1 KEEP-PAP disarms: %llu\n",
+                         (unsigned long long)g_keepPapDisarmCount);
+    }
+};
+KeepPapStatsAtExit _keepPapStatsAtExit;
+}  // namespace
+
 // V3_DBG_TRACE_THUNK_X — file-scope thunk-creation registry.  Bumped
 // at every OP_MAKE_THUNK; consulted by the OP_WITH_LOOKUP cycle dump
 // so we can compare each frame's *current* `t->suspended.desc`
@@ -2370,6 +2392,22 @@ inline void clearForceWriteback(CallFrame & f) noexcept
 // point; post-fix they surface a typed error (or succeed, if the
 // upstream stack-state corruption isn't really a corruption — see
 // project_670_ghc98_sigtrap_2026-05-19.md for the diagnostic chain).
+// C-1 belt (CODEBASE_REVIEW_2026-06-11): a CFF_FORCE_WB_PTR_KEEP must never
+// already be pending when an arm site sets a fresh one — the arm immediately
+// `goto op_force_slow`, which services (and now always disarms, PAPs included)
+// the KEEP before returning to dispatch.  A stale KEEP here would be the
+// protocol regression C-1 fixes.  Under V3_DBG_KEEP_PAP=1 it surfaces loudly;
+// in production it is a single predicted branch (cached gate).
+[[gnu::always_inline]] inline void armKeepBeltCheck(const CallFrame & f)
+{
+    static const bool s_on = std::getenv("V3_DBG_KEEP_PAP") != nullptr;
+    if (__builtin_expect(s_on && (f.flags & CFF_FORCE_WB_PTR_KEEP), 0))
+        std::fprintf(stderr,
+            "v3 C-1 belt: arming CFF_FORCE_WB_PTR_KEEP while one is already "
+            "pending (forceWriteTarget=%p) — stale-KEEP protocol regression\n",
+            (void *)f.forceWriteTarget);
+}
+
 inline bool applyForceWriteback(VMState & vm)
 {
     if (__builtin_expect(vm.frames.empty(), 0))
@@ -2393,15 +2431,40 @@ inline bool applyForceWriteback(VMState & vm)
         needTop("CFF_FORCE_WB_PTR_KEEP");
         Value top = vm.valueStack.back();
         Tag t = top.tag();
-        if (t == Tag::Thunk || t == Tag::App || t == Tag::App3
-            || t == Tag::Slot)
+        // C-1 (CODEBASE_REVIEW_2026-06-11): an under-applied closure-PAP
+        // (App/App3 spine bottoming in a Closure with arity>depth) IS WHNF —
+        // a partial application.  The old test treated ANY App/App3 top as
+        // "not yet WHNF" and `return false`, leaving the KEEP armed with a raw
+        // pointer into a (often shared) Bindings entry.  Because a PAP is
+        // permanently App-tagged, no later retry could ever disarm it, so the
+        // NEXT force in this frame that resolved through op_force_slow fired
+        // the stale KEEP and cross-wrote ITS WHNF (e.g. the String "21" from
+        // forcing llvmVersion) into the old entry — the firefox getLib="21"
+        // residual.  Treat the PAP as WHNF: write it (the PAP is the entry's
+        // true value) and disarm below.
+        bool nonWhnf = (t == Tag::Thunk || t == Tag::App || t == Tag::App3
+                        || t == Tag::Slot)
+                       && !isUnderappliedClosurePap(top);
+        if (nonWhnf)
             return false;
+        // C-1 falsifier counter: how often the KEEP branch fires on a PAP top
+        // (the previously-leaked case).  Nonzero on firefox.drvPath confirms
+        // the mechanism is live.  Retirement criterion: delete this counter
+        // once the firefox getLib residual is closed and byte-identical to TW.
+        if (__builtin_expect(isUnderappliedClosurePap(top), 0))
+            ++g_keepPapDisarmCount;
+        // C-4 (CODEBASE_REVIEW_2026-06-11): never memoize the transient
+        // Blackhole sentinel into shared storage — it means "value not yet
+        // known" (a self-cycle in progress), not a real value.  Disarm without
+        // writing so a later read re-forces rather than seeing a permanent
+        // Blackhole.
         // Phase D coverage: forceWriteTarget can point into a
         // Bindings entry (OP_ATTRS_SELECT_DYN / IC path) or into a
         // stack slot.  We don't track the container here, so route
         // through `cellWrite` with cellContainer=nullptr — the
         // standalone-cell registry catches inter-gen writes.
-        if (f.forceWriteTarget) cellWrite(f.forceWriteTarget, top, nullptr);
+        if (t != Tag::Blackhole && f.forceWriteTarget)
+            cellWrite(f.forceWriteTarget, top, nullptr);
         f.forceWriteTarget = nullptr;
         f.flags &= ~CFF_FORCE_WB_PTR_KEEP;
         return true;
@@ -8670,6 +8733,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     && !isUnderappliedClosurePap(slot)) {
                     push(vm, slot);
                     CallFrame & f = vm.frames.back();
+                    armKeepBeltCheck(f);  // C-1 belt
                     f.forceWriteTarget = &slot;
                     f.flags |= CFF_FORCE_WB_PTR_KEEP | CFF_FORCE_RETRY;
                     f.ip = ip;  // resume past the IC handler on success
@@ -8849,6 +8913,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     && !isUnderappliedClosurePap(slot)) {
                     push(vm, slot);
                     CallFrame & f = vm.frames.back();
+                    armKeepBeltCheck(f);  // C-1 belt
                     f.forceWriteTarget = &slot;
                     f.flags |= CFF_FORCE_WB_PTR_KEEP | CFF_FORCE_RETRY;
                     f.ip = ip;
@@ -9133,6 +9198,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 && !isUnderappliedClosurePap(*found)) {
                 push(vm, *found);
                 CallFrame & f = vm.frames.back();
+                armKeepBeltCheck(f);  // C-1 belt
                 f.forceWriteTarget = found;
                 f.flags |= CFF_FORCE_WB_PTR_KEEP | CFF_FORCE_RETRY;
                 f.ip = ip;
