@@ -55,7 +55,82 @@ PAP work.
    rebuild" bisect is invalid: the HEAD sources are 8B-only and a 16B-value.hh
    build produces `result is not a string (tag=2)` (broken, not a baseline).
 
-## Leading hypothesis (UNCONFIRMED)
+## UPDATE 2026-06-11 (later) — Lever B RULED OUT; measurement corrections
+
+- **NOT Lever B.** Built the pre-Lever-B commit `7beaf0746` (= c690b3f19^, 16B
+  Value default) in an isolated `git worktree` (meson+ninja, clean build) and ran
+  `nix eval hello.drvPath`: it produces the **identical wrong path** (`rpj9…`) as
+  8B HEAD, both ≠ TW (`r77j…`), and the 16B binary fully engages v3
+  (insns=6.2M, bridge=0). So the divergence predates Lever B — it is an **older,
+  core v3 eval bug**, present in both 16B and 8B. (Confirms the cheap
+  value.hh-swap was invalid, and justifies the worktree.)
+- **`nix-instantiate` is NOT a v3 baseline** — it emits no v3 stats ⇒ runs TW.
+  An earlier "nix-instantiate byte-identical ⇒ core eval correct" conclusion was a
+  measurement-gate trap (TW=TW) and is RETRACTED.
+- **`nix eval` DOES fully engage v3** for `(import nixpkgs {}).hello.drvPath`:
+  `closures=28679 thunks=497053 … bridge=0 insns=6212201` (the earlier `insns=2`
+  was a premature cumulative dump — head-N counter trap). So `import` is NOT
+  bridged to TW; v3 evaluates nixpkgs natively and computes the wrong drvPath.
+- **Ruled out by env-gate:** disk cache, content cache, optimiser, chain-bindings,
+  eval-result/drv-hash caches — `hello.drvPath` stays `rpj9…` with each disabled.
+- **Self-contained derivation shapes are all byte-identical** (multi-output,
+  dep-ref via list/concat, two-refs-one-env, output-ref `a.dev`, drvPath-ctx) —
+  so basic derivationStrict + string-context propagation are correct. The bug
+  needs the deeper nixpkgs stdenv eval (first divergent stage = **xclang**).
+
+⇒ Revised: a **core v3 eval divergence** (likely a string-context / value subtlety
+that only the xclang-stage stdenv eval triggers), exposed on current nixpkgs.
+Not version-gated to 26.11 (26.05 also diverges). The historical "byte-identical"
+baselines were on older `flake:nixpkgs` snapshots no longer pinned here.
+
+## UPDATE 2026-06-11 (PRECISE ROOT — `nix eval` path, PAP→Bool in derivationStrict)
+
+The divergence is **not** a generic stdenv eval bug — it is a **fake-store
+fallback** in v3's native `derivationStrict`, triggered by a specific
+**partial-application (PAP) being corrupted to its result type (Bool)**.
+
+**Chain (hello.drvPath, via `nix eval`):**
+1. hello's closure transitively includes **python3** (a build tool via meson etc.);
+   `V3_DRV_DEBUG=1` shows hello has **7 native-derivationStrict fallbacks, all on
+   `python3-3.13.13`**.
+2. `nix eval python3.drvPath` → `/v3-fake-store/…` because native derivationStrict
+   throws and falls back to the fake-store stub. `V3_DRV_DEBUG` reason:
+   **`v3 OP_CALL: callee is not a closure`**.
+3. `V3_DBG_CALL=1` pinpoints the callee: **tag=3 (Bool)**, at the bytecode
+   `OP_GET_UPVALUE_REC_BINDING passthru ; OP_ATTRS_SELECT pythonAtLeast ; OP_CALL`
+   — i.e. nixpkgs `cpython/default.nix:251`
+   `optionals ((!isDarwin || passthru.pythonAtLeast "3.14") && …) [...]`.
+4. `passthru.pythonAtLeast` is defined (`passthrufun.nix:135`) as
+   `lib.versionAtLeast pythonVersion` — an **under-applied PAP** (arity-2
+   `versionAtLeast` given 1 arg). In python3's mkDerivation/finalAttrs eval context
+   v3 has it as a **Bool**, so `OP_CALL` tries to call a Bool → throws.
+
+So: a PAP is **prematurely saturated to its Bool result** somewhere in python3's
+real eval, derivationStrict's `OP_CALL` chokes on the Bool, native bails to the
+fake-store stub (drvPath `/v3-fake-store/…`), and every package depending on
+python3 (≈ all, via the stdenv build-tool closure) gets a wrong/dropped input →
+systemic drvPath divergence. This is **also** the cardano `OP_CALL not closure`.
+
+**Direct access is CORRECT** — `python3.pythonAtLeast` is a `lambda` (callable) in
+both v3 and TW; only the **in-context** access during derivationStrict forcing is a
+Bool. So it's a context-specific PAP corruption (finalAttrs / rec-binding / App-memo
+interaction), NOT a global PAP bug.
+
+**Minimal repro NOT yet isolated** — all of these are byte-identical v3/TW (do NOT
+reproduce): structuredAttrs (scalar/list/nested/outputs), `__functor` calls,
+`deepSeq`/`seq` of a PAP, `fix`/`rec` passthru-PAP-capturing-sibling called via
+self, PAP capturing a **formal parameter** (+ big formals + ellipsis + `optionals`),
+and a real `stdenv.mkDerivation` finalAttrs+structuredAttrs+PAP-passthru-conditional
+(that one only diverges by transitively depending on python3). The trigger needs
+python3's *full* construction (makeScope + passthruFun + overrideAttrs + finalAttrs).
+
+**Next surgical step:** trace the *value* of `passthru.pythonAtLeast` at the failing
+`OP_CALL` (is it a memoized App whose `evaluated` slot holds a Bool? a rec-binding
+slot resolving to the wrong value?) — e.g. instrument the OP_CALL-on-non-closure
+path to dump the callee's provenance, or bisect python3's actual passthru/native-
+BuildInputs expression with real lib/stdenv.
+
+## (earlier) Leading hypothesis (UNCONFIRMED)
 
 A **string-context divergence**: at some bootstrap derivation, v3 computes a
 derivation env string with the same TEXT but a different string-CONTEXT (the set
