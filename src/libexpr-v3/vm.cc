@@ -7412,6 +7412,20 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 // A8: apply writeback if the opcode that initiated this
                 // force set a writeback slot.  No-op when off==FORCE_WB_NONE.
                 applyForceWriteback(vm);
+                // C-11 (CODEBASE_REVIEW_2026-06-11): the force resolved
+                // SYNCHRONOUSLY (the chase reached WHNF inline — no thunk frame
+                // was pushed, so OP_RETURN's retry-clear at vm.cc:7085 never
+                // runs for this force).  CFF_FORCE_RETRY is a one-shot per
+                // force; applyForceWriteback clears the WB bits but NOT RETRY,
+                // and for opcodes that armed RETRY WITHOUT a writeback slot
+                // (OP_HEAD/TAIL/LENGTH/AND_BRANCH/…) it returns false and leaves
+                // RETRY set.  A stale RETRY then spuriously forces this frame's
+                // NEXT legitimate lazy return (the open libsForQt5 deferral
+                // signature: v3 forces `inherit (pkgs) lib` while pkgs is BLACK,
+                // where TW never enters that thunk).  Clear it now — the opcode
+                // re-arms a fresh RETRY if it still needs to force another arg.
+                if (!vm.frames.empty())
+                    vm.frames.back().flags &= ~CFF_FORCE_RETRY;
                 break;
             }
             Thunk * t = v.asThunk();
