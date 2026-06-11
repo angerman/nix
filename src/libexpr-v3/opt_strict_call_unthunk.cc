@@ -530,14 +530,29 @@ const Lambda * resolveCalleeLambda(
             [](const auto & a, const auto & b) {
                 return a.first < b.first;
             });
+        // C-15 (CODEBASE_REVIEW_2026-06-11): require a UNIQUE match.  Picking
+        // the first same-block LetRec with an entry named rb->name is NOT
+        // merely "miss the strictness opportunity" when two different LetRecs
+        // share that entry name: the picked function's strictness mask may be
+        // STRICTER than the real callee's, so the call site de-thunks an arg
+        // the actual callee leaves lazy → over-forcing that throws where TW
+        // doesn't.  If the match is ambiguous, bail (return nullptr below).
+        const LetRec * uniqueMatch = nullptr;
+        bool ambiguous = false;
         for (const auto & [varId, exprPtr] : sortedDefs) {
             const auto * candidate = std::get_if<LetRec>(exprPtr);
             if (!candidate) continue;
             for (const auto & ent : candidate->entries) {
-                if (ent.name == rb->name) { lr = candidate; break; }
+                if (ent.name == rb->name) {
+                    if (uniqueMatch && uniqueMatch != candidate)
+                        ambiguous = true;
+                    else
+                        uniqueMatch = candidate;
+                    break;
+                }
             }
-            if (lr) break;
         }
+        if (!ambiguous) lr = uniqueMatch;
     }
     if (!lr) return nullptr;
     // Find entry whose name matches.

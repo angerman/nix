@@ -1977,9 +1977,15 @@ void primElem(EvalState & state, Value * args, Value & out)
 {
     if (!args[1].isList()) typeError("elem", "list");
     auto * src = args[1].asList();
-    Value x = args[0];
     bool found = false;
-    if (src) {
+    // C-13 (CODEBASE_REVIEW_2026-06-11): the needle (arg0) is registered LAZY,
+    // so it arrives unforced.  TW never forces the needle when the list
+    // short-circuits — `builtins.elem (throw "x") []` returns false in TW but
+    // threw in v3 when arg0 was eagerly pre-forced.  Force it here only when
+    // there is at least one element to compare against (matching TW's
+    // per-comparison force); an empty list returns false without touching it.
+    if (src && src->size > 0) {
+        Value x = forceValue(*state.vm, args[0]);
         for (uint32_t i = 0; i < src->size; ++i) {
             // A12 (2026-05-17) writeback-force: list elements built by
             // primMapAttrs / primGenList are Tag::App and need to be
@@ -9535,8 +9541,15 @@ void registerBuiltinPrimOps()
         // forcing inside the pred does not grow the C stack.
         registerPrimOp({"filter",             2, primFilter,
                         /*lazyArgs=*/0, /*deepForceList=*/0});
+        // C-14 (CODEBASE_REVIEW_2026-06-11): deepForceList=0 — TW's
+        // prim_foldlStrict (libexpr/primops.cc:4133) forces the function + the
+        // list SPINE but never the list ELEMENTS; the op forces an element only
+        // if it uses it.  Pre-forcing all elements made
+        // `foldl' (a: x: a) 0 [1 (throw "boom")]` throw where TW returns 0
+        // (same class as the shipped T4 filter fix).  forceValue is iterative,
+        // so per-element forcing inside the fold doesn't grow the C stack.
         registerPrimOp({"foldl'",             3, primFoldl,
-                        /*lazyArgs=*/0b010, /*deepForceList=*/0b100});
+                        /*lazyArgs=*/0b010, /*deepForceList=*/0});
         // 2026-05-18 IR Phase C fused-loop FFI leaf: __foldlMap.
         // Args: (op, init, f, xs).  Equivalent to
         // `foldl' (acc: x: op acc (f x)) init xs`.  Recognised by
@@ -9544,8 +9557,11 @@ void registerBuiltinPrimOps()
         // `foldl'(op, init, map(f, xs))` to a __foldlMap call.
         // lazyArgs mirrors foldl' (init is lazy).  Internal — leading
         // `__` keeps it out of user-visible `builtins`.
+        // C-14: deepForceList=0 (mirrors foldl' — __foldlMap is the fused
+        // `foldl' (acc: x: op acc (f x)) init xs`; it must not pre-force xs's
+        // elements either).
         registerPrimOp({"__foldlMap",         4, primFoldlMap,
-                        /*lazyArgs=*/0b0010, /*deepForceList=*/0b1000});
+                        /*lazyArgs=*/0b0010, /*deepForceList=*/0});
         registerPrimOp({"genList",            2, primGenList});
         registerPrimOp({"all",                2, primAll});
         registerPrimOp({"any",                2, primAny});
@@ -9559,7 +9575,7 @@ void registerBuiltinPrimOps()
         registerPrimOp({"removeAttrs",        2, primRemoveAttrs});
         registerPrimOp({"intersectAttrs",     2, primIntersectAttrs});
         registerPrimOp({"mapAttrs",           2, primMapAttrs});
-        registerPrimOp({"elem",               2, primElem});
+        registerPrimOp({"elem",               2, primElem, /*lazyArgs=*/0b01});  // C-13: needle lazy
         registerPrimOp({"getAttr",            2, primGetAttr});
         registerPrimOp({"hasAttr",            2, primHasAttr});
         registerPrimOp({"catAttrs",           2, primCatAttrs,
@@ -9599,8 +9615,12 @@ void registerBuiltinPrimOps()
         registerPrimOp({"readFile",           1, primReadFile});
         registerPrimOp({"readDir",            1, primReadDir});
         registerPrimOp({"parseDrvName",       1, primParseDrvName});
+        // C-14: deepForceList=0 — groupBy forces each element's KEY (f x, used
+        // as an attr name) but TW leaves the ELEMENT itself unforced in its
+        // group; pre-forcing elements threw on `groupBy (x: "k") [1 (throw)]`
+        // where TW returns { k = [ 1 <thrown> ]; }.
         registerPrimOp({"groupBy",            2, primGroupBy,
-                        /*lazyArgs=*/0, /*deepForceList=*/0b10});
+                        /*lazyArgs=*/0, /*deepForceList=*/0});
         registerPrimOp({"match",              2, primMatch});
         registerPrimOp({"split",              2, primSplit});
         registerPrimOp({"hashString",         2, primHashString});
@@ -9736,7 +9756,7 @@ void registerBuiltinPrimOps()
         registerPrimOp({"__listToAttrs",      1, primListToAttrs});
         registerPrimOp({"__intersectAttrs",   2, primIntersectAttrs});
         registerPrimOp({"__mapAttrs",         2, primMapAttrs});
-        registerPrimOp({"__elem",             2, primElem});
+        registerPrimOp({"__elem",             2, primElem, /*lazyArgs=*/0b01});  // C-13: needle lazy
         registerPrimOp({"__getAttr",          2, primGetAttr});
         registerPrimOp({"__hasAttr",          2, primHasAttr});
         registerPrimOp({"__catAttrs",         2, primCatAttrs});

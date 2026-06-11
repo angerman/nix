@@ -98,7 +98,15 @@ bool collectForced(const Expr & e,
             return false;
         }
         else if constexpr (std::is_same_v<T, With>) {
-            forced.insert(x.attrs);
+            // C-12 (CODEBASE_REVIEW_2026-06-11): `with x; body` does NOT eagerly
+            // force x at runtime (#686 — the with-attrs are forced lazily only
+            // when a WithLookup actually resolves a name from them).  Marking
+            // x.attrs forced here made the cross-fn fixpoint conclude that
+            // `f = x: with x; 1` forces its arg, so call sites de-thunked it and
+            // `f (throw "boom")` threw where TW returns 1.  Do NOT insert
+            // x.attrs (under-approximating strictness is always sound); the body
+            // is a branched sub-block analyzed separately, and WithLookup is the
+            // only construct that forces the scope.
             return false;
         }
         else if constexpr (std::is_same_v<T, And>
