@@ -8048,8 +8048,9 @@ static void primPathFilteredNative(EvalState & state, Value * args, Value & out)
     // std::function (not auto) so its address binds to addPathFull's param.
     std::function<bool(const std::string &, const std::string &)> v3filter =
         [&](const std::string & p, const std::string & type) -> bool {
-        Value r1 = callClosure(*state.vm, filterFn, mkStringValueOwned(p));
-        Value r2 = callClosure(*state.vm, r1, mkStringValueOwned(type));
+        // P-5: saturated 2-arg call (no per-entry throwaway curry-PAP).
+        Value r2 = callClosure2(*state.vm, filterFn,
+                                mkStringValueOwned(p), mkStringValueOwned(type));
         r2 = forceValue(*state.vm, r2);
         if (r2.tag() != Tag::Bool)
             throw std::runtime_error(
@@ -8550,8 +8551,13 @@ void primSort(EvalState & state, Value * args, Value & out)
     // the non-strict-weak-comparator robustness) is a follow-up.
     std::stable_sort(result->elems, result->elems + src->size,
         [&](const Value & a, const Value & b) {
-            Value step1 = callClosure(*state.vm, cmp, a);
-            Value r = callClosure(*state.vm, step1, b);
+            // P-5 (CODEBASE_REVIEW_2026-06-11): saturated 2-arg call — enters
+            // an arity-2 comparator body once with both args in slots, instead
+            // of the curried callClosure(callClosure(cmp,a),b) which allocated
+            // a throwaway curry-PAP ValuePair PER COMPARISON (O(n log n) of
+            // them). Falls back to the curried form byte-identically for any
+            // other comparator shape.
+            Value r = callClosure2(*state.vm, cmp, a, b);
             // Bytecode-closure comparator can return Tag::Thunk wrapping
             // a bool — force to WHNF before the shape check.
             if (__builtin_expect(r.tag() == Tag::Thunk
@@ -9466,8 +9472,9 @@ void primFilterSource(EvalState & s, Value * a, Value & o) {
     // Per-entry filter: callClosure(filterFn, absPath)(type) -> Bool.  Runs
     // inside fetchToStore (nested v3 eval on the same VMState — STG-10).
     auto v3filter = [&](const std::string & p, const std::string & type) -> bool {
-        Value r1 = callClosure(*s.vm, filterFn, mkStringValueOwned(p));
-        Value r2 = callClosure(*s.vm, r1, mkStringValueOwned(type));
+        // P-5: saturated 2-arg call (no per-entry throwaway curry-PAP).
+        Value r2 = callClosure2(*s.vm, filterFn,
+                                mkStringValueOwned(p), mkStringValueOwned(type));
         r2 = forceValue(*s.vm, r2);
         if (r2.tag() != Tag::Bool)
             throw std::runtime_error(
