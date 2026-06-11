@@ -13215,7 +13215,14 @@ Value forceValue(VMState & vm, Value v)
     // Important: only write back if v is a concrete WHNF value (not
     // another Slot/Thunk/App that we somehow exited the loop with —
     // shouldn't happen, but be safe).
-    if (memoSlot && v.tag() != Tag::Slot)
+    // C-4 (CODEBASE_REVIEW_2026-06-11): also never memoize the transient
+    // Tag::Blackhole sentinel — it means "value not yet known" (a self-cycle
+    // in progress), not a real value, and writing it permanently into the
+    // entered slot turns a "not yet computed" into a permanent Blackhole that
+    // later reads fail on where TW succeeds. The path-compression block below
+    // already excludes Blackhole; this matches it (the inconsistency the
+    // review flagged).
+    if (memoSlot && v.tag() != Tag::Slot && v.tag() != Tag::Blackhole)
         *memoSlot = v;
     // #558 Phase 4 follow-up: path compression writeback.  Only write
     // back when v is a stable WHNF — never vBlackhole (the cross-stack
