@@ -218,3 +218,67 @@ commits excluded). UNCONFIRMED because the bisect needs a full pre-Lever-B build
 - `test/run-759-nixpkgs-drvpath-sweep.sh --quick` (0/8).
 - bootstrap chain probe: `(import <nixpkgs> {}).stdenv(.__bootPackages.stdenv)*.drvPath`
   — stage1 IDENTICAL, xclang DIVERGES.
+
+---
+
+## firefox residual — DETERMINISTIC RCA (2026-06-11, deep instrumentation)
+
+**Status: root cause localized to a single deterministic mechanism; no fix shipped
+(fix domain identified but needs design, not a speculative one-liner).**
+
+### Symptom (HARD, value-based facts)
+- `(import <nixpkgs> {}).firefox.drvPath` under `NIX_V3_DIRECT_EVAL=1` → native
+  `derivationStrict` throws `v3 OP_CALL: callee is not a closure tag=5` (a **String**),
+  falls back to `/v3-fake-store/6444c591…-firefox-151.0.3.drv`. Deterministic
+  (identical fake-store hash across 3 runs).
+- The failing op is **`OP_TAIL_CALL` at codeOff=1434** — a thunk whose body is
+  `getLib cc` (`[1434] GET_UPVALUE_REC_BINDING_SLOT getLib; [1438] GET_UPVALUE_REC_BINDING cc;
+  [1443] OP_TAIL_CALL`). The popped callee `fun` = **String `'21'`** (V3_DBG_TC_STR).
+- `getLib` = `lib.getOutput "lib"` (RBS leaf closure `'output'`, arity 2, depth 1 →
+  a proper under-applied PAP — the SAME class as python3's `pythonAtLeast`).
+
+### Mechanism (verified by single-step canary + writeback poison probes)
+1. The `getLib cc` thunk reads `getLib` into local 0 as a `Tag::Slot` → its
+   rec-binding (App PAP / Thunk; **never a String at read** — `foundTag` ∈ {App,Thunk}
+   across all 18 reads).
+2. At `OP_TAIL_CALL`, `fun` = the Slot → `op_call_dispatch` → `op_call_iter_force`
+   forces the Slot and writes the result back to the fun stack slot, then **retries**
+   the op. The IPT trace shows `OP_TAIL_CALL@1443` runs **twice**: first with
+   `fun = Slot`, then (after the writeback) with `fun = String "21"`.
+3. So **forcing `getLib`'s Slot → the String "21"** (WB-STACK-POISON: idx of the fun
+   slot, oldTag=16 Slot → String "21"). I.e. **getLib's shared rec-binding evaluates
+   to / is memoized as the String "21"** instead of the `getOutput "lib"` PAP.
+4. Independently, an **STG-8 `OP_RETURN` in-place cell-writeback** (`*cell = retVal`)
+   writes the String "21" into a `getLib` binding cell (RET-CELL-POISON), with the
+   returning frame at codeOff=1434. The codeOff=1434 thunk is stored at an entry named
+   **`derivationArgs`** (slot 2 of a size-4 Bindings) — so a `getLib` binding cell and a
+   `derivationArgs`-context binding cell **alias the same `Value*`**. Writing the
+   `derivationArgs`/`getLib cc` result corrupts the shared `getLib` PAP.
+
+### Conclusion
+A **Bindings overlay/merge cell-sharing** bug (overrideAttrs / extendDerivation / `//`
+— the #455-family class): a merged Bindings reuses the base's `Value*` entry cells, and
+the STG-8 in-place cell-writeback (`OP_ATTRS_REC_SET` sets `thunk->cell =
+&entries[i].value`; `OP_RETURN` does `*cell = retVal`) then **overwrites the shared base
+`getLib` PAP binding with a String**, so every later `getLib cc` does `OP_CALL` on a
+String → native fallback → fake-store. **Fix domain: STG-8 cell privacy under Bindings
+overlay/merge** (an overlay entry must get a FRESH cell, never reuse a base entry's
+`Value*`, before STG-8 attaches it as a writeback target).
+
+### Ruled OUT (same-host bisects / probes)
+- ChainBindings (Lever A): `NIX_V3_NO_CHAIN_BINDINGS=1` → identical fake-store hash.
+- Major GC: `NIX_V3_NO_MAJOR_GC=1` (16G heap) → identical. Nursery default-off.
+- The 3 OP_ATTRS_SELECT(/DYN) writebacks (already PAP-guarded), `deepForceList`,
+  stale rec-slot IC, optimizer (`NO_OPTIMISE`), eval/apply force paths (both
+  `forceValue` and `op_force_slow` check `isUnderappliedClosurePap` BEFORE the App
+  `evaluated` memo, so a recognized PAP is never saturated/memo-poisoned by them).
+
+### Caveat
+Pointer-based probes (`dbgGetLibCells`) can false-positive via freed-cell address
+reuse over a long eval; the value-based facts (1)-(3) above are the load-bearing ones.
+
+### Repro / probes (all reverted — were debug-only, never shipped)
+`V3_DBG_TC_STR` (failing-callee + local0), `V3_DBG_CANARY` (single-step slot watch +
+`CANARY-ARM(1434)`), `V3_DBG_WBPOISON` (writeback/cell poison + `RET-CELL-POISON` +
+`REC-SET-1434`), `V3_DBG_IPTRACE_1434` (ip+stack-size trace), `V3_DBG_FSS`
+(Slot→String force classifier).
