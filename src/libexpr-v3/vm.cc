@@ -802,6 +802,11 @@ inline bool valueLess(VMState & vm, const Value & a, const Value & b)
     if (a.isFloat() && b.isInt())   return a.asFloat() < static_cast<double>(b.asInt());
     if (a.isString() && b.isString())
         return std::string_view(a.asString()) < std::string_view(b.asString());
+    // C-23 (CODEBASE_REVIEW_2026-06-11): TW's CompareValues compares two paths
+    // lexically by their absolute path string; v3 rejected paths and fell to
+    // the "cannot compare" error below.
+    if (a.isPath() && b.isPath())
+        return std::string_view(a.asPath()) < std::string_view(b.asPath());
     if (a.isList() && b.isList()) {
         // Lexicographic compare; matches tree-walker.  Phase-13
         // review HIGH-3 fix: force lazy elements before recursing.

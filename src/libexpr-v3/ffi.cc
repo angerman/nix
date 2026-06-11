@@ -230,6 +230,21 @@ bool pureEval(nix::EvalState & state)
     return state.settings.pureEval;
 }
 
+bool restrictEval(nix::EvalState & state)
+{
+    return state.settings.restrictEval;
+}
+
+std::string currentSystem(nix::EvalState & state)
+{
+    // C-20 (CODEBASE_REVIEW_2026-06-11): mirror TW's
+    // `settings.getCurrentSystem()` (eval-settings.cc:122) — the `--system` /
+    // `eval-system` override if set, else `settings.thisSystem` — so
+    // `builtins.currentSystem` honours a system override instead of a baked-in
+    // host triple (which diverges drvPaths for cross-system evaluation).
+    return state.settings.getCurrentSystem();
+}
+
 std::string nixVersion()
 {
     return nix::nixVersion;

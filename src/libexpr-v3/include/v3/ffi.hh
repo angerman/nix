@@ -162,6 +162,10 @@ void callFunction(nix::EvalState & state, nix::Value & fun, nix::Value & arg, ni
 /// pos)`).  Cold (FFI-leaf primop bridging to a TW function).
 void callFunction(nix::EvalState & state, nix::Value & fun, nix::Value & arg, nix::Value & out, nix::PosIdx pos);
 
+/// C-20: builtins.currentSystem honoring --system / settings.thisSystem
+/// (mirrors TW's settings.getCurrentSystem()).
+std::string currentSystem(nix::EvalState & state);
+
 /// Coerce a filesystem path into the store and return its printed store
 /// path: `printStorePath(copyPathToStore(SourcePath(rootFS, CanonPath(p))))`.
 /// Keeps NixStringContext / SourcePath / CanonPath inside ffi.cc.  Cold —
@@ -460,6 +464,10 @@ bool readOnlyMode();
 
 /// `state.settings.pureEval` — the pure-eval gate (getFlake locking).
 bool pureEval(nix::EvalState & state);
+
+/// `state.settings.restrictEval` — the restricted-eval gate (C-19: getEnv
+/// returns "" under pure OR restricted eval, matching TW's prim_getEnv).
+bool restrictEval(nix::EvalState & state);
 
 /// `nix::nixVersion` — the host Nix version string (builtins.nixVersion;
 /// nixpkgs compares it against a minimum).  Cold.

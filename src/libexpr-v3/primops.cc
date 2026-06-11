@@ -1514,6 +1514,16 @@ void primGetEnv(EvalState & state, Value * args, Value & out)
     // contexted strings can't be used as env-var names (would mask
     // accidental drv references in callers).
     requireNoStringContext(state, args[0], "getEnv");
+    // C-19 (CODEBASE_REVIEW_2026-06-11): under pure or restricted eval TW
+    // returns "" (prim_getEnv, libexpr/primops.cc:1372) — it must not leak the
+    // ambient environment into a pure evaluation, where env values flow into
+    // derivation `env` attrs and are store-path-affecting.  Mirror it.
+    if (state.nixEvalState
+        && (ffi::pureEval(*state.nixEvalState)
+            || ffi::restrictEval(*state.nixEvalState))) {
+        out = mkStringValueOwned("");
+        return;
+    }
     const char * e = std::getenv(args[0].asString());
     out = mkStringValueOwned(e ? e : "");
 }
@@ -2756,8 +2766,15 @@ void primZipAttrsWith(EvalState & state, Value * args, Value & out)
         for (uint32_t i = 0; i < lst->size; ++i) {
             Value attrs = forceValue(*state.vm, lst->elems[i]);
             if (!attrs.isAttrs() || !attrs.asAttrs()) continue;
-            for (uint32_t j = 0; j < attrs.asAttrs()->size; ++j) {
-                auto & en = attrs.asAttrs()->entries[j];
+            // C-17 (CODEBASE_REVIEW_2026-06-11): a ChainBindings' entries[] is
+            // the OVERLAY ONLY; iterating it raw silently drops the parent
+            // layers of any `//`-composed input → missing names in the zipped
+            // result.  Materialise to the full sorted view first (no-op for a
+            // plain Sorted Bindings; memoised).
+            const Bindings * ab = attrs.asAttrs();
+            if (ab->isChain()) ab = ab->materialize();
+            for (uint32_t j = 0; j < ab->size; ++j) {
+                auto & en = ab->entries[j];
                 byName[en.name].push_back(en.value);
             }
         }
@@ -3415,10 +3432,19 @@ void primConvertHash(EvalState & state, Value * args, Value & out)
     out = mkStringValueOwned(parsed.to_string(fmt, false));
 }
 
-/// builtins.currentSystem and similar: just return host triple.
-void primCurrentSystem(EvalState &, Value *, Value & out)
+/// builtins.currentSystem: honour --system / settings.thisSystem via the FFI
+/// leaf when a store/eval-state is wired (C-20); else fall back to host triple.
+void primCurrentSystem(EvalState & state, Value *, Value & out)
 {
-    // Use a sensible default; nix tests usually mock this.
+    // C-20 (CODEBASE_REVIEW_2026-06-11): a baked-in host triple ignores any
+    // `--system X` / `settings.thisSystem` override, diverging drvPaths from TW
+    // for cross-system evaluation (`nix eval --system mips64-linux ...`).
+    // Mirror TW's settings.getCurrentSystem() via the FFI leaf.
+    if (state.nixEvalState) {
+        out = mkStringValueOwned(ffi::currentSystem(*state.nixEvalState));
+        return;
+    }
+    // Standalone (no eval-state wired): use a sensible host default.
 #if defined(__APPLE__) && defined(__aarch64__)
     out = mkStringValueOwned("aarch64-darwin");
 #elif defined(__APPLE__) && defined(__x86_64__)
@@ -7422,7 +7448,14 @@ static void valueToXml(EvalState & state, std::string & out, Value v, int indent
         return;
     case Tag::Attrs: {
         out += "<attrs>\n";
-        if (v.asAttrs()) {
+        // C-18 (CODEBASE_REVIEW_2026-06-11): materialise a ChainBindings
+        // (entries[] is the overlay only) so the XML carries parent-layer attrs
+        // too — iterating the chain raw silently dropped them.  (TW's
+        // printValueAsXML additionally emits a <derivation> element for drv
+        // attrsets; that cosmetic special-case is a separate follow-up.)
+        const Bindings * ab = v.asAttrs();
+        if (ab && ab->isChain()) ab = ab->materialize();
+        if (ab) {
             // Sort by name for stable output.
             // #670/#671 follow-on: store names as OWNING std::string,
             // not string_view, because the recursive valueToXml call
@@ -7432,13 +7465,13 @@ static void valueToXml(EvalState & state, std::string & out, Value v, int indent
             // structuredAttrs branch (commit bcc8d6cf1).
             auto & symTab = ir::globalSymbolTable();
             std::vector<std::pair<std::string, Value>> entries;
-            entries.reserve(v.asAttrs()->size);
-            for (uint32_t i = 0; i < v.asAttrs()->size; ++i) {
-                SymbolId sid = v.asAttrs()->entries[i].name;
+            entries.reserve(ab->size);
+            for (uint32_t i = 0; i < ab->size; ++i) {
+                SymbolId sid = ab->entries[i].name;
                 std::string nm = sid < symTab.size()
                     ? std::string(symTab[sid]) : std::string();
                 entries.emplace_back(std::move(nm),
-                    v.asAttrs()->entries[i].value);
+                    ab->entries[i].value);
             }
             std::sort(entries.begin(), entries.end(),
                 [](auto & a, auto & b) { return a.first < b.first; });
@@ -8460,7 +8493,13 @@ void primSort(EvalState & state, Value * args, Value & out)
     ListVec * result = Alloc::allocList(src->size);
     V3_STATS_INC(listsAllocated);
     for (uint32_t i = 0; i < src->size; ++i) result->elems[i] = src->elems[i];
-    std::sort(result->elems, result->elems + src->size,
+    // C-21 (CODEBASE_REVIEW_2026-06-11): TW's builtins.sort is STABLE (peeksort)
+    // and tolerant of comparators that aren't a strict weak ordering, where
+    // std::sort (introsort) reorders equal keys and is UB on a bad comparator
+    // (equal keys can reach drv args → hash divergence).  std::stable_sort is
+    // the minimum to match TW's equal-key ordering; a full peeksort port (for
+    // the non-strict-weak-comparator robustness) is a follow-up.
+    std::stable_sort(result->elems, result->elems + src->size,
         [&](const Value & a, const Value & b) {
             Value step1 = callClosure(*state.vm, cmp, a);
             Value r = callClosure(*state.vm, step1, b);
@@ -8574,6 +8613,10 @@ static bool valueLessHelper(VMState & vm, const Value & a, const Value & b)
     else if (a.isFloat() && b.isInt())   return a.asFloat() < static_cast<double>(b.asInt());
     else if (a.isString() && b.isString())
         return std::string_view(a.asString()) < std::string_view(b.asString());
+    // C-23 (CODEBASE_REVIEW_2026-06-11): TW compares two paths lexically; v3
+    // rejected them ("expected comparable types").
+    else if (a.isPath() && b.isPath())
+        return std::string_view(a.asPath()) < std::string_view(b.asPath());
     else if (a.isList() && b.isList()) {
         // Lexicographic compare; force lazy elements as we go.
         uint32_t na = a.asList() ? a.asList()->size : 0;
