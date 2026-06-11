@@ -965,7 +965,13 @@ namespace detail {
 /// NIX_V3_MAJOR_GC_THRESHOLD_MB (256 MB default) boundary.  RETIREMENT:
 /// remove the opt-out once default-ON has soaked across a release.
 inline const bool g_majorGcEnabled =
-    std::getenv("NIX_V3_NO_MAJOR_GC") == nullptr;
+    std::getenv("NIX_V3_NO_MAJOR_GC") == nullptr
+    // M-3 (CODEBASE_REVIEW_2026-06-11): the major-GC marker ignores
+    // nursery-resident cells (tryMark → inActive() false → their out-edges are
+    // never walked), so an arena cell reachable ONLY through a nursery cell
+    // would be swept — a use-after-free.  Until the nursery is integrated with
+    // the major mark phase, hard-disable major GC whenever the nursery is on.
+    && std::getenv("NIX_V3_NURSERY") == nullptr;
 } // namespace detail
 
 /// R2.1′ (2026-06-03): per-cell TYPE metadata for Nofl-style evacuation.
@@ -1171,18 +1177,23 @@ public:
             return blk;
         }
         // Stage 6 Phase 3: free-list reuse.  Opt-in via
-        // V3_DBG_FREELIST_REUSE=1 because mark phase does NOT scan
-        // the C-stack — primop bodies' local Value/cell pointers are
-        // invisible to mark, so cells reused via the free list MAY
-        // dangle a C-local that still references the previous
-        // occupant.  HNE crashes with SIGBUS under reuse-on due to
-        // this gap; hello.drvPath does not (smaller workload, fewer
-        // primop-mid-flight states).
+        // V3_DBG_FREELIST_REUSE=1.
         //
-        // Reuse-correct path requires either:
-        //   * C-stack conservative scan (Boehm-style; ~1-2 d)
-        //   * Stricter trigger (only at outermost OP_RETURN; ~0.5 d)
-        // Deferred to a follow-up commit; opt-in gate preserves the
+        // M-4 (CODEBASE_REVIEW_2026-06-11) comment correction: the major-GC
+        // MARK phase now DOES conservatively scan the C-stack
+        // (mark_sweep.cc::walkCStackConservative runs at the safepoint), so the
+        // old "mark does not scan the C-stack" rationale is stale.  The free-
+        // list-reuse hazard is INDEPENDENT of that: reuse happens at ALLOC
+        // time (mid-primop), not at a GC safepoint, and the allocator does NOT
+        // consult the C-stack — so a cell reused via the free list MAY still be
+        // referenced by a primop body's C-local that holds the previous
+        // occupant.  HNE crashed with SIGBUS under reuse-on due to this gap;
+        // hello.drvPath did not (smaller workload, fewer primop-mid-flight
+        // states).
+        //
+        // Reuse-correct path requires a stricter trigger (only reuse cells that
+        // can't be C-stack-live — e.g. freed at the outermost OP_RETURN).
+        // Deferred to a follow-up commit; the opt-in gate preserves the
         // mechanism for measurement.
         // Step 6 of post-Phase-3.8 plan: free-list stats per-call
         // tracking.  Zero cost when NIX_V3_FREE_LIST_STATS unset

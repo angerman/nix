@@ -196,6 +196,25 @@ const Value & chaseToWHNF(const Value & v, int maxHops = 32)
 
 static void serializeOne(const Value & vIn, std::string & out);
 
+// M-6 (CODEBASE_REVIEW_2026-06-11): bound serialisation recursion.  serializeOne
+// → serializeList/serializeAttrs → serializeOne is unbounded; a deeply-nested or
+// cyclic Value (which can reach the IFD / drvHash eval-result caches) would
+// overflow the C stack — an uncatchable crash — instead of a catchable
+// SerializeError.  A depth cap is sufficient to convert the overflow into an
+// error (cyclic values hit the cap and throw).
+namespace { thread_local int s_serializeDepth = 0; }
+namespace { constexpr int kMaxSerializeDepth = 10000; }
+struct SerializeDepthGuard {
+    SerializeDepthGuard() {
+        if (++s_serializeDepth > kMaxSerializeDepth) {
+            --s_serializeDepth;
+            throw SerializeError(
+                "value too deeply nested (or cyclic) to serialise");
+        }
+    }
+    ~SerializeDepthGuard() { --s_serializeDepth; }
+};
+
 static void serializeString(const Value & v, std::string & out)
 {
     writeU8(out, kTagString);
@@ -290,6 +309,7 @@ static void serializeList(const Value & v, std::string & out)
 
 static void serializeOne(const Value & vIn, std::string & out)
 {
+    SerializeDepthGuard depthGuard;  // M-6: bound recursion (cycle/deep-nest)
     // Phase 3b: chase Thunk/App/Slot to WHNF.  No-op on already-WHNF
     // inputs (so Phase 1 round-trip + Phase 2 hash semantics are
     // unchanged on derivation-result Values).
