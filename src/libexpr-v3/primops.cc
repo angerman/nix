@@ -6444,8 +6444,14 @@ void primImport(EvalState & state, Value * args, Value & out)
     // regression on cardano-node M5 + haskell.nix smoke + standard
     // hello.drvPath/firefox.name workloads, then delete the opt-out
     // entirely.
+    // T-7 (CODEBASE_REVIEW_2026-06-11): the blanket NIX_V3_NO_DISK_CACHE must
+    // ALSO disable the IFD EvalResult disk cache — previously only the
+    // narrower NIX_V3_NO_IFD_IMPORT_CACHE_DISK did, so a "cold cache" A/B run
+    // with NIX_V3_NO_DISK_CACHE=1 still hit the IFD result cache and measured a
+    // partially-warm run.
     static const bool s_ifdImportDiskCache =
-        std::getenv("NIX_V3_NO_IFD_IMPORT_CACHE_DISK") == nullptr;
+        std::getenv("NIX_V3_NO_IFD_IMPORT_CACHE_DISK") == nullptr
+        && std::getenv("NIX_V3_NO_DISK_CACHE") == nullptr;
     // #741 Phase 4b RCA fix: only consult the disk cache for ACTUAL
     // IFD imports (string-with-ctx or attrset arg).  Non-IFD imports
     // are literal-path nixpkgs files — they're already handled
