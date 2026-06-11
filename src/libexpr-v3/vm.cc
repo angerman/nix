@@ -305,6 +305,22 @@ static const bool g_countOpcodes =
 static const bool g_countOpCycles =
     std::getenv("NIX_VM_OPCYCLES") != nullptr;
 
+// P-1 (CODEBASE_REVIEW_2026-06-11): major-GC threshold + growth tunables,
+// promoted to FILE scope.  They were `static const` declared INSIDE the
+// per-opcode major-GC safepoint, so every dispatched opcode (with major GC on,
+// the default) paid two magic-static guards.  File-scope → init once, no guard.
+static const size_t g_majorGcInitialThresholdBytes = [] {
+    const char * v = std::getenv("NIX_V3_MAJOR_GC_THRESHOLD_MB");
+    long mb = 256;
+    if (v) { long p = std::strtol(v, nullptr, 10); if (p >= 16 && p <= 32768) mb = p; }
+    return static_cast<size_t>(mb) << 20;
+}();
+static const double g_majorGcGrowth = [] {
+    const char * v = std::getenv("NIX_V3_MAJOR_GC_GROWTH");
+    if (v) { double d = std::strtod(v, nullptr); if (d >= 1.5 && d <= 8.0) return d; }
+    return 2.0;
+}();
+
 // #733 (2026-05-21) hot-path stat-counter gate.  The per-descriptor
 // allocCount/forceCount + global thunksForced/thunksAllocated/
 // bridgeThunksForced increments live on the hottest paths in the
@@ -3120,45 +3136,27 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
         // Previously a separate getenv here left the bookkeeping ON but
         // the TRIGGER OFF when only alloc.hh's default flipped.
         const bool s_majorGcEnabled = Arena::majorGcEnabled();
-        if (s_majorGcEnabled) {
-            static const size_t s_majorGcInitialThresholdBytes = [] {
-                const char * v =
-                    std::getenv("NIX_V3_MAJOR_GC_THRESHOLD_MB");
-                long mb = 256;
-                if (v) {
-                    long parsed = std::strtol(v, nullptr, 10);
-                    if (parsed >= 16 && parsed <= 32768) mb = parsed;
-                }
-                return static_cast<size_t>(mb) << 20;
-            }();
-            // Dynamic threshold: starts at initial; after each scavenge
-            // raises to `max(initial, post_scavenge_arena * growth)` so
-            // a scavenge whose live-set ALONE exceeds the initial
-            // threshold doesn't re-fire on the very next iteration.
-            //
-            // Failure mode this prevents (observed on HNE 2026-05-27):
-            // live set ~474 MB, initial threshold 256 MB → every
-            // dispatch tick after scavenge re-fires, copying the same
-            // 474 MB live set over and over.  CPU pegged, no eval
-            // progress.
-            //
-            // growth=2 is a conservative starting point — wait until
-            // arena DOUBLES post-scavenge before next collection.
-            // Tunable via NIX_V3_MAJOR_GC_GROWTH (float, 1.5-8.0).
+        // P-1 (CODEBASE_REVIEW_2026-06-11): test the CHEAP local `exitDepth==0`
+        // FIRST.  The major-GC safepoint only ever fires in the OUTERMOST
+        // dispatch loop, so nested dispatch loops (every callClosure2 per-
+        // element re-entry, every primop callback) previously paid the
+        // threadArena() TLS deref + s_majorGcThresholdBytes TLS + bytesAllocated()
+        // per dispatched opcode for a check that can NEVER fire there.  Gating
+        // on exitDepth==0 up front skips the whole block for nested loops; the
+        // threshold/growth tunables are now file-scope (no per-opcode magic-
+        // static guard).  Correctness-neutral: the firing condition is
+        // unchanged (exitDepth==0 && bytesAllocated >= threshold && !nested).
+        if (s_majorGcEnabled && exitDepth == 0) {
+            // Dynamic threshold (thread_local mutable state): starts at the
+            // file-scope initial; after each scavenge raises to
+            // `max(initial, post_scavenge_arena * growth)` so a scavenge whose
+            // live-set ALONE exceeds the initial threshold doesn't re-fire on
+            // the very next iteration (HNE 2026-05-27: 474 MB live, 256 MB
+            // threshold → re-fire every tick, CPU pegged, no progress).
             static thread_local size_t s_majorGcThresholdBytes =
-                s_majorGcInitialThresholdBytes;
-            static const double s_majorGcGrowth = [] {
-                const char * v =
-                    std::getenv("NIX_V3_MAJOR_GC_GROWTH");
-                if (v) {
-                    double d = std::strtod(v, nullptr);
-                    if (d >= 1.5 && d <= 8.0) return d;
-                }
-                return 2.0;
-            }();
+                g_majorGcInitialThresholdBytes;
             Arena & arena = threadArena();
-            if (arena.bytesAllocated() >= s_majorGcThresholdBytes
-                && exitDepth == 0)
+            if (arena.bytesAllocated() >= s_majorGcThresholdBytes)
             {
                 // Nested-VMState defer (same as nursery).
                 bool nestedDistinct = false;
@@ -3214,9 +3212,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     // grows by `growth-factor × live_set`.
                     size_t liveSet = arena.bytesAllocated();
                     size_t nextThreshold =
-                        static_cast<size_t>(liveSet * s_majorGcGrowth);
-                    if (nextThreshold < s_majorGcInitialThresholdBytes)
-                        nextThreshold = s_majorGcInitialThresholdBytes;
+                        static_cast<size_t>(liveSet * g_majorGcGrowth);
+                    if (nextThreshold < g_majorGcInitialThresholdBytes)
+                        nextThreshold = g_majorGcInitialThresholdBytes;
                     s_majorGcThresholdBytes = nextThreshold;
                 }
             }
