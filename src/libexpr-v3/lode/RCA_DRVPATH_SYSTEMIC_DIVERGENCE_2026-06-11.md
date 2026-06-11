@@ -282,3 +282,56 @@ reuse over a long eval; the value-based facts (1)-(3) above are the load-bearing
 `CANARY-ARM(1434)`), `V3_DBG_WBPOISON` (writeback/cell poison + `RET-CELL-POISON` +
 `REC-SET-1434`), `V3_DBG_IPTRACE_1434` (ip+stack-size trace), `V3_DBG_FSS`
 (Slot→String force classifier).
+
+---
+
+## firefox residual — CORRECTION (2026-06-11, later): STG-8 cell-alias mechanism FALSIFIED
+
+The "STG-8 cell-writeback / overlay cell-sharing" mechanism asserted in the section
+above is **FALSIFIED** by airtight, CU-agnostic, value-based probes. **Rule 0
+walk-back.** Do NOT trust the STG-8/derivationArgs-alias story.
+
+**Why the earlier story was wrong — two confounds:**
+1. **`codeOffset` is PER-CU, not global.** Probes gated on `closure->desc->codeOffset
+   == 1434` matched DIFFERENT functions across different compilation units, so
+   "RET-CELL-POISON frame codeOff=1434", "REC-SET-1434 entryName=derivationArgs",
+   "WB-STACK-POISON codeOff=1434" mixed unrelated instances.
+2. **Pointer-reuse false positives.** `dbgGetLibCells` accumulated `found` cell
+   pointers over a long eval; freed cells get reused, so a later unrelated write to a
+   reused address spuriously "matched" a getLib cell.
+
+**Airtight probes that came back NEGATIVE (value-/name-based, CU-agnostic):**
+- `cellWrite`: no cell holding a `getOutput <arg>` PAP (leaf Closure name "output",
+  arity 2, depth 1) is ever overwritten with a non-callable. → getLib's binding cell
+  is NOT clobbered via the STG-8 `OP_RETURN` writeback / `applyForceWriteback`.
+- `thunkSetEvaluated`: no thunk named "getLib" is ever memoized to a String.
+- `pairSetEvaluated`: no `getOutput`-App pair is ever memoized to a String (App memo).
+- `OP_GET_UPVALUE_REC_BINDING_SLOT` resolution (`sym==getLib`): the resolved entry's
+  name ALWAYS == getLib and its value is NEVER a String → the rec-slot IC / binary
+  search is correct; getLib resolves to the right App-PAP/Thunk binding.
+- `op_force_slow` PAP-recognition: a depth-1 `getOutput`-App (= getLib's PAP) is
+  recognized as a PAP **5691/5691** times (`isUnderappliedClosurePap=1` → break →
+  never saturated). The only `isPAP=0` cases are depth-2 (fully-applied `getLib cc`,
+  legitimately saturated) and a different arity-3 closure that happens to share the
+  param name "output".
+
+**What remains SOLID (narrow):**
+- firefox.drvPath → `/v3-fake-store/6444c591…` deterministically (3/3 runs).
+- native `derivationStrict` throws `OP_CALL: callee is not a closure tag=5`; the
+  callee String content is `"21"` (dumped at the throw — reliable, single instance).
+- The failing-frame disasm (reliable: actual failing `cu`+ip) shows `getLib cc`.
+- NOT ChainBindings, NOT major GC, nursery default-off.
+
+**Mechanism: RE-OPENED.** getLib resolves correctly and its binding is never written
+to a String through any standard path, yet the failure presents as `getLib`→String.
+The next investigation must (a) key probes on `(cu, codeOffset)` PAIRS or value
+signatures, never bare codeOffset; (b) avoid accumulating-pointer-set matching; and
+(c) bridge the gap between "getLib resolves correctly + is never clobbered" and "the
+failing OP_CALL sees a String callee" — e.g. by capturing the exact `cu` pointer of
+the failing frame (from V3_DBG_CALL) and instrumenting ONLY that cu's getLib reads,
+or by tracing the single failing `derivationStrict` call's argument force end-to-end.
+
+**Lesson (codify):** per-CU `codeOffset` and accumulating raw-pointer sets are NOT
+valid identity keys for cross-eval correlation — they silently conflate instances.
+Use value/name signatures or `(cu, off)` pairs. (Sibling of the same-host-bisect and
+head-N-counter traps.)
