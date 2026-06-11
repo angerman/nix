@@ -20,10 +20,20 @@ ripgrep all byte-identical to TW); lang **143/143**; PAP suite 4/4; new
 regression). Same PAP family as the shipped `isFunction`/`typeOf` fix
 (f5875a89c).
 
-**Residual (separate bug, NOT this one):** `haskell.compiler.ghc98.drvPath` still
-fake-stores — native derivationStrict fails with `cannot coerce a value to a
-string: «slot»` (a Tag::Slot reaching string coercion), a distinct
-Slot-resolution issue to track separately.
+**Residual (separate, OPEN bug — `ghc98-slot-leak`):**
+`haskell.compiler.ghc98.drvPath` still fake-stores. Native derivationStrict first
+fails with `cannot coerce a value to a string: «slot»` (a Tag::Slot reaching
+`coerceToString`, vm.cc:1035). A defensive Slot-deref there (deref the let-rec
+indirection, mirroring forceValue) is CORRECT but only peels one layer: the next
+failure is `cannot coerce a SET to a string: { … system = «slot»; env = «slot»; … }`
+— ghc's own derivation attrset with **unforced `system`/`env` slot fields** being
+coerced. So the real bug is a **Slot leak**: ghc's let-rec derivation attrs
+(system/env/…) remain `Tag::Slot` (unforced let-rec indirections) when
+derivationStrict serialises them, where TW has forced values. NOT the PAP class;
+needs its own RCA (where do these env/system slots come from un-forced, and the
+derivation-set→outPath coercion path). The standalone coerceToString Slot-deref
+was reverted (incomplete + no green test on its own) — fold it into the
+ghc98-slot-leak fix.
 
 ---
 
