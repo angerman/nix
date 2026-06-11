@@ -211,6 +211,24 @@ constexpr size_t kMaxCallDepth        = 5000;
         && cur->asClosure()->desc->arity > depth;
 }
 
+/// C-8/9/10 (CODEBASE_REVIEW_2026-06-11): the canonical "does this operand
+/// still need forcing before an opcode can inspect it" predicate for the
+/// force handshake (`if (needsForce(v)) { ip--; flags|=CFF_FORCE_RETRY; goto
+/// op_force_slow; }`).  An under-applied closure-PAP is already WHNF (a partial
+/// application) — it must NOT be sent back through the handshake, because
+/// op_force_slow leaves a PAP unchanged (vm.cc op_force_slow break) and the
+/// opcode would re-test the same App/App3 tag and rewind FOREVER (the infinite
+/// force-retry loop, where TW instead raises a type error).  Covers App AND
+/// App3 (isAppLike) so 3-arg PAPs are handled too.  Excluding PAPs here lets
+/// them fall through to each opcode's existing type-error path, matching TW.
+[[gnu::always_inline]] inline bool needsForce(const Value & v)
+{
+    Tag t = v.tag();
+    return (t == Tag::Thunk || t == Tag::App || t == Tag::App3
+            || t == Tag::Slot)
+        && !isUnderappliedClosurePap(v);
+}
+
 // C-1 falsifier (CODEBASE_REVIEW_2026-06-11): counts how many times the
 // CFF_FORCE_WB_PTR_KEEP branch in applyForceWriteback disarms on an
 // under-applied closure-PAP top — the case that previously left the KEEP
@@ -2474,7 +2492,14 @@ inline bool applyForceWriteback(VMState & vm)
         Value forced = vm.valueStack.back();
         vm.valueStack.pop_back();
         // Phase D: same standalone-cell route as above.
-        if (f.forceWriteTarget) cellWrite(f.forceWriteTarget, forced, nullptr);
+        // C-4/C-8 (CODEBASE_REVIEW_2026-06-11): never memoize the transient
+        // Blackhole sentinel ("value not yet known", a self-cycle in progress)
+        // into the target slot/cell — leave the target at its pre-force value
+        // so a later read re-forces, rather than baking in a permanent
+        // Blackhole that reads fail on where TW succeeds. (A forced PAP IS a
+        // valid WHNF here and is written normally.)
+        if (f.forceWriteTarget && forced.tag() != Tag::Blackhole)
+            cellWrite(f.forceWriteTarget, forced, nullptr);
         f.forceWriteTarget = nullptr;
         f.flags &= ~CFF_FORCE_WB_PTR;
         return true;
@@ -4811,10 +4836,12 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     if (eT != Tag::Thunk && eT != Tag::App && eT != Tag::App3
                         && eT != Tag::Slot) {
                         fun = e;
-                    } else if (eT == Tag::App && isUnderappliedClosurePap(e)) {
-                        // eval/apply: a thunk that evaluated to an under-
-                        // applied closure-PAP is WHNF — apply the next arg at
-                        // op_call_have_fun rather than iter-forcing it.
+                    } else if (isUnderappliedClosurePap(e)) {  // C-10: App OR App3
+                        // eval/apply: a thunk that evaluated to an under-applied
+                        // closure-PAP is WHNF — apply the next arg at
+                        // op_call_have_fun (which now saturates App AND App3
+                        // PAPs) rather than iter-forcing it (which loops forever
+                        // since op_force_slow returns a PAP unchanged).
                         fun = e;
                         goto op_call_have_fun;
                     } else {
@@ -4832,16 +4859,11 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 // fires: arity>1 closures exist only when NIX_V3_EVAL_APPLY
                 // collapsed a curried chain, so `arity > depth` is false for
                 // every ordinary single-arg-closure lazy-app.
-                if (fT == Tag::App && fun.asPair()) {
-                    const Value * cur = &fun; size_t d = 0;
-                    while (cur->tag() == Tag::App && cur->asPair()) {
-                        ++d; cur = &cur->asPair()->left;
-                    }
-                    if (cur->tag() == Tag::Closure && cur->asClosure()
-                        && cur->asClosure()->desc
-                        && cur->asClosure()->desc->arity > d)
-                        goto op_call_have_fun;
-                }
+                // C-10: route App AND App3 PAP callees to op_call_have_fun
+                // (which now saturates both); the prior Tag::App-only walk left
+                // an App3 PAP callee to iter-force and loop forever.
+                if (isUnderappliedClosurePap(fun))
+                    goto op_call_have_fun;
                 goto op_call_iter_force;
             }
             goto op_call_have_fun;
@@ -4953,14 +4975,22 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // here is inert by default (papBase->desc->arity is 0/1).  A bare
             // arity-1 closure falls through to the normal single-arg entry.
             {
+                // C-10 (CODEBASE_REVIEW_2026-06-11): walk a mixed App/App3 spine
+                // to the leaf closure.  An App3 link carries TWO applied args
+                // (right + third), so it contributes 2 to the depth — mirroring
+                // isUnderappliedClosurePap and the force-spine path.  (Previously
+                // this walked Tag::App only, so an App3 PAP callee left
+                // papBase=null and fell through to "callee is not a closure".)
                 const Closure * papBase = nullptr;
                 size_t papDepth = 0;
                 if (fun.tag() == Tag::Closure && fun.asClosure()) {
                     papBase = fun.asClosure();
-                } else if (fun.tag() == Tag::App && fun.asPair()) {
+                } else if (fun.isAppLike() && fun.asPair()) {
                     const Value * cur = &fun;
-                    while (cur->tag() == Tag::App && cur->asPair()) {
-                        ++papDepth; cur = &cur->asPair()->left;
+                    while ((cur->tag() == Tag::App || cur->tag() == Tag::App3)
+                           && cur->asPair()) {
+                        papDepth += (cur->tag() == Tag::App3) ? 2 : 1;
+                        cur = &cur->asPair()->left;
                     }
                     if (cur->tag() == Tag::Closure && cur->asClosure())
                         papBase = cur->asClosure();
@@ -4969,7 +4999,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     const uint8_t A = papBase->desc->arity;
                     const size_t total = papDepth + 1;
                     if (total < A) {
-                        // Under-applied: extend the Tag::App PAP chain.
+                        // Under-applied: extend the PAP chain with one App link
+                        // carrying the new arg (correct for an App OR App3 base).
                         ValuePair * vp = Alloc::allocPair();
                         vp->left = fun; vp->right = arg;
                         pairPostConstructBarrier(vp);
@@ -4978,17 +5009,29 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                         push(vm, v);
                         break;
                     }
-                    // Saturated (total == A — binary OP_CALL can't overshoot):
-                    // gather [a0..a_{A-2}, arg] and enter with them in the
-                    // callee's slots 0..A-1.
+                    // Saturated (total == A).  Gather the spine's args in
+                    // closure-slot order, then append the new OP_CALL arg last.
                     if (A > 16) throw std::runtime_error("v3 OP_CALL: arity > 16");
+                    if (__builtin_expect(total > A, 0))
+                        throw std::runtime_error("v3 OP_CALL: PAP over-applied");
                     Value argbuf[16];
-                    argbuf[total - 1] = arg;
-                    Value chain = fun;
-                    for (size_t i = total - 1; i > 0; --i) {
-                        argbuf[i - 1] = chain.asPair()->right;
-                        chain = chain.asPair()->left;
+                    // Walk the spine outermost-first, collecting args exactly as
+                    // the force-spine path does (App3: third then right; App:
+                    // right).  The closure-slot order is that collection
+                    // reversed; the new OP_CALL arg occupies the last slot.
+                    Value tmp[16]; size_t nTmp = 0;
+                    const Value * w = &fun;
+                    while (w->isAppLike() && w->asPair()) {
+                        const ValuePair * p = w->asPair();
+                        if (w->tag() == Tag::App3) {
+                            tmp[nTmp++] = p->third; tmp[nTmp++] = p->right;
+                        } else {
+                            tmp[nTmp++] = p->right;
+                        }
+                        w = &p->left;
                     }
+                    for (size_t i = 0; i < nTmp; ++i) argbuf[i] = tmp[nTmp - 1 - i];
+                    argbuf[A - 1] = arg;
                     const LambdaDescriptor * d = papBase->desc;
                     if (__builtin_expect(vm.frames.size() >= kMaxCallDepth, 0))
                         throw std::runtime_error(
@@ -5938,10 +5981,15 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 const Closure * tcBase = nullptr; size_t papDepth = 0;
                 if (fun.tag() == Tag::Closure && fun.asClosure()) {
                     tcBase = fun.asClosure();
-                } else if (fun.tag() == Tag::App && fun.asPair()) {
+                } else if (fun.isAppLike() && fun.asPair()) {
+                    // C-10 (CODEBASE_REVIEW_2026-06-11): walk App AND App3 spines
+                    // (App3 carries two applied args → +2 depth), so an App3 PAP
+                    // callee in tail position is handled rather than mishandled.
                     const Value * c0 = &fun;
-                    while (c0->tag() == Tag::App && c0->asPair()) {
-                        ++papDepth; c0 = &c0->asPair()->left;
+                    while ((c0->tag() == Tag::App || c0->tag() == Tag::App3)
+                           && c0->asPair()) {
+                        papDepth += (c0->tag() == Tag::App3) ? 2 : 1;
+                        c0 = &c0->asPair()->left;
                     }
                     if (c0->tag() == Tag::Closure && c0->asClosure())
                         tcBase = c0->asClosure();
@@ -5973,13 +6021,25 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     // and overflow deep folds).  Mirrors the in-place retarget
                     // below (withStack reset + captured-withs).
                     if (A > 16) throw std::runtime_error("v3 OP_TAIL_CALL: arity > 16");
+                    if (__builtin_expect(total > A, 0))
+                        throw std::runtime_error("v3 OP_TAIL_CALL: PAP over-applied");
                     Value argbuf[16];
-                    argbuf[total - 1] = arg;
-                    Value chain = fun;
-                    for (size_t i = total - 1; i > 0; --i) {
-                        argbuf[i - 1] = chain.asPair()->right;
-                        chain = chain.asPair()->left;
+                    // C-10: App3-aware spine gather (mirrors OP_CALL + the
+                    // force-spine path: App3 → third then right; App → right;
+                    // closure-slot order is the collection reversed, new arg last).
+                    Value tmp[16]; size_t nTmp = 0;
+                    const Value * w = &fun;
+                    while (w->isAppLike() && w->asPair()) {
+                        const ValuePair * p = w->asPair();
+                        if (w->tag() == Tag::App3) {
+                            tmp[nTmp++] = p->third; tmp[nTmp++] = p->right;
+                        } else {
+                            tmp[nTmp++] = p->right;
+                        }
+                        w = &p->left;
                     }
+                    for (size_t i = 0; i < nTmp; ++i) argbuf[i] = tmp[nTmp - 1 - i];
+                    argbuf[A - 1] = arg;
                     const LambdaDescriptor * d = tcBase->desc;
                     const CompilationUnit * baseCu = tcBase->cu ? tcBase->cu : cu;
                     vm.valueStack.resize(stackBase + d->nLocals);
@@ -7839,14 +7899,12 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 size_t topIdx = vm.valueStack.size() - 1;
                 Value & rhsRef = vm.valueStack[topIdx];
                 Value & lhsRef = vm.valueStack[topIdx - 1];
-                if (rhsRef.isAppLike() || rhsRef.tag() == Tag::Thunk
-                    || rhsRef.tag() == Tag::Slot) {
+                if (needsForce(rhsRef)) {  // C-8/9/10
                     ip = ip - 1;
                     vm.frames.back().flags |= CFF_FORCE_RETRY;
                     goto op_force_slow;
                 }
-                if (lhsRef.isAppLike() || lhsRef.tag() == Tag::Thunk
-                    || lhsRef.tag() == Tag::Slot) {
+                if (needsForce(lhsRef)) {  // C-8/9/10
                     uint32_t off = static_cast<uint32_t>((topIdx - 1) - stackBase);
                     if (__builtin_expect(off > 0xFFFFu, 0))
                         throw std::runtime_error(
@@ -9295,14 +9353,12 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 size_t topIdx = vm.valueStack.size() - 1;
                 Value & rhsRef = vm.valueStack[topIdx];
                 Value & lhsRef = vm.valueStack[topIdx - 1];
-                if (rhsRef.isAppLike() || rhsRef.tag() == Tag::Thunk
-                    || rhsRef.tag() == Tag::Slot) {
+                if (needsForce(rhsRef)) {  // C-8/9/10
                     ip = ip - 1;
                     vm.frames.back().flags |= CFF_FORCE_RETRY;
                     goto op_force_slow;
                 }
-                if (lhsRef.isAppLike() || lhsRef.tag() == Tag::Thunk
-                    || lhsRef.tag() == Tag::Slot) {
+                if (needsForce(lhsRef)) {  // C-8/9/10
                     uint32_t off = static_cast<uint32_t>((topIdx - 1) - stackBase);
                     if (__builtin_expect(off > 0xFFFFu, 0))
                         throw std::runtime_error(
@@ -9345,14 +9401,12 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 size_t topIdx = vm.valueStack.size() - 1;
                 Value & rhsRef = vm.valueStack[topIdx];
                 Value & lhsRef = vm.valueStack[topIdx - 1];
-                if (rhsRef.isAppLike() || rhsRef.tag() == Tag::Thunk
-                    || rhsRef.tag() == Tag::Slot) {
+                if (needsForce(rhsRef)) {  // C-8/9/10
                     ip = ip - 1;
                     vm.frames.back().flags |= CFF_FORCE_RETRY;
                     goto op_force_slow;
                 }
-                if (lhsRef.isAppLike() || lhsRef.tag() == Tag::Thunk
-                    || lhsRef.tag() == Tag::Slot) {
+                if (needsForce(lhsRef)) {  // C-8/9/10
                     uint32_t off = static_cast<uint32_t>((topIdx - 1) - stackBase);
                     if (__builtin_expect(off > 0xFFFFu, 0))
                         throw std::runtime_error(
@@ -10100,7 +10154,12 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 for (uint32_t k = 0; k < n; ++k) {
                     Value & p = vm.valueStack[argBase + k];
                     Tag t = p.tag();
-                    if (t == Tag::App || t == Tag::App3 || t == Tag::Thunk) {
+                    // C-8/9/10: exclude under-applied closure-PAPs (WHNF) —
+                    // they'd loop the handshake forever; let them reach the
+                    // "cannot coerce a function" path. (Slot deliberately
+                    // ignored here, per the comment above.)
+                    if ((t == Tag::App || t == Tag::App3 || t == Tag::Thunk)
+                        && !isUnderappliedClosurePap(p)) {
                         uint32_t off = static_cast<uint32_t>((argBase + k) - stackBase);
                         if (__builtin_expect(off > 0xFFFFu, 0))
                             throw std::runtime_error(
@@ -10733,23 +10792,22 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 for (uint32_t k = 0; k < nArgs; ++k) {
                     if (po->lazyArgs & (1u << k)) continue;
                     Value & a = vm.valueStack[argBase + k];
-                    Tag t = a.tag();
                     // #455 (2026-06-10): an under-applied closure-PAP (a Tag::App
-                    // spine bottoming out in a closure that still needs more args)
-                    // is ALREADY WHNF — `OP_FORCE` returns it unchanged
-                    // (isUnderappliedClosurePap → break).  Without this guard the
+                    // /App3 spine bottoming out in a closure that still needs more
+                    // args) is ALREADY WHNF — `OP_FORCE` returns it unchanged
+                    // (isUnderappliedClosurePap → break).  Without excluding it the
                     // rewind-and-force handshake below re-scans, sees the same
-                    // Tag::App, rewinds, and loops forever.  Repro:
+                    // App/App3, rewinds, and loops forever.  Repro:
                     // `map (f "x") xs` where `f` is a partially-applied sibling of
-                    // a SEPARATELY-IMPORTED rec module builds arg0 as such a PAP
-                    // (inline it builds a Tag::Closure PAP, which this scan already
-                    // skips).  A PAP is a value; the primop (e.g. map) applies it
-                    // per element exactly as the inline case does.  Saturated/
-                    // over-applied Tag::App args are NOT under-applied PAPs, so they
-                    // still take the force path.  See lode/RCA_455_VNATIVE_2026-06-10.md.
-                    if (t == Tag::App && isUnderappliedClosurePap(a)) continue;
-                    if (t == Tag::Thunk || t == Tag::App || t == Tag::App3
-                        || t == Tag::Slot) {
+                    // a SEPARATELY-IMPORTED rec module builds arg0 as such a PAP.
+                    // A PAP is a value; the primop (e.g. map) applies it per element
+                    // exactly as the inline case does.  Saturated/over-applied apps
+                    // are NOT under-applied PAPs, so they still take the force path.
+                    // C-8 (CODEBASE_REVIEW_2026-06-11): the prior guard only matched
+                    // Tag::App, so an App3 PAP fell into the force handshake and
+                    // looped forever; needsForce() excludes BOTH App and App3 PAPs.
+                    // See lode/RCA_455_VNATIVE_2026-06-10.md.
+                    if (needsForce(a)) {
                         // Set up writeback: duplicate the unforced
                         // value to top-of-stack, encode the original
                         // slot's offset (relative to stackBase) in the
@@ -10834,9 +10892,12 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                         uint32_t startI = (k == resumeK) ? resumeI : 0;
                         for (uint32_t i = startI; i < list->size; ++i) {
                             Value & e = list->elems[i];
-                            Tag t = e.tag();
-                            if (t == Tag::Thunk || t == Tag::App || t == Tag::App3
-                                || t == Tag::Slot) {
+                            // C-8 (CODEBASE_REVIEW_2026-06-11): needsForce
+                            // excludes under-applied closure-PAPs (e.g. lib.pipe's
+                            // function list fed to foldl') — a PAP is already WHNF,
+                            // so forcing it is a no-op and re-arming the handshake
+                            // on it would loop forever.
+                            if (needsForce(e)) {
                                 push(vm, e);
                                 CallFrame & frame = vm.frames.back();
                                 frame.forceWriteTarget = &e;
@@ -10914,9 +10975,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 if (po->lazyArgs & (1u << k)) continue;    // lazy arg
                 uint32_t slot = desc[k] & 0x7FFFu;
                 Value & a = vm.valueStack[stackBase + slot];
-                Tag t = a.tag();
-                if (t == Tag::Thunk || t == Tag::App || t == Tag::App3
-                    || t == Tag::Slot) {
+                if (needsForce(a)) {  // C-8/9/10: PAP is WHNF — don't re-arm
                     push(vm, a);
                     CallFrame & frame = vm.frames.back();
                     setForceWriteback(frame, static_cast<uint16_t>(slot));
@@ -11034,8 +11093,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // A8: iterative force.
             {
                 Value & topRef = vm.valueStack.back();
-                if (topRef.isThunk() || topRef.isAppLike()
-                    || topRef.tag() == Tag::Slot) {
+                if (needsForce(topRef)) {  // C-8/9/10: a PAP is WHNF — fall
+                    // through to the type-error path below (never re-arm the
+                    // handshake on a PAP, which would loop forever).
                     ip = ip - 1;
                     vm.frames.back().flags |= CFF_FORCE_RETRY;
                     goto op_force_slow;
@@ -11060,8 +11120,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // A8: iterative force.
             {
                 Value & topRef = vm.valueStack.back();
-                if (topRef.isThunk() || topRef.isAppLike()
-                    || topRef.tag() == Tag::Slot) {
+                if (needsForce(topRef)) {  // C-8/9/10: a PAP is WHNF — fall
+                    // through to the type-error path below (never re-arm the
+                    // handshake on a PAP, which would loop forever).
                     ip = ip - 1;
                     vm.frames.back().flags |= CFF_FORCE_RETRY;
                     goto op_force_slow;
@@ -11090,8 +11151,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // A8: iterative force.
             {
                 Value & topRef = vm.valueStack.back();
-                if (topRef.isThunk() || topRef.isAppLike()
-                    || topRef.tag() == Tag::Slot) {
+                if (needsForce(topRef)) {  // C-8/9/10: a PAP is WHNF — fall
+                    // through to the type-error path below (never re-arm the
+                    // handshake on a PAP, which would loop forever).
                     ip = ip - 1;
                     vm.frames.back().flags |= CFF_FORCE_RETRY;
                     goto op_force_slow;
@@ -11136,14 +11198,12 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 size_t topIdx = vm.valueStack.size() - 1;
                 Value & idxRef = vm.valueStack[topIdx];
                 Value & lstRef = vm.valueStack[topIdx - 1];
-                if (idxRef.isThunk() || idxRef.isAppLike()
-                    || idxRef.tag() == Tag::Slot) {
+                if (needsForce(idxRef)) {  // C-8/9/10
                     ip = ip - 1;
                     vm.frames.back().flags |= CFF_FORCE_RETRY;
                     goto op_force_slow;
                 }
-                if (lstRef.isThunk() || lstRef.isAppLike()
-                    || lstRef.tag() == Tag::Slot) {
+                if (needsForce(lstRef)) {  // C-8/9/10
                     // Writeback for the deeper slot.  Slot offset =
                     // (topIdx - 1) - stackBase.
                     uint32_t off = static_cast<uint32_t>((topIdx - 1) - stackBase);
