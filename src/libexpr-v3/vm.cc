@@ -294,6 +294,17 @@ inline std::unordered_set<const CompilationUnit *> & cuRegistry()
 static const bool g_dbgAllocDump =
     std::getenv("V3_DBG_ALLOC_DUMP") != nullptr;
 
+// P-2 (CODEBASE_REVIEW_2026-06-11): per-opcode profiling gates, promoted to
+// FILE scope.  These used to be `static const bool` declared INSIDE the
+// dispatch `while` body, so every dispatched opcode paid a magic-static guard
+// (acquire-load + predicted branch) — the exact anti-pattern the file fixes
+// elsewhere via kCountInstructions.  File-scope statics are initialised once at
+// program start with no per-access guard.
+static const bool g_countOpcodes =
+    std::getenv("NIX_VM_OPCOUNTS") != nullptr;
+static const bool g_countOpCycles =
+    std::getenv("NIX_VM_OPCYCLES") != nullptr;
+
 // #733 (2026-05-21) hot-path stat-counter gate.  The per-descriptor
 // allocCount/forceCount + global thunksForced/thunksAllocated/
 // bridgeThunksForced increments live on the hottest paths in the
@@ -3293,22 +3304,14 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
         }
         Op op = decodeOp(instr);
         // 2026-05-18 per-opcode profiling: bump under NIX_VM_OPCOUNTS=1.
-        // Separate gate from NIX_VM_STATS because the per-op increment
-        // adds one extra cache write per dispatch — a few % overhead
-        // on tight inner loops where we'd want to KNOW the cost is
-        // attributable to the workload, not the meter.
-        static const bool s_countOpcodes =
-            std::getenv("NIX_VM_OPCOUNTS") != nullptr;
-        // #786 OPCYCLES (2026-05-23) — per-opcode cycle accumulator.
-        // Gated by NIX_VM_OPCYCLES=1.  Samples clock at dispatch
-        // start; credits the elapsed time to the PREVIOUS opcode.
-        // Per-dispatch overhead ≈ 10-20 ns (clock + add); material
-        // but invariant per-op so relative comparisons across
-        // opcodes stay valid.  Used to verify the per-op-ns
-        // estimates that drove the prior #780 / #783 estimate-based
-        // falsifiers (see lode/PERF_AUDIT_2026-05-23.md review).
-        static const bool s_countOpCycles =
-            std::getenv("NIX_VM_OPCYCLES") != nullptr;
+        // P-2: gates are now file-scope (g_countOpcodes / g_countOpCycles) —
+        // no per-dispatch magic-static guard.  Separate gate from NIX_VM_STATS
+        // because the per-op increment adds one extra cache write per dispatch.
+        // #786 OPCYCLES (2026-05-23) — g_countOpCycles samples the clock at
+        // dispatch start and credits the elapsed time to the PREVIOUS opcode
+        // (≈10-20 ns/dispatch; invariant per-op so relative comparisons hold).
+        const bool s_countOpcodes  = g_countOpcodes;
+        const bool s_countOpCycles = g_countOpCycles;
         if (__builtin_expect(s_countOpCycles, 0)) [[unlikely]] {
             // #790: read/write the FILE-SCOPE thread_local so the
             // dispatchLoop scope guard (see line ~2270) can save+

@@ -723,6 +723,14 @@ inline const bool g_stringsAttrEnabled =
 inline const bool g_immixAllocEnabled =
     std::getenv("V3_DBG_IMMIX_ALLOC") != nullptr;
 
+/// P-3 (CODEBASE_REVIEW_2026-06-11): free-list-reuse gate, promoted to file
+/// scope.  It used to be a `static const bool` declared INSIDE the per-alloc
+/// hot path (alloc()), so every allocation paid a magic-static guard byte-load
+/// (the #768 fast-path-cleanup missed this one).  File scope → init once, no
+/// per-alloc guard.
+inline const bool g_freeListReuseEnabled =
+    std::getenv("V3_DBG_FREELIST_REUSE") != nullptr;
+
 } // namespace detail
 
 struct FreeListStats
@@ -1257,14 +1265,13 @@ public:
             // Fall through to bump path below — do NOT return here.
         }
 
-        static const bool s_reuseOn =
-            std::getenv("V3_DBG_FREELIST_REUSE") != nullptr;
+        // P-3: file-scope gate (no per-alloc magic-static guard).
         // Step 12′: legacy freeListBins_ path active ONLY when
         // V3_DBG_IMMIX_ALLOC=0.  When Immix is on, the bin path is
         // bypassed (its hits/misses would be wrong against the Immix
         // line-region state).  See GC_DECISION §6 — this entire
         // section retires when Step 14′ SHIP gate clears.
-        if (__builtin_expect(majorGcEnabled() && s_reuseOn
+        if (__builtin_expect(majorGcEnabled() && detail::g_freeListReuseEnabled
                              && !detail::g_immixAllocEnabled, 0)) {
             if (void * p = freeListTryPop(bytes)) {
                 // Step 6: count the hit.  Bin is the requested size's
