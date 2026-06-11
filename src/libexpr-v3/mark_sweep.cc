@@ -1966,6 +1966,26 @@ void runMajorMarkSweep(VMState & vm) noexcept
     // huge freed ranges (the evac path sweeps its own ranges separately).
     sweepStringContextRanges(freedRanges);
 
+    // M-2 (CODEBASE_REVIEW_2026-06-11): also sweep the side-table against the
+    // MARK BITMAP.  The range-sweep above only drops context for WHOLE freed
+    // blocks; a string buffer that is DEAD (unmarked) but sits in a STILL-LIVE
+    // block keeps its char* valid, so once granule reuse is on (Immix line
+    // reuse / free-list, the M-7 prerequisite) a NEW string allocated at that
+    // recycled granule would inherit the dead string's context (#682 family).
+    // visitString() marks every reachable string buffer, so an unmarked
+    // in-arena key is genuinely dead.  Erase only `inActive && !isMarked` keys
+    // (a non-arena key — e.g. a static string — is left untouched).
+    {
+        auto & sctbl = stringContextSideTable();
+        for (auto it = sctbl.begin(); it != sctbl.end(); ) {
+            const void * k = static_cast<const void *>(it->first);
+            if (arena.inActive(k) && !marker.isMarked(k))
+                it = sctbl.erase(it);
+            else
+                ++it;
+        }
+    }
+
     // R2.4b: metadata-aware evacuation of sparse candidate blocks (the
     // moving GC that actually returns RSS for v3's scattered dead).
     // No-op unless NIX_V3_EVAC=1.  Runs AFTER whole-block-free (those
