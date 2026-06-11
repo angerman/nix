@@ -9124,7 +9124,13 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // OP_ATTRS_SELECT_IC's site (vm.cc:6075-ish) for protocol
             // details.  Was C-recursive forceValue here; now iterative
             // via op_force_slow + slot writeback.
-            if (__builtin_expect(found->isAppLike(), 0)) {
+            // 2026-06-11: skip the memoizing writeback for an under-applied
+            // closure-PAP — it is already WHNF; forcing+memoizing it saturates
+            // it to its result type and poisons the (shared) entry (the python3
+            // passthru.pythonAtLeast / firefox optionalString PAP->result bug).
+            // Mirrors OP_FORCE (vm.cc:7161) + the OP_ATTRS_SELECT sites above.
+            if (__builtin_expect(found->isAppLike(), 0)
+                && !isUnderappliedClosurePap(*found)) {
                 push(vm, *found);
                 CallFrame & f = vm.frames.back();
                 f.forceWriteTarget = found;

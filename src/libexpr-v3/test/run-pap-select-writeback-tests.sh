@@ -38,7 +38,7 @@ check() {
   else echo "FAIL  $label  (expected: $expected  got: $out)"; fail=$((fail+1)); fi
 }
 
-check "positive (PAP-in-attrset)   " repro-pap-select-pos.nix '[ 11 21 31 "lambda" 101 102 103 ]'
+check "positive (PAP-in-attrset)   " repro-pap-select-pos.nix '[ 11 21 31 "lambda" 101 102 103 41 51 ]'
 check "negative (saturated App memo)" repro-pap-select-neg.nix '[ 11 11 21 "set" ]'
 
 # --- REGRESSION: python3.drvPath byte-identical (nixpkgs-gated) ---
