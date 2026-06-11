@@ -20,7 +20,23 @@ ripgrep all byte-identical to TW); lang **143/143**; PAP suite 4/4; new
 regression). Same PAP family as the shipped `isFunction`/`typeOf` fix
 (f5875a89c).
 
-**Residual (separate, OPEN bug — `ghc98-slot-leak`):**
+**Residual A (OPEN — `firefox-getLib-poison`):** `firefox.drvPath` fake-stores via
+`OP_CALL: callee is not a closure` **tag=5 (String)** at the cc-wrapper `cc_solib`
+thunk doing `getLib cc` (`getLib` = `lib.getOutput "lib"`). `getLib` (a function)
+resolves to a **String** *only inside firefox's cc-wrapper rec-scope* — `lib.getLib`
+/ `lib.getOutput` / `getOutput "lib"` are all correct lambdas in isolation. Same
+*class* as the python3 `pythonAtLeast` poison (a function-valued shared slot
+overwritten with its result type), but a DIFFERENT, unpinned vector. RULED OUT
+(no-guess, empirical): the optimiser (`NO_OPTIMISE`), eval/apply
+(`NO_EVAL_APPLY` — so it is NOT the multi-arity-PAP path), `NO_SATURATED_CALL`/
+`NO_CALL_N`/`NO_BETA_REDUCE`, `op_force_slow` (a `V3_DBG_WBAPP` probe showed it
+breaks on every recognized PAP and only saturates genuinely-saturated apps), and
+the 3 fixed `OP_ATTRS_SELECT` writeback sites + `deepForceList`. Remaining
+candidate vectors (need targeted instrumentation, NOT yet done): in-place
+cell-update of a Thunk/slot, App-memo writeback, or a rec-binding-slot
+mis-resolution (#458 family). Deferred to avoid a speculative fix.
+
+**Residual B (OPEN — `ghc98-slot-leak`):**
 `haskell.compiler.ghc98.drvPath` still fake-stores. Native derivationStrict first
 fails with `cannot coerce a value to a string: «slot»` (a Tag::Slot reaching
 `coerceToString`, vm.cc:1035). A defensive Slot-deref there (deref the let-rec
