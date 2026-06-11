@@ -1980,9 +1980,13 @@ void runMajorMarkSweep(VMState & vm) noexcept
     //
     // Must happen AFTER blocksToFree (freeWholeBlock removes
     // entries from lineMarks; this rebuild walks the surviving set).
-    // No-op when V3_DBG_IMMIX_ALLOC=0 (the Arena alloc path skips
-    // the Immix branch and the rebuilt freeSpans are unused).
-    arena.rebuildFreeSpansFromLineMarks();
+    // P-8 (CODEBASE_REVIEW_2026-06-11): only rebuild the free-line spans when
+    // Immix alloc actually consumes them.  With V3_DBG_IMMIX_ALLOC=0 (default)
+    // the Arena alloc path skips the Immix branch, so the rebuilt freeSpans
+    // were computed and immediately ignored — per-GC dead work over every
+    // surviving block.
+    if (nix::v3::detail::g_immixAllocEnabled)
+        arena.rebuildFreeSpansFromLineMarks();
 
     const auto tSweepEnd = clock::now();
     const double markMs =
