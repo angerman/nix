@@ -335,3 +335,59 @@ or by tracing the single failing `derivationStrict` call's argument force end-to
 valid identity keys for cross-eval correlation — they silently conflate instances.
 Use value/name signatures or `(cu, off)` pairs. (Sibling of the same-host-bisect and
 head-N-counter traps.)
+
+---
+
+## firefox residual — CONCRETE value-based localization (2026-06-11, third pass)
+
+After falsifying the STG-8 story, a value-/name-based trace (no codeOffset/pointer
+keys) pinned the failure cleanly:
+
+**The failing callee `getLib` is a Slot whose target cell holds the String "21".**
+Full operand-stack dump at the throw (value-gated → fires only on the real failure):
+```
+STACK[base..top] cu=<failing-cu> nLocals=3:
+  [local0] tag=16 (Slot) -> deref.tag=5 (String "21")   ← getLib (callee)
+  [+1]     tag=16 (Slot) -> deref.tag=7 (Attrs)          ← cc (correct)
+```
+
+**The "21" is the LLVM version.** Instrumenting OP_RETURN's STG-8 cell-write,
+value-gated on result=="21", the writers are: `attrName` (×54), `llvmVersion`
+(codeOff 1318, ×2), and — **once — a thunk NAMED `getLib`** (codeOff 1707) that
+returns "21" and writes it into its cell.
+
+**The getLib binding's body is `inherit (X) getLib …` = `X.getLib`.** Disasm of the
+getLib-thunk body (codeOff 1707):
+```
+[1707] OP_GET_UPVALUE 0
+[1708] OP_ATTRS_SELECT getLib   (sym 343)
+[1710] OP_RETURN
+```
+(siblings: getName, getVersion, hasPrefix, hostPlatform → an `inherit (X) …` block).
+So `getLib = X.getLib`, and **`X.getLib` evaluates to the String "21"**.
+
+**Both OP_ATTRS_SELECT paths VALIDATE the name** (IC-hit: `entries[e.slot].name ==
+operand`; binary-search: `entries[lo].name == operand`). A wrong slot → miss/error,
+not a wrong value. So the SELECT genuinely returns the entry **named** `getLib`, and
+that entry's **VALUE is "21"** — i.e. `X.getLib`'s slot value was cross-written with
+the llvmVersion.
+
+**Top-level `lib.getLib` is CORRECT** standalone under v3-direct (`typeOf` = lambda;
+`lib.getLib hello` → set). So the corruption is **firefox-context-specific**: the
+particular attrset `X` (cc-wrapper's captured lib / inherit source) has its `getLib`
+entry value = "21", while the global lib does not.
+
+**`mergeBindings`/overlay copy whole entries (name+value as a unit)** — they cannot
+cross getLib's name with llvmVersion's value. So the cross-write is **upstream of any
+merge**: in how `X`'s `getLib` entry was constructed/forced to "21" in this context.
+
+**Solid, retained.** firefox getLib = "21" (= llvmVersion); SELECT name-validated so
+the ENTRY VALUE is wrong; getLib's global SymbolId = 343; not ChainBindings / not
+major GC / nursery off; not via cellWrite/thunkSetEvaluated/pairSetEvaluated of a
+getOutput-PAP; op_force_slow never saturates getLib's depth-1 PAP.
+
+**NEXT STEP (clear):** catch the write of the llvmVersion value ("21") into a
+`getLib`-named (SymbolId 343) Bindings entry — instrument `bindingsSetValue` /
+`bindingsSetEntry` / OP_ATTRS_REC_SET / OP_ATTRS_SET (name==343 && value is the
+llvmVersion String), OR trace the codeOff-1707 thunk's upvalue-0 attrset `X` to find
+where X.getLib was set to "21".  That pins the construction site; the fix follows.
