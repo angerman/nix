@@ -286,6 +286,15 @@ struct Bindings
     /// call `Alloc::allocBindings`.
     const Bindings * materialize() const;
 
+    /// M-1 (CODEBASE_REVIEW_2026-06-11): drop the per-chain materialize memo.
+    /// The memo is a thread_local map<const Bindings*, const Bindings*> that is
+    /// never walked as GC roots; under default-ON major GC its keys (freed +
+    /// reused chain addresses) and values (flat copies reachable only via the
+    /// memo) become stale → wrong-Bindings / use-after-free.  Called at the
+    /// major-GC safepoint, exactly like the attrSelectCache/recSlotCache
+    /// invalidation, so the memo never survives a collection.
+    static void clearMaterializeMemo();
+
     // -----------------------------------------------------------------
     // Lever A (MEMORY_REPRESENTATION_2026-06-07 §6) — k-way-merge
     // Cursor.  This is the piece cppnix has (`Bindings::iterator`) and

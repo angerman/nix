@@ -3142,6 +3142,12 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                             for (auto & e : ic.entries) e.bindings = nullptr;
                         for (auto & rc : icu->recSlotCache) rc.bindings = nullptr;
                     }
+                    // M-1 (CODEBASE_REVIEW_2026-06-11): the Bindings::materialize
+                    // memo is another raw-Bindings* side table that
+                    // walkAllV3Roots does NOT walk — same UAF/aliasing hazard
+                    // as the ICs above.  Clear it before the mark/sweep so no
+                    // stale chain pointer survives a collection.
+                    Bindings::clearMaterializeMemo();
                     runMajorMarkSweep(vm);
                     // Frame pointers may have been forwarded.
                     // Re-read dispatch locals.
@@ -9667,14 +9673,22 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             Value * found = nullptr;
             {
                 auto & ic = cu->recSlotCache[icIdx];
-                if (__builtin_expect(ic.bindings == b, 1)) {
-                    // IC hit — direct entry access.  Bindings* match
-                    // implies sorted-name layout match; cached slot is
-                    // valid.
+                if (__builtin_expect(ic.bindings == b
+                        && ic.slot < b->size
+                        && b->entries[ic.slot].name == sym, 1)) {
+                    // IC hit — direct entry access.  C-3
+                    // (CODEBASE_REVIEW_2026-06-11): validate the cached slot's
+                    // NAME (and bounds), not just Bindings* identity.  Under
+                    // default-ON major GC a freed+reused Bindings address can
+                    // alias the cached pointer with a different name layout,
+                    // silently returning a wrong-named slot (the address-reuse
+                    // hazard the safepoint IC-invalidation defends; this is
+                    // belt-and-suspenders, matching OP_ATTRS_SELECT's IC which
+                    // already name-validates).  On mismatch → binary search.
                     found = &b->entries[ic.slot].value;
                 } else {
-                    // IC miss (cold or shape change).  Binary search
-                    // by SymbolId then install.
+                    // IC miss (cold, shape change, or stale alias).  Binary
+                    // search by SymbolId then install.
                     uint32_t lo = 0, hi = b->size;
                     uint32_t slotIdx = 0;
                     while (lo < hi) {
@@ -9913,7 +9927,12 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             Value * found = nullptr;
             {
                 auto & ic = cu->recSlotCache[icIdx];
-                if (__builtin_expect(ic.bindings == b, 1)) {
+                // C-3: name + bounds check, not just Bindings* identity —
+                // guards against a freed+reused address aliasing the IC under
+                // default-ON GC.
+                if (__builtin_expect(ic.bindings == b
+                        && ic.slot < b->size
+                        && b->entries[ic.slot].name == sym, 1)) {
                     found = &b->entries[ic.slot].value;
                 } else {
                     uint32_t lo = 0, hi = b->size, slotIdx = 0;
@@ -9971,7 +9990,12 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             Value * found = nullptr;
             {
                 auto & ic = cu->recSlotCache[icIdx];
-                if (__builtin_expect(ic.bindings == b, 1)) {
+                // C-3: name + bounds check, not just Bindings* identity —
+                // guards against a freed+reused address aliasing the IC under
+                // default-ON GC.
+                if (__builtin_expect(ic.bindings == b
+                        && ic.slot < b->size
+                        && b->entries[ic.slot].name == sym, 1)) {
                     found = &b->entries[ic.slot].value;
                 } else {
                     uint32_t lo = 0, hi = b->size, slotIdx = 0;

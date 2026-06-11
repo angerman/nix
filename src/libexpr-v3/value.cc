@@ -87,6 +87,23 @@ int64_t unboxInt64(const void * cell) noexcept
 // container has no dirty-list entry; Phase D Step 7 trusts the
 // dirty list and skips `walkBindings`), producing the audit failure
 // signature seen in the deferred Phase C SPIKE.
+// M-1 (CODEBASE_REVIEW_2026-06-11): the per-chain materialize memo, hoisted to
+// file scope so the major-GC safepoint can clear it (see
+// Bindings::clearMaterializeMemo).  The map is NOT walked as GC roots, so under
+// default-ON major GC: (a) a flat copy reachable only via the memo would be
+// swept → a later memo HIT returns a dangling pointer; (b) a freed+reused chain
+// address aliases a key → the wrong Bindings is returned for an unrelated
+// chain.  Clearing at every collection makes both impossible (the memo
+// repopulates on the next materialise; the only cost is at most K copies per
+// GC epoch instead of K per eval).
+static thread_local std::unordered_map<const Bindings *, const Bindings *>
+    s_matMemo;
+
+void Bindings::clearMaterializeMemo()
+{
+    s_matMemo.clear();
+}
+
 const Bindings * Bindings::materialize() const
 {
     if (kind == uint8_t(Kind::Sorted)) return this;
@@ -95,11 +112,8 @@ const Bindings * Bindings::materialize() const
     // materialised copies (measured +195 MB on hello.drvPath — the chain
     // SAVED 301 MB of merge copies but the un-memoised materialise re-added
     // ~496 MB).  Cache the materialised Sorted result per-chain so each
-    // chain materialises at most once.  Thread-local side table (no struct
-    // change); pointers are arena-lived within a single eval (chains don't
-    // survive VMState teardown, so cross-eval staleness can't be observed).
-    static thread_local std::unordered_map<const Bindings *, const Bindings *>
-        s_matMemo;
+    // chain materialises at most once per GC epoch (s_matMemo is cleared at
+    // the major-GC safepoint — see clearMaterializeMemo / M-1 above).
     if (auto it = s_matMemo.find(this); it != s_matMemo.end())
         return it->second;
 
