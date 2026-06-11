@@ -184,26 +184,32 @@ std::vector<std::string> storeRefsContextFor(nix::EvalState & state,
                                              const std::string & path,
                                              const std::string & content)
 {
+    // C-7(b) (CODEBASE_REVIEW_2026-06-11): the former outer `catch (...)` here
+    // swallowed ANY store error and returned an empty context — so a readFile
+    // of a store path under any store hiccup yielded a context-less string,
+    // dropping inputSrcs edges and diverging the drvPath.  The only
+    // legitimately-recoverable case is "this path is not a registered store
+    // object" (the inner `catch (const nix::Error&)`); everything else
+    // (queryPathInfo I/O failure, scan-sink failure) is a real error that must
+    // propagate, not be masked into a missing dependency edge.
     std::vector<std::string> ctx;
-    try {
-        if (state.store->isInStore(path)) {
-            nix::StorePathSet refs;
-            try {
-                auto [storePath, _sub] = state.store->toStorePath(path);
-                refs = state.store->queryPathInfo(storePath)->references;
-            } catch (const nix::Error &) { /* unknown path; no refs */ }
-            if (!refs.empty()) {
-                auto refsSink = nix::PathRefScanSink::fromPaths(refs);
-                refsSink << content;
-                refs = refsSink.getResultPaths();
-            }
-            ctx.reserve(refs.size());
-            for (auto & p : refs) {
-                nix::NixStringContextElem elem = nix::NixStringContextElem::Opaque{ .path = p };
-                ctx.push_back(elem.to_string());
-            }
+    if (state.store->isInStore(path)) {
+        nix::StorePathSet refs;
+        try {
+            auto [storePath, _sub] = state.store->toStorePath(path);
+            refs = state.store->queryPathInfo(storePath)->references;
+        } catch (const nix::Error &) { /* unknown path; no refs */ }
+        if (!refs.empty()) {
+            auto refsSink = nix::PathRefScanSink::fromPaths(refs);
+            refsSink << content;
+            refs = refsSink.getResultPaths();
         }
-    } catch (...) { /* best-effort context attribution */ }
+        ctx.reserve(refs.size());
+        for (auto & p : refs) {
+            nix::NixStringContextElem elem = nix::NixStringContextElem::Opaque{ .path = p };
+            ctx.push_back(elem.to_string());
+        }
+    }
     return ctx;
 }
 

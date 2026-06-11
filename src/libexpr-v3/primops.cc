@@ -267,17 +267,54 @@ struct ScopedNixEvalState {
     ~ScopedNixEvalState() { tlNixEvalState = prev; }
 };
 
+/// C-6/C-7 (CODEBASE_REVIEW_2026-06-11): NIX_V3_ALLOW_FAKE_STORE=1 is a
+/// debug-only escape hatch that re-enables the legacy /v3-fake-store/ path
+/// synthesis — in derivationStrict (store wired but native path skipped) and
+/// in builtins.path (no store wired at all).  By DEFAULT v3 refuses to
+/// fabricate store paths that would silently diverge from a real store and
+/// instead surfaces the failure as an error: a fabricated drvPath/store path
+/// is the error-masking class that cost weeks on the drvPath divergence.
+/// Retirement criterion: delete this gate once no workload or embedding needs
+/// fake-store synthesis (the gate exists purely as a debug/embedding escape
+/// hatch; it should be unused in all real configurations).
+static bool allowFakeStore() {
+    static const bool v = std::getenv("NIX_V3_ALLOW_FAKE_STORE") != nullptr;
+    return v;
+}
+
 // String-context side-table is in alloc.hh — entries are encoded
 // strings (`<path>` Opaque, `=<drvPath>` DrvDeep, `!<output>!<drvPath>`
 // Built).  Helpers below convert to/from nix::NixStringContext.
 
+/// C-7(d) (CODEBASE_REVIEW_2026-06-11): every side-table context token is
+/// produced by v3 itself (encodeStringContext ∘ NixStringContextElem::to_string),
+/// so it MUST round-trip back through ::parse.  A parse failure is therefore a
+/// v3 invariant violation — corruption (e.g. the M-2 arena char* aliasing
+/// class) — and silently skipping it deletes a dependency edge from any drv
+/// that consumed the string, producing a wrong drv hash with no error.  Throw
+/// loudly, naming the offending token, so the corruption surfaces at its
+/// source instead of as a mysterious drvPath divergence downstream.
+static void v3InsertContextToken(nix::NixStringContext & ctx,
+                                 const std::string & token,
+                                 const char * site)
+{
+    try {
+        ctx.insert(nix::NixStringContextElem::parse(token));
+    } catch (const std::exception & e) {
+        throw std::runtime_error(
+            std::string("v3 string-context corruption at ") + site +
+            ": un-parseable context token '" + token + "' (" + e.what() +
+            "). Every v3 side-table token must round-trip through "
+            "NixStringContextElem::parse; a dropped token would silently "
+            "delete a derivation dependency edge.");
+    }
+}
+
 static nix::NixStringContext decodeStringContext(const std::vector<std::string> & entries)
 {
     nix::NixStringContext out;
-    for (auto & e : entries) {
-        try { out.insert(nix::NixStringContextElem::parse(e)); }
-        catch (...) { /* skip un-parseable entries */ }
-    }
+    for (auto & e : entries)
+        v3InsertContextToken(out, e, "decodeStringContext");
     return out;
 }
 
@@ -817,10 +854,17 @@ static std::string toStringCoerceCtx(EvalState & state, Value v,
             for (auto & e : twCtx) ctx.push_back(e.to_string());
             return ns.store->printStorePath(sPath);
         } catch (const std::exception &) {
-            // Path doesn't exist on disk or store-copy refused
-            // (e.g. /no-cert-file.crt that TW also can't copy).
-            // Fall back to raw path; downstream may handle it.
-            return std::string(v.asPath());
+            // C-7(c) (CODEBASE_REVIEW_2026-06-11): we reach here ONLY with
+            // copyPathsToStore=true (see the early return above), i.e. a store
+            // copy was REQUESTED — this coercion feeds a derivation's
+            // args/builder/env.  TW's copyPathToStore (eval.cc:2750) has NO
+            // fallback: fetchToStore throws if the path is missing/uncopyable
+            // and the error propagates.  The former v3 fallback to the raw
+            // `/source/...` path produced a context-less string → a dropped
+            // inputSrcs edge → wrong drv hash, silently.  Rethrow to match TW.
+            // (The prior comment's "/no-cert-file.crt that TW also can't copy"
+            // was a "mirror-TW" claim that doesn't hold — TW throws there too.)
+            throw;
         }
     }
     case Tag::Int:    return std::to_string(v.asInt());
@@ -3451,26 +3495,20 @@ void primReadFile(EvalState & state, Value * args, Value & out)
     std::string content;
     if (state.nixEvalState) {
         auto & ns = *state.nixEvalState;
-        try {
-            nix::Value tw;
-            if (args[0].isString()) tw.mkString(path, ns.mem);
-            else                    tw.mkPath(nix::SourcePath(ns.rootFS, nix::CanonPath(path)), ns.mem);
-            auto sp = ns.realisePath(nix::noPos, tw);
-            content = sp.readFile();
-        } catch (const nix::RestrictedPathError &) {
-            // Tree-walker's prim_readFile rethrows -- mirror.
-            throw;
-        } catch (...) {
-            // Realisation failure (path doesn't exist, etc.) -- fall
-            // through to plain ifstream so the error message matches
-            // the v3 standalone behaviour.
-            std::ifstream f(path);
-            // #692 — match TW phrasing (libexpr/primops.cc readFile).
-            if (!f) throw std::runtime_error("path '" + path + "' does not exist");
-            std::stringstream ss;
-            ss << f.rdbuf();
-            content = ss.str();
-        }
+        // C-7(e) (CODEBASE_REVIEW_2026-06-11): route through realisePath and
+        // let its errors propagate verbatim (mirrors primReadDir at the
+        // `catch (...) { throw; }` sites below).  The former catch(...) fell
+        // back to a plain ifstream on ANY realisation failure — which MASKS
+        // IFD *build* failures: it either reads stale on-disk content or
+        // reports a misleading "does not exist", instead of surfacing the
+        // actual build error.  realisePath already yields TW-matching
+        // "path '<p>' does not exist" errors for genuinely-missing paths, and
+        // rethrows RestrictedPathError like TW's prim_readFile.
+        nix::Value tw;
+        if (args[0].isString()) tw.mkString(path, ns.mem);
+        else                    tw.mkPath(nix::SourcePath(ns.rootFS, nix::CanonPath(path)), ns.mem);
+        auto sp = ns.realisePath(nix::noPos, tw);
+        content = sp.readFile();
     } else {
         std::ifstream f(path);
         if (!f) throw std::runtime_error("v3 primop readFile: cannot open " + path);
@@ -4036,10 +4074,8 @@ static std::string v3CoerceToString(
         // literals) skip the lookup entirely.
         const char * buf = v.asString() ? v.asString() : "";
         if (auto * raw = lookupStringContextEntries(buf)) {
-            for (auto & e : *raw) {
-                try { context.insert(nix::NixStringContextElem::parse(e)); }
-                catch (...) { /* skip un-parseable */ }
-            }
+            for (auto & e : *raw)
+                v3InsertContextToken(context, e, "v3CoerceToString");  // C-7(d)
         }
         return std::string(buf);
     }
@@ -4312,18 +4348,13 @@ void primDerivationStrict(EvalState & state, Value * args, Value & out)
 
     // C-6 (CODEBASE_REVIEW_2026-06-11): fake-store synthesis (the
     // /v3-fake-store/ path at the bottom of this function) is ONLY valid
-    // for standalone `v3-eval` with no store wired.  When a real store is
-    // wired (state.nixEvalState != nullptr) it must NEVER be reached: a
-    // native-path exception there is a genuine failure (a user `throw`
-    // inside builder/args/env, or a v3 bug) and silently degrading to a
-    // fabricated drvPath is exactly the error-masking that cost weeks on
-    // the drvPath divergence.  NIX_V3_ALLOW_FAKE_STORE=1 restores the old
-    // permissive fall-through for debugging only.
-    // Retirement criterion: delete this gate once no workload needs the
-    // fake-store path with a store wired (it should always be 0; the gate
-    // exists purely as a debug escape hatch).
-    static const bool s_allowFakeStore =
-        std::getenv("NIX_V3_ALLOW_FAKE_STORE") != nullptr;
+    // for standalone eval with no store wired.  When a real store is wired
+    // (state.nixEvalState != nullptr) it must NEVER be reached: a native-
+    // path exception there is a genuine failure (a user `throw` inside
+    // builder/args/env, or a v3 bug) and silently degrading to a fabricated
+    // drvPath is exactly the error-masking that cost weeks on the drvPath
+    // divergence.  allowFakeStore() (NIX_V3_ALLOW_FAKE_STORE=1) restores the
+    // old permissive fall-through for debugging only.
 
     // BR-3.5: Phase A native fast path.  Attempted ONLY if the
     // input shape passes isSimpleDerivationAttrs (cheap presence
@@ -4404,7 +4435,7 @@ void primDerivationStrict(EvalState & state, Value * args, Value & out)
             // hello/git/python3/coreutils/stdenv/M5, so this only surfaces
             // genuine failures.  NIX_V3_ALLOW_FAKE_STORE=1 keeps the old
             // fall-through for debugging.
-            if (!s_allowFakeStore)
+            if (!allowFakeStore())
                 throw;
             // fall through to the fake-store synthesizer below.
         }
@@ -4454,7 +4485,7 @@ void primDerivationStrict(EvalState & state, Value * args, Value & out)
     // isSimpleDerivationAttrs) — produce a loud error rather than a
     // silently-wrong /v3-fake-store/ path.  (The more common case — the
     // native path throwing — is rethrown in the catch above.)
-    if (state.nixEvalState && !s_allowFakeStore)
+    if (state.nixEvalState && !allowFakeStore())
         throw std::runtime_error(
             "v3 derivationStrict: refusing to synthesize a /v3-fake-store/ "
             "drvPath while a real store is wired (the native derivation path "
@@ -4983,21 +5014,16 @@ static void primDerivationFromPreprocessed(EvalState & state, Value * args, Valu
     // NixStringContext.  Same parse path as nix::NixStringContextElem::parse;
     // each ctxStr is the unparsed "format token" v3 stores in
     // lookupStringContextEntries.
+    // C-7(d): this absorbCtx feeds drv.inputSrcs/inputDrvs directly — the
+    // DERIVATION path.  A dropped token here is a missing dependency edge and
+    // a wrong drv hash.  v3InsertContextToken throws on an un-parseable token
+    // (a v3 invariant violation) rather than silently skipping it.
     auto absorbCtx = [&](const char * s, nix::NixStringContext & ctx) {
         if (!s) return;
         auto * raw = lookupStringContextEntries(s);
         if (!raw) return;
-        for (auto & token : *raw) {
-            try {
-                // NixStringContextElem::parse(s [, xpSettings]) — the
-                // second arg is the ExperimentalFeatureSettings; default
-                // uses the global singleton, which is what we want here.
-                ctx.insert(nix::NixStringContextElem::parse(token));
-            } catch (const std::exception & e) {
-                // Skip malformed tokens — same defensive policy as
-                // the existing primDerivationStrictNative path.
-            }
-        }
+        for (auto & token : *raw)
+            v3InsertContextToken(ctx, token, "__derivationFromPreprocessed");
     };
 
     // ---- Parse preprocessed args ----
@@ -7360,10 +7386,8 @@ static void valueToXml(EvalState & state, std::string & out, Value v, int indent
         // every referenced drv/path forward (matches TW's
         // printValueAsXML, libexpr/eval-xml.cc).
         if (auto * raw = lookupStringContextEntries(v.asString())) {
-            for (auto & e : *raw) {
-                try { context.insert(nix::NixStringContextElem::parse(e)); }
-                catch (...) { /* skip un-parseable */ }
-            }
+            for (auto & e : *raw)
+                v3InsertContextToken(context, e, "toXML");  // C-7(d)
         }
         out += "<string value=\""; out += xmlEscape(v.asString()); out += "\" />\n";
         return;
@@ -7756,8 +7780,20 @@ void primPath(EvalState & state, Value * args, Value & out)
             primPathFilteredNative(state, args, out);
         return;
     }
-    // Standalone v3-eval (no host store wired): compute a placeholder path
-    // so pure AST evaluation still proceeds without a store.
+    // C-7(a) (CODEBASE_REVIEW_2026-06-11): with no host store wired we used
+    // to fabricate a /v3-fake-store/<name> path unconditionally.  That keys
+    // store-path fabrication on `state.nixEvalState` being unset — which can
+    // happen spuriously on a future thread/fiber entry — silently producing a
+    // store path that diverges from any real store.  Refuse by default and
+    // surface "no store wired"; allowFakeStore() restores the placeholder for
+    // pure no-store AST eval / embedding debugging.
+    if (!allowFakeStore())
+        throw std::runtime_error(
+            "v3 builtins.path: no store is wired (state.nixEvalState is null), "
+            "so a real store path cannot be computed. Set "
+            "NIX_V3_ALLOW_FAKE_STORE=1 to fabricate a placeholder /v3-fake-store/ "
+            "path for store-less AST evaluation.");
+    // Placeholder path so pure AST evaluation still proceeds without a store.
     SymbolId sPath = vmIntern(state, "path");
     SymbolId sName = vmIntern(state, "name");
     auto * src = args[0].asAttrs();
@@ -8313,10 +8349,8 @@ nlohmann::json valueToJsonWithContext(
     case Tag::String: {
         const char * buf = v.asString() ? v.asString() : "";
         if (auto * raw = lookupStringContextEntries(buf)) {
-            for (auto & e : *raw) {
-                try { context.insert(nix::NixStringContextElem::parse(e)); }
-                catch (...) { /* skip un-parseable */ }
-            }
+            for (auto & e : *raw)
+                v3InsertContextToken(context, e, "toJSON");  // C-7(d)
         }
         return json(std::string(buf));
     }
