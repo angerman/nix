@@ -8655,7 +8655,19 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 // (no extra C-recursion); on WHNF, applyForceWriteback
                 // memoizes slot=forced and leaves the value on the stack
                 // for the IC handler's natural continuation.
-                if (__builtin_expect(slot.isAppLike(), 0)) {
+                // eval/apply (#3): an under-applied closure-PAP (Tag::App chain
+                // bottoming in a Closure with arity>depth) is ALREADY WHNF — a
+                // partial application.  Forcing it is a no-op AND the memoizing
+                // writeback below would saturate it to its result type and poison
+                // the (often shared) entry — the 2026-06-11 python3
+                // `passthru.pythonAtLeast` PAP→Bool corruption: the slot mutated
+                // Thunk→App(PAP)→Bool, so a later `pythonAtLeast "3.14"` did
+                // `OP_CALL` on a Bool ("callee is not a closure") and native
+                // derivationStrict fell back to /v3-fake-store/, diverging the
+                // drvPath of every package that depends on python3.  Push the PAP
+                // directly (no force, no writeback) — mirrors OP_FORCE (vm.cc:7161).
+                if (__builtin_expect(slot.isAppLike(), 0)
+                    && !isUnderappliedClosurePap(slot)) {
                     push(vm, slot);
                     CallFrame & f = vm.frames.back();
                     f.forceWriteTarget = &slot;
@@ -8831,8 +8843,10 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 Value & slot = b->entries[lo].value;
                 // 2026-05-17: iterative force + memoizing writeback
                 // (IC install path).  Mirror of the IC HIT path above —
-                // see comment there for rationale.
-                if (__builtin_expect(slot.isAppLike(), 0)) {
+                // see comment there for rationale (incl. the 2026-06-11
+                // under-applied-PAP writeback-poisoning guard).
+                if (__builtin_expect(slot.isAppLike(), 0)
+                    && !isUnderappliedClosurePap(slot)) {
                     push(vm, slot);
                     CallFrame & f = vm.frames.back();
                     f.forceWriteTarget = &slot;

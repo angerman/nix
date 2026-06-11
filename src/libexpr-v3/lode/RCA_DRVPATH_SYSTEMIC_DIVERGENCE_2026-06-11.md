@@ -2,7 +2,34 @@
 Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>, Input Output Group.
 SPDX-License-Identifier: Apache-2.0
 -->
-# RCA (OPEN) — systemic v3-direct drvPath divergence (2026-06-11)
+# RCA (RESOLVED) — systemic v3-direct drvPath divergence (2026-06-11)
+
+## RESOLVED — SELECT App-writeback poisoned under-applied PAPs
+
+**Fix:** in `OP_ATTRS_SELECT`'s two memoizing App-writeback sites (vm.cc ~8658
+IC-hit, ~8853 IC-install), the `if (slot.isAppLike())` force-writeback fired on
+an **under-applied closure-PAP**. A PAP is already WHNF; forcing+memoizing it
+**saturated it to its result type (Bool)** and wrote that back into the (often
+shared) attrset entry. Guarded both with `&& !isUnderappliedClosurePap(slot)`
+(mirrors the OP_FORCE PAP break at vm.cc:7161) → a PAP slot is pushed as-is, not
+force-written.
+
+**Result:** `run-759 --quick` 0/8 → **6/8** (python3/hello/git/openssl/coreutils/
+ripgrep all byte-identical to TW); lang **143/143**; PAP suite 4/4; new
+`test/run-pap-select-writeback-tests.sh` 3/3 (pos/neg + python3.drvPath
+regression). Same PAP family as the shipped `isFunction`/`typeOf` fix
+(f5875a89c).
+
+**Residual (separate bug, NOT this one):** `haskell.compiler.ghc98.drvPath` still
+fake-stores — native derivationStrict fails with `cannot coerce a value to a
+string: «slot»` (a Tag::Slot reaching string coercion), a distinct
+Slot-resolution issue to track separately.
+
+---
+
+(original RCA below, kept for the investigation trail)
+
+# RCA — systemic v3-direct drvPath divergence (2026-06-11)
 
 ## Symptom — CRITICAL, ship-blocking
 
