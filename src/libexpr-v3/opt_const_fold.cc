@@ -149,7 +149,12 @@ static bool foldLess(const Lit & a, const Lit & b, Expr & out)
     } else {
         double da = (a.kind == Lit::K_Float) ? a.f : (double)a.i;
         double db = (b.kind == Lit::K_Float) ? b.f : (double)b.i;
-        if (std::isnan(da) || std::isnan(db)) return false; // tree-walker behaviour: throws
+        // CODEBASE_REVIEW_2026-06-11 §10: refuse to const-fold a NaN compare
+        // (defer to runtime).  The prior comment claimed "TW throws" — it does
+        // NOT: TW's CompareValues does an IEEE `<` which yields false for any
+        // NaN operand, and v3's runtime `<` matches.  Refusing to fold is the
+        // conservative choice (the runtime produces the same false either way).
+        if (std::isnan(da) || std::isnan(db)) return false;
         lt = da < db;
     }
     out = LitBool{lt};

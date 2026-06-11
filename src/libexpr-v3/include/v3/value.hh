@@ -252,16 +252,17 @@ public:
     static Value vEmptyAttrs;
 };
 
-// L0 (LEVER_B_IMPL_PLAN_2026-06-10) canary: `Value` is 16 B today (8 B tag word
-// + 8 B payload).  Lever B shrinks it to a tagged 8 B word (pointer tagging +
-// 61-bit inline ints, box overflow), projected ≈ −28% arena (Bindings entry
-// 24→16, ValuePair 64→32, ListVec elem 16→8, thunk Value field halves).  When
-// that lands, flip this assert to ==8 together with the accessors/mkX encoders.
+// L0 (LEVER_B_IMPL_PLAN_2026-06-10): Lever B HAS LANDED — `Value` is a single
+// tagged 8 B word (NaN-boxed: pointer tagging + 61-bit inline ints, box on
+// overflow).  Consequences are already in effect: Bindings::Entry 16 B,
+// ValuePair 32 B, ListVec elem 8 B, the thunk Value field halved.  (The old
+// canary narrated the pre-Lever-B 16 B layout and is corrected here per
+// CODEBASE_REVIEW_2026-06-11 §0.)
 static_assert(sizeof(Value) == 8,
               "v3 Value must be exactly 8 bytes (NaN-boxed word).");
 
-/// Pair of Values for App / PrimOpApp.  Heap allocated; pointer kept in the
-/// payload of the parent Value to keep the Value itself at 16 bytes.
+/// Pair of Values for App / PrimOpApp.  Heap allocated; the pointer is kept in
+/// the 8 B payload of the parent (NaN-boxed) Value.
 ///
 /// 2026-05-18: `evaluated` field added for App-result memoization.  When
 /// forceValue resolves a Tag::App, it stores the WHNF result in
