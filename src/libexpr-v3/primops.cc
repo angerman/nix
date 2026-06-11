@@ -4310,10 +4310,26 @@ void primDerivationStrict(EvalState & state, Value * args, Value & out)
         }
     }
 
+    // C-6 (CODEBASE_REVIEW_2026-06-11): fake-store synthesis (the
+    // /v3-fake-store/ path at the bottom of this function) is ONLY valid
+    // for standalone `v3-eval` with no store wired.  When a real store is
+    // wired (state.nixEvalState != nullptr) it must NEVER be reached: a
+    // native-path exception there is a genuine failure (a user `throw`
+    // inside builder/args/env, or a v3 bug) and silently degrading to a
+    // fabricated drvPath is exactly the error-masking that cost weeks on
+    // the drvPath divergence.  NIX_V3_ALLOW_FAKE_STORE=1 restores the old
+    // permissive fall-through for debugging only.
+    // Retirement criterion: delete this gate once no workload needs the
+    // fake-store path with a store wired (it should always be 0; the gate
+    // exists purely as a debug escape hatch).
+    static const bool s_allowFakeStore =
+        std::getenv("NIX_V3_ALLOW_FAKE_STORE") != nullptr;
+
     // BR-3.5: Phase A native fast path.  Attempted ONLY if the
     // input shape passes isSimpleDerivationAttrs (cheap presence
-    // check — no value forcing).  Anything that throws falls
-    // through to the existing bridge with no semantics change.
+    // check — no value forcing).  With a store wired, an exception
+    // here propagates (C-6); with no store wired it falls through to
+    // the fake-store synthesizer with no semantics change.
     static const bool nativeDisabled =
         std::getenv("V3_DRV_NO_NATIVE") != nullptr;
     if (!nativeDisabled
@@ -4378,7 +4394,19 @@ void primDerivationStrict(EvalState & state, Value * args, Value & out)
                     std::fprintf(stderr, "\n");
                 }
             }
-            // fall through to the bridge below.
+            // C-6: the native path is attempted ONLY when a store is
+            // wired (see the `state.nixEvalState` guard on the enclosing
+            // `if`), so reaching this catch means a real store is wired.
+            // Rethrow the original native-path exception (preserving its
+            // Nix-style trace) instead of falling through to fake-store
+            // synthesis — the latter would mask the error with a wrong
+            // /v3-fake-store/ drvPath.  Native has been 0-fallback across
+            // hello/git/python3/coreutils/stdenv/M5, so this only surfaces
+            // genuine failures.  NIX_V3_ALLOW_FAKE_STORE=1 keeps the old
+            // fall-through for debugging.
+            if (!s_allowFakeStore)
+                throw;
+            // fall through to the fake-store synthesizer below.
         }
     }
 
@@ -4419,6 +4447,20 @@ void primDerivationStrict(EvalState & state, Value * args, Value & out)
     // default, so this is a zero-default-behavior-change deletion).
     if (!args[0].isAttrs() || !args[0].asAttrs())
         typeError("derivationStrict", "attrset");
+
+    // C-6: with a real store wired we must never synthesize a fake-store
+    // drvPath.  Reaching here with state.nixEvalState set means the native
+    // path was skipped (V3_DRV_NO_NATIVE, or the attrs failed
+    // isSimpleDerivationAttrs) — produce a loud error rather than a
+    // silently-wrong /v3-fake-store/ path.  (The more common case — the
+    // native path throwing — is rethrown in the catch above.)
+    if (state.nixEvalState && !s_allowFakeStore)
+        throw std::runtime_error(
+            "v3 derivationStrict: refusing to synthesize a /v3-fake-store/ "
+            "drvPath while a real store is wired (the native derivation path "
+            "was not taken for this derivation's shape). This would mask a "
+            "wrong drvPath. Set NIX_V3_ALLOW_FAKE_STORE=1 to override.");
+
     const auto & sym = drvStrictSymbols();
 
     auto * src = args[0].asAttrs();
