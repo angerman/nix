@@ -1118,8 +1118,24 @@ inline void requireNoStringContextRuntime(const Value & v,
         + display + "')");
 }
 
-inline std::string coerceToString(const Value & v, bool forceString)
+inline std::string coerceToString(const Value & vIn, bool forceString)
 {
+    // C-4b / «slot» residual (CODEBASE_REVIEW_2026-06-11): Tag::Slot is a
+    // v3-only TRANSPARENT pointer into a tenured cell — the actual value is
+    // `*slot` (tree-walker has no Slot, so every value-expecting leaf must
+    // deref it; the VM chases Slots at ~15 other sites).  coerceToString did
+    // NOT: a Slot operand fell straight through to the "cannot coerce a value
+    // to a string: «slot»" error.  That is exactly the ghc98 .drvPath residual
+    // (a Slot reached `${...}` / `+` coercion un-deref'd).  Chase the Slot
+    // chain (bounded by kMaxIndirectionChase, mirroring the other deref loops)
+    // to the underlying value before coercing.  If the resolved value is still
+    // non-coercible, the error below now reflects that REAL type, not «slot».
+    Value vDeref = vIn;
+    size_t slotGuard = 0;
+    while (vDeref.tag() == Tag::Slot && vDeref.asSlot()
+           && ++slotGuard < kMaxIndirectionChase)
+        vDeref = *vDeref.asSlot();
+    const Value & v = vDeref;
     // Use if/else rather than switch to avoid -Wswitch-enum on every
     // tag we don't care to spell out individually.
     auto typeName = [](const Value & v) -> std::pair<const char *, const char *> {
