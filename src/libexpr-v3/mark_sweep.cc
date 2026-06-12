@@ -875,8 +875,24 @@ static bool sweepOneBlock(
             // Phase 3: route dead cell to the per-exact-size free
             // list and clear its cell-start bit.  Subsequent allocs
             // of this size will reuse the freed slot.
-            arena.freeListAdd(
-                const_cast<void *>(cellAddr), cellSize);
+            //
+            // PLAN_BEAT_TW Phase 0.5 (2026-06-12): the freeListBins_ push is
+            // ONLY ever consumed by the legacy reuse path in Arena::alloc()
+            // (alloc.hh:1315 — gated `g_freeListReuseEnabled &&
+            // !g_immixAllocEnabled`).  On the DEFAULT path (both gates off)
+            // and on the Immix path (line-region reuse, not bins) nothing
+            // pops freeListBins_, so the push was pure RSS bloat (8 B/cell +
+            // unordered_map<vector> growth) and sweep CPU with zero benefit.
+            // Gate it to the only condition that consumes it.  Retirement:
+            // folds away with the freeListBins_ legacy path at the Immix SHIP
+            // gate (GC_DECISION_2026-05-29 §6).  clearCellStartBitFor stays
+            // unconditional — it is bitmap-only (no growth) and keeps the
+            // sweep-iteration semantics identical to before this change.
+            if (nix::v3::detail::g_freeListReuseEnabled
+                && !nix::v3::detail::g_immixAllocEnabled) {
+                arena.freeListAdd(
+                    const_cast<void *>(cellAddr), cellSize);
+            }
             arena.clearCellStartBitFor(cellAddr);
         }
     }

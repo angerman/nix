@@ -299,6 +299,36 @@ static void v3InsertContextToken(nix::NixStringContext & ctx,
                                  const std::string & token,
                                  const char * site)
 {
+    // PLAN_BEAT_TW Phase 0.4 falsifier (2026-06-12): the SAME context token
+    // (one dependency edge) is re-parsed through NixStringContextElem::parse
+    // at EVERY consuming drv (decodeStringContext runs per lookup).  This
+    // thread_local memo bounds the CPU spent re-parsing identical tokens, so
+    // we can decide whether the full interned-context lever (1.1) is worth
+    // funding (firefox CPU drop ≥3% ⇒ parse-back is material; <3% ⇒ the cost
+    // is in the COPIES and 1.1 narrows to span-sharing).  Gate:
+    // V3_DBG_CTX_PARSE_MEMO=1.  Retirement (Rule 0): DELETE this whole block
+    // once the 1.1 scope is decided — it keeps no production behaviour.
+    static const bool s_parseMemo =
+        std::getenv("V3_DBG_CTX_PARSE_MEMO") != nullptr;
+    if (s_parseMemo) {
+        static thread_local std::unordered_map<std::string,
+            nix::NixStringContextElem> s_cache;
+        auto it = s_cache.find(token);
+        if (it != s_cache.end()) { ctx.insert(it->second); return; }
+        try {
+            auto elem = nix::NixStringContextElem::parse(token);
+            ctx.insert(elem);
+            s_cache.emplace(token, std::move(elem));
+            return;
+        } catch (const std::exception & e) {
+            throw std::runtime_error(
+                std::string("v3 string-context corruption at ") + site +
+                ": un-parseable context token '" + token + "' (" + e.what() +
+                "). Every v3 side-table token must round-trip through "
+                "NixStringContextElem::parse; a dropped token would silently "
+                "delete a derivation dependency edge.");
+        }
+    }
     try {
         ctx.insert(nix::NixStringContextElem::parse(token));
     } catch (const std::exception & e) {
