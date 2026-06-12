@@ -7351,13 +7351,30 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                         v = outerPair->evaluated;
                         continue;
                     }
-                    std::vector<Value> rights;
-                    rights.reserve(8);
+                    // P-4 (CODEBASE_REVIEW_2026-06-11): collect the spine's
+                    // args into an INLINE small buffer (observed depth ≤4) to
+                    // avoid a per-force heap std::vector alloc on this cold
+                    // (non-memoized) App-force path; overflow to a heap vector
+                    // for deep spines.  Stack-local → re-entrant-safe
+                    // (op_force_slow re-enters via callClosure below).
+                    constexpr size_t kInlineRights = 16;
+                    Value inlineRights[kInlineRights];
+                    std::vector<Value> overflowRights;
+                    size_t nRights = 0;
+                    auto pushRight = [&](const Value & val) {
+                        if (nRights < kInlineRights) inlineRights[nRights] = val;
+                        else overflowRights.push_back(val);
+                        ++nRights;
+                    };
+                    auto rightAt = [&](size_t i) -> const Value & {
+                        return i < kInlineRights ? inlineRights[i]
+                                                 : overflowRights[i - kInlineRights];
+                    };
                     while (v.isAppLike()) {
                         ValuePair * p = v.asPair();
                         if (v.tag() == Tag::App3)
-                            rights.push_back(p->third);   // arg2 lives in `third` now
-                        rights.push_back(p->right);
+                            pushRight(p->third);   // arg2 lives in `third` now
+                        pushRight(p->right);
                         v = p->left;
                     }
                     vm.frames.back().ip = ip;
@@ -7378,16 +7395,16 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     // substitutes directly with no frame setup needed.
                     // This collapses the App spine to a tight loop
                     // inside this OP_FORCE handler.
-                    for (size_t i = rights.size(); i > 0; --i) {
+                    for (size_t i = nRights; i > 0; --i) {
                         if (v.tag() == Tag::Closure
                             && v.asClosure()
                             && v.asClosure()->desc
                             && v.asClosure()->desc->identityLambda)
                         {
-                            v = rights[i - 1];
+                            v = rightAt(i - 1);
                             continue;
                         }
-                        v = callClosure(vm, v, rights[i - 1]);
+                        v = callClosure(vm, v, rightAt(i - 1));
                     }
                     // 2026-05-30: App-result memoization writeback for
                     // both Tag::App AND Tag::App3 (since App3 now has a
@@ -12534,26 +12551,40 @@ Value forceValue(VMState & vm, Value v)
                 v = outerPair->evaluated;
                 continue;
             }
-            std::vector<Value> rights;
-            rights.reserve(8);
-            // Spine-walk: descend the left chain, pushing rights so
-            // that the apply-loop below (rights.size()-1 down to 0)
-            // applies them in source order.  App3 pushes arg2 first,
-            // then arg1, so arg1 is applied before arg2 (the curried
-            // semantics).
+            // P-4 (CODEBASE_REVIEW_2026-06-11): inline small buffer (observed
+            // spine depth ≤4) avoids a per-force heap std::vector alloc on this
+            // cold (non-memoized) App-force path; overflow to heap for deep
+            // spines.  Stack-local → re-entrant-safe (forceValue re-enters).
+            // Spine-walk: descend the left chain, pushing rights so the
+            // apply-loop below (nRights-1 down to 0) applies them in source
+            // order.  App3 pushes arg2 first, then arg1, so arg1 is applied
+            // before arg2 (the curried semantics).
+            constexpr size_t kInlineRights = 16;
+            Value inlineRights[kInlineRights];
+            std::vector<Value> overflowRights;
+            size_t nRights = 0;
+            auto pushRight = [&](const Value & val) {
+                if (nRights < kInlineRights) inlineRights[nRights] = val;
+                else overflowRights.push_back(val);
+                ++nRights;
+            };
+            auto rightAt = [&](size_t i) -> const Value & {
+                return i < kInlineRights ? inlineRights[i]
+                                         : overflowRights[i - kInlineRights];
+            };
             while (v.isAppLike()) {
                 ValuePair * p = v.asPair();
                 if (v.tag() == Tag::App3)
-                    rights.push_back(p->third);   // arg2 (separate slot from `evaluated`)
-                rights.push_back(p->right);
+                    pushRight(p->third);   // arg2 (separate slot from `evaluated`)
+                pushRight(p->right);
                 v = p->left;
             }
             if (v.tag() == Tag::Slot
                 || v.tag() == Tag::Thunk
                 || v.isAppLike())
                 v = forceValue(vm, v);
-            for (size_t i = rights.size(); i > 0; --i)
-                v = callClosure(vm, v, rights[i - 1]);
+            for (size_t i = nRights; i > 0; --i)
+                v = callClosure(vm, v, rightAt(i - 1));
             // Memoize: store the result in the outermost App / App3
             // pair's evaluated field so the next force short-circuits.
             // Defensive: avoid writing back a non-WHNF result.
