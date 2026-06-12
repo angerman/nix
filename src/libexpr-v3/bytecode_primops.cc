@@ -995,7 +995,25 @@ void installAllBytecodePrimops(nix::EvalState & state)
                 "      envEntries = "
                 "        builtins.filter (e: e != null) "
                 "          (builtins.map envKeyValue keys); "
-                "      baseEnv = builtins.listToAttrs envEntries; "
+                // PLAN_BEAT_TW 1.2b: the COMMON case (no __ignoreNulls) needs no
+                // per-key null filtering, so skip the
+                // attrNames -> map(args.${k}) -> listToAttrs SymbolId<->string
+                // round-trip entirely: drop the flag/special keys with
+                // removeAttrs (keeps SymbolId keys) and coerce each value with
+                // __mapAttrValues (one-arg-lambda mapAttrs, no key string).
+                // `keys`/`envEntries` above stay lazy + unforced on this path.
+                // The __ignoreNulls path keeps the original filter pipeline
+                // because mapAttrs cannot DROP entries.  Byte-identical: same
+                // key set (removeAttrs == filter !isFlag !isSpecialEnv), same
+                // per-value coerce (__derivCoerce), order irrelevant (drv env
+                // is serialised sorted).
+                "      baseEnv = "
+                "        if ignoreNullsFlag "
+                "        then builtins.listToAttrs envEntries "
+                "        else builtins.__mapAttrValues "
+                "               (v: builtins.__derivCoerce v) "
+                "               (builtins.removeAttrs args "
+                "                  (flagKeys ++ specialEnvKeys)); "
                 // Only synthesize an `outputs` env entry when the user
                 // ACTUALLY provided `outputs` in args.  TW's
                 // primDerivationStrict adds it only in the explicit-
