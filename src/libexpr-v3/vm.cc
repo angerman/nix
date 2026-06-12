@@ -8195,6 +8195,11 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // the final value up through the cell chain.)
             //
             // Gated by NIX_V3_CELL_EVERYWHERE=1 for safe rollout.
+            // VM-13 (CODEBASE_REVIEW_2026-06-11) RETIREMENT CRITERION (repo
+            // rule 4): delete this gate + the shapeCell publish once the
+            // cell-update-everywhere experiment is either flipped default-on
+            // (after a clean nixpkgs byte-identity sweep proves no regression)
+            // or abandoned.  Default-off since #558 Phase 1.5.
             {
                 static const bool s_cellEverywhere =
                     std::getenv("NIX_V3_CELL_EVERYWHERE") != nullptr;
@@ -8204,7 +8209,12 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                         if (!(fr.flags & CFF_THUNK_RETURN)) continue;
                         if (!fr.thunk) continue;
                         if (!fr.thunk->shapeCell) continue;
-                        *fr.thunk->shapeCell = v;
+                        // VM-13: route through the write barrier (cellWrite)
+                        // instead of a raw `*shapeCell = v`.  Under default-on
+                        // major GC the raw store is invisible to the dirty-list
+                        // / inter-gen tracking the barrier maintains, so a
+                        // cross-generation edge published here could be missed.
+                        cellWrite(fr.thunk->shapeCell, v, nullptr);
                         break;  // innermost THUNK_RETURN only
                     }
                 }
