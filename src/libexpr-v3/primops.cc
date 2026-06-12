@@ -926,6 +926,29 @@ static std::string toStringCoerceCtx(EvalState & state, Value v,
             // because TW's coerceToString uses ValuePrinter with
             // errorPrintOptions but the difference is irrelevant for
             // small attrsets like passthru.
+            // RCA probe (CODEBASE_REVIEW_2026-06-11, firefox≡ghc98 convergent
+            // residual): V3_DBG_SETCOERCE=1 dumps the VM frame stack (lambda
+            // names + codeOffsets) at this throw so the nix source path that
+            // coerces a structuredAttrs derivation set can be localized.
+            // Retire once the residual is root-caused + fixed.
+            if (std::getenv("V3_DBG_SETCOERCE") && state.vm) {
+                std::fprintf(stderr, "v3 SETCOERCE throw (frames=%zu):\n",
+                             state.vm->frames.size());
+                size_t lim = state.vm->frames.size();
+                for (size_t i = lim; i > 0 && i + 24 > lim; --i) {
+                    const auto & fr = state.vm->frames[i - 1];
+                    const LambdaDescriptor * d = nullptr;
+                    if (fr.thunk) d = fr.thunk->suspended.desc;
+                    else if (fr.closure) d = fr.closure->desc;
+                    const char * nm = (d && !d->name.empty()) ? d->name.c_str() : "<anon>";
+                    const PosSnapshot * ps = d ? resolvePosSnapshot(d->posHandle) : nullptr;
+                    std::fprintf(stderr, "  frame[%zu] %-28s %s:%u:%u codeOff=%u\n",
+                        i - 1, nm,
+                        (ps && !ps->file.empty()) ? ps->file.c_str() : "<no-pos>",
+                        ps ? ps->line : 0u, ps ? ps->column : 0u,
+                        d ? d->codeOffset : 0u);
+                }
+            }
             std::ostringstream os;
             os << "cannot coerce a set to a string: ";
             nix::v3::printNixValue(os, v, ir::globalSymbolTable());
