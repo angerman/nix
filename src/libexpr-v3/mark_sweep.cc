@@ -853,10 +853,13 @@ static bool sweepOneBlock(
             ++blockLiveCells;
             blockLiveBytes += cellSize;
             stats.liveBytes += cellSize;
-            // R2.1′: tally the live cell by its stamped type.
+            // R2.1′ + M-9: tally the live cell by its stamped type.  The
+            // type array is nibble-packed (two granules per byte); unpack via
+            // the shared helper (bounds-checked, returns None when out of
+            // range).  `cellTypeBytes` here is the per-block nibble array.
             const size_t gran = offset >> 4;
-            const uint8_t ty = gran < cellTypeBytes.size()
-                ? cellTypeBytes[gran] : 0;
+            const uint8_t ty =
+                static_cast<uint8_t>(nix::v3::cellTypeUnpack(cellTypeBytes, gran));
             stats.cellTypeHist[ty < 9 ? ty : 0]++;
         } else {
             ++stats.deadCells;

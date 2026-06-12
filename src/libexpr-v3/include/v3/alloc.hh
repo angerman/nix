@@ -1005,6 +1005,44 @@ enum class CellType : uint8_t {
     Chars    = 8,  ///< allocChars string/path buffer
 };
 
+// M-9 (CODEBASE_REVIEW_2026-06-11): the per-block cellTypes array is
+// NIBBLE-PACKED — two adjacent 16-byte granules share one byte (even granule
+// in the low nibble, odd granule in the high nibble).  CellType has 9 values
+// (0-8), so 4 bits suffice; this halves the array from 1 MB to 512 KB per
+// 16 MB block (≈ tens of MB on firefox/HNE-class arenas).  Every read/write
+// of cellTypes routes through these three helpers so the packing layout lives
+// in exactly ONE place (alloc.hh's stamp sites + mark_sweep's sweepOneBlock).
+// Single-threaded VM ⇒ the read-modify-write of a shared byte is race-free.
+
+/// Bytes needed to nibble-pack `granules` granule-types (round up).
+inline constexpr size_t cellTypeBytes(size_t granules) noexcept
+{
+    return (granules + 1) >> 1;
+}
+
+/// Unpack the CellType stamped at granule index `bit`.  Returns None if the
+/// (packed) byte index is out of range — callers rely on this for the
+/// "interior / unstamped" case.
+inline CellType cellTypeUnpack(const std::vector<uint8_t> & arr, size_t bit) noexcept
+{
+    const size_t byte = bit >> 1;
+    if (byte >= arr.size()) return CellType::None;
+    const unsigned shift = (bit & 1u) << 2;   // 0 for even granule, 4 for odd
+    return static_cast<CellType>((arr[byte] >> shift) & 0x0Fu);
+}
+
+/// Pack CellType `t` into granule index `bit`, preserving the neighbouring
+/// granule's nibble (read-modify-write).  No-op if out of range.
+inline void cellTypePack(std::vector<uint8_t> & arr, size_t bit, CellType t) noexcept
+{
+    const size_t byte = bit >> 1;
+    if (byte >= arr.size()) return;
+    const unsigned shift = (bit & 1u) << 2;
+    arr[byte] = static_cast<uint8_t>(
+        (arr[byte] & ~(0x0Fu << shift))
+        | ((static_cast<unsigned>(t) & 0x0Fu) << shift));
+}
+
 class Arena
 {
 public:
@@ -1091,13 +1129,16 @@ public:
         /// memory, single branch in alloc().
         std::vector<std::vector<uint64_t>> cellStarts;
 
-        /// R2.1′ (2026-06-03): per-cell-start TYPE byte, parallel to
-        /// `blocks` (cellTypes[i] is block i's type array).  One byte per
-        /// 16-byte granule; nonzero == a cell of that CellType starts
-        /// here.  Stamped by `alloc(bytes, type)` when major-GC is on;
-        /// read by the evacuation mover to content-walk + move any cell
-        /// (esp. Bindings, which the cell-start-only nursery scavenger
-        /// cannot move).  Gate-OFF: vector stays empty, zero cost.
+        /// R2.1′ (2026-06-03) + M-9 (CODEBASE_REVIEW_2026-06-11): per-cell-
+        /// start TYPE, parallel to `blocks` (cellTypes[i] is block i's type
+        /// array).  NIBBLE-PACKED: HALF a byte per 16-byte granule (two
+        /// granules share a byte — see cellTypeBytes/cellTypePack/
+        /// cellTypeUnpack), so 512 KB/block instead of 1 MB.  A nonzero nibble
+        /// == a cell of that CellType starts at that granule.  Stamped by
+        /// `alloc(bytes, type)` when major-GC is on; read by the evacuation
+        /// mover to content-walk + move any cell (esp. Bindings, which the
+        /// cell-start-only nursery scavenger cannot move).  Gate-OFF: vector
+        /// stays empty, zero cost.
         std::vector<std::vector<uint8_t>> cellTypes;
 
         /// Step 11′ (Immix, 2026-05-29 per GC_DECISION_2026-05-29.md):
@@ -1307,12 +1348,12 @@ public:
             const size_t word = bit >> 6;              // /64
             active_.cellStarts.back()[word] |=
                 1ULL << (bit & 63);
-            // R2.1′: stamp the cell type at this granule (bump path —
+            // R2.1′ + M-9: stamp the cell type at this granule (bump path —
             // the default under NIX_V3_MAJOR_GC; immix-span/freelist/huge
-            // paths leave None, pinning those cells, which is safe).
-            if (type != CellType::None
-                && bit < active_.cellTypes.back().size())
-                active_.cellTypes.back()[bit] = static_cast<uint8_t>(type);
+            // paths leave None, pinning those cells, which is safe).  Nibble-
+            // packed write (preserves the neighbouring granule's nibble).
+            if (type != CellType::None)
+                cellTypePack(active_.cellTypes.back(), bit, type);
         }
         return p;
     }
@@ -1372,10 +1413,11 @@ public:
             const size_t offset = static_cast<size_t>(cp - blk);
             if ((offset & 15) != 0) return CellType::None;
             const size_t bit = offset >> 4;
-            if (i >= active_.cellTypes.size()
-                || bit >= active_.cellTypes[i].size())
+            if (i >= active_.cellTypes.size())
                 return CellType::None;
-            return static_cast<CellType>(active_.cellTypes[i][bit]);
+            // M-9: nibble-packed read (cellTypeUnpack bounds-checks the
+            // packed byte index and returns None when out of range).
+            return cellTypeUnpack(active_.cellTypes[i], bit);
         }
         // R2.4d: huge cells (≥ kHugeCutoff) live outside the regular
         // block index; the cell-start is the block begin.  Return the
@@ -1721,8 +1763,9 @@ public:
         const char * blk = active_.blocks[blockIdx];
         const size_t bit =
             (static_cast<size_t>(static_cast<const char *>(p) - blk)) >> 4;
-        auto & types = active_.cellTypes[blockIdx];
-        if (bit < types.size()) types[bit] = static_cast<uint8_t>(type);
+        // M-9: nibble-packed write — UNCONDITIONAL (incl. None) so a reused
+        // granule loses the prior occupant's type (see header above).
+        cellTypePack(active_.cellTypes[blockIdx], bit, type);
     }
 
     /// Accessor for diagnostic + downstream Step 13′ recycle policy.
@@ -2253,8 +2296,8 @@ private:
             if (cp >= blk && cp < blk + kBlockSize) {
                 if (i >= active_.cellTypes.size()) return;
                 const size_t bit = static_cast<size_t>(cp - blk) >> 4;
-                auto & types = active_.cellTypes[i];
-                if (bit < types.size()) types[bit] = static_cast<uint8_t>(type);
+                // M-9: nibble-packed write — unconditional (incl. None).
+                cellTypePack(active_.cellTypes[i], bit, type);
                 return;
             }
         }
@@ -2345,9 +2388,11 @@ private:
                 kBlockSize / 16 / 64, 0ULL);
             active_.lineMarks.emplace_back(
                 kLineU64sPerBlock, 0ULL);
-            // R2.1′: one type byte per 16-byte granule of the block.
+            // R2.1′ + M-9: nibble-packed type array — half a byte per
+            // 16-byte granule (512 KB/block, was 1 MB).  See cellTypeBytes /
+            // cellTypePack / cellTypeUnpack.
             active_.cellTypes.emplace_back(
-                kBlockSize / 16, uint8_t(CellType::None));
+                cellTypeBytes(kBlockSize / 16), uint8_t(CellType::None));
         }
 #if NIX_USE_BOEHMGC
         // WC-13: tell Boehm to scan this block for pointers to GC
