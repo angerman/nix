@@ -183,6 +183,148 @@ bool remapExprVars(Expr & e, const std::unordered_map<VarId, VarId> & sub)
 }
 
 // ---------------------------------------------------------------------------
+// P-11 (CODEBASE_REVIEW_2026-06-11): recursive sub-block cloning, so
+// beta-reduce can inline lambda bodies whose entry block ends in / contains
+// an If / With / Assert / And / Or / Impl (each owns a sub-Block).  Before
+// this, `bodyIsSimple` rejected any body touching those — the pass fired only
+// on toy shapes.  Algorithm ported from opt_strict_call_unthunk.cc's #744 v4.2
+// machinery, but deliberately bound to *this* file's `remapExprVars` (which
+// still REFUSES Lambda / MkThunk / LetRec — see the carrier list above), so
+// the extension is exactly { If, With, Assert, And, Or, Impl } and nothing
+// more.  (The two passes' remapExprVars have diverged — opt_strict clones
+// Lambda/MkThunk via freeVars remap (#743 v4.1); beta-reduce must not — so the
+// trio is duplicated rather than shared.  A future ir_clone.{hh,cc} extraction
+// could unify them once that divergence is reconciled.)
+// ---------------------------------------------------------------------------
+
+bool bodyIsCloneable(const Module & m, BlockId srcBid,
+                     std::unordered_set<BlockId> & visited);
+VarId cloneBlockBindings(Module & m, BlockId srcBid,
+                         std::unordered_map<VarId, VarId> & sub,
+                         std::vector<Binding> & out);
+BlockId cloneSubBlock(Module & m, BlockId srcBid,
+                      const std::unordered_map<VarId, VarId> & parentSub);
+
+/// Can the block at `srcBid` (and any sub-blocks reachable through
+/// If/With/Assert/And/Or/Impl) be cloned by `cloneBlockBindings`?
+/// Recursive; tracks visited blocks to avoid cycles.  Returns false on an
+/// invalid BlockId, a LetRec binding (out of scope — would need to clone the
+/// per-entry Function bodies with recVar substitution), or any nested
+/// sub-block that itself fails the check.  Non-sub-block exprs are probed
+/// through `remapExprVars` with an empty substitution.
+bool bodyIsCloneable(const Module & m, BlockId srcBid,
+                     std::unordered_set<BlockId> & visited)
+{
+    if (srcBid == kInvalidBlock || srcBid >= (BlockId)m.blocks.size())
+        return false;
+    if (!visited.insert(srcBid).second) return true;
+    const Block & b = m.blocks[srcBid];
+    for (const auto & bd : b.bindings) {
+        bool ok = std::visit([&](const auto & v) -> bool {
+            using T = std::decay_t<decltype(v)>;
+            if constexpr (std::is_same_v<T, If>) {
+                return bodyIsCloneable(m, v.thenBlock, visited)
+                    && bodyIsCloneable(m, v.elseBlock, visited);
+            } else if constexpr (std::is_same_v<T, With>
+                              || std::is_same_v<T, Assert>) {
+                return bodyIsCloneable(m, v.bodyBlock, visited);
+            } else if constexpr (std::is_same_v<T, And>
+                              || std::is_same_v<T, Or>
+                              || std::is_same_v<T, Impl>) {
+                return bodyIsCloneable(m, v.rhsBlock, visited);
+            } else if constexpr (std::is_same_v<T, LetRec>) {
+                return false;  // out of scope (see header note)
+            } else {
+                // Non-sub-block expr — probe via remapExprVars.  This is the
+                // SAME predicate bodyIsSimple used, so Lambda/MkThunk are
+                // still refused here (remapExprVars returns false for them).
+                Expr probe = bd.expr;
+                static const std::unordered_map<VarId, VarId> empty;
+                return remapExprVars(probe, empty);
+            }
+        }, bd.expr);
+        if (!ok) return false;
+    }
+    return true;
+}
+
+/// Clone the bindings of `srcBid` into `out` with fresh local VarIds.
+/// Sub-blocks (If/With/Assert/And/Or/Impl) get fresh BlockIds via
+/// `cloneSubBlock`.  Returns the cloned tail VarId, or `kInvalid` if any
+/// binding refuses to clone (callers must NOT splice `out` on failure).
+/// `sub` is mutable: each binding adds (oldVar → newVar); outer/free VarIds
+/// are absent from `sub`, so remapVar leaves them unchanged.
+VarId cloneBlockBindings(Module & m, BlockId srcBid,
+                         std::unordered_map<VarId, VarId> & sub,
+                         std::vector<Binding> & out)
+{
+    if (srcBid == kInvalidBlock || srcBid >= (BlockId)m.blocks.size())
+        return kInvalid;
+    // Snapshot by value — `m.blocks` may reallocate during nested
+    // `cloneSubBlock` → `freshBlock()` (which resizes the vector).  Holding
+    // references into m.blocks[srcBid] across that point would dangle.
+    std::vector<Binding> srcBindings = m.blocks[srcBid].bindings;
+    Terminal srcTerm = m.blocks[srcBid].terminal;
+    for (auto & bd : srcBindings) {
+        VarId newVar = m.freshVar();
+        sub[bd.var] = newVar;
+        Expr cloned = bd.expr;
+        bool ok = std::visit([&](auto & v) -> bool {
+            using T = std::decay_t<decltype(v)>;
+            if constexpr (std::is_same_v<T, If>) {
+                remapVar(v.cond, sub);
+                v.thenBlock = cloneSubBlock(m, v.thenBlock, sub);
+                v.elseBlock = cloneSubBlock(m, v.elseBlock, sub);
+                return v.thenBlock != kInvalidBlock
+                    && v.elseBlock != kInvalidBlock;
+            } else if constexpr (std::is_same_v<T, With>) {
+                remapVar(v.attrs, sub);
+                v.bodyBlock = cloneSubBlock(m, v.bodyBlock, sub);
+                return v.bodyBlock != kInvalidBlock;
+            } else if constexpr (std::is_same_v<T, Assert>) {
+                remapVar(v.cond, sub);
+                v.bodyBlock = cloneSubBlock(m, v.bodyBlock, sub);
+                return v.bodyBlock != kInvalidBlock;
+            } else if constexpr (std::is_same_v<T, And>
+                              || std::is_same_v<T, Or>
+                              || std::is_same_v<T, Impl>) {
+                remapVar(v.lhs, sub);
+                v.rhsBlock = cloneSubBlock(m, v.rhsBlock, sub);
+                return v.rhsBlock != kInvalidBlock;
+            } else {
+                return remapExprVars(cloned, sub);
+            }
+        }, cloned);
+        if (!ok) return kInvalid;
+        out.push_back({newVar, std::move(cloned)});
+    }
+    if (const auto * tr = std::get_if<TermReturn>(&srcTerm)) {
+        auto it = sub.find(tr->value);
+        return (it != sub.end()) ? it->second : tr->value;
+    }
+    return kInvalid;
+}
+
+/// Clone a sub-block referenced from If/With/etc.  Allocates a fresh
+/// BlockId, clones bindings into it, sets the terminal.  Returns the new
+/// BlockId or kInvalidBlock on failure.  `parentSub` is COPIED so the
+/// sub-block's local bindings don't leak back to the parent's map.
+BlockId cloneSubBlock(Module & m, BlockId srcBid,
+                      const std::unordered_map<VarId, VarId> & parentSub)
+{
+    if (srcBid == kInvalidBlock || srcBid >= (BlockId)m.blocks.size())
+        return kInvalidBlock;
+    BlockId newBid = m.freshBlock();  // may grow m.blocks — hold no refs
+    std::unordered_map<VarId, VarId> sub = parentSub;
+    std::vector<Binding> newBindings;
+    VarId tail = cloneBlockBindings(m, srcBid, sub, newBindings);
+    if (tail == kInvalid) return kInvalidBlock;
+    m.blocks[newBid].bindings = std::move(newBindings);
+    m.blocks[newBid].terminal = TermReturn{tail};
+    return newBid;
+}
+
+// ---------------------------------------------------------------------------
 // Same-block VarRef chase: resolve a VarId through VarRef aliases
 // inside one block.  Returns the underlying Expr*, or nullptr if the
 // chain leads outside the block.
@@ -205,16 +347,9 @@ const Expr * chaseInBlock(VarId v,
     return nullptr;
 }
 
-// Build a map from VarId to its defining Expr* within a single block.
-// VarIds defined in outer blocks are absent.
-std::unordered_map<VarId, const Expr *> mapBlockDefs(const Block & b)
-{
-    std::unordered_map<VarId, const Expr *> defs;
-    defs.reserve(b.bindings.size());
-    for (const auto & bd : b.bindings)
-        defs.emplace(bd.var, &bd.expr);
-    return defs;
-}
+// (P-11: mapBlockDefs removed — betaReduce now builds its defs map from a
+// by-value snapshot of the block's bindings, since cloneSubBlock can realloc
+// m.blocks and dangle Expr* pointers into the live block.)
 
 // ---------------------------------------------------------------------------
 // Count references to each VarId across the entire Module.  Returns a
@@ -312,22 +447,19 @@ UseCounter countModuleUses(const Module & m)
 }
 
 // ---------------------------------------------------------------------------
-// Check whether a Function's body block is "simple enough" to clone:
-// only contains Expr kinds we know how to remap.  Returns true if
-// every binding's Expr passes the remap predicate (without actually
-// modifying anything — we just probe with an empty substitution map).
+// Check whether a Function's body block (rooted at `bid`) is cloneable.
+// P-11 (CODEBASE_REVIEW_2026-06-11): delegates to the recursive
+// `bodyIsCloneable`, which now accepts bodies whose bindings contain
+// If/With/Assert/And/Or/Impl (the sub-blocks are cloned with fresh BlockIds);
+// it still refuses Lambda/MkThunk/LetRec (via this file's remapExprVars).
+// Before P-11 this iterated only the entry block's own bindings and rejected
+// any sub-block carrier, so the pass fired on toy shapes only.
 // ---------------------------------------------------------------------------
 
-bool bodyIsSimple(const Block & body)
+bool bodyIsSimple(const Module & m, BlockId bid)
 {
-    static const std::unordered_map<VarId, VarId> empty;
-    for (const auto & bd : body.bindings) {
-        Expr probe = bd.expr;  // copy so we don't mutate the source
-        if (!remapExprVars(probe, empty))
-            return false;
-    }
-    // Terminal is TermReturn{VarId}, always cloneable.
-    return true;
+    std::unordered_set<BlockId> visited;
+    return bodyIsCloneable(m, bid, visited);
 }
 
 // ---------------------------------------------------------------------------
@@ -336,29 +468,26 @@ bool bodyIsSimple(const Block & body)
 // the cloned tail VarId (i.e. what the App's VarId should VarRef to).
 // ---------------------------------------------------------------------------
 
+// P-11: clone the body block `bodyBid` (and any sub-blocks it owns) into a
+// TEMP vector with paramVar→arg seeded, then splice into `out` only on
+// success.  Returns the cloned tail VarId, or kInvalid if the clone failed
+// (bodyIsSimple/bodyIsCloneable should have guaranteed success, but a sub-
+// block clone can still bail defensively — in which case `out` is untouched
+// and the caller keeps the original App binding).  Cloning into a temp first
+// (rather than directly into `out`) keeps `out` intact on a mid-clone bail.
 VarId inlineBody(Module & m,
-                 const Block & body,
+                 BlockId bodyBid,
                  VarId paramVar,
                  VarId arg,
                  std::vector<Binding> & out)
 {
     std::unordered_map<VarId, VarId> sub;
-    sub.reserve(body.bindings.size() + 1);
     sub[paramVar] = arg;
-
-    for (const auto & bd : body.bindings) {
-        VarId newVar = m.freshVar();
-        sub[bd.var] = newVar;
-        Expr cloned = bd.expr;
-        // bodyIsSimple already verified remapExprVars will succeed.
-        (void)remapExprVars(cloned, sub);
-        out.push_back({newVar, std::move(cloned)});
-    }
-
-    // Terminal: substitute the return-value VarId via the same map.
-    VarId tailOriginal = std::get<TermReturn>(body.terminal).value;
-    auto it = sub.find(tailOriginal);
-    return (it != sub.end()) ? it->second : tailOriginal;
+    std::vector<Binding> tmp;
+    VarId tail = cloneBlockBindings(m, bodyBid, sub, tmp);
+    if (tail == kInvalid) return kInvalid;
+    for (auto & b : tmp) out.push_back(std::move(b));
+    return tail;
 }
 
 } // namespace
@@ -380,18 +509,30 @@ size_t betaReduce(Module & m)
 
     // Pass 2: walk each block; rewrite App-of-Lambda patterns where safe.
     for (BlockId bid = 1; bid < (BlockId)m.blocks.size(); ++bid) {
-        Block & blk = m.blocks[bid];
-        // Build same-block defs map BEFORE rewriting (so we can chase
-        // VarRef → Lambda lookups using the pre-rewrite defs).
-        auto defs = mapBlockDefs(blk);
+        // P-11 (CODEBASE_REVIEW_2026-06-11): snapshot this block's bindings
+        // by VALUE before rewriting.  inlineBody now clones sub-blocks via
+        // cloneSubBlock → freshBlock, which can REALLOCATE m.blocks and dangle
+        // any reference/iterator into m.blocks[bid] — the `defs` Expr* map, the
+        // range-for iterator, and any held `Block&`.  Iterating a stable local
+        // copy + writing the result back by index (not via a cached reference)
+        // removes that hazard by construction.  Behaviour is identical to
+        // iterating the live bindings: `out` is built separately and assigned
+        // only at the end, so nothing observes mid-loop mutation either way.
+        std::vector<Binding> srcBindings = m.blocks[bid].bindings;
 
-        // Single output vector; emit-in-order.  Reserve generously
-        // since beta-reduced blocks grow (one App becomes N body
-        // bindings + one VarRef).
+        // Build the same-block defs map from the SNAPSHOT (so chase lookups
+        // stay valid across freshBlock reallocs).
+        std::unordered_map<VarId, const Expr *> defs;
+        defs.reserve(srcBindings.size());
+        for (const auto & bd : srcBindings) defs.emplace(bd.var, &bd.expr);
+
+        // Single output vector; emit-in-order.  Reserve generously since
+        // beta-reduced blocks grow (one App becomes N body bindings + a VarRef).
         std::vector<Binding> out;
-        out.reserve(blk.bindings.size() * 2);
+        out.reserve(srcBindings.size() * 2);
+        size_t inlinedHere = 0;
 
-        for (const auto & bd : blk.bindings) {
+        for (const auto & bd : srcBindings) {
             // Only App bindings are candidates.
             const App * app = std::get_if<App>(&bd.expr);
             if (!app) {
@@ -406,7 +547,8 @@ size_t betaReduce(Module & m)
             if (!lam) { out.push_back(bd); continue; }
 
             // Find the underlying Function and check the safety
-            // preconditions.
+            // preconditions.  `f` references m.functions (NOT m.blocks), which
+            // cloneSubBlock never touches — so it stays valid across inlining.
             if (lam->funcIdx == 0 || lam->funcIdx >= m.functions.size()) {
                 out.push_back(bd); continue;
             }
@@ -425,8 +567,8 @@ size_t betaReduce(Module & m)
                 out.push_back(bd); continue;
             }
 
-            const Block & body = m.blocks[f.entryBlock];
-            if (!bodyIsSimple(body))         { out.push_back(bd); continue; }
+            // P-11: bodyIsSimple now recurses sub-blocks (If/With/And/Or/...).
+            if (!bodyIsSimple(m, f.entryBlock)) { out.push_back(bd); continue; }
 
             // Use-count safety: the Lambda's VarId must have exactly
             // one use across the entire module (the App we're about
@@ -451,14 +593,18 @@ size_t betaReduce(Module & m)
             }
             if (uses.at(lambdaVar) != 1) { out.push_back(bd); continue; }
 
-            // ALL preconditions met — inline.
-            VarId tail = inlineBody(m, body, f.paramVar, app->arg, out);
+            // ALL preconditions met — inline.  inlineBody clones the body
+            // (and its sub-blocks) into `out`; on a defensive clone failure it
+            // returns kInvalid WITHOUT touching `out`, so keep the original.
+            VarId tail = inlineBody(m, f.entryBlock, f.paramVar, app->arg, out);
+            if (tail == kInvalid) { out.push_back(bd); continue; }
             out.push_back({bd.var, VarRef{tail}});
             ++inlined;
+            ++inlinedHere;
         }
 
-        if (inlined > 0)
-            blk.bindings = std::move(out);
+        if (inlinedHere > 0)
+            m.blocks[bid].bindings = std::move(out);
     }
 
     return inlined;
