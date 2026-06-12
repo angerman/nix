@@ -1173,29 +1173,6 @@ inline std::string coerceToString(const Value & vIn, bool forceString)
         return {"a", "value"};
     };
     auto throwCoerceError = [&](const Value & v) -> std::string {
-        // RCA probe (CODEBASE_REVIEW_2026-06-11 firefox≡ghc98 convergent
-        // residual): V3_DBG_SETCOERCE=1 — for a SET, dump ALL attr names +
-        // whether outPath/__toString are present, to decide if the set is a
-        // coercible derivation whose outPath v3's lookup misses (lookup bug),
-        // or the wrong (args) set being coerced.  Retire once root-caused.
-        if (v.tag() == Tag::Attrs && v.asAttrs()
-            && std::getenv("V3_DBG_SETCOERCE")) {
-            const Bindings * b = v.asAttrs();
-            if (b->isChain()) b = b->materialize();
-            static const SymbolId opId = ir::globalInternSymbol("outPath");
-            static const SymbolId tsId = ir::globalInternSymbol("__toString");
-            std::fprintf(stderr,
-                "v3 SETCOERCE: set size=%u hasOutPath=%d has__toString=%d chain=%d names=[",
-                b->size, b->lookup(opId) ? 1 : 0, b->lookup(tsId) ? 1 : 0,
-                v.asAttrs()->isChain() ? 1 : 0);
-            const auto & st = ir::globalSymbolTable();
-            for (uint32_t i = 0; i < b->size; ++i) {
-                SymbolId nm = b->entries[i].name;
-                const char * s = nm < st.size() ? st[nm].c_str() : "?";
-                std::fprintf(stderr, "%s%s", i ? "," : "", s);
-            }
-            std::fprintf(stderr, "]\n");
-        }
         // #691 — use the shared `valueRepr` for TW-equivalent rendering.
         // Pre-fix this lambda used a stub that emitted `{ ... }` / `[ ... ]`
         // placeholders, leaving a PREFIX-class gap vs TW's actual values.
@@ -10556,31 +10533,6 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                             continue;
                         }
                         if (auto * op = b->lookup(outId)) {
-                            // RCA probe (CODEBASE_REVIEW_2026-06-11 firefox≡ghc98
-                            // residual): V3_DBG_SETCOERCE=1 — the outPath entry's
-                            // thunk forces to a SET/Slot (not a store-path
-                            // string) for firefox/ghc98; log the outPath thunk's
-                            // desc + what it resolves to, to localize the
-                            // wrong-value source.  Retire once root-caused.
-                            if (std::getenv("V3_DBG_SETCOERCE")) {
-                                const Value & ov = *op;
-                                const LambdaDescriptor * d =
-                                    (ov.isThunk() && ov.asThunk()
-                                     && ov.asThunk()->state == ThunkState::Suspended)
-                                        ? ov.asThunk()->suspended.desc : nullptr;
-                                const PosSnapshot * ps =
-                                    d ? resolvePosSnapshot(d->posHandle) : nullptr;
-                                Value forced = forceValue(vm, *op);
-                                std::fprintf(stderr,
-                                    "v3 SETCOERCE outPath: thunk codeOff=%u name=%s pos=%s:%u forced->tag=%u\n",
-                                    d ? d->codeOffset : 0u,
-                                    d && !d->name.empty() ? d->name.c_str() : "<anon>",
-                                    (ps && !ps->file.empty()) ? ps->file.c_str() : "<no-pos>",
-                                    ps ? ps->line : 0u, (unsigned)forced.tag());
-                                parts[i] = forced;
-                                ++depth;
-                                continue;
-                            }
                             parts[i] = forceValue(vm, *op);
                             ++depth;
                             continue;
