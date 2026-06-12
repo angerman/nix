@@ -11595,17 +11595,44 @@ Value getBuiltinsValue() noexcept
         // addPrimOp would have shadowed too).  De-dupe up-front: count
         // distinct stripped names so allocBindings gets the right size,
         // then populate with a "first-write wins" rule.
+        // C-22 (CODEBASE_REVIEW_2026-06-11): v3-INTERNAL implementation primops
+        // must NOT appear in the user-facing `builtins` attrset.  TW has no such
+        // builtins, so exposing them makes `builtins ? derivCoerce` /
+        // `attrNames builtins` diverge and breaks nixpkgs feature-detection
+        // (e.g. `builtins.splitString or lib.splitString` would pick the v3
+        // builtin instead of lib's, silently changing behaviour).  These stay
+        // reachable internally by their REGISTERED name (the optimizer +
+        // bytecode wrappers use allRegisteredPrimOps / the strictness whitelist,
+        // not this attrset).  NOTE: real builtins TW conditionally hides
+        // (currentSystem/currentTime/outputOf/fetchClosure/fetchFinalTree —
+        // gated by impure/experimental) are deliberately KEPT.  Keyed by the
+        // stripped name so both `foo` and `__foo` registrations are covered.
+        static const std::unordered_set<std::string_view> kV3InternalBuiltins = {
+            "derivCoerce", "foldlMap", "derivationFromPreprocessed",
+            "derivationStrictRaw", "derivationRaw", "v3CompileCallFlake",
+            "parseInt", "splitString",
+        };
         std::unordered_map<std::string, std::reference_wrapper<const nix::v3::PrimOp>> stripped;
-        for (auto & [poName, po] : reg) {
-            std::string key = poName;
-            if (key.size() >= 2 && key[0] == '_' && key[1] == '_')
-                key.erase(0, 2);
-            // If the non-prefixed name is also registered, the
-            // non-prefixed entry wins (TW's addPrimOp order:
-            // RegisterPrimOp for non-`__` name first registers normally,
-            // the `__` alias is added separately; we mimic by keeping
-            // first-inserted).  Since reg is ordered, first wins.
-            stripped.emplace(std::move(key), std::cref(po));
+        // C-22: DETERMINISTIC alias pick.  allRegisteredPrimOps is an
+        // unordered_map (hash order), so a single first-wins pass would choose
+        // between a bare `foo` and its `__foo` alias non-deterministically
+        // across processes when their flags differ (the old "since reg is
+        // ordered, first wins" comment was wrong — reg is NOT ordered).  Two
+        // passes make the BARE name always win (TW semantics: `__foo` is the
+        // alias of the primary `foo`); the `__`-prefixed alias only fills a gap
+        // where no bare registration exists.
+        for (auto & [poName, po] : reg) {                       // pass 1: bare
+            if (poName.size() >= 2 && poName[0] == '_' && poName[1] == '_')
+                continue;
+            if (kV3InternalBuiltins.count(poName)) continue;    // C-22
+            stripped.emplace(poName, std::cref(po));
+        }
+        for (auto & [poName, po] : reg) {                       // pass 2: __alias
+            if (!(poName.size() >= 2 && poName[0] == '_' && poName[1] == '_'))
+                continue;
+            std::string key = poName.substr(2);
+            if (kV3InternalBuiltins.count(key)) continue;       // C-22
+            stripped.emplace(std::move(key), std::cref(po));     // no-op if bare present
         }
         uint32_t nVisible = static_cast<uint32_t>(stripped.size());
         Bindings * b = Alloc::allocBindings(nVisible);
