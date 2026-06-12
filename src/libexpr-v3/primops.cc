@@ -79,6 +79,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <set>  // C-23: value-based genericClosure key dedup
 
 #include "nix/util/memory-source-accessor.hh"
 #include "nix/store/store-api.hh"
@@ -3131,6 +3132,11 @@ void primSplitString(EvalState &, Value * args, Value & out)
     out.mkList(lv);
 }
 
+// C-23: forward-declare the value-comparison helper (defined later) so
+// genericClosure's dedup can compare keys by VALUE, matching TW's
+// std::map<Value*, CompareValues> — int/float numeric, throws on incomparable.
+static bool valueLessHelper(VMState & vm, const Value & a, const Value & b);
+
 /// builtins.genericClosure { startSet, operator } -- BFS closure of
 /// startSet under operator.  Items are deduplicated by their "key" attr.
 void primGenericClosure(EvalState & state, Value * args, Value & out)
@@ -3158,50 +3164,51 @@ void primGenericClosure(EvalState & state, Value * args, Value & out)
         for (uint32_t i = 0; i < startV.asList()->size; ++i)
             work.push_back(startV.asList()->elems[i]);
     }
-    std::unordered_set<std::string> seen;
-
-    // Track the first-seen key type — tree-walker rejects mixing
-    // string vs int keys across the closure.  We prefix the key
-    // string with its tag to keep distinct types from colliding,
-    // and explicitly raise if a later item presents a different tag.
-    Tag firstKeyTag = Tag::Uninitialized;
-
-    auto keyOf = [&](Value & it) -> std::string {
+    // C-23 (CODEBASE_REVIEW_2026-06-11): dedup keys by VALUE, matching TW's
+    // `std::map<Value*, Value*, CompareValues>` (libexpr/primops.cc:861).
+    // CompareValues compares int/float NUMERICALLY and allows mixing them
+    // (key `1` and key `1.0` dedup as equal), compares floats by value (no
+    // 6-digit `std::to_string` collision), and THROWS on the first comparison
+    // of an incomparable type (bool / attrset / mixed string-vs-int — its
+    // `default:` arm).  v3 previously stringified keys: it rejected int/float
+    // mixing up front, collided distinct floats, and accepted bool keys.
+    // valueLessHelper reproduces CompareValues exactly (int/float numeric,
+    // string/path/list, throw otherwise), so a std::set keyed by it matches
+    // TW — including TW's subtlety that a SINGLE bool key is fine (no
+    // comparison fires) while two bool keys throw on the second insert.
+    // GC-safe: genericClosure's only allocation safe-point is the nested
+    // callClosure below, and the major-GC safepoint fires ONLY at exitDepth==0
+    // (the outermost dispatch loop), so no collection runs mid-BFS to disturb
+    // these arena-referencing key copies.
+    struct GenKeyCmp {
+        VMState * vm;
+        bool operator()(const Value & a, const Value & b) const {
+            return valueLessHelper(*vm, a, b);
+        }
+    };
+    std::set<Value, GenKeyCmp> seen{GenKeyCmp{state.vm}};
+    auto forceKey = [&](Value & it) -> Value {
         it = forceValue(*state.vm, it);
         if (!it.isAttrs() || !it.asAttrs())
-            // #693 — match TW's `expected a set but found <type>: <value>`
-            // phrasing via forceAttrs.
+            // #693 — match TW's `expected a set but found <type>: <value>`.
             throw std::runtime_error(expectedTypeButFound("a set", it));
         const Value * kRaw = it.asAttrs()->lookup(sKey);
-        // #693 — TW (libexpr/primops.cc:genericClosure) checks
-        // `state.getAttr(state.s.key, ...)` which raises the
-        // standard "attribute 'key' missing" on absence.
+        // #693 — TW's `state.getAttr(state.s.key, ...)` raises this on absence.
         if (!kRaw) throw std::runtime_error("attribute 'key' missing");
         Value k = forceValue(*state.vm, *kRaw);
-        Tag t = k.tag();
-        if (t != Tag::String && t != Tag::Int && t != Tag::Float &&
-            t != Tag::Path && t != Tag::Bool)
-            throw std::runtime_error("'key' must be string / int / float / path / bool");
-        if (firstKeyTag == Tag::Uninitialized) firstKeyTag = t;
-        else if (firstKeyTag != t)
-            throw std::runtime_error("cannot compare keys of incompatible types");
-        if (t == Tag::String) return std::string(k.asString());
-        if (t == Tag::Int)    return std::to_string(k.asInt());
-        if (t == Tag::Float) {
-            // REVIEW §3: reject NaN explicitly -- two NaN values
-            // round-trip through std::to_string identically and would
-            // collide as duplicate keys.  Tree-walker rejects too.
-            if (std::isnan(k.asFloat()))
-                throw std::runtime_error("NaN key is not orderable");
-            return std::to_string(k.asFloat());
-        }
-        if (t == Tag::Path)   return std::string(k.asPath() ? k.asPath() : "");
-        return k.asInt() ? "true" : "false";
+        // Defensive: a NaN float key has no consistent ordering (it would break
+        // the set's strict-weak-ordering); reject it.  (TW would dedup NaN keys
+        // as equal, but a NaN genericClosure key is absurd.)
+        if (k.tag() == Tag::Float && std::isnan(k.asFloat()))
+            throw std::runtime_error("NaN key is not orderable");
+        return k;
     };
 
     while (!work.empty()) {
         Value it = work.front(); work.pop_front();
-        std::string key = keyOf(it);
+        Value key = forceKey(it);
+        // valueLessHelper throws on the first incomparable comparison (bool /
+        // mixed-type / attrset key) — matching TW's CompareValues.
         if (!seen.insert(key).second) continue;
         result.push_back(it);
         Value next = callClosure(*state.vm, opV, it);
