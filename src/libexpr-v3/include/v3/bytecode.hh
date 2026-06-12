@@ -543,6 +543,20 @@ constexpr inline Instruction encode(Op op, uint32_t operand = 0) noexcept
 }
 
 // ---------------------------------------------------------------------------
+// M-10 (CODEBASE_REVIEW_2026-06-11): process-wide string-constant intern pool.
+// Returns a STABLE pointer to the unique copy of `s` (a std::deque never
+// invalidates element addresses).  Single-threaded VM; a mutex guards the rare
+// concurrent-emit/deserialize case.  Used by emit (addStringConst) and
+// deserialize so a literal that recurs across CUs is stored once.
+// ---------------------------------------------------------------------------
+const std::string * internStringConstant(std::string_view s);
+/// (total ref count across all interned CUs, unique pooled strings, pooled
+/// bytes) — for the M-10 keep/revert measurement.  Reported under
+/// NIX_V3_STRINGCONST_STATS=1.
+struct StringConstPoolStats { size_t poolEntries; size_t poolCharBytes; };
+StringConstPoolStats stringConstantPoolStats() noexcept;
+
+// ---------------------------------------------------------------------------
 // CompilationUnit
 // ---------------------------------------------------------------------------
 
@@ -554,7 +568,16 @@ struct CompilationUnit
     /// Constants pools.
     std::vector<int64_t>     intConstants;
     std::vector<double>      floatConstants;
-    std::vector<std::string> stringConstants;
+    /// M-10 (CODEBASE_REVIEW_2026-06-11): string literals are INTERNED against
+    /// a process-wide pool (see internStringConstant) — each entry is a stable
+    /// pointer into that pool, NOT an owned std::string.  Compile-time literals
+    /// that recur across the hundreds of CUs an HNE-scale eval imports are then
+    /// stored ONCE.  The DISK format is unchanged (serialize writes the literal
+    /// text per CU; deserialize re-interns), so this is a pure in-memory dedup
+    /// — no schema bump, no cache invalidation.  Interned strings compare by
+    /// pointer (identical literal ⇒ identical pointer), which the
+    /// deserialize-verify path relies on.
+    std::vector<const std::string *> stringConstants;
 
     /// Per-symbol-id (v3 IR SymbolId space) → string.  Mirrors the IR
     /// symbol table for runtime use (with-lookup, attr-name display).
@@ -650,8 +673,11 @@ struct CompilationUnit
         b += code.capacity()           * sizeof(Instruction);
         b += intConstants.capacity()   * sizeof(int64_t);
         b += floatConstants.capacity() * sizeof(double);
-        b += stringConstants.capacity() * sizeof(std::string);
-        for (const auto & s : stringConstants) b += s.capacity();
+        // M-10: stringConstants now holds interned pointers (8 B each); the
+        // pooled string bodies live once in the global pool (counted by
+        // stringConstantPoolStats, NOT per-CU — counting them here would
+        // over-count shared literals across CUs).
+        b += stringConstants.capacity() * sizeof(const std::string *);
         b += symbolTable.capacity()    * sizeof(std::string);
         for (const auto & s : symbolTable) b += s.capacity();
         b += lambdas.capacity()           * sizeof(LambdaDescriptor);

@@ -112,6 +112,7 @@ void walkImportCacheRoots(const std::function<void(Value &)> & visit);
 size_t importCacheBytecodeBytes() noexcept;
 size_t importCacheCuCount() noexcept;
 size_t importCacheResultCount() noexcept;
+size_t importCacheStringConstRefs() noexcept;  // M-10: total interned-string refs
 
 /// 2026-05-29 evening (DIAG analysis spike): clear in-memory import
 /// cache result set so a subsequent LiveTracer / GC walk sees the

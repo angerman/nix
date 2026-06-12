@@ -647,7 +647,9 @@ struct Emitter
     }
     uint32_t addStringConst(std::string_view s)
     {
-        unit.stringConstants.emplace_back(s);
+        // M-10 (CODEBASE_REVIEW_2026-06-11): intern against the process-wide
+        // pool so literals recurring across CUs are stored once.
+        unit.stringConstants.push_back(internStringConstant(s));
         return static_cast<uint32_t>(unit.stringConstants.size() - 1);
     }
 

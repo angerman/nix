@@ -408,6 +408,22 @@ RootResult runRootExprModule(nix::EvalState & state, ir::Module module)
             "v3-direct phase arena bytes (MB): "
             "lower=%.2f optimise=%.2f compile=%.2f run=%.2f total=%.2f\n",
             dLow, dOpt, dCmp, dRun, dTot);
+        // M-10 (CODEBASE_REVIEW_2026-06-11): string-constant interning dedup
+        // measurement.  refs = total stringConstant slots across cached CUs;
+        // pool = unique interned strings.  Net memory vs the old owned-
+        // std::string layout is roughly:  Δ = pool*32B + refs*8B + poolChars
+        //                                    - refs*(32B + avgChars)
+        // i.e. interning WINS when refs >> pool (heavy cross-CU literal reuse).
+        {
+            const auto ps = stringConstantPoolStats();
+            const size_t refs = importCacheStringConstRefs();
+            const double dedup = refs ? double(refs - ps.poolEntries) / double(refs) : 0.0;
+            std::fprintf(stderr,
+                "v3-direct stringConstant interning (M-10): refs=%zu pool=%zu "
+                "poolChars=%zuB dedup=%.1f%% (pool 8B/ref + 32B+chars/unique vs "
+                "old 32B+chars/ref)\n",
+                refs, ps.poolEntries, ps.poolCharBytes, dedup * 100.0);
+        }
         // Per-Tag breakdown for the RUN phase only (the dominant
         // phase by far; per audit it owns ~98 % of arena growth).
         // Other phases are aggregated above; per-Tag dump here helps

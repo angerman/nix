@@ -15,6 +15,49 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
+#include <mutex>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+
+namespace nix::v3 {
+
+namespace {
+// M-10: pool counters, updated only inside internStringConstant (under its
+// mutex), read by stringConstantPoolStats.  Plain size_t — single-threaded VM.
+size_t g_poolEntries   = 0;
+size_t g_poolCharBytes = 0;
+}  // namespace
+
+// M-10 (CODEBASE_REVIEW_2026-06-11): process-wide string-constant intern pool
+// (declared in bytecode.hh).  A std::deque gives STABLE element addresses
+// (never reallocates existing elements), so the returned pointer is valid for
+// the process lifetime.  The index keys on a string_view into the POOLED
+// string (stable), not the transient input.  Single-threaded VM; the mutex
+// covers the rare concurrent emit/deserialize.
+const std::string * internStringConstant(std::string_view s)
+{
+    static std::deque<std::string> pool;
+    static std::unordered_map<std::string_view, const std::string *> index;
+    static std::mutex mu;
+    std::lock_guard<std::mutex> lk(mu);
+    auto it = index.find(s);
+    if (it != index.end()) return it->second;
+    pool.emplace_back(s);
+    const std::string * p = &pool.back();
+    index.emplace(std::string_view(*p), p);  // key views into the stable copy
+    g_poolEntries   += 1;
+    g_poolCharBytes += p->capacity();
+    return p;
+}
+
+StringConstPoolStats stringConstantPoolStats() noexcept
+{
+    return { g_poolEntries, g_poolCharBytes };
+}
+
+} // namespace nix::v3
 
 namespace nix::v3::serialize {
 
@@ -693,9 +736,10 @@ std::string serializeCU(const CompilationUnit & cu)
     w.u32(static_cast<uint32_t>(cu.floatConstants.size()));
     for (auto v : cu.floatConstants) w.f64(v);
 
-    // Section: stringConstants.
+    // Section: stringConstants.  M-10: entries are interned pointers; write
+    // the literal TEXT (disk format unchanged — deserialize re-interns).
     w.u32(static_cast<uint32_t>(cu.stringConstants.size()));
-    for (auto & s : cu.stringConstants) w.str(s);
+    for (auto * s : cu.stringConstants) w.str(*s);
 
     // Section: symbolTable.  Schema 9 (#781b): SPARSE — only entries
     // for SymbolIds actually referenced by this CU's bytecode +
@@ -896,11 +940,12 @@ CompilationUnit deserializeCU(std::string_view blob)
     }
     if (dbg) { breakdown().floatConstantsNs += nowNs() - t0; t0 = nowNs(); }
 
-    // Section: stringConstants.
+    // Section: stringConstants.  M-10: re-intern the literal text into the
+    // process-wide pool (disk format unchanged — still raw strings on disk).
     {
         uint32_t n = r.u32();
         cu.stringConstants.reserve(n);
-        for (uint32_t i = 0; i < n; ++i) cu.stringConstants.push_back(r.str());
+        for (uint32_t i = 0; i < n; ++i) cu.stringConstants.push_back(internStringConstant(r.str()));
     }
     if (dbg) { breakdown().stringConstantsNs += nowNs() - t0; t0 = nowNs(); }
 

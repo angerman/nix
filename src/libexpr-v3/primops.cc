@@ -6111,6 +6111,20 @@ size_t importCacheCuCount() noexcept
     return importCache().cus.size();
 }
 
+/// M-10 (CODEBASE_REVIEW_2026-06-11): total string-constant REFERENCES across
+/// all cached CUs (= sum of each CU's stringConstants.size()).  Compared
+/// against the interned pool's unique-entry count to decide whether interning
+/// is a net memory win on this workload (high ref:unique ratio ⇒ win, since
+/// each dedup'd ref drops 24 B while each unique ref costs +8 B vs the old
+/// owned-std::string layout).  Reported under NIX_V3_STRINGCONST_STATS=1.
+size_t importCacheStringConstRefs() noexcept
+{
+    size_t total = 0;
+    for (const CompilationUnit & cu : importCache().cus)
+        total += cu.stringConstants.size();
+    return total;
+}
+
 /// Number of cached eval-result entries (the Value cache).
 size_t importCacheResultCount() noexcept
 {
@@ -7018,8 +7032,8 @@ void primImport(EvalState & state, Value * args, Value & out)
                                         std::fprintf(vf,
                                             "  first string diff at idx=%zu: cached='%.80s' fresh='%.80s'\n",
                                             si,
-                                            cu1.stringConstants[si].c_str(),
-                                            cu2.stringConstants[si].c_str());
+                                            cu1.stringConstants[si]->c_str(),  // M-10: interned ptr
+                                            cu2.stringConstants[si]->c_str());
                                         break;
                                     }
                                 }

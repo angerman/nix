@@ -277,13 +277,13 @@ uint32_t disassembleOne(std::FILE * out,
     case OP_LIT_STR:
         if (operand < cu.stringConstants.size()) {
             std::fprintf(out, "   ; ");
-            printStrLit(out, cu.stringConstants[operand], '"');
+            printStrLit(out, *cu.stringConstants[operand], '"');  // M-10: interned ptr
         }
         break;
     case OP_LIT_PATH:
         if (operand < cu.stringConstants.size()) {
             std::fprintf(out, "   ; ");
-            printStrLit(out, cu.stringConstants[operand], '<');
+            printStrLit(out, *cu.stringConstants[operand], '<');  // M-10: interned ptr
         }
         break;
     case OP_LIT_PRIMOP:

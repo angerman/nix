@@ -1948,7 +1948,7 @@ inline Value withLookup(VMState & vm, SymbolId name)
                         "  firing-cu stringConstants (first 32):\n");
                     size_t sn = std::min<size_t>(32, cuI->stringConstants.size());
                     for (size_t i = 0; i < sn; ++i) {
-                        const auto & s = cuI->stringConstants[i];
+                        const auto & s = *cuI->stringConstants[i];  // M-10: interned ptr
                         // Truncate long strings for display.
                         std::string display = s.substr(0, 100);
                         std::fprintf(stderr,
@@ -3443,13 +3443,13 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
         }
         case OP_LIT_STR: {
             Value v;
-            v.mkString(cu->stringConstants[operand].c_str());
+            v.mkString(cu->stringConstants[operand]->c_str());  // M-10: interned ptr
             push(vm, v);
             break;
         }
         case OP_LIT_PATH: {
             Value v;
-            v.mkPath(cu->stringConstants[operand].c_str());
+            v.mkPath(cu->stringConstants[operand]->c_str());  // M-10: interned ptr
             push(vm, v);
             break;
         }
