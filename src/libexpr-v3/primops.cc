@@ -2043,42 +2043,6 @@ void primMapAttrs(EvalState & state, Value * args, Value & out)
     out.mkAttrs(result);
 }
 
-// PLAN_BEAT_TW Lever 1.2b (2026-06-12): `__mapAttrValues f attrs` is mapAttrs
-// for a ONE-ARG lambda — it applies `f value` (NOT `f name value`).  The drv
-// wrapper's env build (`bytecode_primops.cc` full_wrapper) only ever does
-// `v: __derivCoerce v`, never reading the key, yet the old pipeline
-// (`attrNames → map (k: {name=k; value=__derivCoerce args.${k}}) → listToAttrs`)
-// round-tripped every key SymbolId→string→SymbolId THREE times per drv
-// (attrNames stringifies, args.${k} re-interns+binary-searches, listToAttrs
-// re-interns).  This primop iterates `src->entries[]` directly, keeps the
-// SymbolId, and builds a lazy `App(f, value)` per entry — zero key strings,
-// zero dynamic selects, zero re-intern.  Structurally identical to
-// primMapAttrs above minus the name string + Tag::App (vs App3), so it inherits
-// the same chain-materialise + write-barrier correctness.
-void primMapAttrValues(EvalState & state, Value * args, Value & out)
-{
-    Value fn = args[0];
-    if (!args[1].isAttrs()) typeError("__mapAttrValues", "attrset");
-    auto * src = args[1].asAttrs();
-    if (!src) { out = args[1]; return; }
-    // Same chain hazard as primMapAttrs: walk the FULL sorted view, not the
-    // overlay-only entries of a Chain.
-    if (src->isChain()) src = const_cast<Bindings *>(src->materialize());
-    Bindings * result = Alloc::allocBindings(src->size);
-    V3_STATS_INC(attrsetsAllocated);
-    recordBindingsOrigin(result, 0, "primMapAttrValues");
-    for (uint32_t i = 0; i < src->size; ++i) {
-        ValuePair * pp = Alloc::allocPair();
-        pp->left  = fn;
-        pp->right = src->entries[i].value;   // lazy: forced on first demand
-        pairPostConstructBarrier(pp);        // Phase D
-        Value app; app.mkPair(Tag::App, pp);
-        result->entries[i].name = src->entries[i].name;  // SymbolId kept as-is
-        bindingsSetValue(result, i, app);    // Phase D
-    }
-    out.mkAttrs(result);
-}
-
 void primElem(EvalState & state, Value * args, Value & out)
 {
     if (!args[1].isList()) typeError("elem", "list");
@@ -9812,10 +9776,6 @@ void registerBuiltinPrimOps()
         registerPrimOp({"removeAttrs",        2, primRemoveAttrs});
         registerPrimOp({"intersectAttrs",     2, primIntersectAttrs});
         registerPrimOp({"mapAttrs",           2, primMapAttrs});
-        // PLAN_BEAT_TW 1.2b: internal one-arg-lambda mapAttrs (no key string).
-        // Used by the drv wrapper to coerce env values without round-tripping
-        // every key SymbolId<->string.  fn is applied as `fn value`.
-        registerPrimOp({"__mapAttrValues",    2, primMapAttrValues});
         registerPrimOp({"elem",               2, primElem, /*lazyArgs=*/0b01});  // C-13: needle lazy
         registerPrimOp({"getAttr",            2, primGetAttr});
         registerPrimOp({"hasAttr",            2, primHasAttr});
