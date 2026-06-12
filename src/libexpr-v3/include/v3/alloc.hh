@@ -1432,32 +1432,26 @@ public:
     {
         if (!majorGcEnabled() || !addr || bytes == 0) return;
         const char * cp = static_cast<const char *>(addr);
-        // Linear scan to find the containing block.  Same convention
-        // as inActive / isCellStart / findContainingCellStart.
-        // Locality optimisation: recent allocations are in the last
-        // block; check last-first.
         const size_t nBlocks = active_.blocks.size();
         if (nBlocks == 0 || nBlocks > active_.lineMarks.size()) return;
-        for (size_t ii = 0; ii < nBlocks; ++ii) {
-            // Iterate last-block-first.
-            const size_t i = nBlocks - 1 - ii;
-            const char * blk = active_.blocks[i];
-            if (cp < blk || cp >= blk + kBlockSize) continue;
-            const size_t offset = static_cast<size_t>(cp - blk);
-            const size_t end = offset + bytes;
-            // Clamp end-of-cell to end-of-block (defensive; cells
-            // should never straddle block boundaries given allocator
-            // refills on overflow).
-            const size_t clampedEnd = (end > kBlockSize) ? kBlockSize : end;
-            const size_t firstLine = offset / kLineBytes;
-            const size_t lastLine  = (clampedEnd - 1) / kLineBytes;
-            auto & bits = active_.lineMarks[i];
-            for (size_t L = firstLine; L <= lastLine && L < kLinesPerBlock; ++L) {
-                bits[L >> 6] |= 1ULL << (L & 63);
-            }
-            return;
-        }
-        // Not in any active block.  Could be huge or external; skip.
+        // P-7 (CODEBASE_REVIEW_2026-06-11): O(log blocks) block lookup via the
+        // sorted index (was an O(blocks) last-first linear scan PER marked
+        // cell during the line-marking pass).  Same containing-block result.
+        const long bi = blockIndexContaining(cp);
+        if (bi < 0) return;  // huge / external — skip (as before)
+        const size_t i = static_cast<size_t>(bi);
+        if (i >= active_.lineMarks.size()) return;
+        const char * blk = active_.blocks[i];
+        const size_t offset = static_cast<size_t>(cp - blk);
+        const size_t end = offset + bytes;
+        // Clamp end-of-cell to end-of-block (defensive; cells should never
+        // straddle block boundaries given allocator refills on overflow).
+        const size_t clampedEnd = (end > kBlockSize) ? kBlockSize : end;
+        const size_t firstLine = offset / kLineBytes;
+        const size_t lastLine  = (clampedEnd - 1) / kLineBytes;
+        auto & bits = active_.lineMarks[i];
+        for (size_t L = firstLine; L <= lastLine && L < kLinesPerBlock; ++L)
+            bits[L >> 6] |= 1ULL << (L & 63);
     }
 
     /// Query whether the line containing `addr` is marked.  Used by
@@ -2176,9 +2170,16 @@ public:
     {
         if (!p) return RegionKind::External;
         const char * cp = static_cast<const char *>(p);
-        for (const char * blk : active_.blocks) {
-            if (cp >= blk && cp < blk + kBlockSize) return RegionKind::Active;
-        }
+        // P-7 (CODEBASE_REVIEW_2026-06-11): O(log blocks) via the sorted block
+        // index, not an O(blocks) linear scan per visited pointer.  The mark
+        // phase calls this per edge (tryMark→inActive→regionOf), so the old
+        // linear scan was O(edges × blocks) — M5 has 424 regular blocks and
+        // mark ran ~11.6 s.  The sortedBlocks_ cache is the same one
+        // findContainingCellStart already trusts in production; its dirty flag
+        // is set on every block add/free, and mark doesn't allocate, so the
+        // (at most one) rebuild amortises across all of mark's lookups.
+        if (blockIndexContaining(cp) >= 0) return RegionKind::Active;
+        // Huge blocks are few (one cell each); a linear scan is fine.
         for (const auto & h : active_.hugeBlocks) {
             if (cp >= h.begin && cp < h.end) return RegionKind::Active;
         }
