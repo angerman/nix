@@ -38,6 +38,8 @@
 ///   Input Output Group.
 /// SPDX-License-Identifier: Apache-2.0
 
+#include <cstddef>
+
 namespace nix::v3 {
 
 struct VMState;
@@ -57,10 +59,20 @@ struct VMState;
 ///   - May free entire blocks back to libc (fully-dead blocks).
 ///   - Stats banner emitted on stderr under NIX_VM_STATS=1.
 ///
+/// Result of one major mark-sweep cycle, consumed by the dispatch-loop
+/// trigger's adaptive-backoff policy (PLAN_BEAT_TW_V2 §1.1b).  `heapBytes`
+/// is the arena's `bytesAllocated()` at cycle entry (the "freed < 5 % of
+/// heap" denominator + the backoff anchor); `bytesFreed` is what the
+/// sweep returned to libc (whole-block-free + huge-block reclaim).
+struct MajorGcResult {
+    std::size_t bytesFreed = 0;
+    std::size_t heapBytes  = 0;
+};
+
 /// Phase 1+2+3 status: declared here, stubbed in mark_sweep.cc as a
 /// no-op pending implementation.  vm.cc's dispatch-loop integration
 /// can wire to this now (gated default-OFF); the gate remains OFF
 /// until the implementation ships and passes the Phase 4 SHIP gate.
-void runMajorMarkSweep(VMState & vm) noexcept;
+MajorGcResult runMajorMarkSweep(VMState & vm) noexcept;
 
 } // namespace nix::v3

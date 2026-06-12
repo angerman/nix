@@ -1861,7 +1861,7 @@ static void runEvacuation(VMState & vm, Arena & arena,
 
 } // anonymous
 
-void runMajorMarkSweep(VMState & vm) noexcept
+MajorGcResult runMajorMarkSweep(VMState & vm) noexcept
 {
     using clock = std::chrono::steady_clock;
     const auto tStart = clock::now();
@@ -2232,6 +2232,12 @@ void runMajorMarkSweep(VMState & vm) noexcept
         st.arenaBytesPrev = arenaBytesAfter;
         st.tPrevStart = tStart;
     }
+
+    // PLAN_BEAT_TW_V2 §1.1b: hand the trigger what it needs for the
+    // adaptive backoff — bytes the sweep actually returned to libc, and
+    // the heap size at cycle entry (the "freed < 5 % of heap" test + the
+    // backoff anchor).
+    return { sweep.bytesFreed, arenaBytesBefore };
 }
 
 } // namespace nix::v3

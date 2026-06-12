@@ -3253,7 +3253,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     // as the ICs above.  Clear it before the mark/sweep so no
                     // stale chain pointer survives a collection.
                     Bindings::clearMaterializeMemo();
-                    runMajorMarkSweep(vm);
+                    const MajorGcResult gcr = runMajorMarkSweep(vm);
                     // Frame pointers may have been forwarded.
                     // Re-read dispatch locals.
                     if (!vm.frames.empty()) {
@@ -3268,6 +3268,31 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     size_t liveSet = arena.bytesAllocated();
                     size_t nextThreshold =
                         static_cast<size_t>(liveSet * g_majorGcGrowth);
+                    // PLAN_BEAT_TW_V2 §1.1b — adaptive backoff.  When the sweep
+                    // returned < 5 % of the heap to libc, this workload's
+                    // garbage is SCATTERED (flat MS can't whole-block-free it —
+                    // firefox: 224 MB dead, 0 blocks freed; M5: GCs free ~17 MB
+                    // yet cost ~6 s each).  Anchor the next threshold to the
+                    // HEAP SIZE at this useless GC (×8) so one useless GC
+                    // suppresses the rest of the eval's useless re-fires (M5
+                    // 2 fires → 1; CPU −27 % on the cardano-node row, arena
+                    // live unchanged — the suppressed GC freed ~0).
+                    //
+                    // HNE-safe by the yield key: HNE's GC frees ≥ 5 % (≈624 MB
+                    // of whole-dead blocks) → freedLittle is false → the backoff
+                    // never engages → HNE keeps collecting at the low threshold
+                    // and its peak RSS stays capped.  (Rule 0: the sibling §1.1a
+                    // 1 GB-initial-threshold raise was FALSIFIED by the HNE
+                    // guard — +44.7 % RSS — because no single scalar threshold
+                    // fits both a useful and a useless collector; the yield key
+                    // is what distinguishes them.  firefox CPU win → §1.8.)
+                    const bool freedLittle =
+                        gcr.heapBytes == 0 || gcr.bytesFreed < gcr.heapBytes / 20;
+                    if (freedLittle) {
+                        size_t backoff = (gcr.heapBytes > (SIZE_MAX >> 3))
+                            ? SIZE_MAX : gcr.heapBytes * 8;
+                        if (backoff > nextThreshold) nextThreshold = backoff;
+                    }
                     if (nextThreshold < g_majorGcInitialThresholdBytes)
                         nextThreshold = g_majorGcInitialThresholdBytes;
                     s_majorGcThresholdBytes = nextThreshold;
