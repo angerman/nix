@@ -236,6 +236,26 @@ bool restrictEval(nix::EvalState & state)
     return state.settings.restrictEval;
 }
 
+std::optional<std::string> storePathNarHash(nix::EvalState & state,
+                                            const std::string & path)
+{
+    // T-5 (CODEBASE_REVIEW_2026-06-11): the content hash (narHash) of a store
+    // path, for keying the IFD EvalResult cache.  An INPUT-addressed output is
+    // NOT content-addressed in its path, so the same path can hold different
+    // content after a non-deterministic rebuild; keying the cache on the path
+    // alone then serves stale content (and is unsafe to ship in AOT snapshots
+    // across machines).  Returns the SRI narHash, or nullopt if `path` is not a
+    // registered store object (caller then skips caching, which is safe).
+    try {
+        if (!state.store->isInStore(path)) return std::nullopt;
+        auto [storePath, _sub] = state.store->toStorePath(path);
+        auto info = state.store->queryPathInfo(storePath);
+        return info->narHash.to_string(nix::HashFormat::SRI, /*includeAlgo=*/true);
+    } catch (const nix::Error &) {
+        return std::nullopt;
+    }
+}
+
 std::string currentSystem(nix::EvalState & state)
 {
     // C-20 (CODEBASE_REVIEW_2026-06-11): mirror TW's

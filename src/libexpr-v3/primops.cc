@@ -6494,15 +6494,26 @@ void primImport(EvalState & state, Value * args, Value & out)
     // efficiently by the in-memory `cache.results` map + the CU disk
     // cache; disk-caching their full result Value adds nothing and
     // explodes cache size + cold wall.
-    if (s_ifdImportDiskCache && isIfdImport) {
+    // T-5 (CODEBASE_REVIEW_2026-06-11): key the IFD EvalResult disk cache on the
+    // path's narHash (content), not the path alone.  An INPUT-addressed output
+    // is not content-addressed in its path, so the same path can hold different
+    // content after a non-deterministic rebuild; path-only keying then serves
+    // stale content (and is unsafe in AOT snapshots across machines).  If the
+    // narHash is unavailable, skip the disk cache entirely (safe: re-eval).
+    std::optional<std::string> ifdNarHash;
+    if (s_ifdImportDiskCache && isIfdImport)
+        ifdNarHash = ffi::storePathNarHash(*state.nixEvalState, path);
+    if (s_ifdImportDiskCache && isIfdImport && ifdNarHash) {
         CACHE_HOOK_DEFINE_SITE(siteImportIfdLookup,
             "primImport-ifd-disk-lookup");
         CacheHookTimer timer(siteImportIfdLookup);
         std::string keyBytes;
-        keyBytes.reserve(11 + path.size());
+        keyBytes.reserve(12 + path.size() + ifdNarHash->size());
         keyBytes.append("ifd-import");
         keyBytes.push_back('\0');
         keyBytes.append(path);
+        keyBytes.push_back('\0');
+        keyBytes.append(*ifdNarHash);  // T-5: content hash
         auto diskKey = disk_cache::computeKeyForString(keyBytes);
         auto blob = disk_cache::lookupEvalResult(diskKey);
         if (blob) {
@@ -7450,16 +7461,21 @@ skipDiskCacheLookup:
     // Serialiser failures (closures, etc.) are silently skipped;
     // subsequent invocations just see a disk-cache miss + recompute.
     // Also gated on isIfdImport (RCA 2026-05-24).
-    if (s_ifdImportDiskCache && isIfdImport) {
+    // T-5: insert under the SAME content-keyed key as the lookup (reusing the
+    // narHash computed above); skip if unavailable (kept the cache off rather
+    // than persist an unsound path-only entry).
+    if (s_ifdImportDiskCache && isIfdImport && ifdNarHash) {
         CACHE_HOOK_DEFINE_SITE(siteImportIfdInsert,
             "primImport-ifd-disk-insert");
         CacheHookTimer timer(siteImportIfdInsert);
         try {
             std::string keyBytes;
-            keyBytes.reserve(11 + path.size());
+            keyBytes.reserve(12 + path.size() + ifdNarHash->size());
             keyBytes.append("ifd-import");
             keyBytes.push_back('\0');
             keyBytes.append(path);
+            keyBytes.push_back('\0');
+            keyBytes.append(*ifdNarHash);  // T-5: content hash
             auto diskKey = disk_cache::computeKeyForString(keyBytes);
             std::string blob;
             value_serialize::serialize(out, blob);

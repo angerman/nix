@@ -469,6 +469,13 @@ bool pureEval(nix::EvalState & state);
 /// returns "" under pure OR restricted eval, matching TW's prim_getEnv).
 bool restrictEval(nix::EvalState & state);
 
+/// T-5: SRI narHash (content hash) of a store path, or nullopt if `path` is
+/// not a registered store object.  Keys the IFD EvalResult cache by content so
+/// an input-addressed output's content change under the same path is not served
+/// stale (and AOT entries stay sound across machines).
+std::optional<std::string> storePathNarHash(nix::EvalState & state,
+                                             const std::string & path);
+
 /// `nix::nixVersion` — the host Nix version string (builtins.nixVersion;
 /// nixpkgs compares it against a minimum).  Cold.
 std::string nixVersion();
