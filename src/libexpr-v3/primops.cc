@@ -948,6 +948,18 @@ static std::string toStringCoerceCtx(EvalState & state, Value v,
     case Tag::External:
     case Tag::Slot:
     default: {
+        // C-23 (CODEBASE_REVIEW_2026-06-11): a function value — a closure, a
+        // primop / partially-applied primop, or an under-applied closure-PAP —
+        // coerces to TW's exact "cannot coerce a function to a string" (not a
+        // v3-internal "tag=%u").  Callers that pattern-match TW's wording then
+        // behave identically.
+        {
+            Tag tg = v.tag();
+            if (tg == Tag::Closure || tg == Tag::PrimOp || tg == Tag::PrimOpApp
+                || ((tg == Tag::App || tg == Tag::App3)
+                    && underappliedPapLeaf(v)))
+                throw std::runtime_error("cannot coerce a function to a string");
+        }
         // 2026-05-18 cc-wrapper bisection: enhance the diagnostic
         // when we hit a non-stringifiable value.  Specifically for
         // PrimOp / PrimOpApp / Closure, print the function NAME so
@@ -1254,9 +1266,9 @@ void primConcatStringsSep(EvalState & state, Value * args, Value & out)
     }
 }
 
-void primSubstring(EvalState &, Value * args, Value & out)
+void primSubstring(EvalState & state, Value * args, Value & out)
 {
-    if (!args[0].isInt() || !args[1].isInt() || !args[2].isString())
+    if (!args[0].isInt() || !args[1].isInt())
         typeError("substring", "(int, int, string)");
     int64_t start = args[0].asInt();
     int64_t len = args[1].asInt();
@@ -1265,8 +1277,26 @@ void primSubstring(EvalState &, Value * args, Value & out)
     if (start < 0)
         // #693 — match TW phrasing (libexpr/primops.cc:substring).
         throw std::runtime_error("negative start position in 'substring'");
-    std::string_view src(args[2].asString());
-    const char * srcPtr = args[2].asString();
+
+    // C-23 (CODEBASE_REVIEW_2026-06-11): TW's prim_substring COERCES the 3rd
+    // arg (coerceToString, copyToStore=false), so a path / derivation / attrset
+    // with outPath/__toString is accepted (not just a bare string), with its
+    // string context propagated.  The common bare-string case keeps its fast
+    // path (and side-table context forwarding below); a coercible non-string is
+    // coerced via toStringCoerceCtx.
+    std::string srcStorage;
+    std::string_view src;
+    std::vector<std::string> coercedCtx;
+    const char * strCtxKey = nullptr;  // side-table key, bare-string path only
+    if (args[2].isString()) {
+        src = std::string_view(args[2].asString());
+        strCtxKey = args[2].asString();
+    } else {
+        srcStorage = toStringCoerceCtx(state, args[2], coercedCtx,
+                                       /*copyPathsToStore=*/false);
+        src = srcStorage;
+    }
+
     if (static_cast<size_t>(start) >= src.size()) {
         out = mkStringValueOwned("");
     } else {
@@ -1275,18 +1305,17 @@ void primSubstring(EvalState &, Value * args, Value & out)
         out = mkStringValueOwned(std::string(src.substr(start, actualLen)));
     }
     // REVIEW §1.6: forward string-context entries from the input.
-    // Tree-walker (libexpr/primops.cc:1717+ prim_substring) propagates
-    // context unconditionally -- this is what `builtins.substring 0 0
-    // drv.outPath` relies on for ref-stripping (the empty-string result
-    // carries the original drvPath context, marking the derivation as
-    // a runtime dep without including the path).  Without forwarding,
-    // v3 silently drops the context and downstream string concatenation
-    // would lose the runtime dep.
-    if (srcPtr) {
-        if (auto * raw = lookupStringContextEntries(srcPtr)) {
+    // Tree-walker (prim_substring) propagates context unconditionally -- this
+    // is what `builtins.substring 0 0 drv.outPath` relies on for ref-stripping
+    // (the empty-string result carries the original drvPath context, marking
+    // the derivation as a runtime dep without including the path).
+    if (strCtxKey) {
+        if (auto * raw = lookupStringContextEntries(strCtxKey)) {
             std::vector<std::string> copy(raw->begin(), raw->end());
             setStringContextEntries(out.asString(), std::move(copy));
         }
+    } else if (!coercedCtx.empty()) {
+        setStringContextEntries(out.asString(), std::move(coercedCtx));
     }
 }
 
