@@ -406,13 +406,12 @@ std::optional<std::string> lookup(const CacheKey & key)
         int len = sqlite3_column_bytes(raw, 0);
         std::string blob(static_cast<const char *>(data),
                          static_cast<size_t>(len));
-        // Best-effort LRU bump.  Failures are silent.
-        try {
-            sqlite3_stmt * up = static_cast<sqlite3_stmt *>(state->updateLastUsed);
-            sqlite3_reset(up);
-            sqlite3_bind_blob(up, 1, key.bytes, sizeof key.bytes, SQLITE_TRANSIENT);
-            sqlite3_step(up);
-        } catch (...) { /* advisory */ }
+        // P-12 / M-12 (CODEBASE_REVIEW_2026-06-11): the per-hit LRU `last_used`
+        // bump is GONE.  It was a SQLite UPDATE (a write) on the warm-cache READ
+        // path, maintaining an index that NOTHING consumes — there is no
+        // eviction / DELETE anywhere in this file, so last_used was write-only.
+        // Dropping it removes a write per cache hit.  If LRU eviction is ever
+        // added, re-introduce the bump together with the DELETE that reads it.
         st.hits++;
         return blob;
     } catch (...) {
@@ -496,12 +495,8 @@ std::optional<std::string> lookupEvalResult(const CacheKey & key)
         int len = sqlite3_column_bytes(raw, 0);
         std::string blob(static_cast<const char *>(data),
                          static_cast<size_t>(len));
-        try {
-            sqlite3_stmt * up = static_cast<sqlite3_stmt *>(state->evalUpdateLastUsed);
-            sqlite3_reset(up);
-            sqlite3_bind_blob(up, 1, key.bytes, sizeof key.bytes, SQLITE_TRANSIENT);
-            sqlite3_step(up);
-        } catch (...) { /* advisory */ }
+        // P-12 / M-12: per-hit LRU bump removed (no eviction consumes it; it
+        // was a write on the warm-cache read path).  See lookup() above.
         st.evalHits++;
         return blob;
     } catch (...) {
