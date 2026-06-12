@@ -558,19 +558,27 @@ private:
                 : sizeof(Thunk);
             arenaSetForSlot_->markLinesForCell(t, bytes);
         }
-        // Thunk::cell + shapeCell point at Value cells (Bindings-
-        // resident OR standalone allocValue).  Mark them via visitSlot
-        // so the cell payload is walked transitively.
+        // Thunk::cell points at a Value cell (Bindings-resident OR standalone
+        // allocValue).  Mark it via visitSlot so the cell payload is walked
+        // transitively.  (M-8: the shapeCell field was removed — see closure.hh.)
         if (t->cell)      visitSlot(t->cell);
-        if (t->shapeCell) visitSlot(t->shapeCell);
-        // Phase 3.5 safety: walk cellContainer precisely.  When cell
-        // is Bindings-resident, cellContainer is the owning Bindings.
-        // visitSlot above already triggers interior-owner walk for
-        // cell, but doing visitBindings here is cheap insurance + the
-        // explicit precise walk catches all Bindings entries (not
-        // just conservatively).
-        if (t->cellContainer)
-            visitBindings(t->cellContainer);
+        // Phase 3.5 safety: precisely walk the owning Bindings when `cell` is
+        // Bindings-resident.  M-8 (CODEBASE_REVIEW_2026-06-11) removed the
+        // stored Thunk::cellContainer; per the review it is DERIVED on demand
+        // via findContainingCellStart(cell) + a Bindings type-check.  visitSlot
+        // above already triggers the interior-owner walk, so this is the same
+        // "cheap insurance" precise walk it was before, now without the 8 B
+        // per-thunk field.
+        if (t->cell && arenaSetForSlot_) {
+            const char * owner = arenaSetForSlot_->findContainingCellStart(t->cell);
+            if (owner && arenaSetForSlot_->cellTypeAt(owner) == CellType::Bindings) {
+                // visitBindings takes Bindings*& (it may forward under a moving
+                // GC); bind a local lvalue.  We discard any forwarding since we
+                // don't store the derived owner.
+                Bindings * ownerB = reinterpret_cast<Bindings *>(const_cast<char *>(owner));
+                visitBindings(ownerB);
+            }
+        }
         switch (t->state) {
         case ThunkState::Suspended:
         case ThunkState::Blackhole:
@@ -1272,8 +1280,15 @@ private:
         case CellType::Thunk: {
             auto * t = static_cast<Thunk *>(cell);
             if (t->cell)          visitSlot(t->cell);
-            if (t->shapeCell)     visitSlot(t->shapeCell);
-            if (t->cellContainer) visitBindings(t->cellContainer);
+            // M-8 (CODEBASE_REVIEW_2026-06-11): shapeCell removed; cellContainer
+            // removed + DERIVED via findContainingCellStart(cell) (Bindings-typed).
+            if (t->cell) {
+                const char * owner = arena_.findContainingCellStart(t->cell);
+                if (owner && arena_.cellTypeAt(owner) == CellType::Bindings) {
+                    Bindings * ownerB = reinterpret_cast<Bindings *>(const_cast<char *>(owner));
+                    visitBindings(ownerB);
+                }
+            }
             switch (t->state) {
             case ThunkState::Suspended:
             case ThunkState::Blackhole:
@@ -1739,8 +1754,7 @@ static void runEvacuation(VMState & vm, Arena & arena,
                     case CellType::Thunk: {
                         auto * t = reinterpret_cast<const Thunk *>(cs);
                         if (t->cell && inFreeable(reinterpret_cast<uintptr_t>(t->cell))) note("Thunk.cell", cs);
-                        if (t->shapeCell && inFreeable(reinterpret_cast<uintptr_t>(t->shapeCell))) note("Thunk.shapeCell", cs);
-                        if (t->cellContainer && inFreeable(reinterpret_cast<uintptr_t>(t->cellContainer))) note("Thunk.cellContainer", cs);
+                        // M-8: shapeCell + cellContainer fields removed.
                         switch (t->state) {
                         case ThunkState::Suspended:
                         case ThunkState::Blackhole:

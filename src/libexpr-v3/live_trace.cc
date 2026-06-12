@@ -273,8 +273,7 @@ private:
         // because it may reach objects not otherwise rooted.
         if (t->cell && cellsWalked.insert(t->cell).second)
             auditAndVisit(*t->cell);
-        if (t->shapeCell && cellsWalked.insert(t->shapeCell).second)
-            auditAndVisit(*t->shapeCell);
+        // M-8: shapeCell walk removed with the field.
 
         switch (t->state) {
         case ThunkState::Suspended:
@@ -795,7 +794,7 @@ private:
             : sizeof(Thunk) + sizeof(Value) * t->nUpvalues;
         account(bytes);
         if (t->cell && cells_.insert(t->cell).second) visitValue(*t->cell);
-        if (t->shapeCell && cells_.insert(t->shapeCell).second) visitValue(*t->shapeCell);
+        // M-8: shapeCell walk removed with the field.
         switch (t->state) {
         case ThunkState::Suspended:
         case ThunkState::Blackhole:
@@ -1686,7 +1685,7 @@ private:
     void walkThunk(Thunk * t) noexcept
     {
         if (t->cell)      visitSlot(t->cell);
-        if (t->shapeCell) visitSlot(t->shapeCell);
+        // M-8: shapeCell field removed.
         switch (t->state) {
         case ThunkState::Suspended:
         case ThunkState::Blackhole:

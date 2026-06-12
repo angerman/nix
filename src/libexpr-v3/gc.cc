@@ -672,14 +672,8 @@ void Scavenger::walkThunk(Thunk * t)
     if (t->cell && walked.insert(t->cell).second) {
         visitValue(*t->cell);
     }
-    // Round 1 #5 (defensive): shapeCell is only populated when
-    // NIX_V3_CELL_EVERYWHERE=1 — currently default-off — but if
-    // anything flips that gate the cell holds Tag::Thunk(self) at
-    // first then in-progress Bindings; both must be forwarded.
-    // No-op when shapeCell is null (the default).
-    if (t->shapeCell && walked.insert(t->shapeCell).second) {
-        visitValue(*t->shapeCell);
-    }
+    // M-8 (CODEBASE_REVIEW_2026-06-11): the shapeCell visit was removed with
+    // the field (the NIX_V3_CELL_EVERYWHERE experiment is gone).
     switch (t->state) {
     case ThunkState::Suspended:
         if (t->suspended.cu && walkedCUs.insert(t->suspended.cu).second) {
@@ -1203,11 +1197,7 @@ struct Auditor {
             // reach nursery.  Recurse into the cell value.
             visitValue(*t->cell, "Thunk.cell");
         }
-        // Round 1 #5: shapeCell (NIX_V3_CELL_EVERYWHERE) — same as
-        // cell, walk through the contents to catch nursery payloads.
-        if (t->shapeCell) {
-            visitValue(*t->shapeCell, "Thunk.shapeCell");
-        }
+        // M-8: shapeCell visit removed with the field.
         switch (t->state) {
         case ThunkState::Suspended:
             // #705 R9: walk this CU's IC.

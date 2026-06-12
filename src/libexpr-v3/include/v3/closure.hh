@@ -121,51 +121,26 @@ struct Thunk
     /// write happens exactly once per cell-binding.
     Value * cell;
 
-    /// Phase D (Stage 3) write-barrier metadata, 2026-05-21.  If the
-    /// `cell` above points INTO a `Bindings::entries[i].value` slot,
-    /// `cellContainer` is the owning `Bindings *`.  At OP_RETURN's
-    /// cell-write, the write barrier appends `cellContainer` to the
-    /// thread-local dirty-container list (see `v3/barrier.hh`) so
-    /// the next scavenge walks the Bindings and forwards any
-    /// nursery payload the cell-write installed.
-    ///
-    /// nullptr when:
-    ///   - The cell is null (no in-place update planned), OR
-    ///   - The cell is a standalone `Alloc::allocValue()` cell
-    ///     that doesn't sit inside a Bindings.  In that case the
-    ///     barrier uses the thread-local standalone-cell registry
-    ///     (also in `v3/barrier.hh`) instead.
-    ///
-    /// Set at the same MAKE-thunk / publish sites that set `cell`;
-    /// cleared alongside `cell` at OP_RETURN.
-    Bindings * cellContainer;
+    // M-8 (CODEBASE_REVIEW_2026-06-11): the Phase D `Bindings * cellContainer`
+    // field was REMOVED.  It cached the owning Bindings of `cell` purely so the
+    // GC marker could precisely walk it and the nursery write-barrier could
+    // dirty-mark it.  Both are now DERIVED on demand from `cell` via
+    // Arena::findContainingCellStart (+ a Bindings type-check) at the marker
+    // (mark_sweep walkThunk), and the OP_RETURN barrier tracks the single cell
+    // write via the standalone-cell registry (cellWrite(cell, v, nullptr)).
+    // Dropping it (with shapeCell) shrinks the Thunk header 56 B -> 40 B.
 
-    /// #558 Phase 1.5 (2026-05-12) Cell-Update Everywhere: separate
-    /// heap-stable Value* used for IN-PROGRESS shape publishing during
-    /// body execution.  Distinct from `cell` (which is the
-    /// parent-entry-slot pointer for STG-8 in-place updates).
-    ///
-    /// Lifecycle:
-    ///   - At MAKE_THUNK / allocThunkSuspended: allocated, initialized
-    ///     to *shapeCell = Tag::Thunk(this).  The sentinel value
-    ///     "this thunk has not published anything yet."
-    ///   - During body execution, OP_ATTRS_REC_INIT (and friends)
-    ///     update *shapeCell with the in-progress Bindings as the
-    ///     body constructs them.
-    ///   - At OP_RETURN: *shapeCell = retVal; shapeCell = nullptr
-    ///     (read-once).
-    ///
-    /// forceValue's Black branch reads *shapeCell BEFORE consulting
-    /// the partial-Bindings registry.  If shapeCell has been updated
-    /// past the pre-body sentinel, return its contents — this is the
-    /// precise per-thunk in-progress state, free of the cross-thunk
-    /// pollution that publishToAllThunkFrames' registry-wide search
-    /// introduces.
-    ///
-    /// Gated by NIX_V3_CELL_EVERYWHERE=1 for safe rollout.
-    /// nullptr if not allocated (cell-everywhere off, or thunk not
-    /// of a kind that benefits).
-    Value * shapeCell;
+    // M-8 (CODEBASE_REVIEW_2026-06-11): the #558 Phase 1.5 "Cell-Update
+    // Everywhere" `Value * shapeCell` field was REMOVED here.  It was an 8-byte
+    // per-thunk slot used only by the NIX_V3_CELL_EVERYWHERE experiment, which
+    // was DEFAULT-OFF since #558 Phase 1.5 (shapeCell stayed nullptr in every
+    // production eval — allocThunkSuspended only allocated it under the gate).
+    // Removing it (together with `cellContainer`, derived on demand) shrinks
+    // the Thunk header 56 B -> 40 B, which — because Arena::alloc rounds to a
+    // 16 B boundary — drops a consistent 16 B per thunk for ALL upvalue counts
+    // (thunks were ~320 MB on HNE-class evals -> order 80 MB).  The VM-13
+    // retirement criterion (delete the gate + publish) is hereby satisfied:
+    // the experiment is abandoned, not flipped on.
 
     union {
         // ThunkState::Suspended

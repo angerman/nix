@@ -273,8 +273,11 @@ inline std::unordered_map<const Thunk *, ThunkCreationInfo> & thunkCreationMap()
 }
 
 // #558 Phase 3.3 (2026-05-12): partialBindingsRegistry +
-// lookupInPartialChain + pickLargestLayer retired.  Cell-update-
-// everywhere via Thunk::shapeCell (Phase 1.5) replaces them.
+// lookupInPartialChain + pickLargestLayer retired.  The cell-update-
+// everywhere experiment (Thunk::shapeCell, Phase 1.5) that nominally
+// replaced them was itself default-off and has now been removed entirely
+// (M-8, CODEBASE_REVIEW_2026-06-11); a local cycle falls through to the
+// BlackholeError throw, as it always did in production.
 //
 // Note: the anon namespace closing/reopening that used to be required
 // for the external-linkage `partialBindingsRegistry` forward decl is
@@ -7006,22 +7009,19 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                                         "OP_RETURN/CFF_THUNK_RETURN");
                     cellTraceWrite(cell, fr.thunk, retVal,
                                     "OP_RETURN/CFF_THUNK_RETURN");
-                    // Phase D Step 3 batch D: cellWrite routes to
-                    // dirtyContainers (if cellContainer is a Bindings)
-                    // or standaloneCellRoots (if cellContainer is
-                    // nullptr — e.g. allocValue() standalone cells).
-                    cellWrite(cell, retVal, fr.thunk->cellContainer);
+                    // Phase D Step 3 batch D: cellWrite routes nursery
+                    // payloads to standaloneCellRoots.  M-8
+                    // (CODEBASE_REVIEW_2026-06-11): the stored Thunk::
+                    // cellContainer was removed; pass nullptr so this single
+                    // cell write is tracked via the standalone-cell registry
+                    // (sufficient — only this one cell changed; scavenge walks
+                    // standaloneCellRoots).  Zero default-path cost vs deriving
+                    // the owning Bindings on the (default-on) OP_RETURN path
+                    // for a default-off nursery feature.
+                    cellWrite(cell, retVal, nullptr);
                     fr.thunk->cell = nullptr;
-                    fr.thunk->cellContainer = nullptr;  // Phase D Step 4
                 }
-                // #558 Phase 1.5: also update shapeCell with the
-                // final value, then clear it.  This makes a final
-                // forceValue-after-body see the actual result
-                // through shapeCell, mirroring the cell semantics.
-                if (Value * sc = fr.thunk->shapeCell) {
-                    *sc = retVal;
-                    fr.thunk->shapeCell = nullptr;
-                }
+                // M-8: #558 shapeCell final-value publish removed (field gone).
                 // #558 Phase 3.3 (2026-05-12): partial-Bindings
                 // infrastructure retired.  No publishes fire so the
                 // registry stays empty; nothing to erase at OP_RETURN.
@@ -8224,45 +8224,10 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // self-reference recovery via partialBindings observes the
             // entries as they are filled in.
 
-            // #558 Phase 1.5 (2026-05-12) Cell-Update Everywhere:
-            // publish the in-progress Bindings to the innermost
-            // THUNK_RETURN frame's shapeCell.  Consumers that
-            // forceValue this Black thunk can read *shapeCell to
-            // get the partial state — without consulting the
-            // cross-thunk partial-Bindings registry that causes
-            // the #558 isFromBootstrapFiles cascade.
-            //
-            // Only the INNERMOST THUNK_RETURN frame is updated:
-            // this Bindings is the running thunk's own in-progress
-            // value, not the outer frames'.  (For tail-position
-            // results, OP_ATTRS_REC_INIT_TAIL / OP_RETURN propagate
-            // the final value up through the cell chain.)
-            //
-            // Gated by NIX_V3_CELL_EVERYWHERE=1 for safe rollout.
-            // VM-13 (CODEBASE_REVIEW_2026-06-11) RETIREMENT CRITERION (repo
-            // rule 4): delete this gate + the shapeCell publish once the
-            // cell-update-everywhere experiment is either flipped default-on
-            // (after a clean nixpkgs byte-identity sweep proves no regression)
-            // or abandoned.  Default-off since #558 Phase 1.5.
-            {
-                static const bool s_cellEverywhere =
-                    std::getenv("NIX_V3_CELL_EVERYWHERE") != nullptr;
-                if (__builtin_expect(s_cellEverywhere, 0)) {
-                    for (size_t fi = vm.frames.size(); fi > 0; --fi) {
-                        auto & fr = vm.frames[fi - 1];
-                        if (!(fr.flags & CFF_THUNK_RETURN)) continue;
-                        if (!fr.thunk) continue;
-                        if (!fr.thunk->shapeCell) continue;
-                        // VM-13: route through the write barrier (cellWrite)
-                        // instead of a raw `*shapeCell = v`.  Under default-on
-                        // major GC the raw store is invisible to the dirty-list
-                        // / inter-gen tracking the barrier maintains, so a
-                        // cross-generation edge published here could be missed.
-                        cellWrite(fr.thunk->shapeCell, v, nullptr);
-                        break;  // innermost THUNK_RETURN only
-                    }
-                }
-            }
+            // M-8 (CODEBASE_REVIEW_2026-06-11): the #558 Phase 1.5 shapeCell
+            // publish (and its VM-13 NIX_V3_CELL_EVERYWHERE gate) was REMOVED
+            // here along with the Thunk::shapeCell field.  The experiment was
+            // default-off, so production never published — byte-identical.
             push(vm, v);
             break;
         }
@@ -8350,31 +8315,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             Value v;
             v.mkAttrs(b);
 
-            // #558 Phase 1.5 (2026-05-12) Cell-Update Everywhere:
-            // update ONLY the innermost THUNK_RETURN frame's
-            // shapeCell.  Per-thunk cell update is STG-correct;
-            // cross-thunk propagation would re-introduce the same
-            // pollution shape the partial-Bindings registry suffers
-            // from (publishToAllThunkFrames).  If a consumer hits
-            // BLACK on a non-innermost thunk and its shapeCell is
-            // still the sentinel, that's a real cycle from STG's
-            // perspective — fall through to legacy STG WHNF recovery
-            // (which will be retired in Phase 2 once IR-level
-            // laziness eliminates the legitimate-cycle cases).
-            {
-                static const bool s_cellEverywhere =
-                    std::getenv("NIX_V3_CELL_EVERYWHERE") != nullptr;
-                if (__builtin_expect(s_cellEverywhere, 0)) {
-                    for (size_t fi = vm.frames.size(); fi > 0; --fi) {
-                        auto & fr = vm.frames[fi - 1];
-                        if (!(fr.flags & CFF_THUNK_RETURN)) continue;
-                        if (!fr.thunk) continue;
-                        if (!fr.thunk->shapeCell) continue;
-                        *fr.thunk->shapeCell = v;
-                        break;  // innermost only — STG-correct
-                    }
-                }
-            }
+            // M-8 (CODEBASE_REVIEW_2026-06-11): #558 shapeCell publish removed
+            // (default-off experiment; field gone — see closure.hh).
             push(vm, v);
             break;
         }
@@ -9536,23 +9478,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             Value v;
             v.mkAttrs(out);
 
-            // #558 Phase 1.5: tail-position // result.  Update only
-            // the innermost THUNK_RETURN frame's shapeCell — STG-
-            // correct per-thunk cell update.
-            {
-                static const bool s_cellEverywhere =
-                    std::getenv("NIX_V3_CELL_EVERYWHERE") != nullptr;
-                if (__builtin_expect(s_cellEverywhere, 0)) {
-                    for (size_t fi = vm.frames.size(); fi > 0; --fi) {
-                        auto & fr = vm.frames[fi - 1];
-                        if (!(fr.flags & CFF_THUNK_RETURN)) continue;
-                        if (!fr.thunk) continue;
-                        if (!fr.thunk->shapeCell) continue;
-                        *fr.thunk->shapeCell = v;
-                        break;  // innermost only — STG-correct
-                    }
-                }
-            }
+            // M-8 (CODEBASE_REVIEW_2026-06-11): #558 shapeCell publish removed
+            // (default-off experiment; field gone — see closure.hh).
             push(vm, v);
             break;
         }
@@ -11475,12 +11402,12 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 Value * cellTarget =
                     &recAttrs.asAttrs()->entries[i].value;
                 v.asThunk()->cell = cellTarget;
-                // Phase D Step 4: record the owning Bindings so the
-                // cell-write barrier at OP_RETURN can dirty-mark the
-                // correct container.  cellTarget points INTO
-                // recAttrs's entries[], so the container is the
-                // recAttrs Bindings itself.
-                v.asThunk()->cellContainer = recAttrs.asAttrs();
+                // M-8 (CODEBASE_REVIEW_2026-06-11): the owning-Bindings record
+                // (Thunk::cellContainer) was removed.  The GC marker now
+                // DERIVES the container from `cell` via findContainingCellStart
+                // (mark_sweep walkThunk), and the OP_RETURN barrier tracks the
+                // single cell write via the standalone-cell registry — so this
+                // store is no longer needed.
                 cellOwnRecordSet(cellTarget, v.asThunk(),
                                   "OP_ATTRS_REC_SET");
             }
@@ -12923,42 +12850,12 @@ Value forceValue(VMState & vm, Value v)
                     // through x — projections would force x → throws.
                     // With this, the projection sees x's currently-known
                     // shape (the merged // result so far) and proceeds.
-                    // #558 Phase 1.5 (2026-05-12) Cell-Update Everywhere:
-                    // BEFORE consulting the partial-Bindings registry,
-                    // check the thunk's shapeCell.  shapeCell is a
-                    // dedicated heap-stable Value* allocated at
-                    // MAKE_THUNK time; *shapeCell starts as Tag::Thunk(t)
-                    // (sentinel "not updated yet") and gets overwritten
-                    // by OP_ATTRS_REC_INIT inside the body.
-                    //
-                    // If shapeCell has been updated past the sentinel,
-                    // return its contents — this is the precise per-
-                    // thunk in-progress state, free of the cross-thunk
-                    // pollution that the registry-wide peek introduces.
-                    //
-                    // Gated by NIX_V3_CELL_EVERYWHERE=1.  When validated,
-                    // the partial-Bindings registry path (below) can be
-                    // retired.
-                    static const bool s_cellEverywhere =
-                        std::getenv("NIX_V3_CELL_EVERYWHERE") != nullptr;
-                    if (__builtin_expect(s_cellEverywhere, 0)
-                        && t->shapeCell != nullptr)
-                    {
-                        Value shapeVal = *t->shapeCell;
-                        if (!(shapeVal.tag() == Tag::Thunk
-                              && shapeVal.asThunk() == t)) {
-                            static const bool s_dbgCell =
-                                std::getenv("V3_DBG_CELL_EVERYWHERE") != nullptr;
-                            if (__builtin_expect(s_dbgCell, 0)) {
-                                std::fprintf(stderr,
-                                    "v3 shapeCell recovery: thunk=%p "
-                                    "shapeCell=%p shapeVal.tag=%d\n",
-                                    (void *)t, (void *)t->shapeCell,
-                                    (int)shapeVal.tag());
-                            }
-                            return shapeVal;
-                        }
-                    }
+                    // M-8 (CODEBASE_REVIEW_2026-06-11): the #558 Phase 1.5
+                    // shapeCell recovery read was REMOVED with the field.  It
+                    // was gated NIX_V3_CELL_EVERYWHERE (default-off) — in
+                    // production shapeCell was always null so this never fired;
+                    // the local cycle already falls through to the BlackholeError
+                    // throw below, exactly as in every prod eval to date.
                     // #558 Phase 3.3: STG WHNF recovery via partial-
                     // Bindings retired.  Local cycle falls through to
                     // BlackholeError throw.

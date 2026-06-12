@@ -2460,17 +2460,9 @@ struct ListVec;
 void listAllocSiteRecord(const ListVec * l, const char * file,
                           uint32_t line, uint32_t size) noexcept;
 
-// #768a (2026-05-22): namespace-scope env-var cache for allocator-
-// path debug gates whose call sites appear BEFORE the main detail::
-// block further down in this header (the gates referenced by
-// `recordBindingsOrigin` / `cellOwnTrack` / `cellTraceWrite` etc.
-// live in the later block).  The cellEverywhere gate is consulted
-// from `Alloc::allocThunkSuspended` — on every thunk allocation,
-// ~661 K times on hello.drvPath.
-namespace detail {
-inline const bool g_cellEverywhere =
-    std::getenv("NIX_V3_CELL_EVERYWHERE") != nullptr;
-}
+// M-8 (CODEBASE_REVIEW_2026-06-11): the `detail::g_cellEverywhere` env-gate
+// cache was REMOVED — its sole consumer (allocThunkSuspended's shapeCell
+// pre-allocation) is gone with the Thunk::shapeCell field.
 
 struct Alloc
 {
@@ -2586,25 +2578,10 @@ struct Alloc
         t->nUpvalues = nUpvalues;
         t->forces = 0;
         t->cell = nullptr;
-        t->cellContainer = nullptr;  // Phase D write-barrier metadata
-        t->shapeCell = nullptr;
-        // #558 Phase 1.5: pre-allocate shapeCell so the body can
-        // publish in-progress state via *shapeCell, and forceValue
-        // Black can read it.  Gated NIX_V3_CELL_EVERYWHERE=1.
-        //
-        // #768a (2026-05-22): use the namespace-scope `inline const
-        // bool` defined below so the per-thunk-alloc fast path skips
-        // the magic-static guard-byte load.  allocThunkSuspended is
-        // hit ~661 K times on hello.drvPath; even the marginal load
-        // cost shows up in the i-cache.
-        if (__builtin_expect(detail::g_cellEverywhere, 0)) {
-            Value * sc = allocValue();
-            // Sentinel: Tag::Thunk(t) — "this thunk has not yet
-            // published in-progress state."  Readers compare against
-            // (Tag::Thunk && ptr == t) to detect the sentinel.
-            sc->mkThunk(t);
-            t->shapeCell = sc;
-        }
+        // M-8 (CODEBASE_REVIEW_2026-06-11): the shapeCell field + its
+        // NIX_V3_CELL_EVERYWHERE pre-allocation block were REMOVED.  The
+        // experiment was default-off (shapeCell never non-null in production),
+        // so dropping it is byte-identical for prod and reclaims 8 B/thunk.
         t->suspended.capturedWiths = nullptr;
         t->suspended.cu = nullptr;
         // T1.3: record allocation origin under NIX_V3_THUNKS_ATTR=1.
