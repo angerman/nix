@@ -10544,6 +10544,31 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                             continue;
                         }
                         if (auto * op = b->lookup(outId)) {
+                            // RCA probe (CODEBASE_REVIEW_2026-06-11 firefox≡ghc98
+                            // residual): V3_DBG_SETCOERCE=1 — the outPath entry's
+                            // thunk forces to a SET/Slot (not a store-path
+                            // string) for firefox/ghc98; log the outPath thunk's
+                            // desc + what it resolves to, to localize the
+                            // wrong-value source.  Retire once root-caused.
+                            if (std::getenv("V3_DBG_SETCOERCE")) {
+                                const Value & ov = *op;
+                                const LambdaDescriptor * d =
+                                    (ov.isThunk() && ov.asThunk()
+                                     && ov.asThunk()->state == ThunkState::Suspended)
+                                        ? ov.asThunk()->suspended.desc : nullptr;
+                                const PosSnapshot * ps =
+                                    d ? resolvePosSnapshot(d->posHandle) : nullptr;
+                                Value forced = forceValue(vm, *op);
+                                std::fprintf(stderr,
+                                    "v3 SETCOERCE outPath: thunk codeOff=%u name=%s pos=%s:%u forced->tag=%u\n",
+                                    d ? d->codeOffset : 0u,
+                                    d && !d->name.empty() ? d->name.c_str() : "<anon>",
+                                    (ps && !ps->file.empty()) ? ps->file.c_str() : "<no-pos>",
+                                    ps ? ps->line : 0u, (unsigned)forced.tag());
+                                parts[i] = forced;
+                                ++depth;
+                                continue;
+                            }
                             parts[i] = forceValue(vm, *op);
                             ++depth;
                             continue;
