@@ -148,6 +148,16 @@ const Value * lookupPrimopReplacement(const PrimOp * po) noexcept
     return it == m.end() ? nullptr : &it->second;
 }
 
+// T-8 (CODEBASE_REVIEW_2026-06-11): query whether a primop has a bytecode
+// override (installBytecodePrimop records it in installedNames()).  Used by
+// opt_strictness::producesWHNF to distrust its always-WHNF whitelist for an
+// overridden primop whose bytecode impl's WHNF-ness is unknown.
+bool isBytecodePrimopInstalled(std::string_view name)
+{
+    auto & s = installedNames();
+    return s.find(std::string(name)) != s.end();
+}
+
 void installBytecodePrimop(
     nix::EvalState & state,
     const std::string & primopName,

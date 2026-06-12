@@ -58,6 +58,7 @@
 #include "v3/ir.hh"
 #include "v3/ir_scratch.hh"
 #include "v3/primop.hh"
+#include "v3/bytecode_primops.hh"  // T-8: isBytecodePrimopInstalled
 
 #include <cstdio>
 #include <cstdlib>
@@ -213,7 +214,14 @@ bool producesWHNF(const Expr & e)
     if (const auto * pc = std::get_if<PrimOpCall>(&e)) {
         if (!pc->primop) return false;
         const auto & set = alwaysWHNFPrimOps();
-        return set.find(pc->primop->name) != set.end();
+        if (set.find(pc->primop->name) == set.end()) return false;
+        // T-8 (CODEBASE_REVIEW_2026-06-11): the name-keyed always-WHNF whitelist
+        // is only valid for the C implementation.  If this primop has been
+        // swapped for a bytecode override (installBytecodePrimop), its impl may
+        // return a non-WHNF tail — so eliding the Force after it would be
+        // unsound.  Distrust the whitelist for overridden primops (conservative;
+        // costs at most a redundant Force on an already-WHNF result).
+        return !isBytecodePrimopInstalled(pc->primop->name);
     }
     return std::holds_alternative<LitInt>(e)
         || std::holds_alternative<LitFloat>(e)

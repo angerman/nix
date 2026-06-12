@@ -54,6 +54,13 @@ struct PrimOp;
 /// a visitor that forwards each Value's payload.
 void walkBytecodePrimopRoots(const std::function<void(Value &)> & visit);
 
+/// T-8 (CODEBASE_REVIEW_2026-06-11): true if `name` has been replaced by a
+/// bytecode-primop override (installBytecodePrimop).  opt_strictness uses this
+/// to DISTRUST its name-keyed always-WHNF whitelist for overridden primops —
+/// a bytecode override may return a non-WHNF tail, which would break the
+/// elided-Force invariant the whitelist grants (silent wrong-WHNF assumption).
+bool isBytecodePrimopInstalled(std::string_view name);
+
 /// #705 (2026-05-20): walk the static `vBuiltins` Value as a
 /// scavenger root.  `vBuiltins` is a process-wide singleton built by
 /// `getBuiltinsValue()`; the bytecode-primop install path patches its
