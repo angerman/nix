@@ -86,6 +86,13 @@ scan_file() {
                 # This is the *implementation* of getEnv, not a debug
                 # gate, so caching is impossible — the arg varies.
                 if ($0 ~ /std::getenv\(args\[/) next
+                # Explicit cold-site allowlist: a `lint:allow-getenv`
+                # marker on the same line exempts a provably-cold one-off
+                # call (e.g. a static-const fingerprint built once at load
+                # time, where the lambda opener is too far back for the
+                # 5-line []{...} lookback to catch).  The author must
+                # justify coldness in the marker comment.
+                if ($0 ~ /lint:allow-getenv/) next
                 # Prior-line guard.
                 if (looks_safe(NR)) next
                 printf "%s:%d: inline std::getenv(): %s\n",

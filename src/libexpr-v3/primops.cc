@@ -6316,6 +6316,10 @@ static const std::string & codegenGateFingerprint()
         };
         std::string s;
         for (const char * g : kGates) {
+            // lint:allow-getenv — cold: this builds the disk-cache key
+            // fingerprint ONCE at static init (the enclosing []{...}() runs
+            // exactly once), not on any per-opcode/per-force path.  The arg
+            // is a loop variable so it cannot be a cached static-const bool.
             const char * v = std::getenv(g);
             if (v) { s += g; s += '='; s += v; s += ';'; }
         }
