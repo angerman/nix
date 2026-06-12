@@ -203,6 +203,18 @@ guards per return, vm.cc:6648 — is the named suspect; fold into 3.3's cleanup)
 (6b5284374), OP_LESS opcode, reuseScope-TLS-skip-as-sole-lever, bytecode foldl',
 ValuePair 24/32 split (38c263bdb), string-value dedup, Boehm tuning.
 
+**3.3 OPCYCLES-TLS-gating FALSIFIED (2026-06-12, Air, clean same-host A/B):**
+gating the per-dispatchLoop-entry `g_opcyclesPrevOp/Ts` save+reset+restore behind
+`g_countOpCycles` gave 0% on every dispatch-bound row — fib 1.15→1.16s, foldl(id)
+0.33→0.34s, foldl(i*2) 0.57→0.57s — all below the <2% revert bar. Reason: LLVM
+caches the `thread_local` address per function, so the "6 TLS accesses" was really
+~1 `_tlv_get_addr` + cheap loads, negligible per entry. The `_tlv` leaf-time in
+the profile is the sampling artifact the code comment already warned about
+(vm.cc:2855). Reverted. The remaining 3.3 sub-items (fold entry statics into a
+POD; hoist the majorGc test) are pre-empted: the majorGc test is already
+exitDepth-gated file-scope (P-1, vm.cc:3204), and the entry statics are
+magic-static-free post-#768. **3.3 as a whole is retired.**
+
 **Measurement discipline for this phase:** NIX_VM_OPCYCLES is structurally blind
 across nested dispatch loops (attribution resets at the boundary) — validate with
 the gate + NIX_VM_OPCOUNTS only.
