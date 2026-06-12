@@ -5095,8 +5095,29 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     // Saturated (total == A).  Gather the spine's args in
                     // closure-slot order, then append the new OP_CALL arg last.
                     if (A > 16) throw std::runtime_error("v3 OP_CALL: arity > 16");
-                    if (__builtin_expect(total > A, 0))
-                        throw std::runtime_error("v3 OP_CALL: PAP over-applied");
+                    if (__builtin_expect(total > A, 0)) {
+                        // OVER-APPLICATION (R2, 2026-06-12) — twin of the OP_TAIL_CALL
+                        // site (see the full rationale there).  The leaf saturates at
+                        // A and returns a function consuming the remaining args; replay
+                        // the spine + new arg one-at-a-time via callClosure (mirrors the
+                        // OP_CALL_N fallback below).  REPLACES `throw "PAP over-applied"`.
+                        Value tmp2[16]; size_t nT = 0;
+                        const Value * w2 = &fun;
+                        while (w2->isAppLike() && w2->asPair()) {
+                            const ValuePair * pp2 = w2->asPair();
+                            if (w2->tag() == Tag::App3) {
+                                tmp2[nT++] = pp2->third; tmp2[nT++] = pp2->right;
+                            } else {
+                                tmp2[nT++] = pp2->right;
+                            }
+                            w2 = &pp2->left;
+                        }
+                        Value f = *w2;  // leaf closure (spine bottom)
+                        for (size_t i = nT; i > 0; --i) f = callClosure(vm, f, tmp2[i - 1]);
+                        f = callClosure(vm, f, arg);
+                        push(vm, f);
+                        break;
+                    }
                     Value argbuf[16];
                     // Walk the spine outermost-first, collecting args exactly as
                     // the force-spine path does (App3: third then right; App:
@@ -6104,8 +6125,43 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     // and overflow deep folds).  Mirrors the in-place retarget
                     // below (withStack reset + captured-withs).
                     if (A > 16) throw std::runtime_error("v3 OP_TAIL_CALL: arity > 16");
-                    if (__builtin_expect(total > A, 0))
-                        throw std::runtime_error("v3 OP_TAIL_CALL: PAP over-applied");
+                    if (__builtin_expect(total > A, 0)) {
+                        // OVER-APPLICATION (R2, 2026-06-12): the leaf closure's
+                        // arity-A body returns a FUNCTION that consumes the
+                        // remaining (total-A) args.  This arises when an App3 PAP
+                        // packs two args at once over an arity-2 callback whose
+                        // body is a function (e.g. `mapAttrs (n: v: <fn>) attrs`,
+                        // the only App3 builders) and that PAP reaches a call site
+                        // UNFORCED with a further arg (e.g. `map (g: g x) (attrValues
+                        // (mapAttrs …))`).  An App-only spine can't reach depth≥A
+                        // (it saturates at A), so only App3 triggers this.
+                        //
+                        // TW applies one arg at a time: the leaf saturates at A,
+                        // yields the function, which then consumes the rest.  Replay
+                        // the whole spine + the new arg through callClosure from the
+                        // leaf closure (callClosure saturates then re-applies — byte-
+                        // identical to `total` curried OP_CALLs; mirrors the
+                        // OP_TAIL_CALL_N fallback below).  REPLACES the prior
+                        // `throw "PAP over-applied"`, which was simply unimplemented
+                        // over-application.
+                        Value tmp2[16]; size_t nT = 0;
+                        const Value * w2 = &fun;
+                        while (w2->isAppLike() && w2->asPair()) {
+                            const ValuePair * pp2 = w2->asPair();
+                            if (w2->tag() == Tag::App3) {
+                                tmp2[nT++] = pp2->third; tmp2[nT++] = pp2->right;
+                            } else {
+                                tmp2[nT++] = pp2->right;
+                            }
+                            w2 = &pp2->left;
+                        }
+                        Value f = *w2;  // leaf closure (spine bottom)
+                        // tmp2 holds spine args newest-first; apply oldest-first.
+                        for (size_t i = nT; i > 0; --i) f = callClosure(vm, f, tmp2[i - 1]);
+                        f = callClosure(vm, f, arg);
+                        push(vm, f);
+                        break;  // trailing OP_RETURN returns f to the caller
+                    }
                     Value argbuf[16];
                     // C-10: App3-aware spine gather (mirrors OP_CALL + the
                     // force-spine path: App3 → third then right; App → right;
@@ -10519,6 +10575,27 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 // coerce the derivation via outPath, exactly as TW does.
                 while (parts[i].tag() == Tag::Slot && parts[i].asSlot())
                     parts[i] = *parts[i].asSlot();
+                // R1 (HNE typeOf .hello, 2026-06-12): force a Thunk/App/App3 part
+                // to WHNF here — TW's coerceToString forces its operand first, and
+                // both the isAttrs unwind below and coerceToString (which has no VM
+                // to force with) require a resolved value.  The pre-force handshake
+                // above forces every ORIGINAL part, but one the __toString/outPath
+                // unwind produces — or one the opcode-level op_force_slow RETRY path
+                // left Suspended (state=0) — can still arrive unforced; the
+                // forceValue HELPER fully evaluates where the RETRY handshake no-ops.
+                // Skip under-applied closure-PAPs (WHNF functions → "cannot coerce a
+                // function", matching TW).  Re-deref any Slot the force exposes so
+                // the isAttrs unwind sees a derivation attrset.
+                if ((parts[i].tag() == Tag::Thunk || parts[i].tag() == Tag::App
+                     || parts[i].tag() == Tag::App3)
+                    && !isUnderappliedClosurePap(parts[i])) {
+                    parts[i] = forceValue(vm, parts[i]);
+                    while (parts[i].tag() == Tag::Slot && parts[i].asSlot())
+                        parts[i] = *parts[i].asSlot();
+                    // If forceValue still leaves a non-WHNF here it is a genuine
+                    // deeper bug, not a missed force; coerceToString below raises
+                    // the (informative) "cannot coerce a thunk" — no masking.
+                }
                 if (parts[i].isAttrs() && parts[i].asAttrs()) {
                     static const SymbolId tsId  = ir::globalInternSymbol("__toString");
                     static const SymbolId outId = ir::globalInternSymbol("outPath");
