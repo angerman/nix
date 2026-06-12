@@ -1173,6 +1173,29 @@ inline std::string coerceToString(const Value & vIn, bool forceString)
         return {"a", "value"};
     };
     auto throwCoerceError = [&](const Value & v) -> std::string {
+        // RCA probe (CODEBASE_REVIEW_2026-06-11 firefox≡ghc98 convergent
+        // residual): V3_DBG_SETCOERCE=1 — for a SET, dump ALL attr names +
+        // whether outPath/__toString are present, to decide if the set is a
+        // coercible derivation whose outPath v3's lookup misses (lookup bug),
+        // or the wrong (args) set being coerced.  Retire once root-caused.
+        if (v.tag() == Tag::Attrs && v.asAttrs()
+            && std::getenv("V3_DBG_SETCOERCE")) {
+            const Bindings * b = v.asAttrs();
+            if (b->isChain()) b = b->materialize();
+            static const SymbolId opId = ir::globalInternSymbol("outPath");
+            static const SymbolId tsId = ir::globalInternSymbol("__toString");
+            std::fprintf(stderr,
+                "v3 SETCOERCE: set size=%u hasOutPath=%d has__toString=%d chain=%d names=[",
+                b->size, b->lookup(opId) ? 1 : 0, b->lookup(tsId) ? 1 : 0,
+                v.asAttrs()->isChain() ? 1 : 0);
+            const auto & st = ir::globalSymbolTable();
+            for (uint32_t i = 0; i < b->size; ++i) {
+                SymbolId nm = b->entries[i].name;
+                const char * s = nm < st.size() ? st[nm].c_str() : "?";
+                std::fprintf(stderr, "%s%s", i ? "," : "", s);
+            }
+            std::fprintf(stderr, "]\n");
+        }
         // #691 — use the shared `valueRepr` for TW-equivalent rendering.
         // Pre-fix this lambda used a stub that emitted `{ ... }` / `[ ... ]`
         // placeholders, leaving a PREFIX-class gap vs TW's actual values.
