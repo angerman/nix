@@ -114,4 +114,12 @@ void fiberDestroy(Fiber * fiber);
 /// call (no fiber).
 extern thread_local Fiber * currentFiber;
 
+/// M-5 (CODEBASE_REVIEW_2026-06-11): visit the [lo, hi) stack region of every
+/// live, YIELDED fiber (the running fiber's stack is the current C-stack, which
+/// the v3 marker already scans).  The major-GC conservative phase calls this so
+/// a yielded fiber's fiberVm + v3 Values — which live on its own mmap'd stack,
+/// invisible to a scavenge fired on a fresh VMState — are conservatively pinned.
+/// No-op when no fibers are live.  Pre-flip (2) for enabling NIX_V3_FIBER_BRIDGE.
+void walkLiveFiberStacks(const std::function<void(const void *, const void *)> & visit);
+
 } // namespace nix::v3

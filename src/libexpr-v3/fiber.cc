@@ -5,6 +5,9 @@
 /// SPDX-License-Identifier: Apache-2.0
 
 #include "v3/fiber.hh"
+#include <gc/gc.h>   // M-5: GC_add_roots/GC_remove_roots fiber stacks (Boehm)
+#include <mutex>
+#include <unordered_set>
 
 #include <cstdlib>
 #include <cstdio>
@@ -22,6 +25,36 @@
 namespace nix::v3 {
 
 thread_local Fiber * currentFiber = nullptr;
+
+// M-5 (CODEBASE_REVIEW_2026-06-11): live-fiber registry.  fiber.hh §2 documents
+// two GC pre-flips required before enabling the (dormant) NIX_V3_FIBER_BRIDGE:
+//   (1) GC_add_roots the fiber stack so Boehm scans TW nix::Value* held there;
+//   (2) the v3 marker must conservatively scan each YIELDED fiber's stack (its
+//       fiberVm + v3 Values live on that stack and are invisible to a scavenge
+//       fired on a fresh VMState).  The running fiber's stack IS the current
+//       C-stack (already scanned); only yielded ones need separate coverage.
+// This registry + walkLiveFiberStacks() supply (2); the GC_add_roots calls in
+// fiberCreate/fiberDestroy supply (1).  Empty/no-op when no fibers are live.
+namespace {
+std::mutex g_fiberLock;
+std::unordered_set<Fiber *> & liveFibers() {
+    static std::unordered_set<Fiber *> s;
+    return s;
+}
+}  // namespace
+
+void walkLiveFiberStacks(const std::function<void(const void *, const void *)> & visit)
+{
+    std::lock_guard<std::mutex> lk(g_fiberLock);
+    for (Fiber * f : liveFibers()) {
+        if (!f || !f->stack || f->stackSize == 0) continue;
+        // Skip the currently-running fiber: its stack IS the live C-stack the
+        // marker already scans (and its top is the active SP, not f->stack+sz).
+        if (f == currentFiber) continue;
+        const char * lo = static_cast<const char *>(f->stack);
+        visit(lo, lo + f->stackSize);
+    }
+}
 
 namespace {
 
@@ -180,6 +213,14 @@ Fiber * fiberCreate(std::function<void(Fiber *)> entry, size_t stackSize)
     ::makecontext(&f->ctx, fiberTrampoline, 0);
 #pragma clang diagnostic pop
 
+    // M-5: register the usable stack as a Boehm root (so Boehm scans TW
+    // nix::Value* pointers held on the fiber stack) and in the live-fiber
+    // registry (so the v3 marker conservatively scans it when the fiber is
+    // yielded).  Done after getcontext succeeds so the earlier error paths
+    // (which munmap + delete f) need no unregister.
+    GC_add_roots(static_cast<char *>(f->stack),
+                 static_cast<char *>(f->stack) + stackSize);
+    { std::lock_guard<std::mutex> lk(g_fiberLock); liveFibers().insert(f); }
     return f;
 }
 
@@ -235,7 +276,12 @@ void fiberYield(Fiber * fiber)
 void fiberDestroy(Fiber * fiber)
 {
     if (!fiber) return;
+    { std::lock_guard<std::mutex> lk(g_fiberLock); liveFibers().erase(fiber); }
     if (fiber->stack) {
+        // M-5: symmetric with the GC_add_roots in fiberCreate — unregister the
+        // stack root BEFORE munmap (else Boehm scans freed/unmapped memory).
+        GC_remove_roots(static_cast<char *>(fiber->stack),
+                        static_cast<char *>(fiber->stack) + fiber->stackSize);
         // Reverse the layout established in fiberCreate: usableStack
         // sits one page above the mmap'd region, and the total mapping
         // is stackSize + pageSize.
