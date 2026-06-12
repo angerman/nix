@@ -2932,6 +2932,22 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
     const char * const s_trace_env = s_trace_env_static;
     const uint32_t s_trace_codeoff = s_trace_codeoff_static;
     const uint16_t s_trace_nup = s_trace_nup_static;
+    // P-6 (CODEBASE_REVIEW_2026-06-11): fold the per-dispatch *default-off*
+    // diagnostic gates into ONE loop-invariant disjunction.  Without it the
+    // hot path pays ~6 separate branch-predicted-not-taken tests every
+    // iteration (periodic-live-trace, thunk-body-trace, instr-count, limit
+    // poll, opcycles, opcounts).  Every term is either a startup env const or
+    // `limitsActive()` (set once per run by initLimits() before dispatch
+    // begins, constant for this dispatchLoop invocation), so the disjunction
+    // is loop-invariant and the compiler hoists it; the common no-gate path
+    // then tests a single bool instead of six.  The major-GC safepoint is
+    // NOT folded in here — it is default-ON, not a diagnostic gate.
+    // Retire when computed-goto dispatch lands (the bigger lever per P-6;
+    // measure the mask first — measure-twice).
+    const bool kAnySlowGate =
+        kCountInstructions | (s_trace_env != nullptr)
+        | g_periodicLiveTrace | g_countOpcodes | g_countOpCycles
+        | nix::v3::limitsActive();
     // Cheney nursery (#434 Phase C): scavenge gate at top-of-loop.
     // We avoid the per-iteration env-var check by promoting the gate
     // to a function-scope const.  When nursery+scavenge are both on,
@@ -3232,7 +3248,12 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
         //
         // Retirement: when L(t) is integrated into the bench harness
         // as a default-OFF metric, remove this hook + the env-gate.
-        if (__builtin_expect(g_periodicLiveTrace, 0)) [[unlikely]] {   // T2: cached gate
+        // P-6 (CODEBASE_REVIEW_2026-06-11): both PRE-decode default-off
+        // diagnostic gates (periodic-live-trace + thunk-body-trace) sit behind
+        // the ONE folded `kAnySlowGate` mask — the common path tests a single
+        // bool here instead of two separate branch-predicted-not-taken tests.
+        if (__builtin_expect(kAnySlowGate, 0)) [[unlikely]] {
+        if (g_periodicLiveTrace) {   // T2: cached gate
             if (exitDepth == 0) {
                 bool nestedDistinct = false;
                 for (VMState * vmp : activeVMStack()) {
@@ -3253,8 +3274,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
         // ~10% of dispatchLoop time even though it's almost always
         // false.  Mark it unlikely so the compiler keeps the cold body
         // off the fast path and predicts the branch correctly.
-        if (__builtin_expect(s_trace_env != nullptr, 0)
-            && !vm.frames.empty()) [[unlikely]] {
+        if (s_trace_env != nullptr && !vm.frames.empty()) {
             const auto & cur = vm.frames.back();
             if (cur.thunk && (cur.flags & CFF_THUNK_RETURN)
                 && cur.thunk->nUpvalues == s_trace_nup)
@@ -3276,8 +3296,14 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 }
             }
         }
+        }  // end P-6 PRE-decode slow-gate cluster
         Instruction instr = cu->code[ip++];
-        if (__builtin_expect(kCountInstructions, 0)) [[unlikely]] {
+        // P-6: decode the opcode up-front so all POST-decode default-off gates
+        // (instr-count, limit poll, opcycles, opcounts) can share one mask test.
+        Op op = decodeOp(instr);
+        // P-6: POST-decode default-off diagnostic gates, all behind the one mask.
+        if (__builtin_expect(kAnySlowGate, 0)) [[unlikely]] {
+        if (kCountInstructions) {
             vm.nrInstructions++;
             allocStats().bytecodeInstructions++;
         }
@@ -3293,14 +3319,14 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
         // Retire individual gates when bounded-memory / termination
         // / bounded-wall-time guarantees become structural (see
         // limits.cc).
-        if (__builtin_expect(nix::v3::limitsActive(), 0)) [[unlikely]] {
+        if (nix::v3::limitsActive()) {
             static thread_local uint32_t s_pollCounter = 0;
             if (__builtin_expect(++s_pollCounter >= nix::v3::kPollInterval, 0)) {
                 s_pollCounter = 0;
                 nix::v3::checkLimits();  // throws on cap exceed
             }
         }
-        Op op = decodeOp(instr);
+        // (op already decoded above for the shared mask)
         // 2026-05-18 per-opcode profiling: bump under NIX_VM_OPCOUNTS=1.
         // P-2: gates are now file-scope (g_countOpcodes / g_countOpCycles) —
         // no per-dispatch magic-static guard.  Separate gate from NIX_VM_STATS
@@ -3310,7 +3336,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
         // (≈10-20 ns/dispatch; invariant per-op so relative comparisons hold).
         const bool s_countOpcodes  = g_countOpcodes;
         const bool s_countOpCycles = g_countOpCycles;
-        if (__builtin_expect(s_countOpCycles, 0)) [[unlikely]] {
+        if (s_countOpCycles) {
             // #790: read/write the FILE-SCOPE thread_local so the
             // dispatchLoop scope guard (see line ~2270) can save+
             // restore across nested-loop boundaries.
@@ -3322,7 +3348,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             g_opcyclesPrevOp = static_cast<uint8_t>(op);
             g_opcyclesPrevTs = ts;
         }
-        if (__builtin_expect(s_countOpcodes, 0)) [[unlikely]] {
+        if (s_countOpcodes) {
             allocStats().opcodeCounts[static_cast<uint8_t>(op)]++;
             // #782 bigram tracking — only when NIX_VM_BIGRAMS=1
             // alongside NIX_VM_OPCOUNTS=1.  Identifies common
@@ -3390,6 +3416,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 tgPrev = opi;
             }
         }
+        }  // end P-6 POST-decode slow-gate cluster
         uint32_t operand = decodeOperand(instr);
 
         // -Wswitch-enum: deliberately don't list reserved opcodes
