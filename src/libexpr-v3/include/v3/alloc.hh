@@ -2653,6 +2653,22 @@ struct Alloc
     /// T1.3 (2026-05-27): file/line attribution.  NIX_V3_PAIRS_ATTR=1
     /// enables dump.  Pairs are 125 MB on HNE — third-largest non-
     /// Bindings bucket.
+    ///
+    /// M-11 (CODEBASE_REVIEW_2026-06-11) FALSIFIED standalone — do NOT split
+    /// into 24 B (App/PrimOpApp: left+right+evaluated) vs 32 B (App3: +third)
+    /// size classes here.  `alloc()` rounds every request UP to a 16 B
+    /// boundary (alloc.hh: `bytes = (bytes + 15) & ~15`) AND cell-starts are
+    /// tracked per-16-B granule, so a 24 B pair occupies a full 32 B cell
+    /// (the next cell cannot start before the following 16 B boundary) —
+    /// `alloc(24)` and `alloc(32)` both yield 32 B.  The split therefore saves
+    /// ZERO bytes until the arena gains 8 B-granular cell-start tracking
+    /// (doubling the cellStarts/cellTypes bitmaps + changing kAlign), which is
+    /// exactly the coordinated allocator/repr change the review means by
+    /// "fold into the next repr change."  The App3-vs-App discriminant the
+    /// split would need (a CellType::Pair3 routed through walkPair/walkPair3 +
+    /// the gc.cc evac + barrier) is real engineering; spending it for a 0-byte
+    /// win is a measure-twice anti-pattern.  Revisit ONLY alongside that
+    /// allocator-granularity change.
     static ValuePair * allocPair(const char * file = __builtin_FILE(),
                                   uint32_t     line = __builtin_LINE()) noexcept
     {
