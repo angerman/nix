@@ -13,7 +13,33 @@ require the full nixpkgs sweep (darwin-4), which the laptop cannot run.
 | d59f3f692 | Phase 0 falsifiers + 0.5 freeListBins gate | reshaped Phases 1+2; see PHASE0_RESULTS |
 | 68e9d0cba | 3.1 identityLambda fix (R_RETURN-peephole bug) | foldl-over-genList-id **0.50→0.33s (−34%)**, control 0% |
 
-foldl row on this host: **2.18× (plan baseline) → ~1.19×**.
+foldl row on this host: **2.18× (plan baseline) → ~1.19-1.30×**.
+
+### Committed-state CPU snapshot (clean HEAD = Phase 0 + 3.1, Air, min user-CPU, byte-identical)
+
+| row | TW(s) | v3(s) | ratio | vs plan baseline |
+|---|---|---|---|---|
+| fib 30 | 0.94 | 1.21 | **1.29×** | 1.38× |
+| foldl 1e6 | 0.27 | 0.35 | **1.30×** | 2.18× ← 3.1 |
+| hello.drvPath | 0.74 | 1.09 | **1.47×** | 1.65× |
+| git.drvPath | 1.00 | 1.84 | **1.84×** | 1.91× |
+| firefox.drvPath | 1.78 | 4.79 | **2.69×** | 2.83× |
+
+(drvPath rows are unchanged by 3.1 — it only touches identity-lambda iteration;
+firefox RSS already ~2.0× not 2.70×, the 46-commit review having cut it. The
+drvPath CPU rows move only with the darwin-4 levers 1.1/1.2b below.)
+
+### Lever 1.4 — memo-trio parity audit (read-only; CLEAN — no hidden O(N²))
+
+- **drvHashes**: v3 calls `nix::hashDerivationModulo` + `nix::drvHashes.insert_or_assign`
+  (primops.cc:4904-4905) — the SAME global memo TW uses → input hashing O(N+E), shared.
+- **path coercion**: `coercePathToStore` → `state.copyPathToStore` carries TW's
+  internal `srcToStore` memo (ffi.cc:150,158).
+- **ImportCache**: `importCache().results` gives per-file value sharing (skips
+  parse/lower/compile on hit) — the `fileEvalCache` equivalent.
+
+Conclusion: the drvPath CPU gap is **constant-factor** (wrapper + per-edge context
+copies), NOT an algorithmic regression → 1.1/1.2b are the correct targets.
 
 ## Falsified / reverted this session (with data — do NOT re-propose)
 
