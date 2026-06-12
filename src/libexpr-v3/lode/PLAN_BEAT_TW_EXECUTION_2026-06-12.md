@@ -153,27 +153,46 @@ dynamic re-select, no listToAttrs re-intern). Keep the old filter-map-listToAttr
 path under `if ignoreNullsFlag` (it must DROP nulls, which mapAttrs can't).
 Verify v3's mapAttrs doesn't itself stringify keys; gate on full-sweep byte-identity.
 
-## Prioritised next steps (by value × confidence ÷ risk)
+## Prioritised next steps — ALL remaining levers are foundational (multi-day)
 
-1. **[darwin-4] Phase 2 depth>0 non-moving GC** — the real RSS lever; biggest
-   measured headroom (firefox ~450 MB dead-but-resident arena). Soak with
-   GC_STRESS + full-sweep byte-identity.
-2. **[darwin-4] 1.2b wrapper de-stringification** (mapAttrs cut first) — 3 drv
-   rows CPU + allocation volume (helps RSS too). Full-sweep gate.
-3. **[darwin-4] 1.1 context span-sharing** — 3 drv rows; the per-edge copy lever
-   (NOT parse memo). Full-sweep gate.
-4. **[laptop-safe] 3.4 OP_FOLD resident superinstruction** — foldl 1.19×→≤1.0×;
-   the one remaining big lever validatable by lang-tests + byte-identity. Use the
-   existing ip-rewind re-entry protocol (emit.cc Phase-5 R_CALL family is the
-   template); fold driver as an opcode, body OP_RETURN rewinds to it, zero nested
-   dispatchLoop. Bar ≥20%/<10%.
-5. **[laptop-safe] fib 1.38×** — dispatch-bound; rides 3.5 computed-goto (the
-   last dispatch lever) once OP_FOLD lands and dispatch share rises.
+The session-sized levers are exhausted: 3.1 landed (foldl 2.18×→1.45×); the rest
+(wrapper-retire, GC-threshold, Immix-flip, OPCYCLES-TLS, context-sort,
+key-de-stringify) are FALSIFIED with data. What remains, precisely scoped:
 
-3.2 (GET_LOCAL+FORCE fusion) is **already implemented** at the IR level
-(`emitGet*ForceFromIR`, emit.cc:730/1138 + the compacting peephole at :2092);
-its only residual is the narrow "fuses under one expr shape but not under `let`"
-emitter inconsistency — a disasm-diff micro-fix, low yield.
+1. **`//` allocation-volume reduction = chain-SELECT lookup-without-materialize**
+   (the SOLE RSS lever; ~−132 MB firefox measured). **Blocked on a real
+   correctness hazard, not effort:** implemented + reverted 2026-06-07 because
+   forcing/memoising a value reached through a SHARED parent chain layer corrupts
+   sibling chains rooted at the same base (`OP_CALL: callee is not a closure` in
+   cargo/git derivationStrict; vm.cc:8712-8721). The plan's "C-1/C-3 made it
+   defensible" is an UNTESTED hypothesis against a documented failure. Requires a
+   precise shared-Pair/thunk-memoisation analysis (which forced values escape the
+   chain context) + full-sweep before any retry. Bar: −80 MB firefox byte-identical.
+2. **drvPath-CPU wrapper-skeleton reduction** — the 137-insn/22-thunk per-drv
+   wrapper is the dominant cost (1.2b/0.4 proved key+parse are <3%). Shrinking it
+   risks the many bug-fixes it encodes (structuredAttrs, special keys, fix-point
+   ordering). High risk; the Phase-4 single-pass-hashing differentiator may be the
+   better path to firefox-CPU <1.0×.
+3. **3.4 OP_FOLD resident superinstruction** — foldl 1.45×→≤1.0×. NOT a quick
+   reuse: `OP_R_CALL`'s no-nested-dispatch path is arity-1 only (vm.cc:4067); the
+   fold operator is arity-2, so OP_FOLD needs a new 2-arg ip-rewind loop in the
+   dispatch state machine. Broad-eval-critical (foldl is everywhere in lib) →
+   full corpus + cutover-parity, not just lang-tests.
+4. **depth>0 GC** — SUPERSEDED/BLOCKED (see RSS section): reclaims ~nothing
+   (scattered dead) + needs the evac-only C-stack scanner in the mark; moving evac
+   can't run at depth>0. Not a path to lower peak.
+
+3.2 (GET_LOCAL+FORCE fusion) is **already implemented** (IR-level
+`emitGet*ForceFromIR` + compacting peephole emit.cc:2092); residual is a narrow
+let-shape micro-fix, low yield. 3.5 computed-goto is the last dispatch lever for
+fib/foldl once the loops above shrink.
+
+**Honest standing:** v3 currently beats TW on attrNames (0.70× CPU) and on RSS
+for compute workloads (fib 0.27×, foldl 0.5×); the drvPath rows (1.65–2.78× CPU,
+1.9–2.56× RSS) are gated behind the foundational items above. The "≤1.0× on all
+7 rows" goal is reachable but is weeks of careful drv-hash-critical + GC work,
+not a session — and firefox CPU specifically may need the Phase-4 differentiator
+the plan already flagged.
 
 *Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>, Input Output
 Group. SPDX-License-Identifier: Apache-2.0.*
