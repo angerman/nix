@@ -1947,45 +1947,67 @@ void primIntersectAttrs(EvalState &, Value * args, Value & out)
         out.mkAttrs(b);
         return;
     }
-    // #825 Phase C SPIKE: the sorted-merge below indexes `keep->entries[]`
+    // #825 Phase C SPIKE: the searches below index `keep->entries[]`
     // and `src->entries[]` directly, which for a Chain Bindings sees
-    // only the overlay.  Materialise both inputs once at entry.
+    // only the overlay.  Materialise both inputs once at entry so both
+    // are Sorted (entries[] is the full sorted array).
     if (keep->isChain()) keep = keep->materialize();
     if (src->isChain())  src  = src->materialize();
-    // #747 two-pass to avoid arena slack: pass 1 counts the
-    // intersection, pass 2 allocates exact and fills.  The single-
-    // pass version was the dominant slack site on hello.drvPath —
-    // #746 attribution measured 100 % slack (386.3 MB of pure waste
-    // from 1664 calls) because `builtins.intersectAttrs builtins
-    // pkgs`-style patterns allocate `pkgs->size` (thousands) but
-    // keep only a handful.
+    // PLAN_BEAT_TW_V2 §0.3.1 — iterate the SMALLER side, binary-search
+    // the larger.  The dominant nixpkgs pattern is the callPackage
+    // shape `intersectAttrs (functionArgs f) pkgs`: |keep| ≈ formals
+    // count (~10), |src| ≈ |pkgs| (~20 k).  The previous code merged
+    // O(|keep|+|src|) in pass 1 (already linear) but pass 2 walked the
+    // FULL `src` (~20 k) doing `keep->lookup` per entry — O(|src|·log
+    // |keep|) ≈ 66 k comparisons.  Driving the loop from the smaller
+    // side and binary-searching the larger is O(min·log max) ≈ 140
+    // comparisons in that pattern (~100× less work), and it is never
+    // worse than the merge in any size relation.
     //
-    // Pass 1 uses the same sorted-vector property as `keep`: a
-    // linear merge instead of N binary searches is O(|keep|+|src|)
-    // vs O(|src| log |keep|).  Pass 2 walks `src` again with the
-    // same lookup.  In practice |keep| << |src| so the merge is
-    // already faster than the old single-pass binary-search per
-    // entry.
-    uint32_t kExact = 0;
-    {
-        uint32_t i = 0, j = 0;
-        while (i < keep->size && j < src->size) {
-            const SymbolId kn = keep->entries[i].name;
-            const SymbolId sn = src->entries[j].name;
-            if (kn < sn)        ++i;
-            else if (kn > sn)   ++j;
-            else                { ++kExact; ++i; ++j; }
+    // Byte-identical by construction: `intersectAttrs e1 e2` keeps the
+    // entries of e2 (`src`) whose name appears in e1 (`keep`).  The
+    // result set and its values are input-determined; emitting in the
+    // iterated side's sorted name-order yields the same sorted
+    // Bindings regardless of which side drives the loop, and the
+    // emitted entry (name, pos, value) is always copied from `src`.
+    //
+    // Binary search over the full sorted entries[] of a (now Sorted)
+    // Bindings; returns the matched Entry* or nullptr.
+    auto bsearchEntry = [](const Bindings * b, SymbolId name)
+        -> const Bindings::Entry * {
+        uint32_t lo = 0, hi = b->size;
+        while (lo < hi) {
+            uint32_t mid = (lo + hi) >> 1;
+            const SymbolId mn = b->entries[mid].name;
+            if (mn < name)      lo = mid + 1;
+            else if (mn > name) hi = mid;
+            else                return &b->entries[mid];
         }
-    }
+        return nullptr;
+    };
+    const bool iterKeep   = keep->size <= src->size;
+    const Bindings * iter   = iterKeep ? keep : src;   // smaller — drives the loop
+    const Bindings * search = iterKeep ? src  : keep;  // larger  — binary-searched
+    // Pass 1: count the intersection (exact alloc, no arena slack —
+    // #746/#747: a single-pass over-allocate of |src| was 386.3 MB of
+    // pure waste from 1664 calls).
+    uint32_t kExact = 0;
+    for (uint32_t i = 0; i < iter->size; ++i)
+        if (bsearchEntry(search, iter->entries[i].name)) ++kExact;
     Bindings * result = Alloc::allocBindings(kExact);
     V3_STATS_INC(attrsetsAllocated);
+    // Pass 2: fill — always emit the `src` entry (e2's value wins).
     uint32_t k = 0;
-    // Pass 2 keeps the original keep->lookup loop for code
-    // simplicity; sorted-merge copy would also work but the lookup
-    // is already O(log |keep|) and `keep` is small in practice.
-    for (uint32_t i = 0; i < src->size; ++i) {
-        if (keep->lookup(src->entries[i].name))
-            bindingsSetEntry(result, k++, src->entries[i]);  // Phase D
+    if (iterKeep) {
+        // iter == keep: look the matched entry up in src (the value side).
+        for (uint32_t i = 0; i < iter->size; ++i)
+            if (const Bindings::Entry * se = bsearchEntry(src, iter->entries[i].name))
+                bindingsSetEntry(result, k++, *se);  // Phase D
+    } else {
+        // iter == src: emit the src entry directly when its name is in keep.
+        for (uint32_t i = 0; i < iter->size; ++i)
+            if (bsearchEntry(keep, iter->entries[i].name))
+                bindingsSetEntry(result, k++, iter->entries[i]);  // Phase D
     }
     // k == kExact by construction; allocBindings already set the size.
     out.mkAttrs(result);
