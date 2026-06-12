@@ -2527,6 +2527,31 @@ struct Emitter
             }
         }
 
+        // Phase 3.1 (PLAN_BEAT_TW 2026-06-12): the R_RETURN peephole above
+        // (line ~2337) has ALREADY fused the canonical identity body
+        //   OP_GET_LOCAL 0 ; OP_RETURN
+        // into the single instruction `OP_R_RETURN 0` by the time the 2-insn
+        // detector above runs — so it never matched a real `x: x` / `lib.id` /
+        // genList-gen callback, and every such call paid a private nested
+        // dispatchLoop re-entry (measured: 1 of foldl's 2 per-element re-entries).
+        // Detect the post-peephole 1-insn form too.  `OP_R_RETURN 0` as the sole
+        // body instruction, with a single param + no formals + no captures, can
+        // ONLY have come from `GET_LOCAL 0 ; RETURN` (the peephole's precondition)
+        // → it is exactly the identity lambda; no false positives.  Restores the
+        // no-frame identity fast paths (vm.cc OP_CALL / op_force_slow / valueEq).
+        // (The peephole only fuses OP_GET_LOCAL, not OP_GET_LOCAL_FORCE, so the
+        // forced-arg identity body is still caught by the 2-insn detector above.)
+        if (fid != 0
+            && f.argName != ir::kInvalidSymbol
+            && !f.hasFormals
+            && f.freeVars.empty()
+            && unit.code.size() == codeStart + 1)
+        {
+            const Instruction i0 = unit.code[codeStart];
+            if (decodeOp(i0) == OP_R_RETURN && decodeOperand(i0) == 0)
+                unit.lambdas[fid].identityLambda = true;
+        }
+
         unit.lambdaCodeOffsets[fid] = codeStart;
 
         ctx = nullptr;
