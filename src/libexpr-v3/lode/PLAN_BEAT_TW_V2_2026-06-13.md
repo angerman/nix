@@ -273,6 +273,50 @@ Wave 1 (1.1-1.8 + E-stage-0, ~1 wk) → DP-1 re-profile/re-pin → Wave 2 (A ∥
 re-pin + ratchet freeze. Every item: own commit, A/B in the body, hypothesis named,
 bars pre-committed above.
 
+---
+
+## 7. Addendum (2026-06-13, post-guard-A/B): WHY M5 occupies ~2.2-2.7 GB — measured decomposition
+
+Laptop run, byte-identical (`cardano-node-exe-cardano-node-10.6.1`): v3 27.17 s / 2218 MB
+(default 256 MB policy, 2 GC fires) vs TW 8.67 s / 858 MB. Final stats dump (tail -1):
+
+```
+v3_arena=2147.5MB  elsewhere=0.0MB  boehm_free=402.7/402.9MB   ← it is ALL eval heap
+run-phase alloc: thunks=928.0MB  bindings=469.9MB  pairs=253.5MB  closures=183.8MB
+                 chars=137.5MB  lists=72.4MB        (total 2130.7MB)
+thunks allocated=17,140,931  forced=6,302,774  → 63.2% NEVER FORCED (avg 56.8B/thunk)
+mergeBindings: 766,742 calls but only 172.1MB     ← `//` materialization is NOT the M5 story
+bridge=0                                          ← the old "731MB bridge retention" is obsolete (F4)
+GC#1: live=313.5MB  freed=16.8MB (1 block)        GC#2: live=1049.7MB  freed=0.0MB
+GC total: 11.8s of 27.2s CPU (~43%) for 16.8MB reclaimed
+```
+
+**Answer**: M5 is a *genuinely live* giant, not churn and not caches. `getFlake` retains
+the whole flake-outputs tree while haskell.nix's cabalProject fixpoint builds enormous
+package/component attrsets whose values are **~10.8 M never-forced suspended thunks** —
+the GC correctly keeps them (live 1.05 GB mid-eval and growing). The v3-vs-TW RSS gap
+(2147 vs ~858 MB) is dominated by the **representation tax on suspended computation**:
+v3 flat-captures upvalues per thunk (40 B header + 8 B/upvalue ≈ 57 B avg × 17.1 M =
+928 MB), where TW's equivalent thunk is a 16 B Value pointing at a shared AST + a
+**shared Env chain** (sibling thunks in one binding group share one Env spine, ~16-24 B
+amortized). Pairs (253 MB of App partial-applications) add the same class of ballast.
+
+**Consequences for the plan**:
+- The team's adaptive backoff (freed<5% → throttle) is exactly right for M5; HNE's
+  useful GC (−624 MB, whole blocks die) is preserved by the yield key. 1.8 (mark
+  speedup) turns M5's residual mandatory mark from ~5 s toward ~0.5-1 s.
+- Workstream A (chain-SELECT) helps M5 only marginally (merge volume is 172 MB / 8%
+  of arena). Workstream E helps M5 little (live-dominated heap).
+- **NEW candidate workstream H — shared capture frames for sibling thunks** (the M5/HNE-
+  class lever): one upvalue tuple per binding group, sibling thunks reference it (8 B)
+  instead of flat-copying captures — re-introduces TW's env sharing exactly where it
+  wins (huge never-forced thunk populations) while keeping flat capture on the hot
+  forced path. Pre-design measurement first: histogram captured-upvalue duplication
+  across sibling thunks (cheap NIX_V3_*_ATTR-style probe). Potential ≈ 300-500 MB on
+  M5-class; needs-measurement. Sequence after A/B/E per measure-twice.
+- v3 M5 CPU without the GC tax ≈ 15.4 s ≈ 1.78× TW — the same base gap as the other
+  drv rows; the Wave-1 CPU items apply to M5 unchanged.
+
 *Measurements 2026-06-13 by the orchestrating session (profiles in /tmp are transient;
 all load-bearing numbers are reproduced inline above). Agent design analyses: chain-RCA,
 resident-iteration, depth>0-GC, drv-CPU-pack (4 parallel deep reads at HEAD 777d286c7).*
