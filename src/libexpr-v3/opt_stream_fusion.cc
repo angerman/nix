@@ -513,6 +513,18 @@ size_t streamFusion(Module & m)
     static const FusionRule kRules[] = {
         // foldl' op nul (map f xs)  →  __foldlMap op nul f xs
         // (DISABLED by default — regresses; see registry.  Opt-in only.)
+        //
+        // C-14 SOUNDNESS PREREQUISITE (CODEBASE_REVIEW_2026-06-11): this fusion
+        // is also UNSOUND for an element-IGNORING `op` (e.g. `acc: x: acc`).
+        // primFoldlMap EAGERLY evaluates `f x` per element, but the unfused
+        // `foldl' op nul (map f xs)` leaves `f x` as a lazy `map` thunk that an
+        // element-ignoring op never forces — so `foldl' (acc: x: acc) 0
+        // (map (x: throw "e") xs)` is `0` unfused but THROWS fused.  Before this
+        // rule can ever ship default-on it must additionally gate on `op` being
+        // STRICT IN ITS 2nd ARGUMENT (the strictness analysis already computes
+        // per-function forced-arg sets — opt_func_strictness).  It is moot today
+        // because the whole pass is default-OFF (NIX_V3_STREAM_FUSION) and this
+        // rule regresses; the gate is a hard prerequisite for enabling it.
         { "foldl'", "__foldl'", 3, 2, "map", "__map", 2, "__foldlMap" },
     };
     constexpr size_t kNumRules = sizeof(kRules) / sizeof(kRules[0]);
