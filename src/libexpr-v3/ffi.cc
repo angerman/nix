@@ -31,6 +31,7 @@
 #include "v3/value.hh"
 #include "v3/vm.hh"
 #include "v3/primop.hh"
+#include "v3/gc_root.hh"  // M-5: walkEvalScopeRoots declaration
 
 #include "nix/util/source-path.hh"
 #include "nix/util/source-accessor.hh"
@@ -951,6 +952,24 @@ EvalScope::~EvalScope()
         // Mismatch (scope dtor running out of stack order) is a programmer
         // error.  Leak the node so subsequent dtors find their state.
         // In a debug build, an assert would fire.
+    }
+}
+
+// M-5 (CODEBASE_REVIEW_2026-06-11): walk every live EvalScope's valid handle
+// slots as GC roots.  Each payload is a `Value *` (see applyClosure's
+// static_cast<Value *>(payload)).  Called from walkAllV3Roots so the major GC
+// (and the nursery scavenger) keep EvalScope-pinned Values alive / rewrite
+// them on evacuation.  Holds g_scopeLock during the walk — the GC safepoint is
+// single-threaded per VMState, so this never contends in practice.
+void walkEvalScopeRoots(const std::function<void(Value &)> & visit)
+{
+    std::lock_guard<std::mutex> lk(g_scopeLock);
+    for (auto & [gen, node] : g_liveScopes) {
+        if (!node) continue;
+        for (auto & slot : node->slots) {
+            if (slot.valid && slot.payload)
+                visit(*static_cast<Value *>(slot.payload));
+        }
     }
 }
 

@@ -185,6 +185,11 @@ void walkAllV3Roots(VMState & vm, RootVisitor & visitor) noexcept
         walkBuiltinsRoot(adapter);
         walkCallFlakeRoot(adapter);
         walkDeepForceRoots(adapter);
+        // M-5 (CODEBASE_REVIEW_2026-06-11): FFI EvalScope handle table — each
+        // valid HandleSlot::payload is a Value* an embedder registered. Dormant
+        // today (test-only allocClosureHandle) but walked now so opening the
+        // FFI to production embedders (#485) doesn't sweep/dangle these.
+        walkEvalScopeRoots(adapter);
     }
 
     // -- Stage 5: C++-stack roots (sub-source 8) -------------------
@@ -247,6 +252,11 @@ void walkGlobalV3Roots(RootVisitor & visitor) noexcept
         walkBuiltinsRoot(adapter);
         walkCallFlakeRoot(adapter);
         walkDeepForceRoots(adapter);
+        // M-5 (CODEBASE_REVIEW_2026-06-11): FFI EvalScope handle table — each
+        // valid HandleSlot::payload is a Value* an embedder registered. Dormant
+        // today (test-only allocClosureHandle) but walked now so opening the
+        // FFI to production embedders (#485) doesn't sweep/dangle these.
+        walkEvalScopeRoots(adapter);
     }
 }
 

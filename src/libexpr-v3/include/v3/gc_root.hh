@@ -56,6 +56,7 @@
 /// SPDX-License-Identifier: Apache-2.0
 
 #include <vector>
+#include <functional>  // walkEvalScopeRoots adapter (M-5)
 
 namespace nix::v3 {
 
@@ -77,6 +78,16 @@ std::vector<Value *> & gcRootStack() noexcept;
 /// bytecode-frame walker.  External use is fine but rare —
 /// the typical pattern is the `GcRoot` RAII helper below.
 void walkCppStackRoots(RootVisitor & visitor) noexcept;
+
+/// M-5 (CODEBASE_REVIEW_2026-06-11): walk the FFI EvalScope handle table as GC
+/// roots.  Each valid HandleSlot::payload is a `Value *` (the v3 value an
+/// embedder registered via allocClosureHandle); without this walk the major GC
+/// would sweep an EvalScope-pinned-only Value (non-moving) and evacuation would
+/// relocate its referent without rewriting the slot (moving) → dangle.  Dormant
+/// today (only test paths use allocClosureHandle) but load-bearing before the
+/// FFI opens to production embedders (#485).  Defined in ffi.cc (owner of the
+/// g_liveScopes table).  Adapter form to match the global-root call site.
+void walkEvalScopeRoots(const std::function<void(Value &)> & visit);
 
 /// RAII helper: register a Value as a GC root on construct,
 /// unregister on destruct.  Stack-allocate within the helper
