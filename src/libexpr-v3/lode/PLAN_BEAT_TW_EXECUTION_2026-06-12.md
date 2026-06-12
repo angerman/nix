@@ -1,10 +1,50 @@
 # PLAN_BEAT_TW execution status + reframe (2026-06-12)
 
 Companion to `PLAN_BEAT_TW_2026-06-12.md`. Records what was executed, what the
-measurements changed, and the executable next steps. Host: **Air** (laptop) —
-CPU is min-of-N user-CPU (low noise); RSS is noisy (±10-15%, firefox 574-668 MB
-across runs). The drv-hash-critical levers were NOT landed here because they
-require the full nixpkgs sweep (darwin-4), which the laptop cannot run.
+measurements changed, and the executable next steps. Laptop (Air) for fast CPU
+iteration; **darwin-4 (canonical host) for drv-hash-critical levers + RSS**.
+
+## darwin-4 confirmation (canonical host — built at HEAD, lang 143/143)
+
+The plan's table reproduces EXACTLY on darwin-4, and 3.1's foldl win confirms:
+
+| row | CPU baseline | CPU now | RSS (v3/TW) |
+|---|---|---|---|
+| fib 30 | 1.38× | 1.36× | — |
+| foldl 1e6 | 2.18× | **1.45×** (3.1) | 0.5× |
+| hello.drvPath | 1.65× | 1.65× | 239/126 = **1.90×** |
+| git.drvPath | 1.91× | 1.88× | 289/148 = **1.95×** |
+| firefox.drvPath | 2.83× | 2.78× | 1228/479 = **2.56×** |
+
+The laptop RSS (~620 MB firefox) was UNREPRESENTATIVE — darwin-4 firefox v3 RSS
+is **1228 MB** (matches the plan's 1294). RSS bars MUST be darwin-4.
+
+## Two structural diagnoses that bound the whole plan (darwin-4 + code)
+
+**drvPath CPU is wrapper-SKELETON-bound, not key/parse-bound.** 1.2b (de-stringify
+the env-key round-trip, commit 53eac9bd3) measured a **0% wash on darwin-4**
+(hello/git/firefox unchanged, byte-identical) → REVERTED (7e32072f8). With 0.4
+(context parse-back = 2.4%), the firefox 2.78× is the wrapper's per-drv skeleton
+(137 insns + 22 thunk allocs) + the inherent coerce/context/libstore work — the
+two easy levers (key de-stringify, parse memo) are both <3%. The next drvPath-CPU
+lever must shrink the wrapper skeleton itself, or accept >1.0× pending the Phase-4
+single-pass-hashing differentiator.
+
+**RSS peak can only be lowered by allocating less — not by GC.** The arena's
+peak RSS is the bump HIGH-WATER mark. To lower it you must either (a) allocate
+less, or (b) reclaim scattered dead cells MID-eval and reuse the space. (b) is
+blocked three ways: the major GC fires once (`exitDepth==0` safepoint, deep evals
+never return to depth 0 mid-eval); a non-moving whole-block-free at depth>0 would
+reclaim almost nothing (scattered dead → few FULLY-dead blocks) AND needs the
+current-C-stack conservative scanner (`collectCStackDirectPins`, today
+evacuation-only — the non-moving mark assumes precise roots suffice, valid ONLY at
+`exitDepth==0`) wired into the mark; and moving evacuation (which DOES reclaim
+scattered dead) cannot run at depth>0 (it relocates cells out from under primop
+C-locals like `primFoldl`'s `acc`). So GC cannot lower peak here. **The only RSS
+lever is allocate-less**: the arena is **96 MB (hello) / 264 MB (firefox) of `//`
+(OP_ATTRS_UPDATE) materialisation, 100% of mergeBindings** — cut that volume
+(Lever 2.3 chain-SELECT lookup-without-materialize, and `//` that shares/extends
+instead of copying the base) and the high-water mark drops directly + safely.
 
 ## Landed (committed, measured, lang 143/143, byte-identical)
 
@@ -76,12 +116,16 @@ but both run at the one late safepoint, so peak is unaffected.
    1.1 (context copies), 1.2b (wrapper churn), 2.3 (chain-SELECT
    lookup-without-materialize), and a new "`//` that shares/extends instead of
    copying the base" lever.
-2. **Fire the (non-moving) major GC at depth>0 safepoints** — flat mark-sweep
-   does not move cells (vm.cc:3182-3184), so the C-stack-dangling risk that gates
-   it to exitDepth==0 is null for the *non-evacuating* path. Letting whole-block-
-   free + freeWholeBlock run mid-eval at nested safepoints is what actually lowers
-   the high-water mark. This is the real Phase-2 lever; it is NOT in the original
-   plan. (Evacuation must stay exitDepth==0 — it moves cells.)
+2. ~~Fire the non-moving major GC at depth>0 safepoints~~ — **SUPERSEDED by the
+   2026-06-12 darwin-4 analysis above.** Investigated and found BLOCKED: (i) the
+   current-C-stack conservative scanner needed to make depth>0 marking sound
+   (primop C-locals like `primFoldl`'s `acc` are NOT precise roots) exists only
+   in the evacuation path (`collectCStackDirectPins`); (ii) even if wired in, a
+   non-moving whole-block-free reclaims almost nothing at depth>0 because the dead
+   is SCATTERED (few fully-dead blocks); (iii) the moving evacuation that COULD
+   reclaim scattered dead cannot run at depth>0 (relocates C-local-referenced
+   cells). Net: **GC cannot lower the peak here.** Allocate-less (item 1) is the
+   sole RSS lever — see the "Two structural diagnoses" section at the top.
 
 All RSS work needs darwin-4 to measure to the bars (laptop RSS noise ≈ the bars).
 
