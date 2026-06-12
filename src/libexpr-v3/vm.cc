@@ -10530,6 +10530,18 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 // walker's implicit recursion depth; deeper chains are
                 // pathological and surface a clearer error than a stack
                 // overflow.
+                //
+                // C-4b/«slot» (CODEBASE_REVIEW_2026-06-11): deref a Tag::Slot
+                // part FIRST.  A Slot (v3-only transparent pointer into a
+                // tenured cell — *slot is the value) may point at a derivation
+                // attrset; without this it is NOT isAttrs(), so it skips the
+                // __toString/outPath unwind below and falls straight to
+                // coerceToString, which (after its own Slot-deref) errors
+                // "cannot coerce a set" on the derivation — the firefox≡ghc98
+                // .drvPath residual.  Resolving the Slot here lets the unwind
+                // coerce the derivation via outPath, exactly as TW does.
+                while (parts[i].tag() == Tag::Slot && parts[i].asSlot())
+                    parts[i] = *parts[i].asSlot();
                 if (parts[i].isAttrs() && parts[i].asAttrs()) {
                     static const SymbolId tsId  = ir::globalInternSymbol("__toString");
                     static const SymbolId outId = ir::globalInternSymbol("outPath");
