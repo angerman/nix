@@ -11,7 +11,7 @@
 # SPDX-License-Identifier: Apache-2.0
 set -u
 NIX=/Users/angerman/Projects/iohk/nix/build/src/nix/nix
-EXPR='(import <nixpkgs> { config.allowUnfree = true; }).firefox.drvPath'
+EXPR='builtins.length (builtins.filter builtins.isFunction (builtins.genList (i: (x: y: x + y) i) 2000000))'
 # Start the v3 eval in the background, sample it, wait.
 NIX_V3_DIRECT_EVAL=1 NIX_V3_MAX_WALL_TIME=300s NIX_V3_MAX_HEAP=8G \
   "$NIX" eval --impure --expr "$EXPR" >/dev/null 2>&1 &

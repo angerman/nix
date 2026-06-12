@@ -196,6 +196,26 @@ constexpr size_t kMaxCallDepth        = 5000;
 /// makeOverridable / setFunctionArgs / callPackage results).  An App3 link
 /// carries TWO applied args (`right` + `third`), so it contributes 2 to the
 /// applied-arg depth.
+// LOW-6 (CODEBASE_REVIEW_2026-06-11) FALSIFIED as a perf lever — do NOT add an
+// OP_MAKE_CLOSURE arity byte + cache remaining-arity in App/App3 cells to make
+// this O(1).  The spine walk below is O(applied-arg depth), and that depth is
+// 1 for the dominant case (`(x: y: …) a` = a single App link).  For depth 1
+// the loop runs ONCE — it is ALREADY the O(1) that LOW-6 would buy.  Measured
+// on darwin-4 (the dedicated builder): a worst-case PAP storm —
+//   builtins.length (builtins.filter builtins.isFunction
+//     (builtins.genList (i: (x: y: x + y) i) 2000000))
+// (2M depth-1 PAPs, each isFunction-checked → routed through THIS predicate,
+// then forced) — completes in 0.98 s.  The spine walk is not a hotspot at any
+// realistic PAP count, and deeper spines (depth ≥2) are rare.  Against that
+// ~zero benefit, LOW-6 costs an invasive repr change (ValuePair has no spare
+// slot for remaining-arity; the App Value's pointer payload has only 3
+// alignment-low-bits, which would force a mask on EVERY asPair() VM-wide) and
+// risks regressing the just-fixed C-8/9/10 PAP force-handshake — a clear
+// measure-twice loss.  (Correctness of the PAP family is ALREADY fixed by
+// C-8/9/10 / f5875a89c; LOW-6 was only ever a perf/simplification idea.)
+// P-9's saturated-call superinstruction is enabled by this arity byte, so it
+// falls with LOW-6; P-9's other emit fusions are marginal+measure-gated per
+// the SET_LOCAL_KEEP precedent (+1.4%).
 [[gnu::always_inline]] inline bool isUnderappliedClosurePap(const Value & v)
 {
     Tag t = v.tag();
