@@ -167,6 +167,7 @@ if [[ "$mode" == "core" || "$mode" == "full" || "$mode" == "brute" ]]; then
   # negative-test setup that's stale.  Re-add when the test is
   # updated to use NIX_V3_DIRECT_EVAL=1 + a current gate.
   #SUITES+=( "broader-thunkify|#496-498 broader-thunkify upvalue bug|$TEST_DIR/run-broader-thunkify-tests.sh" )
+  SUITES+=( "apply-overrides-1.7|§1.7 OP_APPLY_OVERRIDES chain guard + __overrides byte-identity|NIX=$NIX $TEST_DIR/run-1.7-apply-overrides-tests.sh" )
   SUITES+=( "lint-no-inline-getenv|cached env-var lint|$TEST_DIR/lint-no-inline-getenv.sh" )
   SUITES+=( "lint-no-direct-tw-include|FFI consolidation: no new direct TW #includes|$TEST_DIR/lint-no-direct-tw-include.sh" )
   SUITES+=( "lint-cache-coherence|#814/#815 schema-bump operating rules|$TEST_DIR/lint-cache-coherence.sh" )
@@ -182,6 +183,7 @@ if [[ "$mode" == "full" ]]; then
   already_added[run-let-rec-publish-split-tests.sh]=1
   already_added[run-583-tag-app-cache-tests.sh]=1
   already_added[run-broader-thunkify-tests.sh]=1
+  already_added[run-1.7-apply-overrides-tests.sh]=1  # in core
 
   for script in "$TEST_DIR"/run-*.sh; do
     base="$(basename "$script")"
