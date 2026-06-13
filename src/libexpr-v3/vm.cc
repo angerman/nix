@@ -381,6 +381,38 @@ static std::unordered_map<const Bindings *, uint32_t> & chainChildCount() noexce
     return m;
 }
 
+// PLAN_BEAT_TW_V2 workstream A step 3 — chain-SELECT L1 lever.
+//
+// When set, OP_ATTRS_SELECT / OP_ATTRS_SELECT_DYN on a Chain Bindings does a
+// chain-WALK lookup (NO materialize() flat copy — that copy is the dominant
+// chain-on RSS residual + a shared s_matMemo write surface) instead of
+// materialising.  Writeback safety (the 2026-06-07 corruption fix, now retried
+// per §0.4 since the four wrong-value writers are fixed): a memoizing KEEP
+// writeback is armed ONLY for a LEAF-overlay hit — this chain's own
+// freshly-copied entry, never shared.  A hit in a SHARED parent layer pushes
+// the value WITHOUT arming a writeback: the App/Thunk still self-memoizes at
+// its own level (idempotent, like TW's shared thunks); only the SELECT slot
+// flattening is lost (a small re-force CPU cost), and no value is written into
+// the shared parent.  v1 skips the inline cache for chain operands.
+//
+// Gate: NIX_V3_CHAIN_LOOKUP_SELECT=1 (opt-in).  Retirement: default-on after
+// the QG-1 full set + aggressive-GC byte-identity + fullsweep validate; revert
+// if the firefox peak-RSS −≥80 MB bar is missed or any divergence appears.
+static const bool g_chainLookupSelect =
+    std::getenv("NIX_V3_CHAIN_LOOKUP_SELECT") != nullptr;
+
+// Provenance assert (the precise C-1 guard, gated V3_DBG_SHARED_WB): records the
+// value at each KEEP-armed forceWriteTarget at ARM time; at FIRE time the target
+// must STILL hold that value.  A mismatch means a re-entrant force overwrote the
+// slot between arm and fire — a STALE KEEP about to cross-write an unrelated WHNF
+// (the C-1 corruption mechanism) — which the assert reports/aborts.  thread_local
+// + populated only under the gate → zero production cost.
+static std::unordered_map<const Value *, Value> & armedWritebackValue() noexcept
+{
+    static thread_local std::unordered_map<const Value *, Value> m;
+    return m;
+}
+
 // #733 (2026-05-21) hot-path stat-counter gate.  The per-descriptor
 // allocCount/forceCount + global thunksForced/thunksAllocated/
 // bridgeThunksForced increments live on the hottest paths in the
@@ -2556,6 +2588,31 @@ inline void clearForceWriteback(CallFrame & f) noexcept
 [[gnu::noinline]] static void detectSharedParentWriteback(const Value * target)
 {
     if (!target) return;
+    // (1) PROVENANCE ASSERT (WS-A step 3, the precise C-1 guard): the target
+    // must still hold the value that was at it when the KEEP was armed.  The
+    // intervening op_force_slow only mutates the forced Thunk/App's INTERNAL
+    // state (evaluated), never the slot word — so armed.w must equal target->w
+    // at fire.  A mismatch means a re-entrant force overwrote the slot between
+    // arm and fire: a STALE KEEP about to cross-write an unrelated WHNF into it
+    // (the C-1 corruption mechanism).
+    {
+        auto & am = armedWritebackValue();
+        auto ait = am.find(target);
+        if (ait != am.end()) {
+            if (ait->second.w != target->w) {
+                std::fprintf(stderr,
+                    "v3 SHARED-WB PROVENANCE VIOLATION: target=%p armed payload "
+                    "changed before fire (armed.w=%#llx now=%#llx) — stale KEEP / "
+                    "C-1 cross-write\n",
+                    (const void *)target,
+                    (unsigned long long)ait->second.w,
+                    (unsigned long long)target->w);
+                if (g_sharedWbAbort) std::abort();
+            }
+            am.erase(ait);
+        }
+    }
+    // (2) Shared-parent-writeback counter (benign; see the block comment).
     const char * cs = threadArena().findContainingCellStart(target);
     if (!cs) return;
     const Bindings * owner = reinterpret_cast<const Bindings *>(cs);
@@ -8838,6 +8895,51 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // writeback).  Revisit only with a precise shared-Pair / writeback
             // analysis; not worth the correctness risk for the extra 132 MB.
             if (__builtin_expect(b && b->isChain(), 0)) {
+                // WS-A step 3 — chain-SELECT L1 (NIX_V3_CHAIN_LOOKUP_SELECT):
+                // walk the chain layers instead of materialising a flat copy.
+                // Leaf-overlay hit → memoizing KEEP writeback (this chain's own
+                // copy, never shared).  Parent-layer hit → push WITHOUT a
+                // writeback (the App/Thunk self-memoises at its own level; only
+                // slot-flattening is lost, and nothing is written into the
+                // SHARED parent — the 2026-06-07 C-1 corruption mechanism).
+                // v1 skips the inline cache for chain operands.  A miss falls
+                // through to materialize() so the existing missing-attr error
+                // path is reused unchanged.
+                if (g_chainLookupSelect) {
+                    const Bindings * ownerLayer = nullptr;
+                    Value * lslot = nullptr;
+                    for (const Bindings * L = b; L; L = L->parent) {
+                        if (const Value * v =
+                                L->lookupLocal(static_cast<SymbolId>(operand))) {
+                            lslot = const_cast<Value *>(v);
+                            ownerLayer = L;
+                            break;
+                        }
+                    }
+                    if (lslot) {
+                        const bool leafHit = (ownerLayer == b);
+                        Value & s = *lslot;
+                        if (leafHit && s.isAppLike()
+                            && !isUnderappliedClosurePap(s)) {
+                            // Safe memoizing writeback into the leaf overlay.
+                            push(vm, s);
+                            CallFrame & f = vm.frames.back();
+                            armKeepBeltCheck(f);  // C-1 belt
+                            f.forceWriteTarget = lslot;
+                            f.flags |= CFF_FORCE_WB_PTR_KEEP | CFF_FORCE_RETRY;
+                            if (__builtin_expect(g_sharedWbDetect, 0))
+                                armedWritebackValue()[f.forceWriteTarget] =
+                                    *f.forceWriteTarget;  // provenance
+                            f.ip = ip;
+                            goto op_force_slow;
+                        }
+                        // Parent hit, PAP, plain Thunk, or WHNF: push, no
+                        // writeback (the consumer force-on-receives).
+                        push(vm, s);
+                        break;
+                    }
+                    // miss → fall through to the materialize/error path.
+                }
                 b = const_cast<Bindings *>(b->materialize());
             }
             // V3_DBG_PREHOOK diagnostic: log every ATTRS_SELECT preHook
@@ -9037,6 +9139,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     armKeepBeltCheck(f);  // C-1 belt
                     f.forceWriteTarget = &slot;
                     f.flags |= CFF_FORCE_WB_PTR_KEEP | CFF_FORCE_RETRY;
+                    if (__builtin_expect(g_sharedWbDetect, 0))
+                        armedWritebackValue()[f.forceWriteTarget] = *f.forceWriteTarget;  // WS-A step 3 provenance
                     f.ip = ip;  // resume past the IC handler on success
                     goto op_force_slow;
                 }
@@ -9217,6 +9321,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     armKeepBeltCheck(f);  // C-1 belt
                     f.forceWriteTarget = &slot;
                     f.flags |= CFF_FORCE_WB_PTR_KEEP | CFF_FORCE_RETRY;
+                    if (__builtin_expect(g_sharedWbDetect, 0))
+                        armedWritebackValue()[f.forceWriteTarget] = *f.forceWriteTarget;  // WS-A step 3 provenance
                     f.ip = ip;
                     goto op_force_slow;
                 }
@@ -9470,12 +9576,29 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // ones the attrset's bindings were built with.
             SymbolId id = ir::globalInternSymbol(name.asString());
             Bindings * dynB = attrs.asAttrs();
-            // Lever A: chain dynamic-select MATERIALISES (same rationale as
-            // the static OP_ATTRS_SELECT — a lookup-only path risks the
-            // shared-parent writeback contamination documented there).
-            if (__builtin_expect(dynB->isChain(), 0))
-                dynB = const_cast<Bindings *>(dynB->materialize());
-            Value * found = dynB->lookup(id);
+            // WS-A step 3 — chain-SELECT L1 for the dynamic-name path (mirror
+            // of OP_ATTRS_SELECT): walk the chain layers (no materialize) when
+            // NIX_V3_CHAIN_LOOKUP_SELECT, tracking whether the hit is in the
+            // LEAF overlay.  `dynLeafSafe` gates the memoizing writeback below:
+            // a parent-layer hit pushes without arming (no shared-parent write).
+            Value * found = nullptr;
+            bool dynLeafSafe = true;
+            if (__builtin_expect(dynB->isChain(), 0)) {
+                if (g_chainLookupSelect) {
+                    for (const Bindings * L = dynB; L; L = L->parent) {
+                        if (const Value * v = L->lookupLocal(id)) {
+                            found = const_cast<Value *>(v);
+                            dynLeafSafe = (L == dynB);
+                            break;
+                        }
+                    }
+                } else {
+                    dynB = const_cast<Bindings *>(dynB->materialize());
+                    found = dynB->lookup(id);
+                }
+            } else {
+                found = dynB->lookup(id);
+            }
             if (!found)
                 // #678 — match TW phrasing
                 // (libexpr/eval.cc:1680): `attribute '<name>'
@@ -9496,12 +9619,15 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // passthru.pythonAtLeast / firefox optionalString PAP->result bug).
             // Mirrors OP_FORCE (vm.cc:7161) + the OP_ATTRS_SELECT sites above.
             if (__builtin_expect(found->isAppLike(), 0)
-                && !isUnderappliedClosurePap(*found)) {
+                && !isUnderappliedClosurePap(*found)
+                && dynLeafSafe) {   // WS-A step 3: no writeback into a shared parent
                 push(vm, *found);
                 CallFrame & f = vm.frames.back();
                 armKeepBeltCheck(f);  // C-1 belt
                 f.forceWriteTarget = found;
                 f.flags |= CFF_FORCE_WB_PTR_KEEP | CFF_FORCE_RETRY;
+                if (__builtin_expect(g_sharedWbDetect, 0))
+                    armedWritebackValue()[f.forceWriteTarget] = *f.forceWriteTarget;  // WS-A step 3 provenance
                 f.ip = ip;
                 goto op_force_slow;
             }
