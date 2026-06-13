@@ -344,6 +344,43 @@ static const double g_majorGcGrowth = [] {
     return 2.0;
 }();
 
+// PLAN_BEAT_TW_V2 workstream A step 2 — shared-parent-writeback COUNTER.
+//
+// Counts how many chain children each parent has (incremented at the two
+// allocChainBindings call sites) and, at the single writeback fire point,
+// reports any `forceWriteTarget` that lands inside a parent shared by ≥2
+// chains.  Gated V3_DBG_SHARED_WB=1 (V3_DBG_SHARED_WB_ABORT=1 to abort on the
+// first hit for inspection); DEFAULT-OFF → one predicted-not-taken branch in
+// production.
+//
+// FINDING (2026-06-13): these writebacks are PERVASIVE and BENIGN.  firefox
+// fires 18, git 10, cargo 8, rustc 7 … per eval — yet every drvPath stays
+// byte-identical to TW (the 06-07 failure set, 5/5).  They are correct-WHNF
+// memoisation into a shared layer, exactly like TW's own layered-Bindings
+// memoisation through shared layers (src/libexpr attr-set.hh; PLAN §0.4).  So
+// "any writeback into a shared parent is the C-1 signature" is FALSE — most are
+// safe.  The C-1 corruption is specifically a WRONG-VALUE / stale-KEEP write;
+// its precise detector is a PROVENANCE ASSERT (the armed payload identity must
+// still be at the target at fire time), NOT this child-count heuristic.  This
+// counter's value for the L1 lever: it (a) confirms shared-parent memoisation
+// is benign, and (b) bounds the number of sites L1's "parent hit → no
+// writeback" would convert (losing benign slot-flattening, a CPU cost).
+// Retirement: remove with the chain-SELECT L1 lever (and add the provenance
+// assert there as the real C-1 guard).
+static const bool g_sharedWbDetect = std::getenv("V3_DBG_SHARED_WB") != nullptr;
+static const bool g_sharedWbAbort  = std::getenv("V3_DBG_SHARED_WB_ABORT") != nullptr;
+
+// Child-count per chain parent (detector-only; populated solely when
+// g_sharedWbDetect).  Function-local static so it costs nothing when the gate
+// is off (never touched).  Pointers are stable (flat MS does not move cells);
+// run the detector with a high NIX_V3_MAJOR_GC_THRESHOLD_MB to avoid a freed
+// parent's address being recycled under a stale count.
+static std::unordered_map<const Bindings *, uint32_t> & chainChildCount() noexcept
+{
+    static std::unordered_map<const Bindings *, uint32_t> m;
+    return m;
+}
+
 // #733 (2026-05-21) hot-path stat-counter gate.  The per-descriptor
 // allocCount/forceCount + global thunksForced/thunksAllocated/
 // bridgeThunksForced increments live on the hottest paths in the
@@ -1337,6 +1374,7 @@ inline Bindings * mergeBindings(const Bindings * a, const Bindings * b,
         Bindings * c = Alloc::allocChainBindings(a, b->size);
         for (uint32_t j = 0; j < b->size; ++j)
             bindingsSetEntry(c, j, b->entries[j]);  // overlay sorted; Phase D
+        if (__builtin_expect(g_sharedWbDetect, 0)) ++chainChildCount()[a];  // WS-A detector
         return c;
     }
 
@@ -1420,6 +1458,7 @@ inline Bindings * mergeBindings(const Bindings * a, const Bindings * b,
         Bindings * c = Alloc::allocChainBindings(a, nb);
         for (uint32_t j = 0; j < nb; ++j)
             bindingsSetEntry(c, j, b->entries[j]);  // overlay sorted; Phase D
+        if (__builtin_expect(g_sharedWbDetect, 0)) ++chainChildCount()[a];  // WS-A detector
         return c;
     }
 
@@ -2508,6 +2547,34 @@ inline void clearForceWriteback(CallFrame & f) noexcept
             (void *)f.forceWriteTarget);
 }
 
+// WS-A step 2 counter (see g_sharedWbDetect): report when `target` — a
+// forceWriteTarget about to be written in place — lands inside the entries[] of
+// a chain parent shared by ≥2 chains.  These are BENIGN (correct-WHNF
+// memoisation; see the block comment) — the report is a measurement, not an
+// alarm.  Diagnostic only; resolves the interior pointer to its owning Bindings
+// via the arena cell-start bitmap, then checks the detector's child-count map.
+[[gnu::noinline]] static void detectSharedParentWriteback(const Value * target)
+{
+    if (!target) return;
+    const char * cs = threadArena().findContainingCellStart(target);
+    if (!cs) return;
+    const Bindings * owner = reinterpret_cast<const Bindings *>(cs);
+    if (owner->kind > uint8_t(Bindings::Kind::Chain)) return;  // not a Bindings cell
+    const char * lo = reinterpret_cast<const char *>(owner->entries);
+    const char * hi = reinterpret_cast<const char *>(owner->entries + owner->size);
+    const char * tp = reinterpret_cast<const char *>(target);
+    if (tp < lo || tp >= hi) return;  // target is not inside this Bindings' entries[]
+    auto & m = chainChildCount();
+    auto it = m.find(owner);
+    if (it == m.end() || it->second < 2) return;  // not a ≥2-child (shared) parent
+    std::fprintf(stderr,
+        "v3 SHARED-WB: writeback into chain parent %p shared by %u chains "
+        "(target=%p) — benign WHNF memoisation (byte-identical); L1 would "
+        "convert this to no-writeback\n",
+        (const void *)owner, it->second, (const void *)target);
+    if (g_sharedWbAbort) std::abort();
+}
+
 inline bool applyForceWriteback(VMState & vm)
 {
     if (__builtin_expect(vm.frames.empty(), 0))
@@ -2563,8 +2630,11 @@ inline bool applyForceWriteback(VMState & vm)
         // stack slot.  We don't track the container here, so route
         // through `cellWrite` with cellContainer=nullptr — the
         // standalone-cell registry catches inter-gen writes.
-        if (t != Tag::Blackhole && f.forceWriteTarget)
+        if (t != Tag::Blackhole && f.forceWriteTarget) {
+            if (__builtin_expect(g_sharedWbDetect, 0))
+                detectSharedParentWriteback(f.forceWriteTarget);  // WS-A step 2
             cellWrite(f.forceWriteTarget, top, nullptr);
+        }
         f.forceWriteTarget = nullptr;
         f.flags &= ~CFF_FORCE_WB_PTR_KEEP;
         return true;
@@ -2580,8 +2650,11 @@ inline bool applyForceWriteback(VMState & vm)
         // so a later read re-forces, rather than baking in a permanent
         // Blackhole that reads fail on where TW succeeds. (A forced PAP IS a
         // valid WHNF here and is written normally.)
-        if (f.forceWriteTarget && forced.tag() != Tag::Blackhole)
+        if (f.forceWriteTarget && forced.tag() != Tag::Blackhole) {
+            if (__builtin_expect(g_sharedWbDetect, 0))
+                detectSharedParentWriteback(f.forceWriteTarget);  // WS-A step 2
             cellWrite(f.forceWriteTarget, forced, nullptr);
+        }
         f.forceWriteTarget = nullptr;
         f.flags &= ~CFF_FORCE_WB_PTR;
         return true;
