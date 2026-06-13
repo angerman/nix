@@ -8457,6 +8457,26 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 throw std::runtime_error("v3 OP_APPLY_OVERRIDES: __overrides must be an attrset");
             if (!ov.asAttrs()) break;
             auto * dst = top.asAttrs();
+            // PLAN_BEAT_TW_V2 §1.7 (correctness, from the chain-SELECT RCA):
+            // `dst->lookup(k)` below is CHAIN-AWARE — for a Chain Bindings it
+            // walks overlay then parent layers — and the matched slot is then
+            // mutated in place via `const_cast`.  If `dst` is ever a Chain
+            // whose match lands in a SHARED parent layer, that write corrupts
+            // every sibling chain pointing at the same parent (the C-1
+            // stale-KEEP class: src/libexpr attr-set.hh layered Bindings are
+            // shared across all of nixpkgs).  OP_ATTRS_REC_INIT builds Sorted
+            // Bindings today so this is latent, but guard it now: if `dst` is a
+            // Chain, privatize a flat Sorted copy and operate on THAT, so an
+            // in-place override can never leak into a shared parent.
+            if (dst->isChain()) {
+                const Bindings * flat = dst->materialize();
+                Bindings * priv = Alloc::allocBindings(flat->size);
+                V3_STATS_INC(attrsetsAllocated);
+                for (uint32_t i = 0; i < flat->size; ++i)
+                    bindingsSetEntry(priv, i, flat->entries[i]);  // Phase D
+                top.mkAttrs(priv);   // replace the chain on the stack
+                dst = priv;          // overrides now write into our private copy
+            }
             const auto * src = ov.asAttrs();
             // First pass: overwrite existing entries; collect names to add.
             std::vector<std::pair<SymbolId, Value>> toAdd;
