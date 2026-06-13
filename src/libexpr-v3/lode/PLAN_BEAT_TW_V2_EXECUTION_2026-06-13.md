@@ -63,5 +63,18 @@ laptop largely via §1.2:
 (Laptop ratios; the formal darwin-4 re-pin per QG-2 is the canonical bar. The TSV
 is the laptop ratchet floor for this branch.)
 
+## Wave 2 kickoff — workstream A (chain-SELECT lookup-without-materialize)
+
+| step | verdict | result |
+|---|---|---|
+| A.1 tests-first | **SHIPPED** a01bdd024 | `run-chain-select-0607-failure-set.sh` pins the 06-07 corruption witnesses (git/cargo/rustc/cargo-auditable.cargoDeps/python3.withPackages) byte-identical **5/5** — the canary that must stay green through any materialize-removal. |
+| A.2 detector | **SHIPPED** d6a3265eb | gated `V3_DBG_SHARED_WB` shared-parent-writeback counter. **FINDING: pervasive + BENIGN** — firefox 18 / git 10 / cargo 8 / rustc 7 per eval, all byte-identical to TW. Correct-WHNF memoisation into shared layers, like TW's layered Bindings (§0.4). Kills "writeback into a shared parent = C-1"; the C-1 family is not corrupting at HEAD. The precise C-1 guard is a **provenance assert** (armed-payload identity at the target at fire time), NOT child-count — add WITH L1. |
+| A.3 L1 | **NEXT (fresh session)** | drv-hash-critical. Chain SELECT walks layers; leaf hit → existing KEEP; parent hit → force with NO writeback (or, per A.2's benign finding, weigh L2's parent-hit writeback). Gate `NIX_V3_CHAIN_LOOKUP_SELECT`; provenance assert as the C-1 guard; validate against the A.1 canary + aggressive-GC byte-identity + fullsweep. Bar: firefox peak RSS −≥80 MB byte-identical. |
+
+A.2's finding de-risks A.3 (the writebacks L1 would eliminate are benign, so
+the lever is RSS/CPU, not a corruption fix) AND informs the L1-vs-L2 choice.
+A.3 is the most delicate change in the whole plan; it is sequenced for a fresh,
+focused session rather than rushed.
+
 *Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>, Input Output
 Group. SPDX-License-Identifier: Apache-2.0.*
