@@ -32,7 +32,7 @@ FOLD := builtins.foldl' (a: o: a + builtins.length (builtins.attrNames o)) 0 (bu
 # Regression guard: ~15 s on v3 today, should be ~O(n) once pinned+fixed.
 LTA := let s = builtins.listToAttrs (builtins.genList (i: { name = toString i; value = i; }) 200000); in builtins.seq s 0
 
-.PHONY: help selftest scaling bc-vs-cpp measure-list-iter measure measure-fib measure-lookup measure-fold measure-listtoattrs measure-firefox
+.PHONY: help selftest scaling bc-vs-cpp measure-list-iter measure measure-fib measure-lookup measure-fold measure-listtoattrs measure-firefox pin-seven-rows ratchet-check
 
 help: ## Show this help
 	@printf '\n\033[1mv3 measurement targets\033[0m\n\n'
@@ -59,6 +59,12 @@ measure-list-iter: ## List-iteration yardstick (fix-plan T0): per-pass v3-vs-TW 
 measure: ## Gate one workload:  make measure WORKLOAD='<nix-expr>'
 	@test -n "$(WORKLOAD)" || { echo "set WORKLOAD='<nix-expr>'"; exit 2; }
 	@$(GATE) "$(WORKLOAD)"
+
+pin-seven-rows: ## QG-4: re-pin baselines/seven-rows.tsv (v3/TW CPU + v3 arena, 7 rows)
+	@./pin-seven-rows.sh | tee baselines/seven-rows.tsv
+
+ratchet-check: ## QG-4: fail if any of the 7 rows regressed >3% CPU / >5% arena vs the pinned TSV
+	@./ratchet-check.sh
 
 measure-fib: ## Compute/dispatch (fib 33) — register-VM regime, ~1.28× TW
 	@$(GATE) "$(FIB)"
