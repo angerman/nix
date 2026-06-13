@@ -9,10 +9,29 @@
 #include "v3/barrier.hh"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <deque>
+#include <dlfcn.h>
+#include <unordered_map>
 #include <vector>
 
 namespace nix::v3 {
+
+// SCOPING (broader-A, 2026-06-14): gated per-caller materialize-volume
+// attribution helpers (see Bindings::materialize).  Default-off; zero cost
+// when V3_DBG_MAT_SITES is unset.
+namespace {
+struct MatSiteStats {
+    std::unordered_map<void *, std::pair<uint64_t, uint64_t>> sites;  // addr → (copies, bytes)
+    bool atexitRegistered = false;
+};
+inline MatSiteStats & matSiteStats() { static MatSiteStats s; return s; }
+inline bool matSitesEnabled() {
+    static const bool e = std::getenv("V3_DBG_MAT_SITES") != nullptr;
+    return e;
+}
+} // namespace
 
 // Static empty containers — used as the payload of vEmptyAttrs /
 // vEmptyList so callers that dereference `payload.bindings` /
@@ -151,6 +170,49 @@ const Bindings * Bindings::materialize() const
 
     Bindings * out = Alloc::allocBindings(uint32_t(uniq.size()));
     for (size_t i = 0; i < uniq.size(); ++i) out->entries[i] = uniq[i];
+
+    // SCOPING (broader-A, 2026-06-14, gated V3_DBG_MAT_SITES): per-CALLER
+    // materialize-volume attribution.  This allocation is the flat copy made on
+    // an s_matMemo MISS (the chain's first materialisation); bucket it by the
+    // caller return address + bytes and dump the top consumers atexit (dladdr
+    // symbolised).  Finds which consumer owns the dominant materialize volume —
+    // the target for extending lookup-without-materialize beyond SELECT (L1).
+    if (__builtin_expect(matSitesEnabled(), 0)) {
+        void * ra = __builtin_return_address(0);
+        auto & st = matSiteStats();
+        auto & e = st.sites[ra];
+        e.first += 1;
+        e.second += uint64_t(uniq.size()) * sizeof(Entry) + sizeof(Bindings);
+        if (!st.atexitRegistered) {
+            st.atexitRegistered = true;
+            std::atexit([] {
+                auto & s = matSiteStats();
+                std::vector<std::pair<void *, std::pair<uint64_t, uint64_t>>> v(
+                    s.sites.begin(), s.sites.end());
+                std::sort(v.begin(), v.end(), [](auto & a, auto & b) {
+                    return a.second.second > b.second.second;  // by bytes desc
+                });
+                uint64_t totB = 0, totC = 0;
+                for (auto & p : v) { totB += p.second.second; totC += p.second.first; }
+                std::fprintf(stderr,
+                    "v3 materialize-sites: total %.1f MB over %llu flat copies "
+                    "(%zu distinct callers):\n",
+                    totB / 1e6, (unsigned long long)totC, v.size());
+                for (size_t i = 0; i < v.size() && i < 18; ++i) {
+                    Dl_info di;
+                    const char * sym = "?"; long off = 0;
+                    if (dladdr(v[i].first, &di) && di.dli_sname) {
+                        sym = di.dli_sname;
+                        off = (char *)v[i].first - (char *)di.dli_saddr;
+                    }
+                    std::fprintf(stderr,
+                        "  %8.1f MB  %8llu copies  %s+%ld\n",
+                        v[i].second.second / 1e6,
+                        (unsigned long long)v[i].second.first, sym, off);
+                }
+            });
+        }
+    }
 
     // Phase D post-construct barrier: if any entry holds a nursery
     // payload, dirty-list the result so the next scavenge walks it.
