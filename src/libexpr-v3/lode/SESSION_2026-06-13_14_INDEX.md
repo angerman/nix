@@ -37,6 +37,7 @@ materialize-removal (total materialize = 72MB) — it's the eval heap (→ works
 | L1 darwin-4 formal RSS bar (QG-2) | **MEASURED → gated** | `136b35883` | firefox −33.6MB arena / −29MB maxRSS, byte-identical, CPU-neutral — **below −40MB revert floor** → not default-on |
 | broader lookup-without-materialize | **SCOPED → RETIRED** | `878d6a190` | total materialize 72MB firefox / 40MB hello < 80MB bar → unreachable; **pivot to eval heap** |
 | workstream H sizing (upvalue-dup probe) | **SIZED → small** | `f9dd326b5` | firefox 30MB upvalue-tail / **12MB recoverable**; thunk tax is the 40B HEADER (75MB ff), not upvalues → H NOT the firefox lever. M5 unsizable under probe. |
+| workstream E (depth>0 GC + span reuse) | **FALSIFIED @ stage-1 CPU bar** | (E_DEPTH0_VERDICT doc) | one firefox full-mark GC = **+38.8%** (3.38→4.69s) ≫ +15% bar, from ONE fire; mark cache-bound (§1.8) + non-generational. Gated on generational marking (nursery/Phase D, multi-week). Cheap-projection kill, no depth>0 impl. |
 
 ## Gated artifacts left in place (reproduce any number / guard regressions)
 - Regression canaries: `test/run-chain-select-0607-failure-set.sh`, `test/run-1.7-apply-overrides-tests.sh` (in core suite)
@@ -47,13 +48,17 @@ materialize-removal (total materialize = 72MB) — it's the eval heap (→ works
 **No cheap firefox RSS lever remains** — both candidates measured small: broader-A
 ≤72MB (mostly a cap trade), workstream H ≤30MB (the thunk tax is the 40B-per-thunk
 HEADER, ~75MB firefox / ~680MB M5, which capture-sharing can't touch). The firefox
-RSS is the live eval heap: the **224MB scattered dead** (workstream E — GC reclaim,
-but the mark is cache-bound §1.8 + depth>0 GC is multi-week) plus the thunk header
-(a deeper representation change). Honest options going forward: **E** (multi-week),
-a **thunk-header-shrink** investigation, or accepting firefox RSS and pursuing CPU
-(workstream C — dispatch). M5/cardano H sizing needs a sampling-probe variant
-(the per-thunk map can't survive 17M thunks). L1 default-on pending a recalibrated
-bar. Gated sizing tools left in place: `V3_DBG_MAT_SITES`, `V3_DBG_UPVAL_DUP`.
+RSS is the live eval heap: the **224MB scattered dead** plus the 40B/thunk header.
+But every in-reach RSS lever is now measured-and-blocked: broader-A ≤72MB (cap
+trade), H ≤30MB (header-dominated), and **workstream E is falsified at its stage-1
+CPU bar** (one firefox full-mark GC = +38.8% ≫ +15%; the cache-bound
+non-generational mark can't fire mid-eval within budget). The two real remaining
+firefox levers are both multi-week: **generational marking (nursery / Phase D)** —
+which is E's prerequisite AND would make mid-eval GC cheap — or **CPU work
+(workstream C — dispatch)**. A thunk-header shrink is a smaller representation
+follow-up. M5/cardano H sizing needs a sampling-probe variant. L1 default-on
+pending a recalibrated bar. Gated tools left in place: `V3_DBG_MAT_SITES`,
+`V3_DBG_UPVAL_DUP`, `V3_DBG_SHARED_WB`, `NIX_V3_CHAIN_LOOKUP_SELECT`.
 
 *Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>, Input Output
 Group. SPDX-License-Identifier: Apache-2.0.*
