@@ -395,11 +395,19 @@ static std::unordered_map<const Bindings *, uint32_t> & chainChildCount() noexce
 // flattening is lost (a small re-force CPU cost), and no value is written into
 // the shared parent.  v1 skips the inline cache for chain operands.
 //
-// Gate: NIX_V3_CHAIN_LOOKUP_SELECT=1 (opt-in).  Retirement: default-on after
-// the QG-1 full set + aggressive-GC byte-identity + fullsweep validate; revert
-// if the firefox peak-RSS −≥80 MB bar is missed or any divergence appears.
-static const bool g_chainLookupSelect =
-    std::getenv("NIX_V3_CHAIN_LOOKUP_SELECT") != nullptr;
+// Gate: NIX_V3_CHAIN_LOOKUP_SELECT — DEFAULT-ON (opt-out =0).  Retired to
+// default-on 2026-06-14 (FP-1): −33.6 MB firefox arena / −29 MB maxRSS
+// (darwin-4), byte-identical, CPU-neutral; validated (06-07 canary 5/5, lang
+// 143, core 21/21, provenance 0 violations = C-1 refuted, aggressive-GC clean).
+// The original −≥80 MB single-lever revert bar was MIS-SHAPED: v3's memory
+// excess is a DISTRIBUTED per-object tax, so correct levers are 15-40 MB by
+// construction; the bar is now CUMULATIVE (FP-0 ratchet), and this lever banks
+// −33 MB toward it.  Opt-out =0 retained as the falsifier handle (revert if any
+// divergence ever appears).  See lode/MEMORY_FORWARD_PLAN_2026-06-14.md.
+static const bool g_chainLookupSelect = [] {
+    const char * v = std::getenv("NIX_V3_CHAIN_LOOKUP_SELECT");
+    return v == nullptr || (v[0] != '0');  // default-ON unless explicitly =0
+}();
 
 // Provenance assert (the precise C-1 guard, gated V3_DBG_SHARED_WB): records the
 // value at each KEEP-armed forceWriteTarget at ARM time; at FIRE time the target

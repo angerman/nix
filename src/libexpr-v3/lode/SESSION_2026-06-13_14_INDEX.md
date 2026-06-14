@@ -35,6 +35,8 @@ materialize-removal (total materialize = 72MB) — it's the eval heap (→ works
 | WS-A.2 shared-parent-writeback counter | **SHIPPED + FINDING** | `d6a3265eb` | writebacks PERVASIVE + **BENIGN** (firefox 18, byte-identical) = correct-WHNF memo like TW; "shared-parent write = C-1" is FALSE |
 | WS-A.3 chain-SELECT **L1 + provenance assert** | **SHIPPED (gated)** | `e890e3502` | `NIX_V3_CHAIN_LOOKUP_SELECT`; 06-07 5/5, lang 143, core 21/21 gate-on, **provenance 0 violations** (C-1 refuted), aggressive-GC clean |
 | L1 darwin-4 formal RSS bar (QG-2) | **MEASURED → gated** | `136b35883` | firefox −33.6MB arena / −29MB maxRSS, byte-identical, CPU-neutral — **below −40MB revert floor** → not default-on |
+| **FP-0** re-shape the RSS bar (per-lever → cumulative) | **DONE** | (FP commit) | −80MB single-lever floor RETIRED (tax is distributed → levers are 15-40MB by construction); `baselines/cumulative-rss-ledger.tsv` banks wins, `seven-rows.tsv` stays the regression guard |
+| **FP-1** un-gate L1 default-on | **SHIPPED** | (FP commit) | flipped `NIX_V3_CHAIN_LOOKUP_SELECT` default-ON (opt-out =0); laptop firefox arena **503.3→469.8 (−33.5MB)**, =0 reproduces 503.3 exactly; re-confirmed 06-07 5/5 + core 21/21 + lang 143 byte-identical at the new default |
 | broader lookup-without-materialize | **SCOPED → RETIRED** | `878d6a190` | total materialize 72MB firefox / 40MB hello < 80MB bar → unreachable; **pivot to eval heap** |
 | workstream H sizing (upvalue-dup probe) | **SIZED → small** | `f9dd326b5` | firefox 30MB upvalue-tail / **12MB recoverable**; thunk tax is the 40B HEADER (75MB ff), not upvalues → H NOT the firefox lever. M5 unsizable under probe. |
 | workstream E (depth>0 GC + span reuse) | **FALSIFIED @ stage-1 CPU bar** | (E_DEPTH0_VERDICT doc) | one firefox full-mark GC = **+38.8%** (3.38→4.69s) ≫ +15% bar, from ONE fire; mark cache-bound (§1.8) + non-generational. Gated on generational marking (nursery/Phase D, multi-week). Cheap-projection kill, no depth>0 impl. |
@@ -60,9 +62,12 @@ blocked only on **one characterized missed root** (PhD-6: 41 tenured words → 1
 shared nursery obj on hello — a targeted GC-scavenger RCA, NOT shipped because it
 is a UAF). Fix that one root → flip the nursery default-on → completes Phase D +
 E in one stroke. Secondary: **CPU work (workstream C — dispatch)**. A thunk-header shrink is a smaller representation
-follow-up. M5/cardano H sizing needs a sampling-probe variant. L1 default-on
-pending a recalibrated bar. Gated tools left in place: `V3_DBG_MAT_SITES`,
-`V3_DBG_UPVAL_DUP`, `V3_DBG_SHARED_WB`, `NIX_V3_CHAIN_LOOKUP_SELECT`.
+follow-up. M5/cardano H sizing needs a sampling-probe variant. **L1 is now default-on**
+(FP-1, −33.5MB firefox banked; the recalibrated cumulative bar is FP-0). The
+integrated forward plan is `lode/MEMORY_FORWARD_PLAN_2026-06-14.md` (FP-0..FP-4:
+bar-reshape → L1 → thunk-header 40→24B → pair tax → generational nursery). Gated
+tools left in place: `V3_DBG_MAT_SITES`, `V3_DBG_UPVAL_DUP`, `V3_DBG_SHARED_WB`,
+`NIX_V3_CHAIN_LOOKUP_SELECT=0` (now the L1 opt-out / falsifier handle).
 
 *Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>, Input Output
 Group. SPDX-License-Identifier: Apache-2.0.*

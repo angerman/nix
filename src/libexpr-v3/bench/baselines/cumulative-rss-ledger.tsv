@@ -1,0 +1,30 @@
+# PLAN_BEAT_TW_V2 — cumulative RSS ledger (FP-0, 2026-06-14)
+#
+# WHY THIS FILE EXISTS: the original per-lever −80 MB SHIP/KEEP floor was
+# mis-shaped. v3's memory excess is a DISTRIBUTED per-object tax (thunk 40 B
+# header + 8 B/upvalue, ValuePair 32 B) + churn + 224 MB stranded dead — not one
+# removable structure. A distributed tax yields 15-40 MB levers BY CONSTRUCTION,
+# so a −80 MB single-lever bar rejects correct wins (it shelved L1, a validated
+# −33 MB win). New policy: a lever SHIPS/KEEPS if it is byte-identical to TW AND
+# CPU-neutral-or-better; its arena delta banks toward a per-release CUMULATIVE
+# target, however small. See lode/MEMORY_FORWARD_PLAN_2026-06-14.md.
+#
+# RELATION TO seven-rows.tsv: that TSV is the per-row REGRESSION guard (never get
+# worse). THIS file is the bank-progress ledger (track the sum of banked wins vs
+# an origin). Distinct roles; both checked in.
+#
+# arena = NIX_VM_STATS v3_arena MB on the darwin laptop (deterministic RSS proxy;
+# maxRSS is laptop-noise per QG-2). origin_mb = the pre-lever arena; current_mb =
+# the post-lever arena; saved_mb = origin − current. Each lever row also names
+# the validation (byte-identity scope + CPU verdict).
+#
+# Per-release cumulative TARGET (firefox arena, the canonical RSS workload):
+#   origin (pre-FP) 503.3 MB  →  stacking goal ≈ 60-90 MB off the live tax
+#   (L1 −33 + header −16 + pair −16), THEN the nursery attacks the 224 MB dead.
+#
+# workload	lever	origin_mb	current_mb	saved_mb	cumulative_saved_mb	validation
+firefox	__origin__	503.3	503.3	0.0	0.0	pre-FP baseline (Wave-1 ships, L1 off)
+firefox	FP-1 L1 chain-SELECT default-on	503.3	469.8	33.5	33.5	06-07 5/5 + core 21/21 + lang 143 byte-identical; CPU-neutral (laptop 469.8 vs 503.3, darwin-4 −33.6/−29 maxRSS)
+# next: FP-2 thunk-header 40→24B (proj firefox −16 live; M5 −78 live / −272 churn)
+# next: FP-3 ValuePair 32B (proj firefox ~−16; reconcile vs retired 24/32 split first)
+# then: FP-4 generational nursery attacks the 224 MB stranded dead (Layer C)
