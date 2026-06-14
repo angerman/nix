@@ -160,5 +160,45 @@ count is preserved across the copy.  Aggressive-1MB-nursery + hello.drvPath is t
 deterministic repro.  NOTE: FP-2b already closed the capturedWiths missed-root
 class, so gnuabi64 is the SOLE remaining nursery-flip blocker.
 
+## PhD-6 RCA RESOLVED to 3 missed-root CLASSES (2026-06-14, continued)
+
+The nursery's missed roots are THREE distinct classes — two now FIXED, one
+characterized.  The unifying theme: **scavenge-unaware state that the BRUTE
+(arena scan) + AUDIT (root deep-walk) gates don't cover** (C++-side caches), plus
+a generational barrier-coverage gap.
+
+1. **capturedWiths intern cache (`gnuabi64`) — FIXED (be3b9bae9).**  A 4096-bucket
+   C++ static (`s_capWithsCache`) of singleton with-list `ListVec*`, not a
+   scavenge root → stale after the nursery forwards a cached list → a hit returns
+   a size-0/reused slot → empty `with`-scope → `undefined variable`.  Found via
+   the V3_DBG_WITH dump (firing thunk: nWith=1, capW non-null, but withBase==top).
+   Proven via `NIX_V3_NO_CAPWITHS_INTERN=1` A/B.  Fix: bypass the cache when
+   `phaseDActive()` (nursery allocs are cheap; cache stays for the non-moving
+   major-GC default).  Result: `gcc-name` passes, gnuabi64 gone, byte-identical.
+
+2. **materialize memo (`s_matMemo`) — FIXED (preventive, nursery-safety) (this
+   session).**  chain→materialised-Bindings cache, cleared only at the major-GC
+   safepoint (vm.cc:3506); under the nursery (major-GC off) it's never cleared,
+   yet every scavenge moves its raw pointers → stale/aliased per the M-1 reasoning.
+   Fix: extend the clear to the scavenge path (after `sc.run()`).  Required
+   nursery-safety; not the current AUDIT-hit cause.
+
+3. **Bindings-construction barrier-coverage gap — CHARACTERIZED (the remaining
+   AUDIT hit), the systemic next step.**  AUDIT signature: tenured
+   `Bindings.entries[N].value -> nursery` (hello-drvPath/outPath).  By the
+   generational invariant a tenured→young edge MUST be in the remembered set (the
+   scavenger walks young + dirty-list, NOT all reachable tenured).  `materialize`
+   honours this via `bindingsPostConstructBarrier(out)`, but the ~30 other
+   `allocBindings`+fill sites in primops.cc (derivationStrict / listToAttrs /
+   mapAttrs / // merge / etc.) mostly DON'T — so a large (→tenured) Bindings
+   filled with nursery values leaves an unbarriered edge → missed root.  BRUTE
+   misses it (the Bindings wasn't walked, so its hit reads as "dead"); the deep
+   AUDIT catches it.  **FIX (mechanical, ~30 sites): add
+   `bindingsPostConstructBarrier(b)` after each allocBindings+fill that can hold
+   nursery values** (no-op under the major-GC default → byte-identical; only fires
+   under the nursery).  Then brute-audit's hello/gcc go green (leaving only the
+   stale firefox-150.0.3 golden, a test-data drift to refresh).  This is the
+   final PhD-6 layer before the nursery-flip 5-gate.
+
 *Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>, Input Output
 Group. SPDX-License-Identifier: Apache-2.0.*
