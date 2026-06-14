@@ -2265,13 +2265,25 @@ inline Value withLookup(VMState & vm, SymbolId name)
                           || fr.thunk->state == ThunkState::Blackhole))
                 d = fr.thunk->suspended.desc;
             else if (fr.closure) d = fr.closure->desc;
+            // PhD-6 gnuabi64 RCA: for each frame, also print nWithTargets (did
+            // this lambda/thunk lexically capture a `with`?) and, for thunk
+            // frames, whether capturedWiths is null + hasWithsSlot — so a thunk
+            // that SHOULD have withs (nWith>0) but lost them (capW=0x0) under
+            // scavenge is visible as the empty-with-scope root cause.
+            ListVec * capW = (fr.thunk
+                && (fr.thunk->state == ThunkState::Suspended
+                    || fr.thunk->state == ThunkState::Blackhole))
+                ? thunkCapturedWiths(fr.thunk) : nullptr;
             std::fprintf(stderr,
-                "    frame[%zu]: %s code=[%u..) ip=%u flags=%u thunk=%p withBase=%u\n",
+                "    frame[%zu]: %s code=[%u..) ip=%u flags=%u thunk=%p withBase=%u "
+                "nWith=%u capW=%p%s\n",
                 i - 1,
                 d && !d->name.empty() ? d->name.c_str()
                     : (d ? "<anon>" : "<root>"),
                 d ? d->codeOffset : 0, fr.ip,
-                (unsigned)fr.flags, (void *)fr.thunk, fr.withStackBase);
+                (unsigned)fr.flags, (void *)fr.thunk, fr.withStackBase,
+                d ? (unsigned)d->nWithTargets : 0u, (void *)capW,
+                (fr.thunk && fr.thunk->hasWithsSlot) ? " hasSlot" : "");
             std::fflush(stderr);
         }
         // V3_DBG_WITH_DISASM=1: also dump each frame's bytecode in a
@@ -2425,7 +2437,18 @@ inline ListVec * internOrAllocSingletonCapWiths(const Value & v) noexcept
 {
     static const bool s_disabled =
         std::getenv("NIX_V3_NO_CAPWITHS_INTERN") != nullptr;
-    if (__builtin_expect(s_disabled, 0)) {
+    // PhD-6 (2026-06-14): the cache stores raw ListVec* across calls but is NOT a
+    // scavenge root (a C++ static, not arena/VM-stack).  Under a MOVING nursery a
+    // cached entry goes stale the moment its ListVec is forwarded out of the
+    // nursery; a later cache HIT returns the stale pointer (a reused/zeroed slot →
+    // size 0), so `pushCapturedWiths` pushes nothing → the body runs with an empty
+    // captured-`with` scope → "undefined variable" (reproduced as `gnuabi64` on
+    // hello.drvPath under the aggressive 1 MB nursery; BRUTE+AUDIT both miss it
+    // because neither scans this static).  Bypass the cache when the nursery is
+    // active — nursery allocs are cheap bump-pointer (the cache's own retirement
+    // criterion, §"Retirement").  Under the non-moving major-GC default the cache
+    // stays correct AND valuable, so the fast path is unchanged there.
+    if (__builtin_expect(s_disabled || phaseDActive(), 0)) {
         ListVec * lws = Alloc::allocList(1);
         lws->elems[0] = v;
         listPostConstructBarrier(lws);
