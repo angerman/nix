@@ -138,6 +138,12 @@ inline bool phaseDStep7Active() noexcept
     return s_active;
 }
 
+// PhD-6 (2026-06-14): a walked tenured object's [lo,hi) range + its CellType,
+// so the BRUTE scanner can TYPE the holder of a missed-root word (and compute
+// the field offset = hitAddr - lo).  Carries the type the walk* method already
+// knows; zero extra work beyond the byte the vector already had latent padding for.
+struct ScavLiveRange { uintptr_t lo; uintptr_t hi; uint8_t type; };
+
 struct Scavenger
 {
     Nursery & n;
@@ -167,7 +173,7 @@ struct Scavenger
     /// originated in tenured arena — nursery copies have already
     /// been replaced by their tenured forward at this point).
     /// Sorted-and-searched after drain() completes.
-    std::vector<std::pair<uintptr_t, uintptr_t>> liveTenuredRanges;
+    std::vector<ScavLiveRange> liveTenuredRanges;  // PhD-6: now typed
     /// #738 Phase E v0.1: bytes copied from nursery -> tenured this
     /// scavenge.  Summed by each fwd* function on a successful copy.
     /// Used by run() to call `Nursery::recordSurvival` at the end
@@ -198,11 +204,13 @@ struct Scavenger
     /// the pointer is in the nursery (means a nursery copy that
     /// hasn't been forwarded yet — caller bug, but BRUTE doesn't
     /// care about nursery bytes either way).
-    void recordLiveTenured(const void * p, size_t bytes)
+    void recordLiveTenured(const void * p, size_t bytes,
+                           CellType type = CellType::None)
     {
         if (!p || n.contains(p)) return;
         const uintptr_t lo = reinterpret_cast<uintptr_t>(p);
-        liveTenuredRanges.emplace_back(lo, lo + bytes);
+        liveTenuredRanges.push_back(
+            {lo, lo + bytes, static_cast<uint8_t>(type)});
     }
 
     // -- pointer forwarders (no recursion; just copy + queue) ----
@@ -625,7 +633,7 @@ void Scavenger::walkClosure(Closure * c)
     // BRUTE-refinement (Phase 1.7 R1): record this object's tenured
     // byte range so postScavengeBruteScan can filter hits to live
     // (reachable-from-roots) objects only.
-    recordLiveTenured(c, sizeof(Closure) + sizeof(Value) * c->nUpvalues);
+    recordLiveTenured(c, sizeof(Closure) + sizeof(Value) * c->nUpvalues, CellType::Closure);
     if (c->cu && walkedCUs.insert(c->cu).second) {
         for (const auto & ic : c->cu->attrSelectCache) {
             for (int w = 0; w < CompilationUnit::AttrSelectIC::kWays; ++w) {
@@ -646,7 +654,7 @@ void Scavenger::walkThunk(Thunk * t)
 {
     // BRUTE-refinement: Thunk size depends on state (matches fwdThunk's
     // copy-size logic).  FP-2b: thunkScanSize includes the optional withs slot.
-    recordLiveTenured(t, thunkScanSize(t));
+    recordLiveTenured(t, thunkScanSize(t), CellType::Thunk);
     // The cell (write-back target for OP_RETURN) is tenured; walk
     // its current Value so any nursery payload it holds is found.
     if (t->cell && walked.insert(t->cell).second) {
@@ -727,7 +735,7 @@ void Scavenger::walkThunk(Thunk * t)
 
 void Scavenger::walkList(ListVec * l)
 {
-    recordLiveTenured(l, sizeof(ListVec) + sizeof(Value) * l->size);
+    recordLiveTenured(l, sizeof(ListVec) + sizeof(Value) * l->size, CellType::List);
     for (uint32_t i = 0; i < l->size; ++i) {
         visitValue(l->elems[i]);
     }
@@ -744,7 +752,7 @@ void Scavenger::walkList(ListVec * l)
 
 void Scavenger::walkBindings(Bindings * b)
 {
-    recordLiveTenured(b, sizeof(Bindings) + sizeof(Bindings::Entry) * b->size);
+    recordLiveTenured(b, sizeof(Bindings) + sizeof(Bindings::Entry) * b->size, CellType::Bindings);
     for (uint32_t i = 0; i < b->size; ++i) {
         visitValue(b->entries[i].value);
     }
@@ -754,7 +762,7 @@ void Scavenger::walkBindings(Bindings * b)
 
 void Scavenger::walkPair(ValuePair * p)
 {
-    recordLiveTenured(p, sizeof(ValuePair));
+    recordLiveTenured(p, sizeof(ValuePair), CellType::Pair);
     visitValue(p->left);
     visitValue(p->right);
     // #705 (2026-05-21): `evaluated` field added 2026-05-18 (commit
@@ -1441,21 +1449,35 @@ void postScavengeAudit(const Nursery & n, const VMState & vm)
 // per word.
 void postScavengeBruteScan(
     const Nursery & n,
-    const std::vector<std::pair<uintptr_t, uintptr_t>> & liveRanges)
+    const std::vector<ScavLiveRange> & liveRanges)
 {
     Arena & arena = threadArena();
     auto blocks = arena.blockRanges();
-    // Predicate: is address p inside some live range?  Binary search
-    // for the largest range whose start <= p, then check end > p.
-    auto inLive = [&](uintptr_t p) -> bool {
-        // upper_bound gives the first range with start > p.
-        auto it = std::upper_bound(
-            liveRanges.begin(), liveRanges.end(),
-            std::make_pair(p, uintptr_t{0}),
-            [](const auto & a, const auto & b) { return a.first < b.first; });
-        if (it == liveRanges.begin()) return false;
+    // Predicate: which live range contains address p?  Binary search for the
+    // largest range whose start <= p, then check end > p.  Returns the range
+    // (so the caller can TYPE the holder + compute the field offset) or null.
+    auto inLive = [&](uintptr_t p) -> const ScavLiveRange * {
+        auto it = std::upper_bound(  // first range with lo > p
+            liveRanges.begin(), liveRanges.end(), p,
+            [](uintptr_t v, const ScavLiveRange & r) { return v < r.lo; });
+        if (it == liveRanges.begin()) return nullptr;
         --it;
-        return p < it->second;  // it->first <= p < it->second
+        return (p < it->hi) ? &*it : nullptr;  // it->lo <= p < it->hi
+    };
+    // PhD-6: CellType -> short name for the BRUTE holder-typing dump.
+    auto typeName = [](uint8_t t) -> const char * {
+        switch (static_cast<CellType>(t)) {
+        case CellType::Value:    return "Value";
+        case CellType::Closure:  return "Closure";
+        case CellType::Thunk:    return "Thunk";
+        case CellType::Bindings: return "Bindings";
+        case CellType::List:     return "List";
+        case CellType::Pair:     return "ValuePair";
+        case CellType::Env:      return "Env";
+        case CellType::Chars:    return "Chars";
+        case CellType::None:     return "None";
+        }
+        return "None";
     };
 
     size_t hitsLive = 0;
@@ -1471,12 +1493,16 @@ void postScavengeBruteScan(
             uintptr_t w = *reinterpret_cast<const uintptr_t *>(p);
             if (w == 0) continue;
             if (!n.contains(reinterpret_cast<const void *>(w))) continue;
-            if (inLive(p)) {
+            if (const ScavLiveRange * r = inLive(p)) {
                 if (hitsLive < cap) {
+                    // PhD-6: type the HOLDER + the field offset (p - holder.lo)
+                    // so the missed-root edge is identifiable (e.g. "Bindings
+                    // @+48" = entry[?].value; "ValuePair @+16" = evaluated).
                     std::fprintf(stderr,
-                        "v3 SCAVENGE BRUTE: arena word @ %p holds "
-                        "nursery pointer %p\n",
-                        (void*)p, (void*)w);
+                        "v3 SCAVENGE BRUTE: arena word @ %p holds nursery "
+                        "pointer %p  [holder=%s @+%zu, size=%zu]\n",
+                        (void*)p, (void*)w, typeName(r->type),
+                        (size_t)(p - r->lo), (size_t)(r->hi - r->lo));
                 }
                 ++hitsLive;
             } else {
@@ -1527,7 +1553,8 @@ void scavengeNursery(Nursery & n, VMState & vm) noexcept
     if (__builtin_expect(s_brute, 0)) {
         // Sort the live-tenured-range list by start address so
         // postScavengeBruteScan's binary-search lookup is well-formed.
-        std::sort(sc.liveTenuredRanges.begin(), sc.liveTenuredRanges.end());
+        std::sort(sc.liveTenuredRanges.begin(), sc.liveTenuredRanges.end(),
+                  [](const ScavLiveRange & a, const ScavLiveRange & b) { return a.lo < b.lo; });
         postScavengeBruteScan(n, sc.liveTenuredRanges);
     }
     // V3_DBG_NURSERY=1 — print one line per scavenge with the
