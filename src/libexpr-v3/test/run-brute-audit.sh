@@ -88,6 +88,31 @@ run_case() {
     _process_case "$name" "$want" "$stdout_f" "$stderr_f" $?
 }
 
+# run_case_file <name> <expected-stdout-substring> <path>
+# Same as run_case but parses a self-contained .nix FILE (for multi-line
+# regression fixtures).  Used by the PhD-6 list-primop-barrier regression
+# (test/repro-phd6-list-primop-barriers.nix) — a fixture that hammers every
+# nursery-capable list-construction primop so the class-3 missed-root class
+# (the nursery-flip blocker, 2026-06-15) cannot silently regress.
+run_case_file() {
+    local name="$1" want="$2" path="$3"
+    if [[ ! -f "$path" ]]; then
+        echo "SKIP  $name (fixture $path not found)"
+        return 0
+    fi
+    local stdout_f stderr_f
+    stdout_f="$(mktemp -t v3-brute-file-stdout.XXXXXX)"
+    stderr_f="$(mktemp -t v3-brute-file-stderr.XXXXXX)"
+    local wall_s=60
+    if [[ -n "${V3_DBG_GC_STRESS:-}" && "${V3_DBG_GC_STRESS}" != "0" ]]; then
+        wall_s=300
+    fi
+    NIX_V3_MAX_WALL_TIME="${wall_s}s" NIX_V3_MAX_HEAP=2G \
+        "$V3_EVAL" --file "$path" \
+        >"$stdout_f" 2>"$stderr_f"
+    _process_case "$name" "$want" "$stdout_f" "$stderr_f" $?
+}
+
 # run_case_nix <name> <expected-stdout-substring> <expr>
 # Same as run_case but invokes the integrated `nix eval --impure`
 # path so nixpkgs / channel expressions resolve.  Requires
@@ -226,6 +251,21 @@ run_case_nix "hello-drvPath"  "hello-2.12.3.drv"           '(import <nixpkgs> { 
 run_case_nix "hello-outPath"  "hello-2.12.3"               '(import <nixpkgs> { }).hello.outPath'
 run_case_nix "gcc-name"       "gcc-wrapper"                '(import <nixpkgs> { }).gcc.name'
 run_case_nix "firefox-name"   "firefox-151.0.4"            '(import <nixpkgs> { }).firefox.name'
+
+# 8) PhD-6 regression — the nursery-flip blocker (2026-06-15).  git.drvPath is
+#    the workload that exposed the unbarriered primZipAttrsWith list
+#    construction (7 missed roots: "nursery Thunk reachable via ListVec.elems[]")
+#    that hello/firefox did NOT hit.  Keep it standing so the class-3
+#    list-construction barrier coverage cannot silently regress.
+run_case_nix "git-drvPath"    "git-2.54.0.drv"             '(import <nixpkgs> { }).git.drvPath'
+
+# 9) PhD-6 synthetic — deterministically hammers EVERY swept list-construction
+#    primop (zipAttrsWith/attrValues/concatLists/filter/concatMap/partition/
+#    catAttrs/genericClosure/split/groupBy/fromJSON) under the 1 MB nursery, so
+#    a future omission of listPostConstructBarrier at any of them is caught here
+#    without needing a nixpkgs package that happens to exercise it.
+run_case_file "list-primop-barriers" "ok" \
+    "$ROOT/src/libexpr-v3/test/repro-phd6-list-primop-barriers.nix"
 
 echo
 echo "=== brute-audit: ok=$PASS fail=$FAIL ==="
