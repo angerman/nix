@@ -757,7 +757,7 @@ inline void dbgLogForceSite(const CompilationUnit * cu, uint32_t instrIp,
             auto * d = t->suspended.desc;
             codeOff = d->codeOffset;
             if (!d->name.empty()) tname = d->name.c_str();
-            thunkCu = (const void *)t->suspended.cu;
+            thunkCu = (const void *)d->cu;  // FP-2a: was t->suspended.cu
         }
         std::fprintf(stderr,
             "OP_FORCE@ip=%u site=%s thunk=%p name=%s codeOff=%u state=%d cu=%p caller_cu=%p\n",
@@ -1995,7 +1995,7 @@ inline Value withLookup(VMState & vm, SymbolId name)
                     else if (descValid) d = f.thunk->suspended.desc;
                 }
                 const CompilationUnit * thunkCu =
-                    (descValid && f.thunk) ? f.thunk->suspended.cu : nullptr;
+                    (descValid && f.thunk) ? thunkCU(f.thunk) : nullptr;  // FP-2a: was suspended.cu
                 // OP_TAIL_CALL retargets cur.cu/cur.closure but leaves
                 // f.thunk's descriptor pointing at the original
                 // thunk-body lambda.  So `d` (the THUNK descriptor)
@@ -4848,7 +4848,13 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     std::fflush(stderr);
                 }
             }
-            t->suspended.cu = cu;
+            // FP-2a (2026-06-14): set the descriptor's owning-CU backpointer
+            // instead of a per-thunk `suspended.cu` field.  `desc` was just set
+            // to `&cu->lambdas[funcIdx]` (line ~4777), so the descriptor lives
+            // in THIS cu's lambdas vector and `desc->cu = cu` is authoritative;
+            // the store is idempotent (always the same value for a given desc).
+            // thunkCU(t) reads it back == the exact former `suspended.cu`.
+            t->suspended.desc->cu = cu;
             // V3_DBG_TRACE_THUNK_X -- track creation of every thunk into
             // a process-wide map (thunk_ptr -> (funcIdx, codeOff,
             // name, descPtr, cu)).  Consumed by the cycle-dump
@@ -8140,7 +8146,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             fakeClo->desc = desc;
             fakeClo->nUpvalues = t->nUpvalues;
             fakeClo->capturedWiths = t->suspended.capturedWiths;
-            fakeClo->cu = t->suspended.cu;
+            fakeClo->cu = thunkCU(t);  // FP-2a: was t->suspended.cu
             for (uint16_t i = 0; i < t->nUpvalues; ++i) fakeClo->upvalues[i] = t->tail[i];
             // Phase D coverage: fakeClo's upvalues now mirror t->tail[].
             // If the fakeClo itself is tenured (pool may return tenured)
@@ -8148,7 +8154,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             closurePostConstructBarrier(fakeClo);
 
             ListVec * thunkWiths = t->suspended.capturedWiths;
-            const CompilationUnit * thunkCu = t->suspended.cu ? t->suspended.cu : cu;
+            const CompilationUnit * thunkCu = thunkCU(t);  // FP-2a: was t->suspended.cu
+            if (!thunkCu) thunkCu = cu;                     // ...?: cu fallback preserved
 
             // Same call-depth guard as OP_CALL — catches blackhole-style
             // recursion that doesn't go through OP_CALL (e.g. `let x = x;
@@ -9073,15 +9080,16 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                                 if (i == 0 && t->state == ThunkState::Suspended && d) {
                                     std::fprintf(stderr, "\n    body [%u..%u):\n",
                                         d->codeOffset, d->codeOffset + 200);
-                                    if (t->suspended.cu)
-                                        disassembleWindow(stderr, *t->suspended.cu,
+                                    const CompilationUnit * tcu = thunkCU(t);  // FP-2a
+                                    if (tcu)
+                                        disassembleWindow(stderr, *tcu,
                                             d->codeOffset, d->codeOffset + 200);
                                     // Dump the FUNCTION DESCRIPTORS of every
                                     // MAKE_THUNK target in this body — names
                                     // like "recref-X" tell us what each
                                     // upvalue resolves to in source.
-                                    if (t->suspended.cu) {
-                                        const auto & cu2 = *t->suspended.cu;
+                                    if (tcu) {
+                                        const auto & cu2 = *tcu;
                                         std::fprintf(stderr, "    referenced functions:\n");
                                         for (uint32_t cur = d->codeOffset;
                                              cur < d->codeOffset + 80 && cur < cu2.code.size(); ) {
@@ -11776,9 +11784,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                             // Also dump the body bytecode (40 words) so
                             // we can sanity-check the lowerer emitted
                             // the right ops for `cpu.name` etc.
-                            if (td && t->suspended.cu) {
+                            if (const CompilationUnit * tcu = thunkCU(t); td && tcu) {  // FP-2a
                                 std::fprintf(stderr, "\n      body disasm:\n");
-                                disassembleWindow(stderr, *t->suspended.cu,
+                                disassembleWindow(stderr, *tcu,
                                     td->codeOffset, td->codeOffset + 40);
                             }
                             // Dump up to 6 upvalues with their tags + (for
@@ -13657,14 +13665,13 @@ Value forceValue(VMState & vm, Value v)
         fakeClo->desc = desc;
         fakeClo->nUpvalues = t->nUpvalues;
         fakeClo->capturedWiths = t->suspended.capturedWiths;
-        fakeClo->cu = t->suspended.cu;
+        fakeClo->cu = thunkCU(t);  // FP-2a: was t->suspended.cu
         for (uint16_t i = 0; i < t->nUpvalues; ++i) fakeClo->upvalues[i] = t->tail[i];
         // Phase D coverage: same as the OP_FORCE fakeClo path above.
         closurePostConstructBarrier(fakeClo);
         ListVec * thunkWiths = t->suspended.capturedWiths;
-        const CompilationUnit * thunkCu = t->suspended.cu
-            ? t->suspended.cu
-            : vm.frames.back().cu;
+        const CompilationUnit * thunkCu = thunkCU(t);  // FP-2a: was t->suspended.cu
+        if (!thunkCu) thunkCu = vm.frames.back().cu;    // ...?: frame-cu fallback preserved
         t->state = ThunkState::Blackhole;
 
         size_t exitDepth = vm.frames.size();

@@ -1308,7 +1308,7 @@ private:
             switch (t->state) {
             case ThunkState::Suspended:
             case ThunkState::Blackhole:
-                clearCU(t->suspended.cu);  // evac moves IC'd Bindings
+                clearCU(thunkCU(t));  // FP-2a: was t->suspended.cu; evac moves IC'd Bindings
                 if (t->suspended.capturedWiths) visitList(t->suspended.capturedWiths);
                 for (uint16_t i = 0; i < t->nUpvalues; ++i) visitValue(t->tail[i]);
                 break;

@@ -2583,7 +2583,8 @@ struct Alloc
         // experiment was default-off (shapeCell never non-null in production),
         // so dropping it is byte-identical for prod and reclaims 8 B/thunk.
         t->suspended.capturedWiths = nullptr;
-        t->suspended.cu = nullptr;
+        // FP-2a (2026-06-14): `suspended.cu` removed (derived via thunkCU from
+        // desc->cu, set at OP_MAKE_THUNK).  No per-thunk init needed.
         // T1.3: record allocation origin under NIX_V3_THUNKS_ATTR=1.
         // Forward declaration: thunkAllocSiteRecord is defined further
         // down in this header (needs <unordered_map>); the call site

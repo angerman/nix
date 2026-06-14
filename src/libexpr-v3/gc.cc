@@ -676,8 +676,8 @@ void Scavenger::walkThunk(Thunk * t)
     // the field (the NIX_V3_CELL_EVERYWHERE experiment is gone).
     switch (t->state) {
     case ThunkState::Suspended:
-        if (t->suspended.cu && walkedCUs.insert(t->suspended.cu).second) {
-            for (const auto & ic : t->suspended.cu->attrSelectCache) {
+        if (const CompilationUnit * tcu = thunkCU(t); tcu && walkedCUs.insert(tcu).second) {  // FP-2a
+            for (const auto & ic : tcu->attrSelectCache) {
                 for (int w = 0; w < CompilationUnit::AttrSelectIC::kWays; ++w) {
                     if (Bindings * b = const_cast<Bindings *>(ic.entries[w].bindings))
                         fwdBindings(b);
@@ -702,8 +702,8 @@ void Scavenger::walkThunk(Thunk * t)
         break;
     case ThunkState::Blackhole:
         // Mirror Suspended: walk CU's AttrSelectIC (R9) too.
-        if (t->suspended.cu && walkedCUs.insert(t->suspended.cu).second) {
-            for (const auto & ic : t->suspended.cu->attrSelectCache) {
+        if (const CompilationUnit * tcu = thunkCU(t); tcu && walkedCUs.insert(tcu).second) {  // FP-2a
+            for (const auto & ic : tcu->attrSelectCache) {
                 for (int w = 0; w < CompilationUnit::AttrSelectIC::kWays; ++w) {
                     if (Bindings * b = const_cast<Bindings *>(ic.entries[w].bindings))
                         fwdBindings(b);
@@ -947,7 +947,7 @@ void Scavenger::run()
             else if (v.tag() == Tag::Thunk && v.asThunk()
                      && (v.asThunk()->state == ThunkState::Suspended
                          || v.asThunk()->state == ThunkState::Blackhole))
-                walkOneCU(v.asThunk()->suspended.cu);
+                walkOneCU(thunkCU(v.asThunk()));  // FP-2a: was suspended.cu
         }
         for (Value & v : vm.withStack) {
             if (v.tag() == Tag::Closure && v.asClosure())
@@ -955,7 +955,7 @@ void Scavenger::run()
             else if (v.tag() == Tag::Thunk && v.asThunk()
                      && (v.asThunk()->state == ThunkState::Suspended
                          || v.asThunk()->state == ThunkState::Blackhole))
-                walkOneCU(v.asThunk()->suspended.cu);
+                walkOneCU(thunkCU(v.asThunk()));  // FP-2a: was suspended.cu
         }
     }
 
@@ -1201,7 +1201,7 @@ struct Auditor {
         switch (t->state) {
         case ThunkState::Suspended:
             // #705 R9: walk this CU's IC.
-            walkCUAttrSelectCache(t->suspended.cu);
+            walkCUAttrSelectCache(thunkCU(t));  // FP-2a: was t->suspended.cu
             if (t->suspended.capturedWiths)
                 check(t->suspended.capturedWiths, "Thunk.suspended.capturedWiths", site);
             for (uint16_t i = 0; i < t->nUpvalues; ++i)
@@ -1224,7 +1224,7 @@ struct Auditor {
             // suspended.capturedWiths are live because
             // clearBlackMarksOnException can revert Blackhole →
             // Suspended on exception unwind.  See gc.cc walkThunk.
-            walkCUAttrSelectCache(t->suspended.cu);
+            walkCUAttrSelectCache(thunkCU(t));  // FP-2a: was t->suspended.cu
             if (t->suspended.capturedWiths)
                 check(t->suspended.capturedWiths,
                       "Thunk.Blackhole.suspended.capturedWiths", site);

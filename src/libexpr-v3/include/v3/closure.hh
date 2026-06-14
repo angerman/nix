@@ -152,8 +152,12 @@ struct Thunk
             const LambdaDescriptor * desc;
             /// Same semantics as Closure::capturedWiths.
             ListVec * capturedWiths;
-            /// Same semantics as Closure::cu.
-            const CompilationUnit * cu;
+            // FP-2a (2026-06-14): the per-thunk `const CompilationUnit * cu`
+            // field was REMOVED.  A suspended thunk's CU is now derived from
+            // its descriptor's owning-CU backpointer via `thunkCU(t)` (==
+            // desc->cu).  OP_MAKE_THUNK is the sole suspended-thunk creator and
+            // sets desc = &cu->lambdas[i], so desc->cu is the exact same value
+            // the thunk used to store — byte-identical, and 8 B/thunk smaller.
         } suspended;
         // ThunkState::Evaluated — the cached value.
         Value evaluated;
@@ -168,6 +172,20 @@ struct Thunk
     // FAM: upvalues[nUpvalues] for Suspended; args[fn->arity] for Native.
     Value tail[];
 };
+
+// FP-2a (2026-06-14): thunk-header shrink, stage a.  Removing `suspended.cu`
+// (derived from desc->cu via thunkCU) drops the Suspended union arm from 24 B
+// {desc,capturedWiths,cu} to 16 B {desc,capturedWiths}; the union floors at
+// sizeof(Value)==8 for the Evaluated arm, so the header is now
+// 8 (state/nUpvalues/forces) + 8 (cell) + 16 (union) = 32 B (was 40 B).
+// FP-2b will move `capturedWiths` to the FAM tail (kept only when
+// desc->nWithTargets>0), dropping the union to 8 B and the header to 24 B —
+// at which point Arena's 16 B rounding yields a clean −16 B per thunk for ALL
+// upvalue counts.  This assert pins the stage-a layout so a stray field
+// re-grows it visibly.  See lode/MEMORY_FORWARD_PLAN_2026-06-14.md.
+static_assert(sizeof(Thunk) == 32,
+    "FP-2a: Thunk header must be 32 B (state-word 8 + cell 8 + union 16); "
+    "FP-2b lowers this to 24 B by relocating capturedWiths to the FAM tail");
 
 // ---------------------------------------------------------------------------
 // LambdaDescriptor (shared blueprint)
@@ -382,7 +400,34 @@ struct LambdaDescriptor
     /// libnixexpr's ExprLambda definition.  Held as `void *` to avoid
     /// pulling the AST header into closure.hh; cast at use sites.
     void * astLambda = nullptr;
+
+    /// FP-2a (2026-06-14): owning-CompilationUnit backpointer.  Replaces the
+    /// former per-thunk `Thunk::suspended.cu` field (8 B × every suspended
+    /// thunk — millions on real evals).  A suspended thunk's CU is always its
+    /// descriptor's owning CU: OP_MAKE_THUNK is the SOLE creator of suspended
+    /// thunks (vm.cc:4773/4777 are the only `allocThunkSuspended` caller and
+    /// the only `suspended.desc =` writer), and it sets `desc = &cu->lambdas[i]`
+    /// — so the descriptor LIVES IN that cu's `lambdas` vector and `desc->cu`
+    /// is well-defined and equals the `cu` the thunk would have stored.  Set
+    /// at OP_MAKE_THUNK (idempotently — always the same authoritative value),
+    /// so `thunkCU()` returns each thunk's exact former `cu` (byte-identical).
+    ///
+    /// TRANSIENT: NOT serialized (a raw pointer is meaningless cross-process);
+    /// stays nullptr after a disk-cache load and is re-established at the first
+    /// runtime OP_MAKE_THUNK for the descriptor.  `mutable` for the same reason
+    /// as forceCount/allocCount above — OP_MAKE_THUNK reaches the descriptor
+    /// through a `const CompilationUnit *`; single-threaded VM, no atomics.
+    mutable const CompilationUnit * cu = nullptr;
 };
+
+/// FP-2a accessor: a suspended thunk's owning CU, derived from its descriptor's
+/// backpointer (see LambdaDescriptor::cu).  Returns nullptr when the thunk has
+/// no descriptor (no CU) — callers that previously fell back to the executing
+/// frame's `cu` when `suspended.cu` was null keep that `?: cu` fallback.
+[[gnu::always_inline]] inline const CompilationUnit * thunkCU(const Thunk * t) noexcept
+{
+    return t->suspended.desc ? t->suspended.desc->cu : nullptr;
+}
 
 // `struct ThunkDescriptor` removed -- was a placeholder type only ever
 // reinterpret_cast to LambdaDescriptor at use sites.  Thunk::suspended
