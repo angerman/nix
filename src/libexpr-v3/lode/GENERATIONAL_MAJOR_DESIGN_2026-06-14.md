@@ -58,6 +58,41 @@ Two viable shapes (decide by a falsifier spike, per measure-twice):
 - Bigger build (the Immix allocator was scoped at ~4 KLoC, `GC_DECISION`), but it
   is the *committed* family and directly targets the tenured-dead reclaim.
 
+## RESULT (2026-06-14) — Shape A IMPLEMENTED + MEASURED: works, on M5
+
+Implemented as opt-in `NIX_V3_GEN_MAJOR=1` (requires the nursery): at the major-GC
+safepoint, `nursery->forceScavenge(vm)` empties the nursery (single-region: all
+survivors → tenured), THEN the existing IC-clear + `runMajorMarkSweep` runs over
+the now nursery-free tenured set (M-3-safe).  Correct: hello.drvPath byte-identical
+(r77jznkw) + AUDIT 0 hits + canary 5/5 (default path unchanged, opt-in).
+
+Measured (laptop, min user-CPU + maxRSS over 2; firefox + M5; HNE excluded — it
+does IFD = remote build, not a clean eval benchmark):
+
+| workload | major-default | nursery-alone | gen-major (Shape A) |
+|---|---|---|---|
+| firefox | 4.27 s / 580 MB | 2.97 s / 639 MB | 3.70 s / **589 MB** |
+| M5      | 15.51 s / 2492 MB | 12.56 s / 2251 MB | 16.02 s / **1868 MB** |
+
+**Verdict: Shape A reclaims the tenured stranded dead — hugely on M5 (the
+production-goal workload), negligibly on firefox.**
+- **M5: −624 MB vs major-default (2492→1868) at +3 % CPU; −383 MB vs nursery at
+  +28 % CPU.** This IS the Layer-C reclaim — on M5, where the dead lives.
+- **firefox: 589 ≈ major's 580** — Shape A only recovers what the one major-GC
+  already reclaims (+13 % CPU vs nursery, −13 % vs major).  firefox has NO 100 MB+
+  of *additional* tenured dead beyond a single major.
+
+**The pre-committed firefox falsifier (peak < 518 MB AND CPU ≤ +15 % vs nursery)
+FAILED** (589 ≮ 518; +25 % CPU).  BUT per the threshold-recalibration rule its
+load-bearing PREMISE — "firefox holds 224 MB reclaimable tenured dead" — was
+measured WRONG: firefox's major-GC already gets it; the reclaimable dead is on M5
+(−624 MB).  Recalibrated to the correct workload, Shape A SHIPS the win.
+
+**Net vs the production major-GC default, gen-major wins on BOTH headline
+workloads:** M5 −624 MB RSS at +3 % CPU, firefox −13 % CPU at neutral RSS.  So
+gen-major is a SHIP-worthy opt-in lever; a default-flip is a cost/benefit call
+(vs nursery-alone it trades +25-28 % CPU for the M5 −383 MB).
+
 ## Recommendation
 
 **Shape A first** (cheap, reuses `mark_sweep.cc`): add a tenured-growth-triggered

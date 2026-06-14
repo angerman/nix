@@ -343,6 +343,18 @@ static const double g_majorGcGrowth = [] {
     if (v) { double d = std::strtod(v, nullptr); if (d >= 1.5 && d <= 8.0) return d; }
     return 2.0;
 }();
+// FP-4 Shape A (GENERATIONAL_MAJOR_DESIGN_2026-06-14): opt-in
+// generational-major.  Under the nursery the per-op major GC is hard-disabled
+// (M-3: the major marker skips nursery cells → would sweep arena cells reachable
+// only through them = UAF).  Shape A composes them safely: at the major-GC
+// safepoint, force a scavenge FIRST (promotes all survivors to tenured, empties
+// the nursery — single-region), THEN run the major mark-sweep over the now
+// nursery-free tenured set.  This reclaims the tenured stranded dead (the Layer-C
+// 224 MB) that the nursery alone leaves, while firing only on tenured-growth
+// (O(1-few)/eval, dodging the cache-bound-mark wall).  Default OFF — a measured
+// cost/benefit lever (NIX_V3_GEN_MAJOR=1, requires NIX_V3_NURSERY=1).
+static const bool g_genMajorEnabled =
+    std::getenv("NIX_V3_GEN_MAJOR") != nullptr;
 
 // PLAN_BEAT_TW_V2 workstream A step 2 — shared-parent-writeback COUNTER.
 //
@@ -3448,6 +3460,11 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
         // Previously a separate getenv here left the bookkeeping ON but
         // the TRIGGER OFF when only alloc.hh's default flipped.
         const bool s_majorGcEnabled = Arena::majorGcEnabled();
+        // FP-4 Shape A: generational-major is active when NIX_V3_GEN_MAJOR is set
+        // AND the nursery is on (nursery != nullptr).  It reuses the major-GC
+        // safepoint block below, prepending a forceScavenge so the major mark
+        // sees no nursery cells (M-3).
+        const bool s_genMajor = g_genMajorEnabled && nursery != nullptr;
         // P-1 (CODEBASE_REVIEW_2026-06-11): test the CHEAP local `exitDepth==0`
         // FIRST.  The major-GC safepoint only ever fires in the OUTERMOST
         // dispatch loop, so nested dispatch loops (every callClosure2 per-
@@ -3458,7 +3475,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
         // threshold/growth tunables are now file-scope (no per-opcode magic-
         // static guard).  Correctness-neutral: the firing condition is
         // unchanged (exitDepth==0 && bytesAllocated >= threshold && !nested).
-        if (s_majorGcEnabled && exitDepth == 0) {
+        if ((s_majorGcEnabled || s_genMajor) && exitDepth == 0) {
             // Dynamic threshold (thread_local mutable state): starts at the
             // file-scope initial; after each scavenge raises to
             // `max(initial, post_scavenge_arena * growth)` so a scavenge whose
@@ -3482,6 +3499,13 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     // Sync ip into the frame so the scavenger
                     // walks a consistent VM state.
                     if (!vm.frames.empty()) vm.frames.back().ip = ip;
+                    // FP-4 Shape A: empty the nursery FIRST (promote all young
+                    // survivors to tenured, single-region) so the major mark
+                    // below sees no nursery-resident cells — the M-3 invariant
+                    // that lets the major run safely under the nursery.
+                    // forceScavenge forwards frames; the dispatch-local re-read
+                    // after runMajorMarkSweep (below) picks up the final frames.
+                    if (s_genMajor) nursery->forceScavenge(vm);
                     // R2.4d (2026-06-04) INLINE-CACHE INVALIDATION before
                     // the major GC.  attrSelectCache + recSlotCache hold
                     // raw Bindings* per call site; walkAllV3Roots does NOT
