@@ -413,6 +413,91 @@ static std::unordered_map<const Value *, Value> & armedWritebackValue() noexcept
     return m;
 }
 
+// ── Workstream H sizing probe (V3_DBG_UPVAL_DUP, default-off) ────────────────
+// Sizes the recoverable RSS from SHARED CAPTURE FRAMES: v3 flat-copies each
+// thunk's captured upvalues into its tail[]; sibling thunks that capture a
+// byte-identical tuple could instead share ONE frame (TW's Env model).  At each
+// OP_MAKE_THUNK we hash the tail[] capture tuple and bucket it; atexit we report
+// total thunk-upvalue bytes, distinct tuples, and the duplicated (recoverable)
+// fraction = Σ_tuple (count-1)·nUp·8 — a conservative LOWER BOUND (only
+// byte-identical tuples; the broader subset-Env sharing could recover more),
+// plus the top source lambdas by upvalue volume.  Pointers in the tuple are
+// stable (flat MS doesn't move); run with a high NIX_V3_MAJOR_GC_THRESHOLD_MB so
+// the same logical thunks aren't re-counted across collections.
+static const bool g_dbgUpvalDup = std::getenv("V3_DBG_UPVAL_DUP") != nullptr;
+
+namespace upvaldup {
+struct TupleStat { uint64_t count = 0; uint16_t nUp = 0; };
+struct LambdaStat { uint64_t thunks = 0; uint64_t upWords = 0; const LambdaDescriptor * desc = nullptr; };
+inline std::unordered_map<uint64_t, TupleStat> & tuples() {
+    static std::unordered_map<uint64_t, TupleStat> m; return m;
+}
+inline std::unordered_map<uint32_t, LambdaStat> & lambdas() {
+    static std::unordered_map<uint32_t, LambdaStat> m; return m;
+}
+inline bool & atexitRegistered() { static bool b = false; return b; }
+inline void dump();  // defined after resolvePosSnapshot is in scope (below)
+} // namespace upvaldup
+
+// Record one thunk's capture tuple (called from OP_MAKE_THUNK when nUp>0 and the
+// gate is on).  fmix64-folds tail[0..nUp).w with nUp into a 64-bit tuple hash.
+[[gnu::noinline]] static void recordUpvalDup(const Thunk * t, uint16_t nUp)
+{
+    uint64_t h = 0x9E3779B97F4A7C15ull ^ (uint64_t(nUp) * 0xC2B2AE3D27D4EB4Full);
+    for (uint16_t i = 0; i < nUp; ++i) {
+        uint64_t x = t->tail[i].w;
+        x ^= x >> 33; x *= 0xff51afd7ed558ccdull; x ^= x >> 33;
+        h ^= x; h *= 0x100000001B3ull;
+    }
+    auto & ts = upvaldup::tuples()[h];
+    ts.count += 1; ts.nUp = nUp;
+    const LambdaDescriptor * d = t->suspended.desc;
+    uint32_t co = d ? d->codeOffset : 0;
+    auto & ls = upvaldup::lambdas()[co];
+    ls.thunks += 1; ls.upWords += nUp; ls.desc = d;
+    if (!upvaldup::atexitRegistered()) {
+        upvaldup::atexitRegistered() = true;
+        std::atexit([] { upvaldup::dump(); });
+    }
+}
+
+namespace upvaldup {
+inline void dump()
+{
+    uint64_t thunksWithUp = 0, totalUpWords = 0, recoverableWords = 0;
+    for (auto & kv : tuples()) {
+        thunksWithUp     += kv.second.count;
+        totalUpWords     += kv.second.count * kv.second.nUp;
+        recoverableWords += (kv.second.count - 1) * kv.second.nUp;  // dedup tuple
+    }
+    const double upMB  = totalUpWords     * double(sizeof(Value)) / 1e6;
+    const double recMB = recoverableWords * double(sizeof(Value)) / 1e6;
+    std::fprintf(stderr,
+        "v3 upval-dup (workstream H sizing): thunks-with-upvalues=%llu  "
+        "upvalue-bytes=%.1f MB  distinct-capture-tuples=%zu  "
+        "duplicated(recoverable by shared frames)=%.1f MB (%.1f%%)\n",
+        (unsigned long long)thunksWithUp, upMB, tuples().size(),
+        recMB, upMB > 0 ? 100.0 * recMB / upMB : 0.0);
+    // Top source lambdas by upvalue volume (the H candidates).
+    std::vector<std::pair<uint32_t, LambdaStat>> v(lambdas().begin(), lambdas().end());
+    std::sort(v.begin(), v.end(),
+        [](auto & a, auto & b) { return a.second.upWords > b.second.upWords; });
+    std::fprintf(stderr, "  top source lambdas by captured-upvalue volume:\n");
+    for (size_t i = 0; i < v.size() && i < 12; ++i) {
+        const LambdaDescriptor * d = v[i].second.desc;
+        const PosSnapshot * ps = d ? resolvePosSnapshot(d->posHandle) : nullptr;
+        std::fprintf(stderr,
+            "    %7.1f MB  %9llu thunks  avg-nUp=%.1f  %s @%s:%u\n",
+            v[i].second.upWords * double(sizeof(Value)) / 1e6,
+            (unsigned long long)v[i].second.thunks,
+            v[i].second.thunks ? double(v[i].second.upWords) / v[i].second.thunks : 0.0,
+            (d && !d->name.empty()) ? d->name.c_str() : "<anon>",
+            (ps && !ps->file.empty()) ? ps->file.c_str() : "<no-pos>",
+            ps ? ps->line : 0u);
+    }
+}
+} // namespace upvaldup
+
 // #733 (2026-05-21) hot-path stat-counter gate.  The per-descriptor
 // allocCount/forceCount + global thunksForced/thunksAllocated/
 // bridgeThunksForced increments live on the hottest paths in the
@@ -4800,6 +4885,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 }
             }
             for (uint16_t i = nUp; i > 0; --i) t->tail[i - 1] = pop(vm);
+            if (__builtin_expect(g_dbgUpvalDup, 0) && nUp > 0)
+                recordUpvalDup(t, nUp);  // workstream H sizing probe
             if (nWiths == 1) {
                 // Day 13-15 (2026-05-29): singleton interning — this
                 // is the HEADLINE site per T1_3 (vm.cc:3831 in the
