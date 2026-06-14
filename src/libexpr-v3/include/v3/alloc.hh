@@ -2567,14 +2567,22 @@ struct Alloc
     /// `file` / `line` default to the caller's site via `__builtin_FILE`
     /// + `__builtin_LINE`.  Used by T1.3 per-Thunk attribution
     /// (NIX_V3_THUNKS_ATTR=1).  Zero cost when the gate is off.
+    // FP-2b: `reserveWithsSlot` adds one trailing 8 B slot at tail[nUpvalues]
+    // for the capturedWiths ListVec*.  OP_MAKE_THUNK passes `willHaveWiths`
+    // (computed before this call) which EXACTLY predicts capturedWiths!=null, so
+    // ~74-97% of thunks pass false and pay nothing (24 B header, no slot).
     static Thunk * allocThunkSuspended(uint16_t nUpvalues,
+                                        bool reserveWithsSlot = false,
                                         const char * file = __builtin_FILE(),
                                         uint32_t     line = __builtin_LINE()) noexcept
     {
-        const size_t bytes = sizeof(Thunk) + sizeof(Value) * nUpvalues;
+        const size_t bytes = sizeof(Thunk)
+            + sizeof(Value) * nUpvalues
+            + (reserveWithsSlot ? sizeof(Value) : 0);  // FP-2b withs slot
         V3_STATS_BUMP(bytesThunks, bytes);
         auto * t = static_cast<Thunk *>(nurseryOrArena(bytes, CellType::Thunk));
         t->state = ThunkState::Suspended;
+        t->hasWithsSlot = reserveWithsSlot ? 1 : 0;  // FP-2b (was _pad0)
         t->nUpvalues = nUpvalues;
         t->forces = 0;
         t->cell = nullptr;
@@ -2582,7 +2590,11 @@ struct Alloc
         // NIX_V3_CELL_EVERYWHERE pre-allocation block were REMOVED.  The
         // experiment was default-off (shapeCell never non-null in production),
         // so dropping it is byte-identical for prod and reclaims 8 B/thunk.
-        t->suspended.capturedWiths = nullptr;
+        // FP-2b: zero the withs slot up front so a GC fired between this alloc
+        // and the OP_MAKE_THUNK store sees a null (not garbage) ListVec*.  The
+        // upvalue tail[0..nUpvalues) is filled by the maker; the slot sits past
+        // it at tail[nUpvalues].
+        if (reserveWithsSlot) thunkSetCapturedWiths(t, nullptr);
         // FP-2a (2026-06-14): `suspended.cu` removed (derived via thunkCU from
         // desc->cu, set at OP_MAKE_THUNK).  No per-thunk init needed.
         // T1.3: record allocation origin under NIX_V3_THUNKS_ATTR=1.

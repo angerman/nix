@@ -241,16 +241,7 @@ private:
     {
         ++counts.thunks;
         size_t bytes;
-        switch (t->state) {
-        case ThunkState::Suspended:
-        case ThunkState::Native:
-        case ThunkState::Blackhole:
-            bytes = sizeof(Thunk) + sizeof(Value) * t->nUpvalues;
-            break;
-        case ThunkState::Evaluated:
-            bytes = sizeof(Thunk);
-            break;
-        }
+        bytes = thunkScanSize(t);  // FP-2b: incl. optional withs slot
         counts.bytesThunks += bytes;
         // DIAG-2: per-posHandle attribution.  Only Suspended/Blackhole
         // have a valid suspended.desc->posHandle; Evaluated/Native/Bridge
@@ -278,8 +269,8 @@ private:
         switch (t->state) {
         case ThunkState::Suspended:
         case ThunkState::Blackhole:
-            if (t->suspended.capturedWiths)
-                enqueue(t->suspended.capturedWiths, GK_LIST);
+            if (ListVec * w = thunkCapturedWiths(t))  // FP-2b: tail slot
+                enqueue(w, GK_LIST);
             for (uint16_t i = 0; i < t->nUpvalues; ++i)
                 auditAndVisit(t->tail[i]);
             break;
@@ -789,16 +780,14 @@ private:
     void walkThunk(Thunk * t)
     {
         // Evaluated thunks dropped their tail; the rest keep nUpvalues.
-        const size_t bytes = (t->state == ThunkState::Evaluated)
-            ? sizeof(Thunk)
-            : sizeof(Thunk) + sizeof(Value) * t->nUpvalues;
+        const size_t bytes = thunkScanSize(t);  // FP-2b: incl. withs slot
         account(bytes);
         if (t->cell && cells_.insert(t->cell).second) visitValue(*t->cell);
         // M-8: shapeCell walk removed with the field.
         switch (t->state) {
         case ThunkState::Suspended:
         case ThunkState::Blackhole:
-            if (t->suspended.capturedWiths) enqueue(t->suspended.capturedWiths, GK_LIST);
+            if (ListVec * w = thunkCapturedWiths(t)) enqueue(w, GK_LIST);  // FP-2b: tail slot
             for (uint16_t i = 0; i < t->nUpvalues; ++i) visitValue(t->tail[i]);
             break;
         case ThunkState::Evaluated:
@@ -1109,11 +1098,7 @@ public:
         for (Closure   * c : markedClosures_)
             credit(c, sizeof(Closure) + sizeof(Value) * c->nUpvalues);
         for (Thunk     * t : markedThunks_) {
-            size_t bytes = (t->state == ThunkState::Suspended
-                         || t->state == ThunkState::Native
-                         || t->state == ThunkState::Blackhole)
-                ? sizeof(Thunk) + sizeof(Value) * t->nUpvalues
-                : sizeof(Thunk);
+            size_t bytes = thunkScanSize(t);  // FP-2b: incl. withs slot
             credit(t, bytes);
         }
         for (Bindings  * b : markedBindings_)
@@ -1406,11 +1391,7 @@ private:
             markRange(c,
                 sizeof(Closure) + sizeof(Value) * c->nUpvalues);
         for (Thunk * t : markedThunks_) {
-            size_t bytes = (t->state == ThunkState::Suspended
-                         || t->state == ThunkState::Native
-                         || t->state == ThunkState::Blackhole)
-                ? sizeof(Thunk) + sizeof(Value) * t->nUpvalues
-                : sizeof(Thunk);
+            size_t bytes = thunkScanSize(t);  // FP-2b: incl. withs slot
             markRange(t, bytes);
         }
         for (Bindings * b : markedBindings_)
@@ -1552,11 +1533,7 @@ public:
                 ++s.allocCount;
                 if (markedThunks_.count(const_cast<Thunk *>(t))) {
                     Thunk * tnc = const_cast<Thunk *>(t);
-                    size_t lbytes = (tnc->state == ThunkState::Suspended
-                                  || tnc->state == ThunkState::Native
-                                  || tnc->state == ThunkState::Blackhole)
-                        ? sizeof(Thunk) + sizeof(Value) * tnc->nUpvalues
-                        : sizeof(Thunk);
+                    size_t lbytes = thunkScanSize(tnc);  // FP-2b: incl. withs slot
                     s.liveBytes += lbytes;
                     ++s.liveCount;
                 }
@@ -1689,8 +1666,8 @@ private:
         switch (t->state) {
         case ThunkState::Suspended:
         case ThunkState::Blackhole:
-            if (t->suspended.capturedWiths)
-                visitList(t->suspended.capturedWiths);
+            if (ListVec * w = thunkCapturedWiths(t))  // FP-2b: tail slot
+                visitList(w);
             for (uint16_t i = 0; i < t->nUpvalues; ++i)
                 visitValue(t->tail[i]);
             break;
@@ -1774,11 +1751,7 @@ void dumpV3LiveBlockProbe() noexcept
     for (Closure * c : pr.markedClosuresPub())
         liveBytesApprox += sizeof(Closure) + sizeof(Value) * c->nUpvalues;
     for (Thunk * t : pr.markedThunksPub()) {
-        size_t b = (t->state == ThunkState::Suspended
-                 || t->state == ThunkState::Native
-                 || t->state == ThunkState::Blackhole)
-            ? sizeof(Thunk) + sizeof(Value) * t->nUpvalues
-            : sizeof(Thunk);
+        size_t b = thunkScanSize(t);  // FP-2b: incl. withs slot
         liveBytesApprox += b;
     }
     for (Bindings * b : pr.markedBindingsPub())

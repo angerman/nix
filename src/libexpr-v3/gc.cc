@@ -336,17 +336,10 @@ Thunk * Scavenger::fwdThunk(Thunk * t)
     // #738 Phase E v0.2: branch on region same as fwdClosure.
     // Layout-dependent byte calculation matches the legacy single-
     // region copy path.
-    auto computeThunkBytes = [](Thunk * tk) -> size_t {
-        switch (tk->state) {
-        case ThunkState::Suspended:
-        case ThunkState::Native:
-        case ThunkState::Blackhole:
-            return sizeof(Thunk) + sizeof(Value) * tk->nUpvalues;
-        case ThunkState::Evaluated:
-            return sizeof(Thunk);
-        }
-        return sizeof(Thunk);
-    };
+    // FP-2b: single source of truth (includes the optional withs tail slot for
+    // Suspended/Blackhole) — this is the EVAC COPY size; under-counting here
+    // would drop the slot on relocation = UAF.
+    auto computeThunkBytes = [](Thunk * tk) -> size_t { return thunkScanSize(tk); };
     if (n.isPhaseEActive()) {
         if (n.inYoung(t)) {
             auto it = forward.find(t);
@@ -652,21 +645,8 @@ void Scavenger::walkClosure(Closure * c)
 void Scavenger::walkThunk(Thunk * t)
 {
     // BRUTE-refinement: Thunk size depends on state (matches fwdThunk's
-    // copy-size logic).
-    {
-        size_t bytes;
-        switch (t->state) {
-        case ThunkState::Suspended:
-        case ThunkState::Native:
-        case ThunkState::Blackhole:
-            bytes = sizeof(Thunk) + sizeof(Value) * t->nUpvalues;
-            break;
-        case ThunkState::Evaluated:
-            bytes = sizeof(Thunk);
-            break;
-        }
-        recordLiveTenured(t, bytes);
-    }
+    // copy-size logic).  FP-2b: thunkScanSize includes the optional withs slot.
+    recordLiveTenured(t, thunkScanSize(t));
     // The cell (write-back target for OP_RETURN) is tenured; walk
     // its current Value so any nursery payload it holds is found.
     if (t->cell && walked.insert(t->cell).second) {
@@ -684,8 +664,8 @@ void Scavenger::walkThunk(Thunk * t)
                 }
             }
         }
-        if (t->suspended.capturedWiths)
-            t->suspended.capturedWiths = fwdList(t->suspended.capturedWiths);
+        if (ListVec * w = thunkCapturedWiths(t))  // FP-2b: tail slot, was suspended.capturedWiths
+            thunkSetCapturedWiths(t, fwdList(w));
         for (uint16_t i = 0; i < t->nUpvalues; ++i) {
             visitValue(t->tail[i]);
         }
@@ -734,8 +714,8 @@ void Scavenger::walkThunk(Thunk * t)
         //   - scavenge fires during the body
         //
         // Fix: identical to the Suspended case.
-        if (t->suspended.capturedWiths)
-            t->suspended.capturedWiths = fwdList(t->suspended.capturedWiths);
+        if (ListVec * w = thunkCapturedWiths(t))  // FP-2b: tail slot, was suspended.capturedWiths
+            thunkSetCapturedWiths(t, fwdList(w));
         for (uint16_t i = 0; i < t->nUpvalues; ++i) {
             visitValue(t->tail[i]);
         }
@@ -1202,8 +1182,8 @@ struct Auditor {
         case ThunkState::Suspended:
             // #705 R9: walk this CU's IC.
             walkCUAttrSelectCache(thunkCU(t));  // FP-2a: was t->suspended.cu
-            if (t->suspended.capturedWiths)
-                check(t->suspended.capturedWiths, "Thunk.suspended.capturedWiths", site);
+            if (ListVec * w = thunkCapturedWiths(t))  // FP-2b: tail slot
+                check(w, "Thunk.suspended.capturedWiths", site);
             for (uint16_t i = 0; i < t->nUpvalues; ++i)
                 visitValue(t->tail[i], "Thunk.suspended.tail[]");
             break;
@@ -1225,8 +1205,8 @@ struct Auditor {
             // clearBlackMarksOnException can revert Blackhole →
             // Suspended on exception unwind.  See gc.cc walkThunk.
             walkCUAttrSelectCache(thunkCU(t));  // FP-2a: was t->suspended.cu
-            if (t->suspended.capturedWiths)
-                check(t->suspended.capturedWiths,
+            if (ListVec * w = thunkCapturedWiths(t))  // FP-2b: tail slot
+                check(w,
                       "Thunk.Blackhole.suspended.capturedWiths", site);
             for (uint16_t i = 0; i < t->nUpvalues; ++i)
                 visitValue(t->tail[i], "Thunk.Blackhole.tail[]");

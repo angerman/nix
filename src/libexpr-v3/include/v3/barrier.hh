@@ -317,14 +317,13 @@ thunkPostConstructBarrier(Thunk * t) noexcept
         for (uint16_t i = 0; i < t->nUpvalues; ++i) {
             if (isNurseryPayload(t->tail[i], n)) { dirty = true; break; }
         }
-        // Suspended-capturedWiths.  Native / Bridge use the union for
-        // other purposes; check the state byte.
-        if (!dirty
-            && (t->state == ThunkState::Suspended
-                || t->state == ThunkState::Blackhole)
-            && t->suspended.capturedWiths
-            && n.contains(t->suspended.capturedWiths))
-            dirty = true;
+        // Suspended-capturedWiths.  FP-2b: now in the tail slot (thunkCapturedWiths),
+        // present only for Suspended/Blackhole with hasWithsSlot — so the state
+        // check is implicit in the accessor (null otherwise).
+        if (!dirty) {
+            if (ListVec * w = thunkCapturedWiths(t); w && n.contains(w))
+                dirty = true;
+        }
         if (dirty) dirtyContainers().push_back({DirtyKind::Thunk, t});
     }
 }

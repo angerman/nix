@@ -506,66 +506,10 @@ inline void dump()
 }
 } // namespace upvaldup
 
-// ── FP-2b sizing probe (V3_DBG_THUNK_WITHS, default-off) ─────────────────────
-// Sizes the *marginal* RSS win of FP-2b (relocate capturedWiths to the FAM tail,
-// kept only when the thunk actually carries withs).  Arena rounds every alloc up
-// to 16 B (alloc.hh: (bytes+15)&~15), so removing 8 B from the header changes the
-// ALLOCATED size only when it crosses a 16 B boundary.  FP-2a (shipped) already
-// took the header 40→32 B and banked the win for EVEN-nUp thunks; FP-2b takes
-// null-withs thunks to a 24 B header (8 B smaller still), which crosses a 16 B
-// boundary — and thus saves a further 16 B — only for null-withs thunks with ODD
-// nUp.  Thunks that carry withs keep a tail slot (net 0).  This probe tallies, at
-// OP_MAKE_THUNK, every suspended thunk by (nUp, capturedWiths==null), and at exit
-// reports the three projected savings (combined FP-2, already-banked FP-2a, and
-// the FP-2b marginal) so the FP-2b keep/revert decision is data-driven instead of
-// rounding-guesswork.  Retirement: DELETE after the FP-2b decision lands (this is
-// a one-shot sizing measurement, not a permanent gate).
-static const bool g_dbgThunkWiths = std::getenv("V3_DBG_THUNK_WITHS") != nullptr;
-
-namespace thunkwiths {
-// Index 0..3 = nUp; index 4 = nUp>=4.  [.][0]=withs-null, [.][1]=withs-present.
-inline uint64_t (&buckets())[5][2] { static uint64_t b[5][2] = {}; return b; }
-inline bool & atexitRegistered() { static bool r = false; return r; }
-inline void dump()
-{
-    uint64_t total = 0, nullW = 0, evenNup = 0, nullOddNup = 0;
-    auto (&b)[5][2] = buckets();
-    for (int n = 0; n < 5; ++n) {
-        const uint64_t nn = b[n][0], pp = b[n][1], row = nn + pp;
-        total += row; nullW += nn;
-        // For the saving model, treat the nUp>=4 bucket by its parity at n==4
-        // (even); odd-nUp thunks with nUp>=5 land in this bucket too, so the
-        // FP-2b-marginal estimate from this bucket is a (slight) LOWER BOUND.
-        const bool even = (n % 2) == 0 || n == 4;
-        if (even) evenNup += row; else nullOddNup += nn;
-    }
-    const double combinedMB   = nullW      * 16.0 / 1e6;  // 16 B clean per null-withs thunk
-    const double fp2aBankedMB = evenNup    * 16.0 / 1e6;  // FP-2a already (even-nUp, any withs)
-    const double fp2bMargMB   = nullOddNup * 16.0 / 1e6;  // FP-2b adds (null-withs, odd-nUp)
-    std::fprintf(stderr,
-        "v3 thunk-withs (FP-2b sizing): suspended-thunks=%llu  withs-null=%llu (%.1f%%)\n"
-        "  projected COMBINED FP-2 saving (vs orig 40B) = %.1f MB (16 B x null-withs)\n"
-        "  of which FP-2a already banked (16 B x even-nUp, any withs)  = %.1f MB\n"
-        "  FP-2b MARGINAL (16 B x null-withs & odd-nUp)                = %.1f MB\n",
-        (unsigned long long)total, (unsigned long long)nullW,
-        total ? 100.0 * nullW / total : 0.0, combinedMB, fp2aBankedMB, fp2bMargMB);
-    std::fprintf(stderr, "  per-nUp [nUp: null / present]:");
-    for (int n = 0; n < 5; ++n)
-        std::fprintf(stderr, "  %s%d:%llu/%llu", n == 4 ? ">=" : "", n,
-            (unsigned long long)b[n][0], (unsigned long long)b[n][1]);
-    std::fprintf(stderr, "\n");
-}
-} // namespace thunkwiths
-
-[[gnu::noinline]] static void recordThunkWiths(uint16_t nUp, bool withsNull)
-{
-    const int n = nUp >= 4 ? 4 : nUp;
-    thunkwiths::buckets()[n][withsNull ? 0 : 1] += 1;
-    if (!thunkwiths::atexitRegistered()) {
-        thunkwiths::atexitRegistered() = true;
-        std::atexit([] { thunkwiths::dump(); });
-    }
-}
+// (FP-2b sizing probe V3_DBG_THUNK_WITHS retired 2026-06-14 — it measured the
+// capturedWiths null-fraction (firefox 74% / M5 97%) to greenlight FP-2b's
+// tail-relocation; FP-2b landed byte-identical with M5 arena −151 MB, so the
+// one-shot measurement is removed per its retirement criterion.)
 
 // #733 (2026-05-21) hot-path stat-counter gate.  The per-descriptor
 // allocCount/forceCount + global thunksForced/thunksAllocated/
@@ -4831,7 +4775,15 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // protocol.  Second data word is the with-target count;
             // the with-targets sit BELOW the upvalues on the stack.
             uint16_t nWiths = static_cast<uint16_t>(cu->code[ip++]);
-            Thunk * t = Alloc::allocThunkSuspended(nUp);
+            // FP-2b: predict whether this thunk will capture a non-null with-list
+            // and reserve the trailing tail slot iff so.  This EXACTLY matches
+            // the capturedWiths logic below: nWiths>0 => an explicit lexical with;
+            // else snapshotCurrentWiths(vm) is non-null iff the frame's with-stack
+            // is non-empty (its `top<=base => null` test).  ~74-97% are false.
+            const bool willHaveWiths = (nWiths > 0)
+                || (vm.withStack.size()
+                    > (vm.frames.empty() ? 0 : vm.frames.back().withStackBase));
+            Thunk * t = Alloc::allocThunkSuspended(nUp, willHaveWiths);
             // The "descriptor" we use is the LambdaDescriptor for the
             // referenced function (treated as 0-arg for thunks).
             // Reuse the LambdaDescriptor pointer through suspended.desc.
@@ -4962,27 +4914,31 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             for (uint16_t i = nUp; i > 0; --i) t->tail[i - 1] = pop(vm);
             if (__builtin_expect(g_dbgUpvalDup, 0) && nUp > 0)
                 recordUpvalDup(t, nUp);  // workstream H sizing probe
+            // FP-2b: capturedWiths now lives in the reserved tail slot
+            // (tail[nUpvalues], present iff willHaveWiths).  Each branch that
+            // stores produces a non-null list AND implies willHaveWiths (so the
+            // slot exists); the nWiths==0 && !willHaveWiths case stores nothing
+            // (no slot — thunkCapturedWiths returns null, matching the old
+            // snapshot-returns-null behaviour) and skips the snapshot alloc.
             if (nWiths == 1) {
                 // Day 13-15 (2026-05-29): singleton interning — this
                 // is the HEADLINE site per T1_3 (vm.cc:3831 in the
                 // 05-27 numbering): 544 K allocs / 12.8 MB on HNE,
                 // avg-size 1.04.  Almost all hit the singleton path.
                 Value w = pop(vm);
-                t->suspended.capturedWiths = internOrAllocSingletonCapWiths(w);
+                thunkSetCapturedWiths(t, internOrAllocSingletonCapWiths(w));
             } else if (nWiths > 0) {
                 ListVec * lws = Alloc::allocList(nWiths);
                 for (uint16_t i = nWiths; i > 0; --i)
                     lws->elems[i - 1] = pop(vm);
                 listPostConstructBarrier(lws);  // Phase D coverage
-                t->suspended.capturedWiths = lws;
-            } else {
-                // No lexical with-chain at the creation site — fall
-                // back to runtime snapshot for parity with synthetic
-                // make-paths (see OP_MAKE_CLOSURE comment).
-                t->suspended.capturedWiths = snapshotCurrentWiths(vm);
+                thunkSetCapturedWiths(t, lws);
+            } else if (willHaveWiths) {
+                // No lexical with-chain, but the frame's with-stack is non-empty
+                // → snapshot is non-null and a slot was reserved.  (When
+                // !willHaveWiths the snapshot would be null and no slot exists.)
+                thunkSetCapturedWiths(t, snapshotCurrentWiths(vm));
             }
-            if (__builtin_expect(g_dbgThunkWiths, 0))
-                recordThunkWiths(nUp, t->suspended.capturedWiths == nullptr);  // FP-2b sizing
             // #498: trace MK_THUNK for thunks named "res" with nUp=4
             // (the all-packages.nix `let res = ...` thunk) and dump
             // captured upvalues to identify which freeVars[1] is.
@@ -8208,7 +8164,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             }
             fakeClo->desc = desc;
             fakeClo->nUpvalues = t->nUpvalues;
-            fakeClo->capturedWiths = t->suspended.capturedWiths;
+            fakeClo->capturedWiths = thunkCapturedWiths(t);  // FP-2b: was suspended.capturedWiths
             fakeClo->cu = thunkCU(t);  // FP-2a: was t->suspended.cu
             for (uint16_t i = 0; i < t->nUpvalues; ++i) fakeClo->upvalues[i] = t->tail[i];
             // Phase D coverage: fakeClo's upvalues now mirror t->tail[].
@@ -8216,7 +8172,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // and t->tail[] carries nursery payloads, dirty-list.
             closurePostConstructBarrier(fakeClo);
 
-            ListVec * thunkWiths = t->suspended.capturedWiths;
+            ListVec * thunkWiths = thunkCapturedWiths(t);  // FP-2b: was suspended.capturedWiths
             const CompilationUnit * thunkCu = thunkCU(t);  // FP-2a: was t->suspended.cu
             if (!thunkCu) thunkCu = cu;                     // ...?: cu fallback preserved
 
@@ -13727,12 +13683,12 @@ Value forceValue(VMState & vm, Value v)
         Closure * fakeClo = Alloc::allocFakeClo(t->nUpvalues);
         fakeClo->desc = desc;
         fakeClo->nUpvalues = t->nUpvalues;
-        fakeClo->capturedWiths = t->suspended.capturedWiths;
+        fakeClo->capturedWiths = thunkCapturedWiths(t);  // FP-2b: was suspended.capturedWiths
         fakeClo->cu = thunkCU(t);  // FP-2a: was t->suspended.cu
         for (uint16_t i = 0; i < t->nUpvalues; ++i) fakeClo->upvalues[i] = t->tail[i];
         // Phase D coverage: same as the OP_FORCE fakeClo path above.
         closurePostConstructBarrier(fakeClo);
-        ListVec * thunkWiths = t->suspended.capturedWiths;
+        ListVec * thunkWiths = thunkCapturedWiths(t);  // FP-2b: was suspended.capturedWiths
         const CompilationUnit * thunkCu = thunkCU(t);  // FP-2a: was t->suspended.cu
         if (!thunkCu) thunkCu = vm.frames.back().cu;    // ...?: frame-cu fallback preserved
         t->state = ThunkState::Blackhole;

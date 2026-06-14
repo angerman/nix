@@ -550,13 +550,7 @@ private:
         // on state (Suspended/Native/Blackhole have FAM trailers;
         // Evaluated/Bridge are header-only).
         if (arenaSetForSlot_) {
-            const size_t bytes =
-                (t->state == ThunkState::Suspended ||
-                 t->state == ThunkState::Native    ||
-                 t->state == ThunkState::Blackhole)
-                ? sizeof(Thunk) + sizeof(Value) * t->nUpvalues
-                : sizeof(Thunk);
-            arenaSetForSlot_->markLinesForCell(t, bytes);
+            arenaSetForSlot_->markLinesForCell(t, thunkScanSize(t));  // FP-2b: incl. withs slot
         }
         // Thunk::cell points at a Value cell (Bindings-resident OR standalone
         // allocValue).  Mark it via visitSlot so the cell payload is walked
@@ -582,8 +576,8 @@ private:
         switch (t->state) {
         case ThunkState::Suspended:
         case ThunkState::Blackhole:
-            if (t->suspended.capturedWiths)
-                visitList(t->suspended.capturedWiths);
+            if (ListVec * w = thunkCapturedWiths(t))  // FP-2b: tail slot
+                visitList(w);
             for (uint16_t i = 0; i < t->nUpvalues; ++i)
                 visitValue(t->tail[i]);
             break;
@@ -1012,14 +1006,8 @@ static size_t evacCellSize(const void * p, CellType t) noexcept
     case CellType::Closure:
         return sizeof(Closure)
              + sizeof(Value) * static_cast<const Closure *>(p)->nUpvalues;
-    case CellType::Thunk: {
-        auto * tk = static_cast<const Thunk *>(p);
-        return (tk->state == ThunkState::Suspended
-             || tk->state == ThunkState::Native
-             || tk->state == ThunkState::Blackhole)
-            ? sizeof(Thunk) + sizeof(Value) * tk->nUpvalues
-            : sizeof(Thunk);
-    }
+    case CellType::Thunk:
+        return thunkScanSize(static_cast<const Thunk *>(p));  // FP-2b: incl. withs slot
     case CellType::Bindings:
         return sizeof(Bindings)
              + sizeof(Bindings::Entry) * static_cast<const Bindings *>(p)->size;
@@ -1309,7 +1297,7 @@ private:
             case ThunkState::Suspended:
             case ThunkState::Blackhole:
                 clearCU(thunkCU(t));  // FP-2a: was t->suspended.cu; evac moves IC'd Bindings
-                if (t->suspended.capturedWiths) visitList(t->suspended.capturedWiths);
+                if (ListVec * w = thunkCapturedWiths(t)) visitList(w);  // FP-2b: tail slot
                 for (uint16_t i = 0; i < t->nUpvalues; ++i) visitValue(t->tail[i]);
                 break;
             case ThunkState::Evaluated: visitValue(t->evaluated); break;
@@ -1775,7 +1763,7 @@ static void runEvacuation(VMState & vm, Arena & arena,
                         case ThunkState::Suspended:
                         case ThunkState::Blackhole:
                         case ThunkState::Native:
-                            if (t->suspended.capturedWiths && inFreeable(reinterpret_cast<uintptr_t>(t->suspended.capturedWiths))) note("Thunk.capturedWiths", cs);
+                            if (ListVec * w = thunkCapturedWiths(t); w && inFreeable(reinterpret_cast<uintptr_t>(w))) note("Thunk.capturedWiths", cs);  // FP-2b: tail slot
                             for (uint16_t i = 0; i < t->nUpvalues; ++i)
                                 if (refCand(t->tail[i])) { note("Thunk.tail", cs); break; }
                             break;

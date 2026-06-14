@@ -90,7 +90,13 @@ enum class ThunkState : uint8_t {
 struct Thunk
 {
     ThunkState state;
-    uint8_t    _pad0;
+    /// FP-2b (2026-06-14): repurposed from `_pad0` (which had no readers).  1
+    /// iff this thunk reserved a trailing capturedWiths slot at tail[nUpvalues]
+    /// (a raw `ListVec*`, NOT a NaN-boxed Value).  Set at allocThunkSuspended
+    /// from `willHaveWiths` (= the thunk WILL capture a non-null with-list),
+    /// which is computed before alloc and EXACTLY predicts capturedWiths!=null.
+    /// Only Suspended/Blackhole thunks carry the slot; read via thunkCapturedWiths.
+    uint8_t    hasWithsSlot;
     uint16_t   nUpvalues;   // for Suspended state
     /// Phase 13 instrumentation (was `_pad1`).  Counts Suspended →
     /// Blackhole transitions for *this* thunk instance.  Each force
@@ -150,14 +156,15 @@ struct Thunk
             // reinterpret_cast back to LambdaDescriptor at every read
             // site.  Storing the real type kills ~10 reinterpret_casts.
             const LambdaDescriptor * desc;
-            /// Same semantics as Closure::capturedWiths.
-            ListVec * capturedWiths;
             // FP-2a (2026-06-14): the per-thunk `const CompilationUnit * cu`
-            // field was REMOVED.  A suspended thunk's CU is now derived from
-            // its descriptor's owning-CU backpointer via `thunkCU(t)` (==
-            // desc->cu).  OP_MAKE_THUNK is the sole suspended-thunk creator and
-            // sets desc = &cu->lambdas[i], so desc->cu is the exact same value
-            // the thunk used to store — byte-identical, and 8 B/thunk smaller.
+            // field was REMOVED — derived from desc->cu via thunkCU(t).
+            // FP-2b (2026-06-14): the per-thunk `ListVec * capturedWiths` field
+            // was REMOVED from the header.  It is now stored in the FAM tail at
+            // tail[nUpvalues] (a raw ListVec*) ONLY when the thunk actually
+            // captures a non-null with-list (hasWithsSlot==1) — 74-97% of thunks
+            // capture none and pay 0.  Accessed via thunkCapturedWiths(t) /
+            // thunkSetCapturedWiths(t,w).  This empties the Suspended union arm
+            // to just {desc} = 8 B, taking the header 32 B -> 24 B.
         } suspended;
         // ThunkState::Evaluated — the cached value.
         Value evaluated;
@@ -173,19 +180,65 @@ struct Thunk
     Value tail[];
 };
 
-// FP-2a (2026-06-14): thunk-header shrink, stage a.  Removing `suspended.cu`
-// (derived from desc->cu via thunkCU) drops the Suspended union arm from 24 B
-// {desc,capturedWiths,cu} to 16 B {desc,capturedWiths}; the union floors at
-// sizeof(Value)==8 for the Evaluated arm, so the header is now
-// 8 (state/nUpvalues/forces) + 8 (cell) + 16 (union) = 32 B (was 40 B).
-// FP-2b will move `capturedWiths` to the FAM tail (kept only when
-// desc->nWithTargets>0), dropping the union to 8 B and the header to 24 B —
-// at which point Arena's 16 B rounding yields a clean −16 B per thunk for ALL
-// upvalue counts.  This assert pins the stage-a layout so a stray field
-// re-grows it visibly.  See lode/MEMORY_FORWARD_PLAN_2026-06-14.md.
-static_assert(sizeof(Thunk) == 32,
-    "FP-2a: Thunk header must be 32 B (state-word 8 + cell 8 + union 16); "
-    "FP-2b lowers this to 24 B by relocating capturedWiths to the FAM tail");
+// FP-2 (2026-06-14): thunk-header shrink complete.  FP-2a removed `suspended.cu`
+// (derived from desc->cu via thunkCU); FP-2b removed `suspended.capturedWiths`
+// (relocated to the FAM tail at tail[nUpvalues], present only when
+// hasWithsSlot==1).  The Suspended union arm is now just {desc} = 8 B; the union
+// floors at sizeof(Value)==8 (the Evaluated arm), so the header is
+// 8 (state/hasWithsSlot/nUpvalues/forces) + 8 (cell) + 8 (union) = 24 B (was 40).
+// Arena's 16 B rounding then yields a clean −16 B per null-withs thunk for ALL
+// upvalue counts (≈97% of M5's 17.1 M thunks; M5 arena peak is thunk-bound).
+// This assert pins the layout so a stray field re-grows it visibly.  Every GC
+// size computation MUST go through thunkScanSize() (below) so the optional withs
+// slot is never dropped on evac copy.  See lode/MEMORY_FORWARD_PLAN_2026-06-14.md.
+static_assert(sizeof(Thunk) == 24,
+    "FP-2: Thunk header must be 24 B (state-word 8 + cell 8 + union 8). The "
+    "optional capturedWiths lives at tail[nUpvalues] when hasWithsSlot==1.");
+
+// FP-2b SINGLE SOURCE OF TRUTH for a thunk's scanned/copied byte size.  EVERY GC
+// size computation (evac copy in Cheney/scavenge, line-marking, byte accounting)
+// MUST use this — if any under-counts, the evac copy drops the trailing withs
+// slot and the forwarded thunk reads a stale pointer = use-after-free.  Mirrors
+// the prior per-state logic (Suspended/Blackhole/Native carry the FAM tail;
+// Evaluated's union holds a Value with no live tail) and adds the 8 B withs slot
+// for Suspended/Blackhole when hasWithsSlot==1.
+[[gnu::always_inline]] inline std::size_t thunkScanSize(const Thunk * t) noexcept
+{
+    switch (t->state) {
+    case ThunkState::Suspended:
+    case ThunkState::Blackhole:
+        return sizeof(Thunk) + sizeof(Value) * t->nUpvalues
+             + (t->hasWithsSlot ? sizeof(Value) : 0);
+    case ThunkState::Native:
+        return sizeof(Thunk) + sizeof(Value) * t->nUpvalues;
+    case ThunkState::Evaluated:
+    default:
+        return sizeof(Thunk);
+    }
+}
+
+// FP-2b capturedWiths accessors.  The with-list lives at tail[nUpvalues] as a RAW
+// ListVec* (not a NaN-boxed Value), present iff hasWithsSlot.  Read returns null
+// when absent; the setter is valid only when the slot was reserved at alloc (its
+// callers — OP_MAKE_THUNK and the GC evac forward — only write when present).
+[[gnu::always_inline]] inline ListVec * thunkCapturedWiths(const Thunk * t) noexcept
+{
+    // Gate on state as well as hasWithsSlot: the bit is set at alloc and never
+    // cleared on the Suspended→Evaluated transition, and an evac-copied
+    // Evaluated thunk is relocated as sizeof(Thunk) (tail dropped) — so reading
+    // tail[nUpvalues] would be out of bounds.  Only Suspended/Blackhole carry a
+    // live slot.  (All real callers are already in those states; this is
+    // defence-in-depth in a UAF-prone area, same cache line, zero behaviour change.)
+    return (t->hasWithsSlot
+            && (t->state == ThunkState::Suspended
+                || t->state == ThunkState::Blackhole))
+        ? *reinterpret_cast<ListVec * const *>(&t->tail[t->nUpvalues])
+        : nullptr;
+}
+[[gnu::always_inline]] inline void thunkSetCapturedWiths(Thunk * t, ListVec * w) noexcept
+{
+    *reinterpret_cast<ListVec **>(&t->tail[t->nUpvalues]) = w;
+}
 
 // ---------------------------------------------------------------------------
 // LambdaDescriptor (shared blueprint)
