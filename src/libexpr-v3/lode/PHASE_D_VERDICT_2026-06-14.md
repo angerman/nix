@@ -183,22 +183,33 @@ a generational barrier-coverage gap.
    Fix: extend the clear to the scavenge path (after `sc.run()`).  Required
    nursery-safety; not the current AUDIT-hit cause.
 
-3. **Bindings-construction barrier-coverage gap — CHARACTERIZED (the remaining
-   AUDIT hit), the systemic next step.**  AUDIT signature: tenured
-   `Bindings.entries[N].value -> nursery` (hello-drvPath/outPath).  By the
-   generational invariant a tenured→young edge MUST be in the remembered set (the
-   scavenger walks young + dirty-list, NOT all reachable tenured).  `materialize`
-   honours this via `bindingsPostConstructBarrier(out)`, but the ~30 other
-   `allocBindings`+fill sites in primops.cc (derivationStrict / listToAttrs /
-   mapAttrs / // merge / etc.) mostly DON'T — so a large (→tenured) Bindings
-   filled with nursery values leaves an unbarriered edge → missed root.  BRUTE
-   misses it (the Bindings wasn't walked, so its hit reads as "dead"); the deep
-   AUDIT catches it.  **FIX (mechanical, ~30 sites): add
-   `bindingsPostConstructBarrier(b)` after each allocBindings+fill that can hold
-   nursery values** (no-op under the major-GC default → byte-identical; only fires
-   under the nursery).  Then brute-audit's hello/gcc go green (leaving only the
-   stale firefox-150.0.3 golden, a test-data drift to refresh).  This is the
-   final PhD-6 layer before the nursery-flip 5-gate.
+3. **A tenured-Bindings→nursery missed root — OPEN, and NOT what I first
+   guessed.**  AUDIT signature: tenured `Bindings.entries[N].value -> nursery`
+   (hello-drvPath/outPath, entries[16/38/49]), reachable from roots, that the
+   scavenger (young + dirty-list, not all reachable tenured) didn't forward.
+
+   **FALSIFIED first hypothesis ("~30 unbarriered construction sites"):** an audit
+   of the actual code shows construction IS barriered everywhere —
+   `OP_ATTRS_INIT` uses `bindingsSetValue` (vm.cc:8455), essentially all ~30
+   primops.cc `allocBindings`+fill sites use `bindingsSetValue`/`bindingsSetEntry`
+   ("// Phase D"), `materialize` uses `bindingsPostConstructBarrier(out)`, the
+   OP_RETURN cell-writeback uses `cellWrite`→`standaloneCellRoots` (barrier.hh:423)
+   which the scavenge walks (gc.cc:1071/1398), and there are no raw `*cell=`/
+   `*slot=` writebacks bypassing it.  So the construction-gap theory is WRONG; do
+   NOT add blanket barriers (they're already there).
+
+   **Still OPEN — candidates for the real cause (need targeted instrumentation):**
+   (a) a `standaloneCellRoots` cell pointer that goes STALE when its containing
+   Bindings is itself forwarded (the registry holds raw `Value*` into a movable
+   object — same staleness family as the caches, but for tenured Bindings the
+   pointer should be stable, so check the nursery-Bindings-promoted case);
+   (b) a writeback through a path that computes the wrong `cellContainer`/cell;
+   (c) an entry mutated via the SELECT/chain memoization writeback (L1) without
+   re-barriering.  **Next step: extend the AUDIT (or add a write-path tag) to
+   report HOW the offending entry was last written** — the typed BRUTE scanner
+   gives the holder; an analogous "last-writer" tag on the AUDIT edge would pin
+   the site.  This is the final PhD-6 layer before the nursery-flip 5-gate; it is
+   NOT the trivial barrier-sweep first assumed.
 
 *Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>, Input Output
 Group. SPDX-License-Identifier: Apache-2.0.*
