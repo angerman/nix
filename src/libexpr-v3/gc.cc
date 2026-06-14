@@ -1258,8 +1258,34 @@ struct Auditor {
         if (!l) return;
         check(l, "ListVec", site);
         if (!visited.insert(l).second) return;
-        for (uint32_t i = 0; i < l->size; ++i)
-            visitValue(l->elems[i], "ListVec.elems[]");
+        // PhD-6 (2026-06-15): the missed-root proved to be a nursery THUNK
+        // (a lazily-built element, NOT a forced WHNF) held in a TENURED list.
+        // Such a list is arena-allocated only because the nursery was full at
+        // allocList time (alloc.hh nurseryOrArena); its pointer is stable, so
+        // the listOriginTable (NIX_V3_LISTS_ATTR=1) alloc-site lookup HITS and
+        // names the exact construction site that filled it with nursery thunks
+        // WITHOUT a listPostConstructBarrier.  Also keep the last-writer lookup
+        // (cellWrite/bindings setters) for the writeback case.
+        ListOrigin lo{"?", 0, 0};
+        if (__builtin_expect(listsAttrEnabled(), 0)) {
+            auto & ot = listOriginTable();
+            auto oit = ot.find(l);
+            if (oit != ot.end()) lo = oit->second;
+        }
+        for (uint32_t i = 0; i < l->size; ++i) {
+            const char * lastWriter = "?";
+            if (__builtin_expect(dbgCellWriteSite(), 0)) {
+                auto & m = cellWriteSiteMap();
+                auto it = m.find(&l->elems[i]);
+                lastWriter = (it != m.end()) ? it->second
+                                             : "(no-recorded-writer=raw/bulk-path)";
+            }
+            char ebuf[224];
+            std::snprintf(ebuf, sizeof(ebuf),
+                "ListVec(%p sz=%u allocAt=%s:%u).elems[%u] lastWriter=%s",
+                (const void *)l, l->size, lo.file, lo.line, i, lastWriter);
+            visitValue(l->elems[i], ebuf);
+        }
     }
 
     void visitPair(const ValuePair * p, const char * site)

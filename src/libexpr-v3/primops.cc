@@ -741,6 +741,7 @@ void primAttrValues(EvalState &, Value * args, Value & out)
     ListVec * lv = Alloc::allocList(n);
     V3_STATS_INC(listsAllocated);
     for (uint32_t i = 0; i < n; ++i) lv->elems[i] = pairs[i].second;
+    listPostConstructBarrier(lv);  // Phase D coverage (primAttrValues; PhD-6)
     out.mkList(lv);
 }
 
@@ -1231,6 +1232,7 @@ void primConcatLists(EvalState & state, Value * args, Value & out)
         for (uint32_t j = 0; j < el.asList()->size; ++j)
             result->elems[k++] = el.asList()->elems[j];
     }
+    listPostConstructBarrier(result);  // Phase D coverage (primConcatLists; PhD-6)
     out.mkList(result);
 }
 
@@ -1416,6 +1418,7 @@ void primFilter(EvalState & state, Value * args, Value & out)
     ListVec * result = Alloc::allocList(static_cast<uint32_t>(kept.size()));
     V3_STATS_INC(listsAllocated);
     for (size_t i = 0; i < kept.size(); ++i) result->elems[i] = kept[i];
+    listPostConstructBarrier(result);  // Phase D coverage (primFilter; PhD-6)
     out.mkList(result);
 }
 
@@ -1691,6 +1694,7 @@ void primConcatMap(EvalState & state, Value * args, Value & out)
     ListVec * result = Alloc::allocList(static_cast<uint32_t>(all.size()));
     V3_STATS_INC(listsAllocated);
     for (size_t i = 0; i < all.size(); ++i) result->elems[i] = all[i];
+    listPostConstructBarrier(result);  // Phase D coverage (primConcatMap; PhD-6)
     out.mkList(result);
 }
 
@@ -1721,6 +1725,7 @@ void primPartition(EvalState & state, Value * args, Value & out)
         ListVec * l = Alloc::allocList(static_cast<uint32_t>(v.size()));
         V3_STATS_INC(listsAllocated);
         for (size_t i = 0; i < v.size(); ++i) l->elems[i] = v[i];
+        listPostConstructBarrier(l);  // Phase D coverage (primPartition; PhD-6)
         Value out;
         out.mkList(l);
         return out;
@@ -2152,6 +2157,7 @@ void primCatAttrs(EvalState & state, Value * args, Value & out)
     ListVec * result = Alloc::allocList(static_cast<uint32_t>(kept.size()));
     V3_STATS_INC(listsAllocated);
     for (size_t i = 0; i < kept.size(); ++i) result->elems[i] = kept[i];
+    listPostConstructBarrier(result);  // Phase D coverage (primCatAttrs; PhD-6)
     out.mkList(result);
 }
 
@@ -2870,6 +2876,13 @@ void primZipAttrsWith(EvalState & state, Value * args, Value & out)
         ListVec * vl = Alloc::allocList(static_cast<uint32_t>(vs.size()));
         V3_STATS_INC(listsAllocated);
         for (size_t i = 0; i < vs.size(); ++i) vl->elems[i] = vs[i];
+        // Phase D barrier (PhD-6, 2026-06-15): the lazy entries `vs[i]` are
+        // (typically) nursery thunks, and `vl` is tenured when the nursery was
+        // full at allocList time (nurseryOrArena).  Without this the scavenger
+        // never visits `vl` (it's neither young nor in the remembered set) and
+        // its nursery thunks dangle — the git.drvPath missed-root that blocked
+        // the nursery flip.  Mirrors primMap/primTail/primAttrNames.
+        listPostConstructBarrier(vl);  // Phase D coverage (primZipAttrsWith)
         Value lv;
         lv.mkList(vl);
         // Build name string.
@@ -3289,6 +3302,7 @@ void primGenericClosure(EvalState & state, Value * args, Value & out)
     ListVec * lv = Alloc::allocList(static_cast<uint32_t>(result.size()));
     V3_STATS_INC(listsAllocated);
     for (size_t i = 0; i < result.size(); ++i) lv->elems[i] = result[i];
+    listPostConstructBarrier(lv);  // Phase D coverage (primGenericClosure; PhD-6)
     out.mkList(lv);
 }
 
@@ -3415,6 +3429,7 @@ void primSplit(EvalState & state, Value * args, Value & out)
         ListVec * lv = Alloc::allocList(static_cast<uint32_t>(parts.size()));
         V3_STATS_INC(listsAllocated);
         for (size_t i = 0; i < parts.size(); ++i) lv->elems[i] = parts[i];
+        listPostConstructBarrier(lv);  // Phase D coverage (primSplit; PhD-6) — caps sublists
         out.mkList(lv);
     } catch (const std::regex_error &) {
         // #689 — TW phrasing (mirror of #689 fix in primMatch).
@@ -3837,6 +3852,7 @@ void primGroupBy(EvalState & state, Value * args, Value & out)
         ListVec * lv = Alloc::allocList(static_cast<uint32_t>(items.size()));
         V3_STATS_INC(listsAllocated);
         for (size_t i = 0; i < items.size(); ++i) lv->elems[i] = items[i];
+        listPostConstructBarrier(lv);  // Phase D coverage (primGroupBy; PhD-6) — lazy src elems
         Value lstV;
         lstV.mkList(lv);
         entries.emplace_back(vmIntern(state, name), lstV);
@@ -7853,6 +7869,7 @@ static Value tomlToValue(EvalState & state, const toml::value & t)
         V3_STATS_INC(listsAllocated);
         for (size_t i = 0; i < arr.size(); ++i)
             lv->elems[i] = tomlToValue(state, arr[i]);
+        listPostConstructBarrier(lv);  // Phase D coverage (fromTOML; PhD-6) — nested values
         v.mkList(lv);
         return v;
     }
@@ -8413,6 +8430,7 @@ Value jsonToValue(EvalState & state, const nlohmann::json & j)
         ListVec * lv = Alloc::allocList(static_cast<uint32_t>(j.size()));
         V3_STATS_INC(listsAllocated);
         for (size_t i = 0; i < j.size(); ++i) lv->elems[i] = jsonToValue(state, j[i]);
+        listPostConstructBarrier(lv);  // Phase D coverage (fromJSON; PhD-6) — nested values
         out.mkList(lv);
         return out;
     }
