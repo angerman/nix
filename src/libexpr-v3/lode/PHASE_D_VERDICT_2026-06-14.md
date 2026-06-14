@@ -109,5 +109,56 @@ correct, (b) caught + corrected a contention artifact (the "50-150× slow"),
 the broad BRUTE gate — caught a real missed root that the narrower gates missed,
 correctly blocking a UAF-shipping default-on flip. No flip, no rushed GC change.
 
+## PhD-6 RCA UPDATE (2026-06-14, post-FP-2): the missed root SPLIT INTO TWO
+
+Built a **typed BRUTE scanner** (4b8cf66cc) — `postScavengeBruteScan` now reports
+each live missed-root word's HOLDER CellType + field offset (`[holder=Bindings
+@+48]`) via a typed `ScavLiveRange` carrying the type each `walk*` already knows.
+A same-host-bisect (FP-2a/eca683aa1 vs HEAD) on hello.drvPath under the aggressive
+brute config (1 MB nursery, constant scavenge) then split the "41-words" blocker
+into **two independent phenomena**:
+
+1. **The 43-words `capturedWiths` missed root — FIXED by FP-2b (incidentally).**
+   Pre-FP-2b: BRUTE = **43 tenured words → 1 shared nursery obj** (`0xb0c0a3820`).
+   Post-FP-2b: BRUTE = **0 live**.  FP-2b's corrected withs-slot evac-forward
+   (`thunkSetCapturedWiths(fwdList(w))` + `thunkScanSize` incl. the slot) forwards
+   those references correctly.  So the header-`capturedWiths` field was the
+   41/43-words holder class, and relocating+forwarding it via the FAM tail closed
+   that missed-root class.  (This is *why* FP-2b's `--brute` count was "unchanged
+   at 21/22" — the BRUTE-hit sub-cases flipped to 0-live, but the case still fails
+   on phenomenon #2 below, which short-circuits on `rc!=0` before the BRUTE check.)
+
+2. **`error: undefined variable 'gnuabi64'` — the REAL remaining blocker, distinct
+   and PRE-EXISTING (NOT FP-2b).**  Reproduces at BOTH pre- and post-FP-2b under
+   aggressive scavenge, with **AUDIT clean + BRUTE 0-live (post-FP-2b)**.  It is a
+   *wrong evaluation* (a lost `with`-binding — `gnuabi64` is a free var resolved
+   through a `with abis;`-style scope), NOT a dangling nursery pointer — so BOTH
+   the arena BRUTE scan and the deep-walk AUDIT miss it.  Only under the aggressive
+   1 MB nursery (many scavenges); the DEFAULT-size nursery evaluates hello.drvPath
+   byte-identically.  Scavenge-frequency-dependent = classic missed-root, but of a
+   class the current scanners don't cover.
+
+**Next concrete RCA step for gnuabi64 (first hypothesis already REFUTED):** the
+obvious guess — `vm.withStack`/`vm.valueStack` not forwarded — is WRONG: the
+scavenger DOES forward both (gc.cc:805-806 `visitValue`) and the AUDIT walks both
+(gc.cc:1311-1314), all clean.  So the with-attrset Value on the stack is forwarded
+correctly.  The bug is therefore deeper — candidates, in rough priority:
+  1. **Truncated/stale with-attrset Bindings copy** — the abis Bindings is
+     forwarded but the gnuabi64 ENTRY isn't copied (a `walkBindings`/`fwdBindings`
+     size or entry-loop bug under back-to-back scavenges), so `OP_WITH_LOOKUP`
+     finds the attrset but not the name → "undefined variable."
+  2. **Stale cached lookup after a move** — an inline cache / `attrSelectCache` /
+     memoised with-lookup slot pointing at the pre-move location (the IC walk at
+     gc.cc:679/705 forwards IC'd Bindings, but a with-lookup-specific cache may be
+     uncovered).
+  3. **A with-attrset built in the nursery and forwarded mid-construction** (pushed
+     onto withStack before all entries were written).
+Instrument `OP_WITH_LOOKUP` to dump, on the failing gnuabi64 lookup, the
+with-stack attrsets it searched (count + sizes + whether any was recently
+forwarded), and/or add a post-scavenge check that every withStack attrset's entry
+count is preserved across the copy.  Aggressive-1MB-nursery + hello.drvPath is the
+deterministic repro.  NOTE: FP-2b already closed the capturedWiths missed-root
+class, so gnuabi64 is the SOLE remaining nursery-flip blocker.
+
 *Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>, Input Output
 Group. SPDX-License-Identifier: Apache-2.0.*
