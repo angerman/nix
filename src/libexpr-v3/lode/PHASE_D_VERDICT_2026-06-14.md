@@ -198,18 +198,35 @@ a generational barrier-coverage gap.
    `*slot=` writebacks bypassing it.  So the construction-gap theory is WRONG; do
    NOT add blanket barriers (they're already there).
 
-   **Still OPEN — candidates for the real cause (need targeted instrumentation):**
-   (a) a `standaloneCellRoots` cell pointer that goes STALE when its containing
-   Bindings is itself forwarded (the registry holds raw `Value*` into a movable
-   object — same staleness family as the caches, but for tenured Bindings the
-   pointer should be stable, so check the nursery-Bindings-promoted case);
-   (b) a writeback through a path that computes the wrong `cellContainer`/cell;
-   (c) an entry mutated via the SELECT/chain memoization writeback (L1) without
-   re-barriering.  **Next step: extend the AUDIT (or add a write-path tag) to
-   report HOW the offending entry was last written** — the typed BRUTE scanner
-   gives the holder; an analogous "last-writer" tag on the AUDIT edge would pin
-   the site.  This is the final PhD-6 layer before the nursery-flip 5-gate; it is
-   NOT the trivial barrier-sweep first assumed.
+   **ROOT CAUSE CONFIRMED (the 3rd instance of the same family): the OP_RETURN
+   cell-writeback registers a raw interior cell pointer that goes stale when its
+   Bindings is promoted.**  All three `cellWrite` calls (vm.cc:2814/2834/7411)
+   pass `cellContainer = nullptr`, so for a forced-thunk result the barrier takes
+   the standalone branch — `standaloneCellRoots().push_back(cell)` where `cell =
+   &B.entries[N].value` (barrier.hh:422-423).  Under the MOVING nursery, when B is
+   promoted nursery→tenured, that raw interior pointer is NOT updated (the registry
+   has no back-link to B), so it dangles at B's old (from-space) address; the
+   scavenge walks the stale cell, while the real promoted `B'.entries[N].value`
+   still holds the un-forwarded nursery Closure/ListVec → the AUDIT hit.  Evidence:
+   (1) all construction is barriered via the move-safe DirtyKind::Bindings path, so
+   only the writeback path is exposed; (2) the AUDIT values are Closure/ListVec =
+   forced results written by OP_RETURN, not thunks from construction; (3) it only
+   bites under a moving collector (raw cells are stable under the non-moving
+   major-GC default, where this code is correct).  This is a moving-GC consequence
+   of **M-8** (CODEBASE_REVIEW_2026-06-11), which dropped `Thunk::cellContainer`
+   (barrier.hh:14 — "so OP_RETURN's cell-write can find its containing Bindings")
+   to shrink the thunk header, replacing the move-safe container-dirty-list with
+   the move-unsafe raw-cell registry.  Same family as fixes #1/#2: scavenge-unaware
+   raw pointers under a moving collector.
+
+   **FIX OPTIONS (real GC work, careful):** (a) keep the cell-start bitmap
+   maintained under the nursery so `cellWrite` can derive the container and
+   dirty-list it (move-safe; the verdict's standing suggestion); (b) register
+   `(Bindings*, idx)` instead of the raw cell, so promotion forwards the Bindings
+   and the idx stays valid; (c) have the scavenger, when it forwards a from-space
+   object, rewrite any `standaloneCellRoots` entries whose address falls in that
+   object's old range to the new location (interior-pointer fixup via the existing
+   forward map).  This is the FINAL PhD-6 layer before the nursery-flip 5-gate.
 
 *Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>, Input Output
 Group. SPDX-License-Identifier: Apache-2.0.*
