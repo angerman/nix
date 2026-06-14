@@ -36,6 +36,7 @@ materialize-removal (total materialize = 72MB) — it's the eval heap (→ works
 | WS-A.3 chain-SELECT **L1 + provenance assert** | **SHIPPED (gated)** | `e890e3502` | `NIX_V3_CHAIN_LOOKUP_SELECT`; 06-07 5/5, lang 143, core 21/21 gate-on, **provenance 0 violations** (C-1 refuted), aggressive-GC clean |
 | L1 darwin-4 formal RSS bar (QG-2) | **MEASURED → gated** | `136b35883` | firefox −33.6MB arena / −29MB maxRSS, byte-identical, CPU-neutral — **below −40MB revert floor** → not default-on |
 | broader lookup-without-materialize | **SCOPED → RETIRED** | `878d6a190` | total materialize 72MB firefox / 40MB hello < 80MB bar → unreachable; **pivot to eval heap** |
+| workstream H sizing (upvalue-dup probe) | **SIZED → small** | `f9dd326b5` | firefox 30MB upvalue-tail / **12MB recoverable**; thunk tax is the 40B HEADER (75MB ff), not upvalues → H NOT the firefox lever. M5 unsizable under probe. |
 
 ## Gated artifacts left in place (reproduce any number / guard regressions)
 - Regression canaries: `test/run-chain-select-0607-failure-set.sh`, `test/run-1.7-apply-overrides-tests.sh` (in core suite)
@@ -43,12 +44,16 @@ materialize-removal (total materialize = 72MB) — it's the eval heap (→ works
 - Measurement gates (default-off): `V3_DBG_SHARED_WB` (provenance + shared-WB counter), `V3_DBG_MAT_SITES` (per-caller materialize attribution), the `markMs`/`mark-split` stats, `NIX_V3_CHAIN_LOOKUP_SELECT` (L1)
 
 ## Open / next direction
-**Pivot to workstream H — shared capture frames** (the representation tax; firefox
-~1M thunks + ~1M pairs; M5 = 928MB thunks). Measure-twice first step: a gated
-captured-upvalue-duplication histogram across sibling thunks to size the
-recoverable fraction before the write-barrier/shared-frame work. Secondary:
-workstream E (GC reclaim of the 224MB scattered dead — but mark cache-bound +
-multi-week). L1 default-on remains pending a recalibrated bar / broader removal.
+**No cheap firefox RSS lever remains** — both candidates measured small: broader-A
+≤72MB (mostly a cap trade), workstream H ≤30MB (the thunk tax is the 40B-per-thunk
+HEADER, ~75MB firefox / ~680MB M5, which capture-sharing can't touch). The firefox
+RSS is the live eval heap: the **224MB scattered dead** (workstream E — GC reclaim,
+but the mark is cache-bound §1.8 + depth>0 GC is multi-week) plus the thunk header
+(a deeper representation change). Honest options going forward: **E** (multi-week),
+a **thunk-header-shrink** investigation, or accepting firefox RSS and pursuing CPU
+(workstream C — dispatch). M5/cardano H sizing needs a sampling-probe variant
+(the per-thunk map can't survive 17M thunks). L1 default-on pending a recalibrated
+bar. Gated sizing tools left in place: `V3_DBG_MAT_SITES`, `V3_DBG_UPVAL_DUP`.
 
 *Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>, Input Output
 Group. SPDX-License-Identifier: Apache-2.0.*

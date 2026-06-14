@@ -69,11 +69,41 @@ broader-A stays retired (≤72 MB ceiling, mostly a cap trade). L1 remains the
 shipped, gated, validated chain-SELECT machinery (its standing value is the C-1
 falsification, not RSS).
 
-## Instrument left in place
-`V3_DBG_MAT_SITES=1` (gated, default-off) — per-caller materialize-volume
-attribution via `__builtin_return_address` + `dladdr`, dumped atexit. Reusable
-for the same attribution on any workload; retire when the materialize machinery
-is reworked.
+## H sizing result (2026-06-14, V3_DBG_UPVAL_DUP, commit f9dd326b5)
+
+The upvalue-duplication probe ran — and **H is NOT the firefox RSS lever either**:
+
+| workload | thunks-w/up | upvalue-tail bytes | recoverable (identical-tuple dedup) |
+|---|---|---|---|
+| hello.drvPath | 445,673 | 7.1 MB | 2.7 MB (38.6%) |
+| firefox.drvPath | 1,880,010 | 30.0 MB | **12.1 MB** (40.2%) |
+
+Recoverable UPPER bound = the *total* upvalue-tail volume = **30 MB firefox**
+(realistically 12 MB via identical-tuple dedup; broader subset-Env sharing can't
+exceed 30 MB). Far below the −80 MB bar. Reason: the thunk RSS is dominated by the
+per-thunk **HEADER** (40 B × 1.88 M ≈ **75 MB firefox** / ~680 MB M5; already
+minimised to 40 B per the M-8 review — `state`+`nUpvalues`+`forces`+`cell`+ the
+24 B suspended union), which capture-frame sharing does NOT touch. Kills "the
+thunk representation tax is mostly recoverable upvalues."
+
+M5 (H's original motivation — 17 M thunks) **could not be sized under the probe**:
+the cardano eval now exceeds 80 s wall (cold eval-cache) and the per-thunk map
+over 17 M entries compounds it; the one completed run reached only getFlake's
+flake-input loading (1431 thunks) — INVALID. A valid M5 sizing needs a
+sampling/streaming probe variant — a follow-up only if cardano RSS is prioritised.
+
+**Net verdict.** No cheap RSS lever remains for firefox: broader-A ≤72 MB (mostly
+a cap trade), H ≤30 MB (header-dominated tax it can't touch). firefox RSS is the
+live eval heap — the 224 MB scattered dead (workstream E / GC reclaim, mark
+cache-bound §1.8 + multi-week) plus the 40 B/thunk header (a deeper representation
+change). Honest options: E (multi-week) or a thunk-header shrink investigation,
+NOT capture sharing.
+
+## Instruments left in place (gated, default-off)
+- `V3_DBG_MAT_SITES=1` — per-caller materialize-volume attribution
+  (`__builtin_return_address`+`dladdr`, atexit). Reusable on any workload.
+- `V3_DBG_UPVAL_DUP=1` — per-thunk capture-tuple dedup sizing (the H probe).
+  Both retire when their machinery is reworked.
 
 *Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>, Input Output
 Group. SPDX-License-Identifier: Apache-2.0.*
