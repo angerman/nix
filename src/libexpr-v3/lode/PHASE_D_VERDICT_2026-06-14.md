@@ -160,6 +160,35 @@ count is preserved across the copy.  Aggressive-1MB-nursery + hello.drvPath is t
 deterministic repro.  NOTE: FP-2b already closed the capturedWiths missed-root
 class, so gnuabi64 is the SOLE remaining nursery-flip blocker.
 
+## PhD-6 RESOLVED — all 3 classes FIXED; flip unblocked but RSS payoff reframed (2026-06-14)
+
+**Correctness (the campaign-long blocker): RESOLVED.** All three missed-root
+classes are fixed (be3b9bae9 capturedWiths cache / gnuabi64; ebba1a684 materialize
+memo; d361886a7 raw forced-result writebacks).  The nursery is now **`--brute`
+CLEAN**: full `all-v3-tests --brute` = 21/22, the sole failure being `brute-audit`
+whose only failing sub-case is a STALE TEST GOLDEN (firefox-name want=150.0.3 vs
+nixpkgs's current 151.0.4 — a version-drift to refresh, NOT a missed root).
+hello.drvPath under the aggressive 1 MB nursery: 0 AUDIT hits (was 3), 0 BRUTE
+live, gnuabi64-free, drvPath byte-identical.  Byte-identical under the major-GC
+default everywhere (06-07 canary 5/5, core 21/21).
+
+**BUT the flip's RSS payoff is REFRAMED (honest correction to this doc's earlier
+"caps RSS cheaply" framing).** Quick check, firefox.drvPath, now-correct:
+major-GC default peak_rss **618 MB** vs nursery **820 MB (+202 MB WORSE)**; arena
+identical (453), drvPath byte-identical.  Mechanism: the nursery scavenges only
+YOUNG churn; under it the major GC is OFF (M-3), so the **224 MB *tenured*
+stranded dead is NOT reclaimed**, and the Cheney semispace adds overhead.  On a
+single-pass drvPath eval (where major-GC fires once near the end and reclaims),
+the nursery LOSES that reclaim → higher peak.  So: **the nursery is a CPU lever
+(avoid the cache-bound major mark on mark-heavy repeated workloads — the Phase D
+−19/−53/−42 % numbers), NOT a peak-RSS lever; the Layer-C 224 MB tenured-dead
+reclaim needs a GENERATIONAL MAJOR collection (mark the tenured set) ON TOP of the
+nursery — the nursery alone is necessary infra but not sufficient for that win.**
+Flipping default-on is therefore a workload-dependent cost/benefit decision (now
+that it's SAFE), needing: re-measured HNE/M5 CPU wins + nursery-size tuning +
+the firefox RSS regression understood/accepted or a generational major pass added.
+NOT auto-flipped.
+
 ## PhD-6 RCA RESOLVED to 3 missed-root CLASSES (2026-06-14, continued)
 
 The nursery's missed roots are THREE distinct classes — two now FIXED, one
