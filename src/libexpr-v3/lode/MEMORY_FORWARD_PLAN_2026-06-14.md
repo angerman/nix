@@ -74,11 +74,35 @@ pre-FP-2b baseline: BRUTE hits are the pre-existing PhD-6 family (hello-drvPath/
 outPath, gcc-name) + a stale firefox golden (150.0.3 vs 151.0.4), none
 withs-related → FP-2b added NO new missed root.  V3_DBG_THUNK_WITHS probe retired.
 
-### FP-3 — pair tax (ValuePair 32 B) — investigate, reconcile first
-~16 MB firefox. BUT "ValuePair 24/32 split" is on the plan's do-not-repropose list.
-Re-examine *why* it was retired: if the killer was the mis-shaped single-lever bar,
-it now stacks (split App=24 B `{left,right,evaluated}` / App3=32 B). If it was a real
-aliasing/`s_matMemo` hazard, leave retired. Reconcile before any code.
+### FP-3 — pair tax (ValuePair 32 B) — INVESTIGATED; split stays RETIRED, tax is large but foundational
+**Reconcile (the question this step posed): the 24/32 split was retired for a
+THIRD reason neither anticipated — the 16 B alloc-rounding wall, NOT the
+mis-shaped bar and NOT an aliasing hazard** (commit 38c263bdb): `alloc(24)` rounds
+up to a full 32 B cell, byte-for-byte identical to `alloc(32)`, so the split saves
+ZERO.  The FP-0 cumulative-bar reframe does **not** revive it — there is no byte to
+bank.  (Contrast FP-2: the thunk removed *two* 8 B fields = a full 16 B granule, so
+it crossed; the pair has only *one* removable field `third`, so 32→24 rounds back.)
+**Stays retired.**
+
+**Sizing (measured, live per-tag arena): the pair tax is LARGE — firefox 45.85 MB
+(10.5 % of 436 MB), M5 253.52 MB (13.7 % of 1845 MB).**  So it is worth a future
+foundational sprint, just not a cheap lever.  Two paths, both foundational:
+- **8 B-granular allocator** (kAlign 16→8, double the cellStarts/cellTypes
+  bitmaps): unlocks the original split (App = 24 B `{left,right,evaluated}`, drop
+  only `third`) → ~8 B / 2-arg pair ≈ **~63 MB M5** / ~11 MB firefox.  Lower
+  semantic risk (keeps the App memo) but a real allocator change; benefits other
+  sub-16 B cases too.
+- **ValuePair 32→16 B `{left,right}`** (drop BOTH `evaluated` AND `third` to cross
+  the boundary): ~**127 MB M5** / ~23 MB firefox — but `evaluated` is the
+  load-bearing App-result memo (vm.cc:12243; App self-memoization), so removing it
+  needs the memo relocated (e.g. cell-update like thunks) — drv-hash-critical and
+  the higher-risk path.
+
+**Recommendation: keep the split retired; propose the pair tax as a FUTURE
+foundational item (8 B-granular allocator preferred — lower risk), sequenced AFTER
+FP-4** (the nursery is the bigger Layer-C win and shares no surface).  No code this
+step — the reconcile + sizing is the deliverable (Rule 0: kills "FP-0 revives the
+split").
 
 ### FP-4 — generational nursery (the strategic Layer-C lever; multi-week; ⚠)
 The ONLY path to beating TW on derivations (reclaim the 224 MB dead mid-eval — the
