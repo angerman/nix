@@ -32,17 +32,52 @@ confirmed), byte-identical, CPU-neutral; validated (06-07 canary 5/5, lang 143, 
 21/21 gate-on, provenance 0, aggressive-GC clean). Re-confirm byte-identity + core
 after the default flip. ½ day. → banks −33 MB.
 
-### FP-2 — thunk-header shrink 40 → 24 B (the M5 lever; ~1 wk; ⚠ drv-hash-critical)
-Code-verified removable (vm.cc:8143/13657, closure.hh:156/195):
-- add `const CompilationUnit* cu` to `LambdaDescriptor` (set at CU build) → drop
-  `Thunk::suspended.cu`; read sites already fall back to the frame cu.
-- side-table `capturedWiths` gated on `desc.nWithTargets>0` → drop the field
-  (null for the common no-`with` thunk).
-−16 B/thunk. firefox ~−16 MB live / −33 MB churn; **M5 4.9 M thunks → ~−78 MB live /
-−272 MB churn** — the M5 lever the H-probe missed (it measured tuple dedup, not field
-removability). Gates: full byte-identity (06-07 + 7 rows + lang 143 + core 21) +
-update the GC mark + scavenger `walkThunk` + `barrier.hh` to derive `cu` from `desc`
-and walk the side-tabled withs + brute scanner clean.
+### FP-2 — thunk-header shrink 40 → 24 B (the M5 lever; ⚠ drv-hash + GC-critical)
+Two stages; each removes 8 B from the suspended union. **Arena rounds allocs to
+16 B** (`(bytes+15)&~15`, cell-bitmap depends on it), so removing 8 B changes the
+*allocated* size only when it crosses a 16 B boundary: the full 16 B (40→24) gives
+null-withs thunks a clean 16 B, but split into 8 B stages each helps half the
+population by `nUp` parity.
+
+**FP-2a — drop `suspended.cu` — SHIPPED (56968f897).** A suspended thunk's CU is
+its descriptor's owning CU: OP_MAKE_THUNK is the SOLE creator (vm.cc:4773/4777 =
+only `allocThunkSuspended` caller + only `suspended.desc=` writer) and sets
+`desc=&cu->lambdas[i]`, so `desc->cu` is well-defined and equals the stored `cu`.
+Added a transient (NOT-serialized) `mutable cu` backpointer to `LambdaDescriptor`,
+set idempotently at MAKE; read via `thunkCU(t)`. Byte-identical by construction;
+canary 5/5 + core 21/21 + `static_assert(sizeof(Thunk)==32)`. Header 40→32. NB:
+ABI change → rebuild ALL v3 test binaries (a stale v3-smoke gave a false 20/21).
+Arena unchanged on firefox (469.8) — banked the even-`nUp` half, masked by peak.
+
+**FP-2b — relocate `capturedWiths` to the FAM tail — GREENLIT, NOT YET DONE
+(eca683aa1 sized it).** The reviewer's "gate on `nWithTargets>0`" was imprecise —
+the snapshot fallback makes `capturedWiths` non-null whenever a `with` is active.
+Measured the real gate (V3_DBG_THUNK_WITHS, = `capturedWiths==null`): firefox
+74.1 % of 2.05 M (marginal 11.6 MB, but firefox arena PEAK unmoved at FP-2a → its
+thunks are CHURN, NOT a firefox-peak lever); **M5 97.1 % of 17.1 M → marginal
+141 MB; M5 arena 2013.3 vs the 2147.5 pin (−134 MB ≈ FP-2a's 128 MB even-`nUp`)
+→ M5 peak IS thunk-bound, so FP-2b's 141 MB is expected to materialize.** FP-2 is
+an M5/large-resident-closure lever, not firefox.
+
+Turnkey FP-2b design (UAF-prone GC surgery — do with fresh attention):
+- Remove `capturedWiths` from the union → `{desc}` = 8 B → header **24 B**
+  (`static_assert` → `==24`).
+- Gate `willHaveWiths = (nWiths>0) || (withStack.size() > frame.withStackBase)`
+  — computable BEFORE alloc and EXACTLY predicts `capturedWiths!=null`
+  (`snapshotCurrentWiths` is null iff `top<=base`). 97 %/74 % are false.
+- Reserve ONE extra tail slot iff `willHaveWiths` (`allocThunkSuspended(nUp,
+  willHaveWiths)`); store the `ListVec*` RAW (not a NaN-boxed Value) at
+  `tail[nUpvalues]`; record the bit in the spare `_pad0` byte (→ `hasWithsSlot`).
+- Accessors `thunkCapturedWiths(t)` (read, null if `!hasWithsSlot`) +
+  `thunkSetCapturedWiths(t,w)` (write, for evac forward).
+- ~30 `suspended.capturedWiths` sites: MAKE writes (vm.cc:4904/4910/4916)→slot;
+  fakeClo reads (8148/13666); GC read+FORWARD (gc.cc:687-688/737-738 = the UAF
+  surface), brute (1205/1228); mark_sweep (585/1312/1778); live_trace
+  (281/801/1692); barrier.hh:325; alloc.hh:2585 init drops.
+- Gates: full byte-identity (06-07 + 7 rows + lang 143 + core 21, rebuild ALL
+  binaries) + `--brute` clean under the nursery (the forward sites are the
+  missed-root surface) + measure the M5 arena to confirm peak realization (the
+  firefox caveat: cumulative≠peak). Then delete the V3_DBG_THUNK_WITHS probe.
 
 ### FP-3 — pair tax (ValuePair 32 B) — investigate, reconcile first
 ~16 MB firefox. BUT "ValuePair 24/32 split" is on the plan's do-not-repropose list.
