@@ -506,6 +506,67 @@ inline void dump()
 }
 } // namespace upvaldup
 
+// ── FP-2b sizing probe (V3_DBG_THUNK_WITHS, default-off) ─────────────────────
+// Sizes the *marginal* RSS win of FP-2b (relocate capturedWiths to the FAM tail,
+// kept only when the thunk actually carries withs).  Arena rounds every alloc up
+// to 16 B (alloc.hh: (bytes+15)&~15), so removing 8 B from the header changes the
+// ALLOCATED size only when it crosses a 16 B boundary.  FP-2a (shipped) already
+// took the header 40→32 B and banked the win for EVEN-nUp thunks; FP-2b takes
+// null-withs thunks to a 24 B header (8 B smaller still), which crosses a 16 B
+// boundary — and thus saves a further 16 B — only for null-withs thunks with ODD
+// nUp.  Thunks that carry withs keep a tail slot (net 0).  This probe tallies, at
+// OP_MAKE_THUNK, every suspended thunk by (nUp, capturedWiths==null), and at exit
+// reports the three projected savings (combined FP-2, already-banked FP-2a, and
+// the FP-2b marginal) so the FP-2b keep/revert decision is data-driven instead of
+// rounding-guesswork.  Retirement: DELETE after the FP-2b decision lands (this is
+// a one-shot sizing measurement, not a permanent gate).
+static const bool g_dbgThunkWiths = std::getenv("V3_DBG_THUNK_WITHS") != nullptr;
+
+namespace thunkwiths {
+// Index 0..3 = nUp; index 4 = nUp>=4.  [.][0]=withs-null, [.][1]=withs-present.
+inline uint64_t (&buckets())[5][2] { static uint64_t b[5][2] = {}; return b; }
+inline bool & atexitRegistered() { static bool r = false; return r; }
+inline void dump()
+{
+    uint64_t total = 0, nullW = 0, evenNup = 0, nullOddNup = 0;
+    auto (&b)[5][2] = buckets();
+    for (int n = 0; n < 5; ++n) {
+        const uint64_t nn = b[n][0], pp = b[n][1], row = nn + pp;
+        total += row; nullW += nn;
+        // For the saving model, treat the nUp>=4 bucket by its parity at n==4
+        // (even); odd-nUp thunks with nUp>=5 land in this bucket too, so the
+        // FP-2b-marginal estimate from this bucket is a (slight) LOWER BOUND.
+        const bool even = (n % 2) == 0 || n == 4;
+        if (even) evenNup += row; else nullOddNup += nn;
+    }
+    const double combinedMB   = nullW      * 16.0 / 1e6;  // 16 B clean per null-withs thunk
+    const double fp2aBankedMB = evenNup    * 16.0 / 1e6;  // FP-2a already (even-nUp, any withs)
+    const double fp2bMargMB   = nullOddNup * 16.0 / 1e6;  // FP-2b adds (null-withs, odd-nUp)
+    std::fprintf(stderr,
+        "v3 thunk-withs (FP-2b sizing): suspended-thunks=%llu  withs-null=%llu (%.1f%%)\n"
+        "  projected COMBINED FP-2 saving (vs orig 40B) = %.1f MB (16 B x null-withs)\n"
+        "  of which FP-2a already banked (16 B x even-nUp, any withs)  = %.1f MB\n"
+        "  FP-2b MARGINAL (16 B x null-withs & odd-nUp)                = %.1f MB\n",
+        (unsigned long long)total, (unsigned long long)nullW,
+        total ? 100.0 * nullW / total : 0.0, combinedMB, fp2aBankedMB, fp2bMargMB);
+    std::fprintf(stderr, "  per-nUp [nUp: null / present]:");
+    for (int n = 0; n < 5; ++n)
+        std::fprintf(stderr, "  %s%d:%llu/%llu", n == 4 ? ">=" : "", n,
+            (unsigned long long)b[n][0], (unsigned long long)b[n][1]);
+    std::fprintf(stderr, "\n");
+}
+} // namespace thunkwiths
+
+[[gnu::noinline]] static void recordThunkWiths(uint16_t nUp, bool withsNull)
+{
+    const int n = nUp >= 4 ? 4 : nUp;
+    thunkwiths::buckets()[n][withsNull ? 0 : 1] += 1;
+    if (!thunkwiths::atexitRegistered()) {
+        thunkwiths::atexitRegistered() = true;
+        std::atexit([] { thunkwiths::dump(); });
+    }
+}
+
 // #733 (2026-05-21) hot-path stat-counter gate.  The per-descriptor
 // allocCount/forceCount + global thunksForced/thunksAllocated/
 // bridgeThunksForced increments live on the hottest paths in the
@@ -4920,6 +4981,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 // make-paths (see OP_MAKE_CLOSURE comment).
                 t->suspended.capturedWiths = snapshotCurrentWiths(vm);
             }
+            if (__builtin_expect(g_dbgThunkWiths, 0))
+                recordThunkWiths(nUp, t->suspended.capturedWiths == nullptr);  // FP-2b sizing
             // #498: trace MK_THUNK for thunks named "res" with nUp=4
             // (the all-packages.nix `let res = ...` thunk) and dump
             // captured upvalues to identify which freeVars[1] is.
