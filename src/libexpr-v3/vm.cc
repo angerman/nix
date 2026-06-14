@@ -853,14 +853,20 @@ inline bool valueEqual(VMState & vm, Value a0, Value b0, bool insideContainer0 =
                                  || at == Tag::App || at == Tag::App3
                                  || at == Tag::Slot, 0)) {
                 a = forceValue(vm, a);
-                if (t.aSlot) *t.aSlot = a;  // C-16: A12 memoization writeback
+                // PhD-6: barrier this writeback. t.aSlot points into the compared
+                // container (e.g. &Bindings.entries[i].value, tenured); the forced
+                // `a` can be a nursery Closure/ListVec, so a raw `*t.aSlot = a`
+                // creates an unbarriered tenured→nursery edge the scavenger misses
+                // (the confirmed class-3 missed root).  cellWrite registers the
+                // standalone cell under the nursery; no-op-cost under major-GC.
+                if (t.aSlot) cellWrite(t.aSlot, a, nullptr);  // was *t.aSlot = a
             }
             Tag bt = b.tag();
             if (__builtin_expect(bt == Tag::Thunk
                                  || bt == Tag::App || bt == Tag::App3
                                  || bt == Tag::Slot, 0)) {
                 b = forceValue(vm, b);
-                if (t.bSlot) *t.bSlot = b;  // C-16: A12 memoization writeback
+                if (t.bSlot) cellWrite(t.bSlot, b, nullptr);  // PhD-6: was *t.bSlot = b (see aSlot)
             }
         }
         if (a.tag() != b.tag()) {
@@ -5684,7 +5690,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     // returns whatever `f` returns (could be a thunk if f
                     // is lazy).  Eager force here can drive a Tag::Slot
                     // chase through the as-yet-uninitialised slot.
-                    *slotStorage = res;
+                    cellWrite(slotStorage, res, nullptr);  // PhD-6: barrier raw writeback
                     push(vm, res);
                     break;
                 }
@@ -10086,7 +10092,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     "v3 OP_REC_SLOT_PUBLISH: top of stack is not Tag::Attrs");
             }
             Value * heapSlot = Alloc::allocValue();
-            *heapSlot = top;
+            cellWrite(heapSlot, top, nullptr);  // PhD-6: barrier raw fresh-cell init
             Value slotRef;
             slotRef.mkSlot(heapSlot);
             push(vm, slotRef);
@@ -10126,7 +10132,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // thunk's OP_RETURN cell-update will overwrite it with
             // the evaluated value.
             Value * cell = Alloc::allocValue();
-            *cell = top;
+            cellWrite(cell, top, nullptr);  // PhD-6: barrier raw fresh-cell init
             // Attach cell to the thunk so OP_RETURN's CFF_THUNK_RETURN
             // handler at vm.cc:3003 fires `*cell = retVal`.  Only
             // attach if the thunk is fresh (Suspended with no cell
@@ -13819,7 +13825,7 @@ Value forceValue(VMState & vm, Value v)
     // already excludes Blackhole; this matches it (the inconsistency the
     // review flagged).
     if (memoSlot && v.tag() != Tag::Slot && v.tag() != Tag::Blackhole)
-        *memoSlot = v;
+        cellWrite(memoSlot, v, nullptr);  // PhD-6: barrier raw withLookup memo writeback
     // #558 Phase 4 follow-up: path compression writeback.  Only write
     // back when v is a stable WHNF — never vBlackhole (the cross-stack
     // deferred-value marker, which is transient and shouldn't be
@@ -14134,7 +14140,7 @@ Value callClosure(VMState & vm, Value fun, Value arg)
                 Value slotV;
                 slotV.mkSlot(slotStorage);
                 Value res = callClosure(vm, arg, slotV);
-                *slotStorage = res;
+                cellWrite(slotStorage, res, nullptr);  // PhD-6: barrier raw writeback
                 return res;
             }
         }
