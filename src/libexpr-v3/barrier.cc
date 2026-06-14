@@ -19,6 +19,7 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <unordered_map>
 
 namespace nix::v3 {
 
@@ -48,6 +49,11 @@ thread_local std::vector<Value *> tl_standaloneCells;
 /// the same lambda reads a stale cached pointer.
 thread_local std::vector<Closure **> tl_singletonClosureRegistry;
 
+// PhD-6 last-writer instrument (gated): cell address -> the barrier setter that
+// last wrote it.  Consulted by the post-scavenge AUDIT to report HOW an offending
+// Bindings entry was last written (pins the missed-root write path vs reasoning).
+thread_local std::unordered_map<const void *, const char *> tl_cellWriteSite;
+
 } // anonymous
 
 std::vector<DirtyEntry> & dirtyContainers() noexcept
@@ -63,6 +69,21 @@ std::vector<Value *> & standaloneCellRoots() noexcept
 std::vector<Closure **> & singletonClosureRegistry() noexcept
 {
     return tl_singletonClosureRegistry;
+}
+
+// PhD-6 last-writer instrument: storage accessor + gate (on under the AUDIT
+// config so it's free in production).  The map keys on cell addresses; under the
+// moving nursery nursery-cell keys churn (stale), but the AUDIT-hit cells are
+// TENURED (stable addresses), so the lookup is valid for the failing edges.
+std::unordered_map<const void *, const char *> & cellWriteSiteMap() noexcept
+{
+    return tl_cellWriteSite;
+}
+namespace detail {
+const bool g_dbgCellWriteSite = [] {
+    const char * v = std::getenv("V3_DBG_NURSERY_AUDIT");
+    return v != nullptr && v[0] != '\0' && v[0] != '0';
+}();
 }
 
 // #767 (2026-05-22): exposed as a namespace-scope `const bool` so

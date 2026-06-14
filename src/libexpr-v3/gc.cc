@@ -1236,10 +1236,19 @@ struct Auditor {
         for (uint32_t i = 0; i < b->size; ++i) {
             // Build a per-entry site string so the audit message
             // identifies which Bindings + which entry + origin.
-            char ebuf[160];
+            // PhD-6: append the last-writer (gated) so a missed-root entry
+            // names the barrier setter that last wrote it + whether it dirtied.
+            const char * lastWriter = "?";
+            if (__builtin_expect(dbgCellWriteSite(), 0)) {
+                auto & m = cellWriteSiteMap();
+                auto it = m.find(&b->entries[i].value);
+                lastWriter = (it != m.end()) ? it->second
+                                             : "(no-recorded-writer=raw/bulk-path)";
+            }
+            char ebuf[224];
             std::snprintf(ebuf, sizeof(ebuf),
-                "Bindings(%p)[%s].entries[%u].value",
-                (const void *)b, originSrc, i);
+                "Bindings(%p)[%s].entries[%u].value lastWriter=%s",
+                (const void *)b, originSrc, i, lastWriter);
             visitValue(b->entries[i].value, ebuf);
         }
     }

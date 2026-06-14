@@ -48,6 +48,7 @@
 
 #include <cstdint>
 #include <vector>
+#include <unordered_map>
 
 namespace nix::v3 {
 
@@ -95,6 +96,18 @@ std::vector<Value *> & standaloneCellRoots() noexcept;
 /// Mark phase walks this to keep cached singleton closures alive
 /// across arena sweeps.
 std::vector<Closure **> & singletonClosureRegistry() noexcept;
+
+// PhD-6 last-writer instrument (gated on V3_DBG_NURSERY_AUDIT via
+// detail::g_dbgCellWriteSite).  Maps a cell address to a string naming the
+// barrier setter that last wrote it AND whether the inter-gen branch fired.
+// Consulted by the post-scavenge AUDIT to report HOW an offending Bindings
+// entry was last written — pins the missed-root write path instead of reasoning.
+std::unordered_map<const void *, const char *> & cellWriteSiteMap() noexcept;
+namespace detail { extern const bool g_dbgCellWriteSite; }
+[[gnu::always_inline]] inline bool dbgCellWriteSite() noexcept
+{
+    return detail::g_dbgCellWriteSite;
+}
 
 // ---------------------------------------------------------------------------
 // Fast-path gate
@@ -192,8 +205,12 @@ bindingsSetValue(Bindings * b, uint32_t i, Value v) noexcept
         // Bindings are always tenured today (`Alloc::allocBindings`
         // calls threadArena() directly), so the `!n.contains(b)`
         // check is a defensive doublecheck — cheap.
-        if (!n.contains(b) && isNurseryPayload(v, n))
+        const bool inter = !n.contains(b) && isNurseryPayload(v, n);
+        if (inter)
             dirtyContainers().push_back({DirtyKind::Bindings, b});
+        if (__builtin_expect(dbgCellWriteSite(), 0))  // PhD-6 last-writer
+            cellWriteSiteMap()[&b->entries[i].value] =
+                inter ? "bindingsSetValue[dirtied]" : "bindingsSetValue[no-dirty]";
     }
 }
 
@@ -208,8 +225,12 @@ bindingsSetEntry(Bindings * b, uint32_t i, Bindings::Entry e) noexcept
     b->entries[i] = e;
     if (__builtin_expect(phaseDActive(), 0)) [[unlikely]] {
         const Nursery & n = threadNursery();
-        if (!n.contains(b) && isNurseryPayload(e.value, n))
+        const bool inter = !n.contains(b) && isNurseryPayload(e.value, n);
+        if (inter)
             dirtyContainers().push_back({DirtyKind::Bindings, b});
+        if (__builtin_expect(dbgCellWriteSite(), 0))  // PhD-6 last-writer
+            cellWriteSiteMap()[&b->entries[i].value] =
+                inter ? "bindingsSetEntry[dirtied]" : "bindingsSetEntry[no-dirty]";
     }
 }
 
@@ -416,12 +437,18 @@ cellWrite(Value * cell, Value v, Bindings * cellContainer) noexcept
     *cell = v;
     if (__builtin_expect(phaseDActive(), 0)) [[unlikely]] {
         const Nursery & n = threadNursery();
-        if (isNurseryPayload(v, n)) {
+        const bool np = isNurseryPayload(v, n);
+        if (np) {
             if (cellContainer && !n.contains(cellContainer))
                 dirtyContainers().push_back({DirtyKind::Bindings, cellContainer});
             else if (!cellContainer)
                 standaloneCellRoots().push_back(cell);
         }
+        if (__builtin_expect(dbgCellWriteSite(), 0))  // PhD-6 last-writer
+            cellWriteSiteMap()[cell] =
+                !np            ? "cellWrite[not-nursery]"
+              : cellContainer  ? "cellWrite[dirtied-container]"
+                               : "cellWrite[standalone-reg]";
     }
 }
 
