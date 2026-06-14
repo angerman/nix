@@ -225,7 +225,7 @@ run_case_nix "hello-name"     "hello-2.12.3"               '(import <nixpkgs> { 
 run_case_nix "hello-drvPath"  "hello-2.12.3.drv"           '(import <nixpkgs> { }).hello.drvPath'
 run_case_nix "hello-outPath"  "hello-2.12.3"               '(import <nixpkgs> { }).hello.outPath'
 run_case_nix "gcc-name"       "gcc-wrapper"                '(import <nixpkgs> { }).gcc.name'
-run_case_nix "firefox-name"   "firefox-150.0.3"            '(import <nixpkgs> { }).firefox.name'
+run_case_nix "firefox-name"   "firefox-151.0.4"            '(import <nixpkgs> { }).firefox.name'
 
 echo
 echo "=== brute-audit: ok=$PASS fail=$FAIL ==="
