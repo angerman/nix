@@ -101,9 +101,13 @@ const bool g_dbgCellWriteSite = [] {
 // diagnostic correctness (BRUTE+AUDIT distinguish LIVE vs DEAD);
 // gating on _SCAVENGE would silently lose dirty-list entries.
 namespace detail {
+// FLIP (2026-06-15): nursery default-ON.  Phase D barriers are active by
+// default; disabled ONLY when the nursery is explicitly opted out
+// (NIX_V3_NURSERY=0).  RETIREMENT: drop the opt-out branch once default-on
+// soaks across a release.
 const bool g_phaseDActive = [] {
     const char * v = std::getenv("NIX_V3_NURSERY");
-    return v != nullptr && v[0] != '\0' && v[0] != '0';
+    return v == nullptr || (v[0] != '\0' && v[0] != '0');
 }();
 }
 

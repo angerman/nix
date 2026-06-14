@@ -977,9 +977,20 @@ inline const bool g_majorGcEnabled =
     // M-3 (CODEBASE_REVIEW_2026-06-11): the major-GC marker ignores
     // nursery-resident cells (tryMark → inActive() false → their out-edges are
     // never walked), so an arena cell reachable ONLY through a nursery cell
-    // would be swept — a use-after-free.  Until the nursery is integrated with
-    // the major mark phase, hard-disable major GC whenever the nursery is on.
-    && std::getenv("NIX_V3_NURSERY") == nullptr;
+    // would be swept — a use-after-free.  Under the nursery, the gen-major
+    // Shape A safepoint (vm.cc) replaces this per-op major (it forceScavenges
+    // the nursery EMPTY before marking — M-3-safe).
+    //
+    // FLIP (2026-06-15): nursery is default-ON, so per-op major-GC is
+    // default-OFF.  It runs ONLY when the nursery is EXPLICITLY disabled
+    // (NIX_V3_NURSERY=0) — tracking the EFFECTIVE nursery state, not env-var
+    // presence (the prior `== nullptr` test would have wrongly re-enabled the
+    // per-op major in the default case, where NIX_V3_NURSERY is unset but the
+    // nursery is on → the M-3 UAF).  RETIREMENT: simplify once default-on soaks.
+    && [] {
+        const char * v = std::getenv("NIX_V3_NURSERY");
+        return v != nullptr && v[0] == '0';
+    }();
 } // namespace detail
 
 /// R2.1′ (2026-06-03): per-cell TYPE metadata for Nofl-style evacuation.
