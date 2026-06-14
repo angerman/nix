@@ -25,10 +25,11 @@
 # workload	lever	origin_mb	current_mb	saved_mb	cumulative_saved_mb	validation
 firefox	__origin__	503.3	503.3	0.0	0.0	pre-FP baseline (Wave-1 ships, L1 off)
 firefox	FP-1 L1 chain-SELECT default-on	503.3	469.8	33.5	33.5	06-07 5/5 + core 21/21 + lang 143 byte-identical; CPU-neutral (laptop 469.8 vs 503.3, darwin-4 −33.6/−29 maxRSS)
-firefox	FP-2a drop suspended.cu (hdr 40→32)	469.8	469.8	0.0	33.5	byte-identical (canary 5/5, core 21/21); arena PEAK unmoved — firefox thunks are CHURN, FP-2 is NOT a firefox-peak lever (V3_DBG_THUNK_WITHS: 74% null-withs, marginal cumulative-only)
+firefox	FP-2a drop suspended.cu (hdr 40→32)	469.8	469.8	0.0	33.5	byte-identical (canary 5/5, core 21/21); arena PEAK unmoved (even-nUp half, masked)
+firefox	FP-2b capturedWiths→FAM tail (hdr 32→24)	469.8	453.0	16.8	50.3	byte-identical (canary 5/5, core 21/21, drvPath identical incl. under nursery); the nUp=1 bucket crossed the 16B boundary → firefox peak moved after all
 # M5/cardano-node — the FP-2 target (large resident closure; peak IS thunk-bound)
 M5	__origin__	2147.5	2147.5	0.0	0.0	seven-rows pin (pre-FP)
 M5	FP-1 + FP-2a (combined; not split)	2147.5	2013.3	134.2	134.2	arena −134 ≈ FP-2a's 128 MB even-nUp projection (17.1M thunks, 97.1% null-withs) → M5 peak responds to thunk-header size
-# next: FP-2b relocate capturedWiths to FAM tail → M5 proj MARGINAL +141 MB (null-withs odd-nUp); GREENLIT, GC-critical surgery (eca683aa1 sized it)
+M5	FP-2b capturedWiths→FAM tail (hdr 32→24)	2013.3	1862.3	151.0	285.2	beats the 141 MB projection; name byte-identical incl. under nursery; --brute unchanged (pre-existing PhD-6). COMBINED FP-1+FP-2a+FP-2b M5 = 2147.5→1862.3 = −285 MB
 # next: FP-3 ValuePair 32B (proj firefox ~−16; reconcile vs retired 24/32 split first)
 # then: FP-4 generational nursery attacks the 224 MB stranded dead (Layer C)

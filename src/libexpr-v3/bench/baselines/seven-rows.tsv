@@ -1,6 +1,7 @@
 # PLAN_BEAT_TW_V2 QG-4 ratchet baseline — pinned 2026-06-13 (darwin laptop,
 # post Wave-1 ships: §1.2 intersectAttrs + §1.1b GC backoff + §1.7 chain guard).
-# firefox arena re-pinned 2026-06-14 (FP-1: L1 chain-SELECT default-on → 503.3→469.8).
+# firefox arena re-pinned 2026-06-14 (FP-1: L1 chain-SELECT default-on → 503.3→469.8;
+# FP-2b: thunk hdr 40→24 → firefox 469.8→453.0, M5 2147.5→1862.3 [−285 combined]).
 # Regenerate: make -C src/libexpr-v3/bench pin-seven-rows
 # Guard:      make -C src/libexpr-v3/bench ratchet-check   (>3% CPU / >5% arena = fail)
 # CPU = min user over 3 (NIX_V3_DIRECT_EVAL=1); arena = NIX_VM_STATS v3_arena MB
@@ -20,5 +21,5 @@ fib	4.68	3.41	1.37	16.8	yes
 foldl	1.8	0.57	3.16	268.4	yes
 hello	0.86	0.67	1.28	167.8	yes
 git	1.45	0.94	1.54	234.9	yes
-firefox	3.98	1.67	2.38	469.8	yes
-M5	19.23	8.34	2.31	2147.5	yes
+firefox	3.98	1.67	2.38	453.0	yes
+M5	19.23	8.34	2.31	1862.3	yes

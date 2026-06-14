@@ -49,35 +49,30 @@ canary 5/5 + core 21/21 + `static_assert(sizeof(Thunk)==32)`. Header 40→32. NB
 ABI change → rebuild ALL v3 test binaries (a stale v3-smoke gave a false 20/21).
 Arena unchanged on firefox (469.8) — banked the even-`nUp` half, masked by peak.
 
-**FP-2b — relocate `capturedWiths` to the FAM tail — GREENLIT, NOT YET DONE
-(eca683aa1 sized it).** The reviewer's "gate on `nWithTargets>0`" was imprecise —
-the snapshot fallback makes `capturedWiths` non-null whenever a `with` is active.
-Measured the real gate (V3_DBG_THUNK_WITHS, = `capturedWiths==null`): firefox
-74.1 % of 2.05 M (marginal 11.6 MB, but firefox arena PEAK unmoved at FP-2a → its
-thunks are CHURN, NOT a firefox-peak lever); **M5 97.1 % of 17.1 M → marginal
-141 MB; M5 arena 2013.3 vs the 2147.5 pin (−134 MB ≈ FP-2a's 128 MB even-`nUp`)
-→ M5 peak IS thunk-bound, so FP-2b's 141 MB is expected to materialize.** FP-2 is
-an M5/large-resident-closure lever, not firefox.
+**FP-2b — relocate `capturedWiths` to the FAM tail — SHIPPED (8cd42314d).**
+The reviewer's "gate on `nWithTargets>0`" was imprecise — the snapshot fallback
+makes `capturedWiths` non-null whenever a `with` is active.  Measured the real
+gate (V3_DBG_THUNK_WITHS, = `capturedWiths==null`): firefox 74.1 % of 2.05 M; M5
+97.1 % of 17.1 M.  Design: removed `capturedWiths` from the union (→ `{desc}` =
+8 B → header **24 B**, `static_assert==24`); store the `ListVec*` RAW at
+`tail[nUpvalues]` iff `willHaveWiths = (nWiths>0) || (withStack > frame.base)`
+(pre-alloc; EXACTLY predicts `capturedWiths!=null` since `snapshotCurrentWiths`
+is null iff `top<=base`); bit in the spare `_pad0` → `hasWithsSlot`; accessors
+`thunkCapturedWiths`/`thunkSetCapturedWiths` (getter gated on Suspended/Blackhole
+so a stale bit on an evac-shrunk Evaluated thunk can't read OOB).  CRITICAL: one
+source-of-truth `thunkScanSize()` replaces all ~15 size sites so the evac COPY
+never drops the slot (= UAF); all reads/forwards updated (gc.cc:667/717 evac
+forward = the UAF surface; mark_sweep, live_trace, barrier.hh; fakeClo ×2; MAKE ×3).
 
-Turnkey FP-2b design (UAF-prone GC surgery — do with fresh attention):
-- Remove `capturedWiths` from the union → `{desc}` = 8 B → header **24 B**
-  (`static_assert` → `==24`).
-- Gate `willHaveWiths = (nWiths>0) || (withStack.size() > frame.withStackBase)`
-  — computable BEFORE alloc and EXACTLY predicts `capturedWiths!=null`
-  (`snapshotCurrentWiths` is null iff `top<=base`). 97 %/74 % are false.
-- Reserve ONE extra tail slot iff `willHaveWiths` (`allocThunkSuspended(nUp,
-  willHaveWiths)`); store the `ListVec*` RAW (not a NaN-boxed Value) at
-  `tail[nUpvalues]`; record the bit in the spare `_pad0` byte (→ `hasWithsSlot`).
-- Accessors `thunkCapturedWiths(t)` (read, null if `!hasWithsSlot`) +
-  `thunkSetCapturedWiths(t,w)` (write, for evac forward).
-- ~30 `suspended.capturedWiths` sites: MAKE writes (vm.cc:4904/4910/4916)→slot;
-  fakeClo reads (8148/13666); GC read+FORWARD (gc.cc:687-688/737-738 = the UAF
-  surface), brute (1205/1228); mark_sweep (585/1312/1778); live_trace
-  (281/801/1692); barrier.hh:325; alloc.hh:2585 init drops.
-- Gates: full byte-identity (06-07 + 7 rows + lang 143 + core 21, rebuild ALL
-  binaries) + `--brute` clean under the nursery (the forward sites are the
-  missed-root surface) + measure the M5 arena to confirm peak realization (the
-  firefox caveat: cumulative≠peak). Then delete the V3_DBG_THUNK_WITHS probe.
+**Realized win (the M5 lever): M5 arena 2013.3 → 1862.3 MB (−151 MB, beats the
+141 MB projection); COMBINED FP-1+FP-2a+FP-2b M5 = 2147.5 → 1862.3 = −285 MB.**
+firefox 469.8 → 453.0 (−16.8; the `nUp=1` bucket crossed the 16 B boundary so its
+peak moved after all).  Byte-identical: canary 5/5 + core 21/21 + firefox/M5
+drvPath/name under major-GC AND hello/firefox/git.drvPath under `NIX_V3_NURSERY=1`
+(validates the withs-slot scavenge forward).  `--brute` 21/22 — UNCHANGED vs the
+pre-FP-2b baseline: BRUTE hits are the pre-existing PhD-6 family (hello-drvPath/
+outPath, gcc-name) + a stale firefox golden (150.0.3 vs 151.0.4), none
+withs-related → FP-2b added NO new missed root.  V3_DBG_THUNK_WITHS probe retired.
 
 ### FP-3 — pair tax (ValuePair 32 B) — investigate, reconcile first
 ~16 MB firefox. BUT "ValuePair 24/32 split" is on the plan's do-not-repropose list.
