@@ -288,5 +288,42 @@ a generational barrier-coverage gap.
    become a targeted choice.  This is the FINAL PhD-6 layer before the
    nursery-flip 5-gate.
 
+## RESOLUTION (2026-06-15) — the flip blocker was a NEW class, now fixed
+
+The full-gate default-on flip was attempted: byte-correct on hello + firefox,
+but `git.drvPath` raised **7 SCAVENGE AUDIT missed roots** (`nursery Thunk
+reachable via ListVec.elems[]`). The flip was reverted (latent UAF). RCA +
+fix in `CODEBASE_REVIEW_2026-06-15.md`; summary:
+
+- **NOT the Bindings writebacks, NOT the deep-force writebacks.** The AUDIT
+  reported nursery *Thunks* — lazy elements, not forced WHNF — so the culprit
+  was **lazy list CONSTRUCTION** storing nursery thunks into a *tenured* list
+  (a list is tenured when the nursery was full at `allocList`/`nurseryOrArena`
+  time). A new instrument (gc.cc `visitList` + `listOriginTable` alloc-site)
+  named it: **`primZipAttrsWith`** built a value-list of lazy thunks and skipped
+  `listPostConstructBarrier` — unlike siblings primMap/primTail/primAttrNames.
+
+- **Fix = class-3 completion (list side):** add `listPostConstructBarrier` at
+  every nursery-capable list-construction primop (zipAttrsWith, attrValues,
+  concatLists, filter, concatMap, partition, catAttrs, genericClosure, split,
+  groupBy, fromTOML, fromJSON) + the `forceDeepRec` writeback (NOT root-covered,
+  unlike print.cc `forceDeep` whose `tlDeepForceRoots` IS scavenge-walked).
+  Verified-safe sites (string/null-only, tenured-attrset, genList tenured-pairs,
+  empty) skipped with documentation. Commits `6643ef8a4` + `67856e930`.
+
+- **Validated:** git AUDIT 7→0 byte-identical; hello/git/firefox 0 hits
+  byte-identical (flip-equiv `NIX_V3_NURSERY=1 NIX_V3_NURSERY_SCAVENGE=1
+  NIX_V3_GEN_MAJOR=1 NIX_V3_NO_MAJOR_GC=1`); brute battery 15/15; `--core` lang
+  21/21; new regression `test/repro-phd6-list-primop-barriers.nix` clean.
+
+- **vm.cc:11459 `deepForceList` `forceWriteTarget`** (the older "Round 1 #6"
+  latent): re-audited — empirically clean (fold-genlist-100k brute stress, no
+  hit/crash; value-stack-root recovery + re-derivation = memoization-loss-only).
+
+**Net: the correctness blocker is resolved; the default-on flip is unblocked.**
+Remaining flip steps are mechanical (re-apply gates, rebuild ALL binaries,
+broader nixpkgs byte-equality sweep) + the cost/benefit default decision
+(nursery = CPU lever, RSS workload-dependent; gen-major Shape A = the RSS lever).
+
 *Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>, Input Output
 Group. SPDX-License-Identifier: Apache-2.0.*
