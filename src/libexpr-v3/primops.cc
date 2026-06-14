@@ -2276,6 +2276,18 @@ static Value forceDeepRec(VMState & vm, Value v, std::unordered_set<const void *
         if (!seen.insert(v.asList()).second) return v;
         for (uint32_t i = 0; i < v.asList()->size; ++i)
             v.asList()->elems[i] = forceDeepRec(vm, v.asList()->elems[i], seen);
+        // Phase D barrier (PhD-6, 2026-06-15): unlike print.cc forceDeep (whose
+        // worklist `tlDeepForceRoots` IS a scavenge root — gc.cc:992 — so its
+        // list writebacks are root-covered), forceDeepRec walks via a plain C++
+        // local `v` that is NOT a scavenge root.  The raw `elems[i] =` writeback
+        // above can store a freshly-forced nursery value (Closure/ListVec) into a
+        // tenured list; if that list is later reachable only through a non-
+        // remembered tenured container, the scavenger never visits it and the
+        // nursery value dangles.  Register it in the remembered set.  No scavenge
+        // fires during the recursion (primDeepSeq runs at exitDepth>=1), so
+        // `v.asList()` is stable and one post-loop barrier suffices.  Mirrors the
+        // attrs branch's per-entry bindingsSetValue below.
+        listPostConstructBarrier(v.asList());
     } else if (v.isAttrs() && v.asAttrs()) {
         // ChainBindings: deep-force every value in the WHOLE chain (overlay +
         // parent), else a `throw` in a parent value would escape deepSeq.
