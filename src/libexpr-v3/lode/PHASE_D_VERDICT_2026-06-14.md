@@ -198,9 +198,19 @@ a generational barrier-coverage gap.
    `*slot=` writebacks bypassing it.  So the construction-gap theory is WRONG; do
    NOT add blanket barriers (they're already there).
 
-   **ROOT CAUSE CONFIRMED (the 3rd instance of the same family): the OP_RETURN
-   cell-writeback registers a raw interior cell pointer that goes stale when its
-   Bindings is promoted.**  All three `cellWrite` calls (vm.cc:2814/2834/7411)
+   **CORRECTION (Rule 0, 2026-06-14): the "promotion staleness" story below was
+   OVER-CLAIMED as confirmed — it has a hole.**  A Cheney promotion COPIES AND
+   SCANS the Bindings, forwarding its entries, so a *promoted* `B'` ends up
+   correct.  That means promotion-staleness does NOT explain a *tenured* B holding
+   an un-forwarded nursery entry (the actual AUDIT signature).  The raw-interior-
+   pointer registry IS move-unsafe in general (the mechanism below is real), but
+   it is NOT established as the cause of THIS hit.  Two reasoned hypotheses have
+   now both been holed (construction-gap, promotion-staleness) → STOP reasoning;
+   the cause requires the last-writer instrument (see "REAL next step" at the end).
+
+   **(retained as a real move-unsafety, not the proven cause): the OP_RETURN
+   cell-writeback registers a raw interior cell pointer.**  All three `cellWrite`
+   calls (vm.cc:2814/2834/7411)
    pass `cellContainer = nullptr`, so for a forced-thunk result the barrier takes
    the standalone branch — `standaloneCellRoots().push_back(cell)` where `cell =
    &B.entries[N].value` (barrier.hh:422-423).  Under the MOVING nursery, when B is
@@ -219,14 +229,20 @@ a generational barrier-coverage gap.
    the move-unsafe raw-cell registry.  Same family as fixes #1/#2: scavenge-unaware
    raw pointers under a moving collector.
 
-   **FIX OPTIONS (real GC work, careful):** (a) keep the cell-start bitmap
-   maintained under the nursery so `cellWrite` can derive the container and
-   dirty-list it (move-safe; the verdict's standing suggestion); (b) register
-   `(Bindings*, idx)` instead of the raw cell, so promotion forwards the Bindings
-   and the idx stays valid; (c) have the scavenger, when it forwards a from-space
-   object, rewrite any `standaloneCellRoots` entries whose address falls in that
-   object's old range to the new location (interior-pointer fixup via the existing
-   forward map).  This is the FINAL PhD-6 layer before the nursery-flip 5-gate.
+   **REAL next step — INSTRUMENT, don't reason (two hypotheses now holed):** add a
+   gated last-writer tag.  A thread_local `map<const Value* cell, {site, was-
+   nursery-at-write, registered?}>` populated at `cellWrite` / `bindingsSetValue` /
+   `bindingsSetEntry` / the materialize bulk-copy; at the AUDIT, look up the
+   offending `&B.entries[N].value` (stable — B is tenured) and print HOW/where it
+   was last written and whether the barrier should have caught it.  That
+   distinguishes: (i) a write that bypassed all setters (→ find the raw path);
+   (ii) a write where `isNurseryPayload(v)` was false at write-time but v later
+   resolved to nursery (→ a Slot/late-resolution gap); (iii) a re-write after the
+   cell was registered+dropped in an earlier scavenge.  Only after the data names
+   the path do the fix options (move-safe registry: bitmap-derived container
+   dirty-list / `(Bindings*,idx)` registration / scavenger interior-pointer fixup)
+   become a targeted choice.  This is the FINAL PhD-6 layer before the
+   nursery-flip 5-gate.
 
 *Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>, Input Output
 Group. SPDX-License-Identifier: Apache-2.0.*
