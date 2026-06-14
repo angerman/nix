@@ -189,6 +189,21 @@ that it's SAFE), needing: re-measured HNE/M5 CPU wins + nursery-size tuning +
 the firefox RSS regression understood/accepted or a generational major pass added.
 NOT auto-flipped.
 
+**UPDATE (2026-06-14): the generational major pass is now IMPLEMENTED + measured
+(Shape A, `GENERATIONAL_MAJOR_DESIGN_2026-06-14.md §RESULT`, commit 77dc0299c).**
+Opt-in `NIX_V3_GEN_MAJOR=1`: scavenge-then-major at the safepoint (M-3-safe, the
+nursery is empty when the major runs).  Correct (hello byte-identical + AUDIT 0 +
+canary 5/5 + core 21/21).  Measured: it reclaims the tenured stranded dead on M5
+(**−624 MB vs major-default, 2492→1868, at +3 % CPU**) — firefox only matches the
+one major-GC (589≈580), since firefox's dead is already major-reclaimed (the
+firefox-centric falsifier premise was mis-targeted; the dead lives on M5).  **Net
+vs the production major-GC default, gen-major wins on BOTH headline workloads**
+(M5 −624 MB RSS @ +3 % CPU; firefox −13 % CPU @ neutral RSS).  Ships as the opt-in
+lever; the nursery's own RSS effect is workload-dependent (firefox +59 MB /
+M5 −241 MB) so it's a CPU lever, gen-major adds the RSS reclaim.  Default-flip
+remains the user's cost/benefit call; Shape B (Immix tenured) is a future
+contingency only if a workload needs more than Shape A delivers.
+
 ## PhD-6 RCA RESOLVED to 3 missed-root CLASSES (2026-06-14, continued)
 
 The nursery's missed roots are THREE distinct classes — two now FIXED, one
