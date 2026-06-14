@@ -1544,6 +1544,18 @@ void scavengeNursery(Nursery & n, VMState & vm) noexcept
     buf.clear();
     Scavenger sc{n, vm, buf.forward, buf.walked, buf.graylist};
     sc.run();
+    // PhD-6 (2026-06-14): the per-chain materialize memo (value.cc s_matMemo)
+    // caches (chain -> materialised Bindings) by raw pointer and is NOT a GC
+    // root.  It is cleared at the major-GC safepoint (vm.cc:3506) for exactly
+    // the M-1 reasons (a swept/forwarded entry would be returned stale, or a
+    // freed+reused key would alias) — but under the nursery the major GC is OFF,
+    // so that clear never fires and the scavenge just MOVED the cached pointers.
+    // A later memo HIT would return a stale Bindings whose entries point at
+    // pre-move (reclaimed) nursery objects → the AUDIT "tenured Bindings.entries
+    // [N].value -> nursery" missed-root signature.  Clear here, after every
+    // scavenge, mirroring the major-GC safepoint clear (bounded cost: the memo
+    // repopulates on the next materialise — at most K copies per scavenge epoch).
+    Bindings::clearMaterializeMemo();
     // #738 Phase E v0.1: record bytes-survived into Nursery so the
     // process-lifetime totals are visible to run.cc's NIX_VM_STATS
     // banner.  Cost: two adds + branch per scavenge.
