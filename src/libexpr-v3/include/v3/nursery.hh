@@ -447,19 +447,13 @@ private:
         // until HNE-class measurement (3 GB peak) justifies the
         // flip; HNE-class workloads may yet show enough absolute
         // benefit to clear the threshold.
-        // FLIP (2026-06-15): nursery default-ON; disabled ONLY by explicit
-        // NIX_V3_NURSERY=0.  RETIREMENT: drop the opt-out once default-on soaks.
-        const char * gate = std::getenv("NIX_V3_NURSERY");
-        if (gate && gate[0] == '0') {
-            enabled = false;
-            return;
-        }
+        // OPT-OUT RETIRED (2026-06-15): the flip soaked clean across all of
+        // nixpkgs (darwin-4, 24882 attrs, 0 divergence) → the nursery + its
+        // scavenge are now unconditional.  NIX_V3_NURSERY / NIX_V3_NURSERY_SCAVENGE
+        // no longer gate on/off (the NIX_V3_NURSERY_SIZE / _TRIGGER_PCT tuning
+        // knobs below remain).
         enabled = true;
-        // Phase C: scavenge default-ON under the flip (the nursery is a
-        // generational GC, not allocate-only); disabled ONLY by explicit
-        // NIX_V3_NURSERY_SCAVENGE=0.  RETIREMENT: drop the opt-out once soaked.
-        const char * sg = std::getenv("NIX_V3_NURSERY_SCAVENGE");
-        scavengeEnabled = !(sg && sg[0] == '0');
+        scavengeEnabled = true;
         const char * sz = std::getenv("NIX_V3_NURSERY_SIZE");
         size_t mb = 32;
         if (sz) {

@@ -972,25 +972,22 @@ namespace detail {
 /// type stamp + per-block bitmap memory; the mark/sweep pause at the
 /// NIX_V3_MAJOR_GC_THRESHOLD_MB (256 MB default) boundary.  RETIREMENT:
 /// remove the opt-out once default-ON has soaked across a release.
-inline const bool g_majorGcEnabled =
-    std::getenv("NIX_V3_NO_MAJOR_GC") == nullptr
-    // M-3 (CODEBASE_REVIEW_2026-06-11): the major-GC marker ignores
-    // nursery-resident cells (tryMark → inActive() false → their out-edges are
-    // never walked), so an arena cell reachable ONLY through a nursery cell
-    // would be swept — a use-after-free.  Under the nursery, the gen-major
-    // Shape A safepoint (vm.cc) replaces this per-op major (it forceScavenges
-    // the nursery EMPTY before marking — M-3-safe).
-    //
-    // FLIP (2026-06-15): nursery is default-ON, so per-op major-GC is
-    // default-OFF.  It runs ONLY when the nursery is EXPLICITLY disabled
-    // (NIX_V3_NURSERY=0) — tracking the EFFECTIVE nursery state, not env-var
-    // presence (the prior `== nullptr` test would have wrongly re-enabled the
-    // per-op major in the default case, where NIX_V3_NURSERY is unset but the
-    // nursery is on → the M-3 UAF).  RETIREMENT: simplify once default-on soaks.
-    && [] {
-        const char * v = std::getenv("NIX_V3_NURSERY");
-        return v != nullptr && v[0] == '0';
-    }();
+// OPT-OUT RETIRED (2026-06-15): the nursery is now unconditional (the flip
+// soaked clean across all of nixpkgs on darwin-4).  The non-generational per-op
+// major mark-sweep is therefore FULLY REPLACED by the gen-major Shape A
+// safepoint (vm.cc: forceScavenge the nursery EMPTY, then mark the now
+// nursery-free tenured set — M-3-safe).  So `g_majorGcEnabled` is now a hard
+// `false`: the per-op major trigger AND its per-alloc bookkeeping (cell-start
+// bitmaps / type stamps / immix / freelist-reuse, all gated on
+// majorGcEnabled()) stay OFF — exactly the value validated in the default flip
+// and in the FP-4 gen-major measurements (where it was already false).
+//
+// CRITICAL: this MUST be `false`, NOT `getenv("NIX_V3_NO_MAJOR_GC")==nullptr`
+// (which is `true` by default) — re-enabling the per-op major alongside the
+// always-on nursery would reinstate the M-3 use-after-free (the major marker
+// skips nursery-resident cells).  The old NIX_V3_NO_MAJOR_GC opt-out is now
+// vestigial (per-op major never runs regardless).
+inline const bool g_majorGcEnabled = false;
 } // namespace detail
 
 /// R2.1′ (2026-06-03): per-cell TYPE metadata for Nofl-style evacuation.

@@ -1,5 +1,12 @@
 #!/usr/bin/env bash
 #
+# OBSOLETE since 2026-06-15: the NIX_V3_NURSERY opt-out was RETIRED after this
+# sweep ran clean on darwin-4 (24882 attrs, 0 divergence).  The `base =
+# NIX_V3_NURSERY=0` mode below is now a NO-OP (nursery unconditional) → base ==
+# flip trivially, so a fresh run is vacuous.  Kept as the historical record of
+# the opt-out-retirement gate.  To re-A/B, use the pre-retirement binary
+# (git e863f127d..3ff650587) as the base.
+#
 # flip-nixpkgs-fullsweep.sh — full nixpkgs drvPath byte-equality sweep for the
 # nursery + gen-major FLIP (shipped 2026-06-15, commit e863f127d).
 #

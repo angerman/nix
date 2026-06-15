@@ -1,4 +1,11 @@
 #!/usr/bin/env bash
+# OBSOLETE since 2026-06-15: the NIX_V3_NURSERY opt-out was RETIRED (the nursery
+# is now unconditional), so the `v3-majordft = NIX_V3_NURSERY=0` baseline below
+# is a NO-OP — base == flip trivially, and a "flip-diverge=0" result here is
+# vacuous (it compares identical configs).  Kept only as the historical record
+# of the flip-transparency validation.  To re-A/B, check out the pre-retirement
+# binary (git e863f127d..3ff650587) as the base.
+#
 # v3 nursery+gen-major FLIP soak — byte-equality across a broad nixpkgs slice.
 #
 # Shipped 2026-06-15 with the default-on flip (commit e863f127d). This is the

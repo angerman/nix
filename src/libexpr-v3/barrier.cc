@@ -101,14 +101,12 @@ const bool g_dbgCellWriteSite = [] {
 // diagnostic correctness (BRUTE+AUDIT distinguish LIVE vs DEAD);
 // gating on _SCAVENGE would silently lose dirty-list entries.
 namespace detail {
-// FLIP (2026-06-15): nursery default-ON.  Phase D barriers are active by
-// default; disabled ONLY when the nursery is explicitly opted out
-// (NIX_V3_NURSERY=0).  RETIREMENT: drop the opt-out branch once default-on
-// soaks across a release.
-const bool g_phaseDActive = [] {
-    const char * v = std::getenv("NIX_V3_NURSERY");
-    return v == nullptr || (v[0] != '\0' && v[0] != '0');
-}();
+// OPT-OUT RETIRED (2026-06-15): the NIX_V3_NURSERY flip soaked clean across all
+// of nixpkgs on darwin-4 (24882 attrs, 0 divergence).  The nursery is now
+// unconditional, so the Phase D write barriers are ALWAYS active.  (The barrier
+// helpers still no-op cheaply when phaseDActive() is true but no inter-gen edge
+// exists — see barrier.hh; this constant only removes the env opt-out.)
+const bool g_phaseDActive = true;
 }
 
 } // namespace nix::v3

@@ -351,14 +351,12 @@ static const double g_majorGcGrowth = [] {
 // the nursery — single-region), THEN run the major mark-sweep over the now
 // nursery-free tenured set.  This reclaims the tenured stranded dead (the Layer-C
 // 224 MB) that the nursery alone leaves, while firing only on tenured-growth
-// (O(1-few)/eval, dodging the cache-bound-mark wall).  FLIP (2026-06-15):
-// default-ON (with the nursery); disabled ONLY by explicit NIX_V3_GEN_MAJOR=0.
-// Net win on measured deep workloads (M5 −624 MB @ +3 % CPU; firefox neutral
-// RSS @ −13 % CPU).  RETIREMENT: drop the opt-out once default-on soaks.
-static const bool g_genMajorEnabled = [] {
-    const char * v = std::getenv("NIX_V3_GEN_MAJOR");
-    return v == nullptr || (v[0] != '\0' && v[0] != '0');
-}();
+// (O(1-few)/eval, dodging the cache-bound-mark wall).  OPT-OUT RETIRED
+// (2026-06-15): unconditional now — gen-major Shape A is the SOLE major
+// collector under the always-on nursery (the flip soaked clean across all of
+// nixpkgs on darwin-4, 24882 attrs, 0 divergence).  Net win on measured deep
+// workloads (M5 −624 MB @ +3 % CPU; firefox neutral RSS @ −13 % CPU).
+static const bool g_genMajorEnabled = true;
 
 // PLAN_BEAT_TW_V2 workstream A step 2 — shared-parent-writeback COUNTER.
 //
@@ -3287,18 +3285,13 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
     // ceiling before they exit; the next outer iteration will then
     // reclaim.  Acceptable because re-entry depth is bounded by
     // the call depth, and primop callbacks return promptly.
-    // FLIP (2026-06-15): nursery + scavenge default-ON; each disabled ONLY by
-    // its explicit `=0` opt-out.  Must agree with nursery.hh enabled/
-    // scavengeEnabled and barrier.cc g_phaseDActive (all default-on).
-    // RETIREMENT: drop the opt-outs once default-on soaks across a release.
-    static const bool s_kNurseryOn_static = [] {
-        const char * v = std::getenv("NIX_V3_NURSERY");
-        return v == nullptr || v[0] != '0';
-    }();
-    static const bool s_kScavengeOn_static = [] {
-        const char * v = std::getenv("NIX_V3_NURSERY_SCAVENGE");
-        return v == nullptr || v[0] != '0';
-    }();
+    // OPT-OUT RETIRED (2026-06-15): nursery + scavenge are unconditional (the
+    // flip soaked clean across all of nixpkgs on darwin-4).  These mirror
+    // nursery.hh enabled/scavengeEnabled and barrier.cc g_phaseDActive (all now
+    // hard-true).  The NIX_V3_NURSERY_SIZE / _TRIGGER_PCT tuning knobs (read in
+    // nursery.hh) and V3_DBG_GC_STRESS (below) still apply.
+    static const bool s_kNurseryOn_static = true;
+    static const bool s_kScavengeOn_static = true;
     // Stage 3 prereq (action plan Phase 1.7): V3_DBG_GC_STRESS=N
     // forces a scavenge every N opcodes regardless of nursery
     // occupancy.  Surfaces missed-root bugs that natural scavenge
