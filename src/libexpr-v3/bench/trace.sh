@@ -63,8 +63,12 @@ esac
 # deps are absent (so CI never hard-fails on an optional matplotlib/psutil).
 if [[ "$SMOKE" == 1 ]]; then
   RUNS=1
+  K=4                                    # fine cadence so the short eval samples
   name="smoke"
-  expr='let f = n: if n < 2 then n else f (n - 1) + f (n - 2); in f 27'
+  # Allocate a ~32 MB live ListVec at depth>0 (genList+length run as primops),
+  # so the smoke actually exercises EVERY panel — incl. the de-gated live
+  # sampler + the dead-band — not just the perf-trace overlay.  ~1 s.
+  expr='builtins.length (builtins.genList (i: i) 4000000)'
 fi
 
 # --- pick a python with psutil + matplotlib --------------------------------
