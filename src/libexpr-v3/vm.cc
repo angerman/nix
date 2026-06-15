@@ -3609,19 +3609,35 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
         // bool here instead of two separate branch-predicted-not-taken tests.
         if (__builtin_expect(kAnySlowGate, 0)) [[unlikely]] {
         if (g_periodicLiveTrace) {   // T2: cached gate
-            if (exitDepth == 0) {
-                bool nestedDistinct = false;
-                for (VMState * vmp : activeVMStack()) {
-                    if (vmp && vmp != &vm) {
-                        nestedDistinct = true;
-                        break;
-                    }
-                }
-                if (!nestedDistinct) {
-                    if (!vm.frames.empty()) vm.frames.back().ip = ip;
-                    maybeSamplePeriodicLiveFraction(vm);
-                }
-            }
+            // De-gated from `exitDepth == 0` (2026-06-15).  The old gate
+            // shared the major-GC safepoint constraint, so on deep evals
+            // that stay in nested dispatch loops until the end (firefox.
+            // drvPath, M5/cardano) it fired ~ONCE — the L(t) "time series"
+            // degenerated to a single sample on exactly the workloads the
+            // memory question is about (lode/WHY_V3_USES_MORE_MEMORY_2026
+            // -06-14 §infra).
+            //
+            // Sampling at ANY depth is memory-SAFE here because the sample
+            // is READ-ONLY: maybeSamplePeriodicLiveFraction runs a LiveTracer
+            // transitive walk that builds its own visited-set — it sets no
+            // mark bits, moves nothing, and frees nothing (unlike the GC,
+            // whose depth>0 hazards are reclaim/relocation, not marking).
+            // At a between-opcodes safepoint every live object is intact and
+            // `walkAllV3Roots` already enumerates activeVMStack(), so all
+            // active VMStates' precise roots are covered regardless of depth.
+            //
+            // ACCURACY: this is a precise-root LOWER BOUND — transient values
+            // held only in primop C-locals below a nested dispatchLoop (e.g.
+            // primFoldl's acc, a half-built mergeBindings result) are not in
+            // any frame/valueStack and are omitted.  The fully-accurate
+            // variant would drive the real marker's walkCStackConservative
+            // (mark_sweep.cc) in a count-only / no-sweep mode — sound mid-eval
+            // for the same read-only reason — see live_trace.cc for the
+            // upgrade note.  For the gross live-vs-dead shape that informs the
+            // generational-GC decision, the lower bound is sufficient and is
+            // labelled as such in the CSV/plot.
+            if (!vm.frames.empty()) vm.frames.back().ip = ip;
+            maybeSamplePeriodicLiveFraction(vm);
         }
         // V3_DBG_TRACE_THUNK_BODY: print this instruction if the current
         // frame is a thunk frame matching the configured codeOffset/nUp.

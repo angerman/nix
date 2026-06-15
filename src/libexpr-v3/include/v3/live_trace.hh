@@ -132,8 +132,22 @@ bool periodicLiveTraceEnabled() noexcept;
 /// arena's `bytesAllocated()` has crossed the next K-multiple since
 /// the last sample, walks the precise-root transitive closure and
 /// records one CSV row (alloc_offset_mb, resident_mb, live_mb,
-/// L_resident, L_cumulative, wall_ms).  Called from vm.cc at
-/// exitDepth==0 safepoints, next to the major-GC trigger.
+/// L_resident, L_cumulative, wall_ms).
+///
+/// Called from vm.cc at EVERY dispatch-loop safepoint, at ANY depth
+/// (2026-06-15).  It used to be gated to `exitDepth == 0` — the same
+/// constraint as the major-GC trigger — which made it fire ~once on
+/// deep evals (firefox/M5 stay in nested dispatch loops to the end),
+/// so the L(t) series degenerated to a single sample on exactly the
+/// workloads of interest.  Sampling at any depth is memory-safe because
+/// the walk is READ-ONLY (own visited-set; no mark bits, no move, no
+/// free) and `walkAllV3Roots` already covers `activeVMStack()`.
+///
+/// ACCURACY: precise-root LOWER BOUND — transient values held only in
+/// primop C-locals below a nested dispatchLoop are omitted.  The
+/// fully-accurate upgrade is to drive the real marker's
+/// `walkCStackConservative` in count-only/no-sweep mode (sound mid-eval
+/// for the same read-only reason); see live_trace.cc for the note.
 void maybeSamplePeriodicLiveFraction(VMState & vm) noexcept;
 
 /// End-of-run hook.  Writes accumulated CSV samples to

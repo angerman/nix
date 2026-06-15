@@ -1773,9 +1773,23 @@ void dumpV3LiveBlockProbe() noexcept
 //
 // Per `lode/L_MEASUREMENT_GAP_2026-05-28.md` §5: extend dumpV3LiveFraction
 // with periodic sampling so we get L(t) across the eval, not just L_end.
-// Fires every K MB of arena allocation from the dispatch-loop safepoint.
-// Each sample = one full transitive walk; records CSV row; flushes file
-// at end-of-run.
+// Fires every K MB of arena allocation from the dispatch-loop safepoint
+// at ANY depth (de-gated from exitDepth==0 on 2026-06-15 — see the call
+// site in vm.cc and live_trace.hh).  Each sample = one full READ-ONLY
+// transitive walk (own visited-set; no mark bits / move / free, so safe
+// mid-eval at any depth); records a CSV row; flushes at end-of-run.
+//
+// ACCURACY / upgrade path: walkAllV3Roots covers all active VMStates, so
+// this is accurate for everything reachable from VM roots, but it is a
+// precise-root LOWER BOUND — transient values reachable only via primop
+// C-locals below a nested dispatchLoop (primFoldl's acc, a half-built
+// mergeBindings result) are omitted.  To make it exact, drive the real
+// marker's precise + walkCStackConservative scan (mark_sweep.cc) in a
+// count-only / no-sweep mode: the conservative C-stack scan is what makes
+// a mid-eval, depth>0 mark sound (it is read-only here — no reclaim, so
+// none of the depth>0-GC reclaim/relocation hazards apply).  Deferred: the
+// lower bound is sufficient for the live-vs-dead shape that drives the
+// generational-GC decision, and it avoids mutating the GC's mark bitmap.
 //
 // Gate: NIX_V3_LIVE_TRACE_PERIODIC=<K>      (K in MB; default 64)
 //       NIX_V3_LIVE_TRACE_PERIODIC_OUT=<f>  (CSV path; default

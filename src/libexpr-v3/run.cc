@@ -380,6 +380,15 @@ RootResult runRootExprModule(nix::EvalState & state, ir::Module module)
     }
     // (bridge-table DIAG clear retired — TW_VALUE_ERADICATION F4, 2026-06-02.)
 
+    // Periodic L(t) CSV flush (Step 4 of post-Phase-3.8).  Hoisted OUT of
+    // the NIX_VM_STATS block (2026-06-15): the periodic live-trace is its
+    // own self-contained feature gated by NIX_V3_LIVE_TRACE_PERIODIC, and
+    // requiring the unrelated NIX_VM_STATS to also be set to get the CSV
+    // was a footgun (samples accumulated but never flushed).  The function
+    // self-gates (no-op unless periodicLiveTraceEnabled()), so this is
+    // unconditional and runs exactly once.
+    flushPeriodicLiveTraceCsv();
+
     // NIX_VM_STATS=1: dump alloc counters at completion.  Lets us
     // attribute alloc explosions to thunks vs closures vs Bindings
     // vs lists.
@@ -714,12 +723,8 @@ RootResult runRootExprModule(nix::EvalState & state, ir::Module module)
         // Stage 6 generational tenured collector (GHC-RTS style).
         // Gated NIX_V3_BLOCK_PROBE=1; zero cost otherwise.
         dumpV3LiveBlockProbe();
-        // Step 4 of post-Phase-3.8 plan (2026-05-29): periodic L(t)
-        // trace flush.  If NIX_V3_LIVE_TRACE_PERIODIC=<K> was set,
-        // writes the per-sample CSV at NIX_V3_LIVE_TRACE_PERIODIC_OUT
-        // (or default /tmp/v3-live-periodic-<pid>.csv) + emits a
-        // summary banner.  Per L_MEASUREMENT_GAP_2026-05-28 §5.
-        flushPeriodicLiveTraceCsv();
+        // (periodic L(t) CSV flush hoisted above the NIX_VM_STATS gate —
+        // see flushPeriodicLiveTraceCsv() call before `s_dumpStats`.)
         // #660 verification: dump bridge-primop call counts.  v3-eval
         // already does this via its own NIX_VM_STATS path; mirror here
         // so the integrated `nix` CLI (and any future v3 driver that
