@@ -1335,6 +1335,35 @@ struct Emitter
     // 2*n instead of n.
     void emitOne(const ir::AttrSet & e)
     {
+        // foldl lever (2026-06-16): demote a NON-recursive static attrset to
+        // the cheap OP_ATTRS_INIT (pop-N build) instead of the
+        // OP_ATTRS_REC_INIT + per-entry OP_ATTRS_REC_SET + slot/publish/
+        // cell-update protocol.  A non-rec `{...}` literal can never
+        // self-reference or `with self;` during construction (both require
+        // `rec`), so that machinery is dead weight.  Profiled: the FOLD 7-row
+        // workload's 3.5× v3-vs-TW gap is per-element record construction; this
+        // removes the 2 REC_SET + 2 slot stores per record.  Values are pushed
+        // BEFORE the opcode (like OP_LIST_INIT) so no deferred-flush dance is
+        // needed (unlike REC_INIT which pushes the Bindings first).
+        // Gated NIX_V3_NONREC_ATTRS_INIT=1 (default OFF) pending a full-nixpkgs
+        // drvPath byte-equality sweep.  RETIREMENT: un-gate (or revert) once the
+        // sweep confirms byte-identity, mirroring the nursery-flip soak gate.
+        static const bool s_nonRecAttrsInit =
+            std::getenv("NIX_V3_NONREC_ATTRS_INIT") != nullptr;
+        if (s_nonRecAttrsInit && e.nonRecursive) {
+            const size_t nn = e.entries.size();
+            if (nn == 0) {
+                unit.code.push_back(encode(OP_ATTRS_INIT, 0));
+                return;
+            }
+            for (const auto & en : e.entries) emitVarRef(en.value);
+            unit.code.push_back(encode(OP_ATTRS_INIT, static_cast<uint32_t>(nn)));
+            for (const auto & en : e.entries) {
+                unit.code.push_back(en.name);
+                unit.code.push_back(en.pos);
+            }
+            return;
+        }
         // STG-style early-alloc (#548c, 2026-05-10): allocate the
         // Bindings UPFRONT via OP_ATTRS_REC_INIT and fill entries via
         // per-entry OP_ATTRS_REC_SET.  This mirrors GHC's allocate-Con-

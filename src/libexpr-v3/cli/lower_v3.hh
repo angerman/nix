@@ -1211,6 +1211,12 @@ struct LowererV3 {
         }
 
         ir::AttrSet as;
+        // foldl lever (2026-06-16): this branch is reached ONLY for a
+        // non-recursive, non-dynamic attrset literal (the `e->recursive` and
+        // `!e->dynamicAttrs.empty()` cases returned above).  Mark it so emit.cc
+        // can demote it to the cheap OP_ATTRS_INIT — no self-ref/with-self is
+        // possible, so the REC_INIT machinery is dead weight.
+        as.nonRecursive = true;
         as.entries.reserve(e->attrs.size());
         for (auto & d : e->attrs) {
             ir::AttrSet::Entry en;

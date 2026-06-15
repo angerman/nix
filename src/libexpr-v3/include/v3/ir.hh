@@ -213,6 +213,17 @@ struct AttrSet {
     /// falsely advertise sub-expression shapes via the partial-
     /// Bindings peek path (vm.cc:withLookup).
     bool isFunctionReturn = false;
+
+    /// 2026-06-16 (foldl lever): true iff this AttrSet was lowered from a
+    /// NON-recursive, non-dynamic attrset literal (`{...}`, not `rec {...}`,
+    /// no `${e}` dynamic keys).  Such an attrset can never have inter-entry
+    /// references or `with self;` lookups during construction (both require
+    /// `rec`), so the OP_ATTRS_REC_INIT slot/publish/cell-update machinery is
+    /// pure overhead.  emit.cc demotes flagged sets to the cheaper
+    /// OP_ATTRS_INIT (pop-N build) under the NIX_V3_NONREC_ATTRS_INIT gate.
+    /// Default false → conservative REC_INIT (rec sets + synthesized sets stay
+    /// on the safe path).
+    bool nonRecursive = false;
 };
 
 /// #558 emit-order restructure: companion to `AttrSet` that emits the
