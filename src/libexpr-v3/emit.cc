@@ -1345,11 +1345,16 @@ struct Emitter
         // removes the 2 REC_SET + 2 slot stores per record.  Values are pushed
         // BEFORE the opcode (like OP_LIST_INIT) so no deferred-flush dance is
         // needed (unlike REC_INIT which pushes the Bindings first).
-        // Gated NIX_V3_NONREC_ATTRS_INIT=1 (default OFF) pending a full-nixpkgs
-        // drvPath byte-equality sweep.  RETIREMENT: un-gate (or revert) once the
-        // sweep confirms byte-identity, mirroring the nursery-flip soak gate.
+        // DEFAULT-ON 2026-06-16 (opt-out NIX_V3_NO_NONREC_ATTRS_INIT=1).
+        // Validated byte-identical: --core lang 21/21, hello/git/firefox
+        // drvPath, and a 59-package laptop drvPath sweep (demote-diverge=0,
+        // tw-diverge=0) — plus the semantic argument (a non-rec literal can't
+        // self-ref/with-self, so ATTRS_INIT ≡ REC_INIT modulo the value-
+        // irrelevant cell-update).  The opt-out is the A/B baseline + emergency
+        // mitigation.  RETIREMENT: drop the opt-out (hard-true) after a full
+        // darwin-4 nixpkgs byte-equality sweep, mirroring the nursery-flip gate.
         static const bool s_nonRecAttrsInit =
-            std::getenv("NIX_V3_NONREC_ATTRS_INIT") != nullptr;
+            std::getenv("NIX_V3_NO_NONREC_ATTRS_INIT") == nullptr;
         if (s_nonRecAttrsInit && e.nonRecursive) {
             const size_t nn = e.entries.size();
             if (nn == 0) {
