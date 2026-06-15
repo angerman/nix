@@ -32,7 +32,7 @@ FOLD := builtins.foldl' (a: o: a + builtins.length (builtins.attrNames o)) 0 (bu
 # Regression guard: ~15 s on v3 today, should be ~O(n) once pinned+fixed.
 LTA := let s = builtins.listToAttrs (builtins.genList (i: { name = toString i; value = i; }) 200000); in builtins.seq s 0
 
-.PHONY: help selftest scaling bc-vs-cpp measure-list-iter measure measure-fib measure-lookup measure-fold measure-listtoattrs measure-firefox pin-seven-rows ratchet-check
+.PHONY: help selftest scaling bc-vs-cpp measure-list-iter measure measure-fib measure-lookup measure-fold measure-listtoattrs measure-firefox pin-seven-rows ratchet-check trace trace-smoke
 
 help: ## Show this help
 	@printf '\n\033[1mv3 measurement targets\033[0m\n\n'
@@ -42,7 +42,8 @@ help: ## Show this help
 	@printf '    make selftest                       # validate the engagement detector\n'
 	@printf "    make measure WORKLOAD='1 + 1'       # any expr, gated\n"
 	@printf '    make measure-firefox                # demonstrates the DIVERGENT catch\n'
-	@printf '\n  \033[1mknobs\033[0m  RUNS=3  V3_WALL=120s  V3_HEAP=6G  NIX_BIN=…  ALLOW_DIVERGENT=1\n\n'
+	@printf '    make trace WL=firefox               # TW-vs-v3 CPU+RSS overlay + v3 dead-band SVGs\n'
+	@printf '\n  \033[1mknobs\033[0m  RUNS=3  K=16(MB,trace)  V3_WALL=120s  V3_HEAP=6G  NIX_BIN=…  ALLOW_DIVERGENT=1\n\n'
 
 selftest: ## Validate the gate's own engagement detector (run this first)
 	@$(GATE) --selftest
@@ -65,6 +66,13 @@ pin-seven-rows: ## QG-4: re-pin baselines/seven-rows.tsv (v3/TW CPU + v3 arena, 
 
 ratchet-check: ## QG-4: fail if any of the 7 rows regressed >3% CPU / >5% arena vs the pinned TSV
 	@./ratchet-check.sh
+
+trace: ## Regenerate TW-vs-v3 CPU+RSS overlay + v3 dead-band figure:  make trace WL=firefox  (WL=hello|git|firefox|m5|<expr>)
+	@test -n "$(WL)" || { echo "set WL=<hello|git|firefox|m5|nix-expr>"; exit 2; }
+	@WL='$(WL)' RUNS='$(RUNS)' K='$(K)' ./trace.sh
+
+trace-smoke: ## Freshness guard: fast 1-run trace so the plotters can't silently rot (skips if no matplotlib/psutil)
+	@SMOKE=1 ./trace.sh
 
 measure-fib: ## Compute/dispatch (fib 33) — register-VM regime, ~1.28× TW
 	@$(GATE) "$(FIB)"

@@ -45,3 +45,17 @@ if [[ "$fail" == 1 ]]; then
   echo "ratchet-check: FAIL — a row regressed beyond tolerance (re-pin with justification to move it)"; exit 1
 fi
 echo "ratchet-check: PASS — no row regressed beyond tolerance"
+
+# Freshness guard for the time-series tooling (perf-trace.py / plot-v3-memory.py
+# / trace.sh): a fast 1-run smoke that regenerates the overlays on a synthetic
+# workload.  Keeps the graphing infra from silently bit-rotting (its prior
+# decay — last SVG 2026-05-20 — is what prompted this).  SKIP_TRACE_SMOKE=1
+# opts out; the smoke itself skips cleanly if matplotlib/psutil are absent so
+# CI never hard-fails on optional plotting libs — it only FAILS if the tooling
+# errors when the deps ARE present.
+if [[ "${SKIP_TRACE_SMOKE:-0}" != 1 ]]; then
+  echo "ratchet-check: trace-smoke (graphing-infra freshness)…"
+  if ! SMOKE=1 OUT="$(mktemp -d)/trace-smoke" bash "$SELF_DIR/trace.sh"; then
+    echo "ratchet-check: FAIL — trace tooling broke (perf-trace.py/plot-v3-memory.py); SKIP_TRACE_SMOKE=1 to bypass"; exit 1
+  fi
+fi

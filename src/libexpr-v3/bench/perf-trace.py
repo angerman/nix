@@ -100,15 +100,12 @@ def mode_env(mode):
             "(no-op since #758); treating as v3-native",
             file=sys.stderr,
         )
-        return {
-            "NIX_V3_DIRECT_EVAL": "1",
-            "NIX_V3_SKIP_INSTALLABLE_PREEVAL": "1",
-        }, "v3-direct (DEPRECATED v3-bridge → v3-native)"
+        # NIX_V3_DIRECT_EVAL=1 is the sole gate now; the old
+        # NIX_V3_SKIP_INSTALLABLE_PREEVAL was retired in #760/#764.
+        return {"NIX_V3_DIRECT_EVAL": "1"}, \
+            "v3-direct (DEPRECATED v3-bridge → v3-native)"
     if mode == "v3-native":
-        return {
-            "NIX_V3_DIRECT_EVAL": "1",
-            "NIX_V3_SKIP_INSTALLABLE_PREEVAL": "1",
-        }, "v3-direct (v3-native default)"
+        return {"NIX_V3_DIRECT_EVAL": "1"}, "v3-direct (v3-native default)"
     raise ValueError(f"unknown mode: {mode}")
 
 
