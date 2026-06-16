@@ -63,6 +63,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <array>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
@@ -1035,6 +1036,53 @@ static std::string toStringCoerce(EvalState & state, Value v)
 
 void primToString(EvalState & state, Value * args, Value & out)
 {
+    // foldl lever (2026-06-16): small-non-negative-int toString cache.  The
+    // profile showed toString(int) is dispatch + per-call allocChars bound, NOT
+    // formatting bound (an snprintf/to_chars fast-path measured SLOWER — the
+    // formatting is already cheap).  The removable cost is the per-call arena
+    // string allocation.  toString of a small int (list indices, versions,
+    // generated attr names — the dominant case) returns a PROCESS-STATIC String
+    // Value, skipping the alloc + format + the coerce machinery entirely.
+    // GC-safe: the buffers are C++-static (never freed/moved) and a String
+    // Value's char* is not a GC-managed pointer (isNurseryPayload is false for
+    // String).  Byte-identical: same decimal text as the slow path's
+    // std::to_string(asInt()); ints carry no string context.  DEFAULT-ON
+    // (opt-out NIX_V3_NO_TOSTRING_INT_CACHE=1) — validated --core 21/21,
+    // hello/git/firefox drvPath, 59-pkg drvPath sweep (cache-diverge=0,
+    // tw-diverge=0).  RETIREMENT: drop the opt-out after a full darwin-4 sweep.
+    static const bool s_toStrFast =
+        std::getenv("NIX_V3_NO_TOSTRING_INT_CACHE") == nullptr;
+    if (s_toStrFast) {
+        Value v = args[0];
+        Tag t = v.tag();
+        if (t == Tag::Thunk || v.isAppLike() || t == Tag::Slot) {
+            v = forceValue(*state.vm, v);
+            t = v.tag();
+        }
+        if (t == Tag::Int) {
+            constexpr int64_t kCacheN = 1024;
+            int64_t n = v.asInt();
+            if (n >= 0 && n < kCacheN) {
+                // C++-static buffers (stable c_str() forever; the bufs array
+                // never reallocates) + pre-built String Values.  Built once.
+                static std::array<std::string, kCacheN> bufs;
+                static const std::array<Value, kCacheN> cache = [] {
+                    std::array<Value, kCacheN> c;
+                    for (int64_t i = 0; i < kCacheN; ++i) {
+                        bufs[i] = std::to_string(i);
+                        c[i].mkString(bufs[i].c_str());
+                    }
+                    return c;
+                }();
+                out = cache[static_cast<size_t>(n)];
+                return;
+            }
+            // Larger / negative int: format + arena-copy, no ctx.
+            out = mkStringValueOwned(std::to_string(n));
+            return;
+        }
+        // non-int → fall through to the general coercion path below.
+    }
     // §1.6: thread context through nested list/attrs traversal.
     // user-facing `builtins.toString`: TW-compatible non-copying
     // behaviour for paths (eval.cc:2880-2902, copyToStore=false).
