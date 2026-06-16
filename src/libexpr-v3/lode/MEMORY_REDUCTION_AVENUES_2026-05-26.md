@@ -109,9 +109,9 @@ The #748/#750/#752 playbook *worked* by finding workload-specific slack patterns
 |---|---|---|
 | **HNE NIX_VM_STATS bucket decomposition** | ≤ 1 hr | Tells us where the 3 GB lives; gates everything else |
 | **HNE NIX_V3_BINDINGS_ATTR with top-10 sites** | ≤ 1 d | Confirms or refutes "mergeBindings dominant" pattern on HNE |
-| **T1.3 per-alloc-site for Thunks/Closures/ListVecs/Strings** | 1-2 d | Surfaces non-Bindings hot sites; templated #746 pattern |
+| **T1.3 per-alloc-site for Thunks/Closures/ListVecs/Strings** | 1-2 d | Surfaces non-Bindings hot sites; templated #746 pattern — **Thunks/Closures/Pairs/Lists landed 2026-05-27; strings still pending — see [`STRING_DEDUP_AUDIT_2026-05-28.md`](STRING_DEDUP_AUDIT_2026-05-28.md)** |
 | **T1.2 elsewhere bucket decomposition** | 1 d | Decomposes the residual elsewhere bucket per AR23 |
-| **T3.2 common-value tracer (top-N strings/ints/paths)** | 1 d | Finds duplication; if > 10 % is duplicate, string-intern is easy win |
+| **T3.2 common-value tracer (top-N strings/ints/paths)** | 1 d | Finds duplication; if > 10 % is duplicate, string-intern is easy win. **Audit landed 2026-05-28: attribute keys + PosIdx fully deduped; runtime string VALUES NOT deduped; spike proposal in [`STRING_DEDUP_AUDIT_2026-05-28.md`](STRING_DEDUP_AUDIT_2026-05-28.md) with pre-committed thresholds.** |
 | **HNE post-V3_RELEASE baseline** | ≤ 1 hr | Confirms V3_RELEASE −25-40 MB on HNE |
 | **HNE force-deep audit** | ≤ 1 d | Identifies whether IFD probe or callPackages chains over-allocate |
 
@@ -309,7 +309,7 @@ Recommend tagging the original §2.1 ("shapeCell #ifdef") as LANDED (V3_RELEASE 
 - **HNE NIX_V3_BINDINGS_ATTR may have been run** but not surfaced in commit history. Check before re-running.
 - **The "lifetime not allocation" hypothesis (Category 4)** is novel here; not supported by direct evidence. May or may not be the lever.
 - **The "structural memory hardness" alternative (§5 strategic alternative)** depends on Week 1 outcomes — it's a contingency, not a current claim.
-- **String interning may already exist** in some form (Symbol table is interning); the question is whether VALUE-level strings (not symbol names) are duplicated. Worth verifying before T3.2.
+- ~~**String interning may already exist** in some form (Symbol table is interning); the question is whether VALUE-level strings (not symbol names) are duplicated. Worth verifying before T3.2.~~ **RESOLVED 2026-05-28** per [`STRING_DEDUP_AUDIT_2026-05-28.md`](STRING_DEDUP_AUDIT_2026-05-28.md): attribute keys via `globalSymbolTable` + PosIdx via `posSnapshotIndex` are deduped; runtime string VALUES (`allocChars` at 20+ sites) are NOT. Spike proposal landed with pre-committed thresholds; needs measurement run.
 - **Whippet GC, persistent attrsets, precise GC** are listed for completeness; none are this-week items.
 - **The "post-V3_RELEASE re-baseline" task** assumes V3_RELEASE has actually been built and tested on HNE. If only synthetic alloc-heavy bench was measured (per A2 commit), HNE measurement remains unverified.
 

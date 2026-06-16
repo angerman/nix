@@ -52,7 +52,29 @@ The parser only ever fed v3's own pipeline. It **never** created a bridge-table 
 
 Code-grounded trace at HEAD (`5d29d96e6`). Every remaining TW-value use traces to an FFI-leaf primop — **zero** trace to parsing.
 
-### 3.1 The dominant source: fetchers (`bridgeBuiltin<N>`)
+### 3.0 CORRECTION 2026-06-02 — the M5-dominant source is `builtins.path` filters (TW→v3), NOT fetchers (v3→TW)
+
+The original §3.1 below claimed fetchers (`bridgeBuiltin<N>`, the v3→TW marshalling direction) were the dominant remaining source. **An M5 measurement falsified that for the real workload.** Evaluating `(getFlake cardano-node).outputs.packages.aarch64-darwin.cardano-node.name` under v3-direct: `__v3_call_bridge_1 = 20034`, `v3BridgeClosures = 10033`. An lldb backtrace pinned the source:
+
+```
+primV3CallBridge1 (primops.cc:4532) ← TW callFunction (eval.cc:1817)
+ ← TW callPathFilter (libexpr/primops.cc:2956) ← addPath per-fs-entry λ (:2991)
+ ← SourceAccessor::dumpPath (NAR walk) ← Store::addToStore ← prim_path (TW builtins.path)
+```
+
+**Mechanism (H5):** haskell.nix copies many source trees to the store with `cleanSourceWith`-style `path: type: bool` filters. v3's `primPath` has a left-behind TODO (`primops.cc:9821`: "closure re-entry not yet wired") — for the `filter` case it **bails to TW's `builtins.path`**, handing TW the v3 filter closure. TW's NAR-dump (`dumpPath`) then calls that bridged closure **once per filesystem entry** (×2 for the curried 2-arg predicate). That is the 20034. The 10033 entries are filter lambdas + per-call curry intermediates — NOT flake outputs, NOT callPackage closures.
+
+**The flake / getFlake / import / mapAttrs / fetchFinalTree path is ALREADY fully v3-native** — hypotheses H1-H4 (each-input-outputs-bridged, call-flake.nix-on-TW, higher-order-TW-builtin, fetchTree-returns-closure) were all REFUTED against code; v3's own OP_CALL bridge handler fired **0** times. The bridge is load-bearing on cardano-node **solely** because of source-tree filtering.
+
+**Leaf-or-violation nuance:** the NAR-dump/hash/store-insert *driver* is an irreducible libstore leaf; the per-entry filter *predicate* is legitimate Nix eval that must run per entry. The bridge is pure marshalling overhead of routing that predicate `v3→TW→v3` instead of having v3 drive the libstore loop directly. So this is a library leaf *parameterized by a Nix predicate*, not TW doing misplaced evaluation.
+
+**TWO DISTINCT BRIDGE DIRECTIONS — both needed for full eradication:**
+- **v3 → TW** (hand an attrset to a TW builtin): fetchers — §3.1 below, phases F1/F2.
+- **TW → v3** (TW calls back into a v3 closure): `builtins.path` filter — **the M5 keystone, phase F3, now PROMOTED** (was framed as the marginal "awkward one"; it is in fact the load-bearing source on the real workload).
+
+**F3 is the M5 keystone.** It's smaller/lower-risk than the fetcher rewrite, the plumbing already exists (`ffi.cc:437`'s `fetchToStore` callback already does re-entrant `callClosure`-from-inside-libstore; `primPathNative` already handles the no-filter case), and it removes all 20034 calls + 10033 entries on cardano-node. Effort ~1-2 days / ~100-150 LoC. See §4 + F3 in §5.
+
+### 3.1 The other direction: fetchers (`bridgeBuiltin<N>`) — v3→TW marshalling
 
 `primops.cc:11768` (`bridgeBuiltin<N>`) implements 7 fetchers + `fetchFinalTree` by:
 ```
@@ -60,7 +82,7 @@ nargs[i] = v3ToTreeWalker(state, args[i]);          // v3 attrset → TW attrset
 ns.callFunction(builtins.fetchTree, *nargs[i], cur); // invoke the TW BUILTIN
 result   = treeWalkerToV3(state, cur);               // TW attrset → v3 (Bridge thunks)
 ```
-This is the pattern we want gone. It calls the TW **builtin wrapper** (`builtins.fetchTree`), not the libfetchers **library function** — so it trades in `nix::Value` both directions, populating the bridge tables and arming the BP callbacks.
+This is the v3→TW pattern we want gone. It calls the TW **builtin wrapper** (`builtins.fetchTree`), not the libfetchers **library function** — so it trades in `nix::Value` both directions, populating the bridge tables. **Note:** per §3.0, on cardano-node this is NOT the hot source (the `builtins.path` filter callback is); F1/F2 remain necessary for the v3→TW direction (and the hello/flake path), but F3 is what moves M5.
 
 Fetchers covered: `fetchurl`, `fetchTree`, `fetchGit`, `fetchMercurial`, `fetchClosure`, `fetchTarball`, `filterSource`, `fetchFinalTree`.
 
@@ -143,16 +165,26 @@ Once §3.1 produces v3-native data instead of a TW value:
 
 ## 5. Phasing
 
-| Phase | Work | Pre-commit gate |
-|---|---|---|
-| **F0 — re-measure** | Re-run bridge frequency + bridge-retention under HEAD (the inventory's 61-crossings / 0.014% / 99.8% numbers predate today's commits). Establish the current TW-value source breakdown. | Fresh `NIX_V3_BRIDGE_TIMING` + `dumpV3BridgeRetention` numbers on hello/HNE/M5 |
-| **F1 — fetchTree direct** | Convert the single highest-frequency fetcher (`fetchTree`, the flake/IFD path) to `ffi::fetchTree` plain-data + v3-native result. Leave the other fetchers on `bridgeBuiltin` behind the same gate. | drvPath byte-equal on flake + IFD workloads; bridge-table entries for fetchTree drop to 0; no perf regression |
-| **F2 — remaining fetchers** | `fetchurl`/`fetchGit`/`fetchMercurial`/`fetchTarball`/`fetchClosure`/`filterSource`/`fetchFinalTree`, one at a time, same pattern. | each: drvPath byte-equal; its bridge feeder → 0 |
-| **F3 — builtins.path filter** | The one non-fetcher `callFunction` (`primops.cc:9840`): wire the filter closure to re-enter v3's VM per dir-entry instead of `callFunction(builtins.path)`. | `builtins.path` with filter byte-equal |
-| **F4 — retire the apparatus** | With all TW-value sources gone: delete BP1/BP2/BP3, the Bridge-thunk OP_CALL paths, `v3ToTreeWalker`/`treeWalkerToV3`, the three bridge tables, the `fallbackExpr` safety nets. | full suite + nixpkgs sweep green; `grep nix::Value` in v3 → only ffi.cc leaf shims |
-| **F5 — retire derivationStrict fallback** | Already default-off; delete after a second cross-arch soak confirms `fallback=0`. | `V3_DRV_KEEP_BRIDGE` removed; no TW `derivationStrict` path |
+**Re-baselined 2026-06-02 after enumerating the closed crossing-site set (`grep v3ToTreeWalker( + callFunction`). The family's inputs are nearly gone — fetchers landed; ONE live site remains.**
 
-**F1 is the keystone.** It both proves the pattern end-to-end and (per F0's breakdown) likely removes the dominant remaining TW-value source on flake/IFD workloads.
+**State of the crossing-site set (the family's ONLY inputs):**
+- `callFunction`-into-TW-builtins: **0 sites** (grep empty).
+- **F1/F2 fetchers: ✅ DONE** — `bridgeBuiltin<N>` round-trip DELETED (primops.cc:11736 "every fetcher is now V3-NATIVE; bridgeBuiltin had zero remaining callers, so it's deleted"). The v3→TW fetcher direction is closed.
+- Live independent `v3ToTreeWalker` entry sources, default path: **TWO** — `primPath` filter (9845, F3, the sole live source on cardano-node) + `derivationStrict` fallback (6471, gated/default-off, 0 fallback measured).
+- Secondary re-bridges (4896 in primV3CallBridge1, 5114 in primV3ForceAttr): die automatically when the two above are gone.
+
+| Phase | Work | Status / gate |
+|---|---|---|
+| **F0 — re-measure** | M5 = 20034 `__v3_call_bridge_1` / 10033 closure-bridge entries, traced (lldb) to `builtins.path` filter (NOT fetchers); hello.drvPath = 0 bridge entries; flake path v3-native. | ✅ DONE 2026-06-02 |
+| **F1/F2 — fetchers v3-native** | `fetchTree`/`fetchurl`/`fetchGit`/`fetchMercurial`/`fetchTarball`/`fetchClosure`/`filterSource`/`fetchFinalTree` → plain-data `ffi::` + v3-native result; `bridgeBuiltin` deleted. | ✅ DONE (primops.cc:11734-11852) |
+| **F3 — builtins.path filter (THE keystone)** | `primPathFilteredNative` (primops.cc) drives `ffi::addPathFiltered` with a per-entry `callClosure` callback; no `nix::Value` crosses to TW. | ✅ **DONE 2026-06-02 (`a112991a5`)** — M5 `__v3_call_bridge_1` 20034→0, `v3BridgeClosures` 10033→0, drvPath byte-identical. TW bridge kept ONLY as a defensive never-fire exception fallback (removed with the apparatus in F4). |
+| **F5 — derivationStrict fallback** | The default-off TW-bridge fallback (`6471`) DELETED. | ✅ **DONE 2026-06-02 (`eb9bcd1c7`)** |
+| **(also) outputOf / toFile / storePath / import / readDir** | results built v3-native via `ffi::` plain-data (not bridged). | ✅ DONE (`01fdd2a2b`/`97756f7a7`/`9cd9d2c6a`/`e086a25e3`) — outputOf was "the last external bridge user" |
+| **F4 — retire the apparatus** | **ALL EXTERNAL FEEDERS NOW GONE (`01fdd2a2b`): every `v3ToTreeWalker`/`treeWalkerToV3` caller is apparatus-INTERNAL → self-referential dead code.** Remaining: delete BP1/BP2/BP3 + the three bridge tables + `v3ToTreeWalker`/`treeWalkerToV3` + Bridge-thunk machinery; unregister `__v3_call_bridge_1`. | ⏳ **THE SOLE REMAINING STEP** — pure deletion of unreachable code; gate: full suite + nixpkgs sweep green, `grep nix::Value` in v3 → only ffi.cc leaf shims |
+
+**F3 is now not just the keystone — it is essentially the ONLY remaining live work** before the entire `__v3_*` family is deletable. The fetcher direction (F1/F2) already landed; the family's input set has collapsed to one site (`primPath` filter) + one gated near-zero fallback. Ship F3 → confirm F5 → the family + tables + Bridge thunks all become unreachable (F4).
+
+**Principle (why ALL of the family is eliminable):** the `__v3_*` family is the artifact of handing a v3 value to a TW *builtin* (forces/calls via TW's evaluator). The crossing-site set is closed and every member takes the library route instead — Pattern A (v3 drives the library loop with a direct-`callClosure` C++ callback) or Pattern B (extract plain data before the call). Fetchers proved it (callFunction count = 0); `primPath` is the last holdout.
 
 ---
 
