@@ -1,0 +1,27 @@
+# v3-autoresearch — falsified-lever journal (the loop reads this BEFORE proposing and
+# APPENDS on every revert).  A lever here was already measured and killed; re-proposing it
+# burns cycles.  This is the persistent memory autoresearch's single thread lacks.
+#
+# Seeded 2026-06-16 from the session record (PLAN_BEAT_TW_V2 do-not-repropose list +
+# commit bodies).  Format: lever <TAB> verdict <TAB> evidence/commit
+#
+# lever	verdict	evidence
+closure-arity-cache-byte	FALSIFIED	depth-1 PAPs already O(1); no win (6b5284374)
+OP_LESS-dedicated-opcode	FALSIFIED	+1.0%, alloc-dominated not dispatch-dominated
+reuseScope-TLS-skip-as-sole-lever	FALSIFIED	−5.7% only; TLS is per-opcode safepoint not per-re-entry
+bytecode-foldl-prime	FALSIFIED	loop-interp + per-iter rec-attrset WORSE than C++ primFoldl
+ValuePair-24/32-split	FALSIFIED	0-byte win (16B alloc rounding); tax is foundational (38c263bdb)
+string-value-dedup	FALSIFIED	≤25MB on HNE, below threshold (STRINGS_ATTR spike)
+Boehm-tuning-free_space_divisor-periodic-gc	FALSIFIED	0 unmapped on macOS aarch64; 9× wall regression
+wrapper-retire-all-C-derivationStrict	FALSIFIED	all-C path infinite-recurses (0.1 falsifier)
+GC-threshold-lowering-alone	FALSIFIED	gc_count stayed 1 (exitDepth==0 gate, since fixed); RAISED RSS on light rows
+Immix-flip-as-gated	FALSIFIED-THEN-SUPERSEDED	starved (spans born at the one late GC); resolved properly by gen-major flip e863f127d
+OPCYCLES-TLS-gating	FALSIFIED	0% (LLVM caches the TLS addr)
+drv-env-key-de-stringify	FALSIFIED	0% on darwin-4 (7e32072f8 reverted)
+context-parse-memo-alone	FALSIFIED	2.4% < 3% bar; cost is in copies not parse-back
+context-single-source-sort-skip	FALSIFIED	wash (single-entry contexts already trivial)
+GET_LOCAL+FORCE-fusion-as-miss	STALE-PREMISE	already fused at HEAD; real residual was the flushAllDeferred over-flush
+single-pass-drv-hashing-as-ratio-lever	RATIO-NEGATIVE	shared with TW byte-for-byte; cutting it moves the ratio AWAY from 1.0 (absolute-CPU lever only)
+materialize-removal-as-the-firefox-RSS-lever	FALSIFIED	total materialize 72MB ceiling < 80MB; L1 took the cleanly-removable slice
+broader-lookup-without-materialize	RETIRED	≤72MB ceiling, mostly a kMaxLayers cap-trade not a free win
+upvalue-tuple-dedup-as-the-thunk-lever	MIS-MEASURED	12MB; the real lever was the 40→24B HEADER shrink (cu+capturedWiths), shipped FP-2a/2b
