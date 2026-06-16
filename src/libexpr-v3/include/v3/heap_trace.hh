@@ -15,20 +15,27 @@
 /// cadence.  The pthread is a daemon; it exits cleanly when
 /// `nix::v3::stopHeapTrace()` is called (or at process exit).
 ///
-/// **Output format**: one tab-separated `key=val` line per sample,
-/// to stderr, parseable by `perf-trace.py`:
+/// **Output format**: one space-separated `key=val` line per sample,
+/// to stderr, parseable by `perf-trace.py` and `bench/plot-v3-memory.py`:
 ///
-///   v3 heap-trace t_us=12345678 heap=402653184 free=12345678 total=234567890
+///   v3 heap-trace t_us=12345678 heap=402653184 free=12345678 total=234567890 rss=1234567 cpu_ms=842
 ///
 /// where:
-///   - `t_us`  — monotonic microseconds since `startHeapTrace()`
-///   - `heap`  — `GC_get_heap_size()` (current arena size in bytes)
-///   - `free`  — `GC_get_free_bytes()` (unallocated within the arena)
-///   - `total` — `GC_get_total_bytes()` (cumulative allocations,
-///               monotonically increasing)
+///   - `t_us`   — monotonic microseconds since `startHeapTrace()`
+///   - `heap`   — `GC_get_heap_size()` (current Boehm arena size in bytes)
+///   - `free`   — `GC_get_free_bytes()` (unallocated within the Boehm arena)
+///   - `total`  — `GC_get_total_bytes()` (cumulative allocations,
+///                monotonically increasing)
+///   - `rss`    — current process RESIDENT bytes (mach `resident_size` /
+///                /proc/self/statm; NOT peak).  The honest memory-over-time
+///                signal — v3's malloc-backed arena is invisible to `heap`.
+///   - `cpu_ms` — cumulative process CPU (user+sys) ms; differentiate
+///                Δcpu_ms/Δwall to get CPU%.  v3's only CPU-time signal.
 ///
+/// The `rss`/`cpu_ms` fields (added 2026-06-03) are APPENDED so the
+/// historical 4-field `perf-trace.py` regex keeps matching unchanged.
 /// Per `PERF_TRACE_TOOL_DESIGN_2026-05-20.md` §"In-process Boehm
-/// heap probe (~80 LoC, gated)".
+/// heap probe (~80 LoC, gated)" + `OBSERVABILITY_AUDIT_2026-06-03.md`.
 ///
 /// Retirement criterion: when in-process GC stats are exposed via
 /// a runtime API that external samplers can read without parsing

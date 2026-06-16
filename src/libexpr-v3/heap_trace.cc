@@ -20,9 +20,21 @@
 
 #include <gc/gc.h>
 
+// Resident-RSS + CPU-time reads for the unified in-process time-series
+// (observability, 2026-06-03).  Self-contained here (not a cross-TU call
+// into limits.cc) to keep the sampler a single isolated translation unit;
+// the platform code mirrors `limits.cc::currentRssBytes` exactly.
+#include <sys/resource.h>   // getrusage (CPU user+sys)
+#if defined(__APPLE__)
+#  include <mach/mach.h>    // task_info / MACH_TASK_BASIC_INFO (current resident)
+#else
+#  include <unistd.h>       // sysconf(_SC_PAGESIZE) for /proc/self/statm
+#endif
+
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
@@ -38,6 +50,47 @@ std::thread g_thread;
 std::mutex g_cvMutex;
 std::condition_variable g_cv;
 
+/// Current RESIDENT set size in bytes (not peak).  A time-series wants the
+/// live footprint at each tick, so this mirrors `limits.cc::currentRssBytes`
+/// (macOS mach `resident_size`; Linux /proc/self/statm) — NOT `ru_maxrss`,
+/// which is the run's high-water mark.  v3's real arena lives in the
+/// malloc-backed `threadArena` (the "elsewhere" bucket invisible to Boehm),
+/// so this is the only honest memory-over-time signal in-process.
+size_t sampleRssBytes() noexcept
+{
+#if defined(__APPLE__)
+    mach_task_basic_info_data_t info{};
+    mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO,
+                  reinterpret_cast<task_info_t>(&info), &count) == KERN_SUCCESS)
+        return static_cast<size_t>(info.resident_size);
+    return 0;
+#else
+    long pages = 0, dummy = 0;
+    std::FILE * f = std::fopen("/proc/self/statm", "r");
+    if (!f) return 0;
+    int rc = std::fscanf(f, "%ld %ld", &dummy, &pages);
+    std::fclose(f);
+    if (rc < 2 || pages <= 0) return 0;
+    long pgsize = sysconf(_SC_PAGESIZE);
+    return static_cast<size_t>(pages) * static_cast<size_t>(pgsize);
+#endif
+}
+
+/// Cumulative process CPU time (user+sys) in milliseconds, all threads.
+/// Emitted as a running total per tick so the consumer can differentiate
+/// Δcpu_ms/Δwall_ms into a CPU% — this is the ONLY CPU-time signal v3 emits
+/// (every other timer in the VM is wall-clock; see OBSERVABILITY_AUDIT).
+long long sampleCpuMillis() noexcept
+{
+    struct rusage ru;
+    if (getrusage(RUSAGE_SELF, &ru) != 0) return -1;
+    return static_cast<long long>(ru.ru_utime.tv_sec) * 1000
+         + static_cast<long long>(ru.ru_utime.tv_usec) / 1000
+         + static_cast<long long>(ru.ru_stime.tv_sec) * 1000
+         + static_cast<long long>(ru.ru_stime.tv_usec) / 1000;
+}
+
 void samplerLoop(std::chrono::milliseconds interval)
 {
     auto t0 = std::chrono::steady_clock::now();
@@ -50,11 +103,22 @@ void samplerLoop(std::chrono::milliseconds interval)
         size_t free = GC_get_free_bytes();
         size_t total = GC_get_total_bytes();
 
+        // Process resident + cumulative CPU — the unified-series fields.
+        // Read here on the sampler thread; all three syscalls are
+        // thread-safe and the sampler's own CPU is negligible (it sleeps).
+        size_t rss = sampleRssBytes();
+        long long cpu_ms = sampleCpuMillis();
+
         // Single fprintf for atomicity (no interleaving with other
-        // stderr lines from concurrent threads).
+        // stderr lines from concurrent threads).  The `rss=`/`cpu_ms=`
+        // fields are APPENDED after `total=` so the historical
+        // perf-trace.py regex (which captures the first four fields)
+        // keeps matching unchanged.
         std::fprintf(stderr,
-            "v3 heap-trace t_us=%lld heap=%zu free=%zu total=%zu\n",
-            static_cast<long long>(t_us), heap, free, total);
+            "v3 heap-trace t_us=%lld heap=%zu free=%zu total=%zu "
+            "rss=%zu cpu_ms=%lld\n",
+            static_cast<long long>(t_us), heap, free, total,
+            rss, cpu_ms);
         std::fflush(stderr);
 
         // Sleep with interruption-aware wait_for.  If g_stop is set
