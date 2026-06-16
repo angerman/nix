@@ -9,16 +9,33 @@ Design rationale + full context: `lode/AUTORESEARCH_V3_DESIGN_2026-06-16.md`.
 
 ## Objective (pick ONE per run; the loop optimizes this single target)
 
-> Default: **lower v3 CPU on the `foldl` row** (the attrset-construction-heavy fold,
-> currently the worst CPU ratio) without regressing any other row.
+> Default: **lower v3 CPU on the `git` row** (a REAL nixpkgs drvPath eval) without
+> regressing any other row.
+
+**REAL-WORLD-GAINS RULE (2026-06-16, learned the hard way — see
+do-not-repropose.tsv "foldl-microopts-realworld-neutral"):** the objective MUST be a
+real workload row (`git` / `hello` / `firefox` / `M5`), NOT the synthetic `foldl`/`fib`
+rows. A win on `foldl`/`fib` alone is presumed BENCHMARK-TUNING and does NOT count —
+the synthetic FOLD is artificially dominated by one or two ops (e.g. non-rec
+attrset-construction, small-int toString), so optimizing it can net ~0% on hello/git
+(measured: the attrset-demotion + toString-cache levers gave ~18% on FOLD but ~1% / −0.8%
+on hello/git). Every keep MUST improve a REAL row by the bar AND not regress the others.
+Use `foldl`/`fib` only as fast directional proxies, never as the keep target.
+
+Where the real CPU actually goes (git.drvPath sample, 2026-06-16): `forceValue →
+callClosure → dispatchLoop` (~53%), driven by `primFoldl` + `primFilter` (nixpkgs
+`lib.foldl'`/`filter`/`map`).  The real-world lever is **per-element callClosure /
+dispatch-loop overhead**, not record-construction.  (Core-vm.cc → slow rebuild + higher
+risk than the §"Where to look" sweet spot; treat as a careful manual-RCA target, or let
+the loop attack it via opt-passes that cut dispatch on real lib iteration.)
 
 Alternative objectives (swap the `OBJECTIVE_ROW`/`OBJECTIVE_METRIC` below):
 - lower v3 arena (MB) on `firefox` / `M5` (deterministic metric — preferred for memory)
-- lower v3 CPU on `git` / `hello` / `firefox`
+- lower v3 CPU on `hello` / `firefox` / `M5`
 
 ```
-OBJECTIVE_ROW=foldl
-OBJECTIVE_METRIC=cpu        # cpu | arena
+OBJECTIVE_ROW=git          # a REAL workload — never `foldl`/`fib` (benchmark-tuning)
+OBJECTIVE_METRIC=cpu       # cpu | arena
 ```
 
 ## HARD constraints (a change that violates ANY is an automatic REVERT)
