@@ -136,12 +136,14 @@ const graded = await pipeline(ideas,
 phase('Synthesize')
 const all = graded.filter(Boolean)
 const isKeep = r => r.verdict && r.verdict.verdict === 'KEEP-CANDIDATE'
-const confirmed  = all.filter(r => isKeep(r) && r.refute && !r.refute.refuted)
-const refuted    = all.filter(r => isKeep(r) && r.refute && r.refute.refuted)
-// A KEEP-CANDIDATE whose verifier agent died (refute == null) must NOT vanish:
-// it matched none of confirmed/refuted/rejected before this bucket. Surface it
-// for human review rather than silently dropping an unverified candidate win.
-const needsReview = all.filter(r => isKeep(r) && !r.refute)
+// A verdict only counts if the verifier returned a BOOLEAN `refuted`.  A null
+// refute (agent died) OR a malformed object missing `refuted` must NOT be read
+// as "not refuted" (`!undefined === true`) and silently confirmed — route it to
+// needsReview. These three buckets stay disjoint + total over the isKeep rows.
+const refVerdict = r => (r.refute && typeof r.refute.refuted === 'boolean') ? r.refute.refuted : null
+const confirmed  = all.filter(r => isKeep(r) && refVerdict(r) === false)
+const refuted    = all.filter(r => isKeep(r) && refVerdict(r) === true)
+const needsReview = all.filter(r => isKeep(r) && refVerdict(r) === null)
 log(`confirmed ${confirmed.length}/${all.length} (refuted-keeps: ${refuted.length}, needs-review: ${needsReview.length}). All keeps are PROVISIONAL — full flip-soak + human confirm before any default-flip.`)
 return {
   objective: { row: ROW, metric: METRIC },

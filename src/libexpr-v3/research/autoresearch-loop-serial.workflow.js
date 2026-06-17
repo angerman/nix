@@ -180,11 +180,14 @@ const verified = await parallel(graded.map(g => () => {
 phase('Synthesize')
 const all = verified.filter(Boolean)
 const isKeep = r => r.verdict && r.verdict.verdict === 'KEEP-CANDIDATE'
-const confirmed = all.filter(r => isKeep(r) && r.refute && !r.refute.refuted)
-const refuted   = all.filter(r => isKeep(r) && r.refute && r.refute.refuted)
-// A KEEP-CANDIDATE whose verifier agent died (refute == null) must NOT vanish
-// from all three buckets — surface it for manual review.
-const needsReview = all.filter(r => isKeep(r) && !r.refute)
+// A verdict only counts if the verifier returned a BOOLEAN `refuted`.  A null
+// refute (agent died) OR a malformed object missing `refuted` must NOT be read
+// as "not refuted" and silently confirmed — route it to needsReview. Disjoint +
+// total over the isKeep rows.
+const refVerdict = r => (r.refute && typeof r.refute.refuted === 'boolean') ? r.refute.refuted : null
+const confirmed = all.filter(r => isKeep(r) && refVerdict(r) === false)
+const refuted   = all.filter(r => isKeep(r) && refVerdict(r) === true)
+const needsReview = all.filter(r => isKeep(r) && refVerdict(r) === null)
 const dirty     = all.filter(r => r.verdict && r.verdict.treeRestored === false)
 log(`confirmed ${confirmed.length}/${all.length} (refuted-keeps: ${refuted.length}, needs-review: ${needsReview.length}; arms that left the tree dirty: ${dirty.length}). All keeps are PROVISIONAL — full flip-soak + darwin-4 + human confirm before any default-flip.`)
 return {

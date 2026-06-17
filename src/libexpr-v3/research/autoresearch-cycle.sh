@@ -23,7 +23,7 @@
 #    NEUTRAL             within noise (|Δ| < keep bar) — revert to avoid carcasses
 #
 #  Usage:
-#    autoresearch-cycle.sh --row foldl --metric cpu
+#    autoresearch-cycle.sh --row git --metric cpu
 #    autoresearch-cycle.sh --row firefox --metric arena
 #    autoresearch-cycle.sh --expr '1 + 1' --impure 0 --baseline-cpu 0.5 --metric cpu
 #    autoresearch-cycle.sh --no-build --row fib --metric cpu     # measure current binary
@@ -68,7 +68,10 @@ esac; done
 # its own process; a shared /tmp/arc.err + /tmp/arc.build would let one arm read
 # another arm's stderr → cross-contaminated CPU/arena/engaged values, i.e. the
 # verdict graded on the wrong measurement.  mktemp -d isolates per process.
-TMPD="$(mktemp -d "${TMPDIR:-/tmp}/arc.XXXXXX")"
+TMPD="$(mktemp -d "${TMPDIR:-/tmp}/arc.XXXXXX")" || { echo "autoresearch-cycle: mktemp -d failed (TMPDIR unwritable/full?)" >&2; exit 1; }
+# Guard: an empty TMPD would send redirects to /err and /build (root) and the
+# trap would rm -rf "" — so refuse to proceed without a real scratch dir.
+[[ -n "$TMPD" && -d "$TMPD" ]] || { echo "autoresearch-cycle: no scratch dir" >&2; exit 1; }
 trap 'rm -rf "$TMPD"' EXIT
 
 # --- the 7 pinned-row workloads (kept in sync with bench/pin-seven-rows.sh) --
@@ -83,7 +86,7 @@ row_expr() { case "$1" in
   *) return 1;;
 esac; }
 
-# --- run_arm <envprefix> : echoes "cpu arena result engaged"  (mirrors pin-seven-rows) ---
+# --- run_arm <envprefix> : echoes "engaged cpu arena result"  (mirrors pin-seven-rows) ---
 run_arm() {
   local envp="$1" best="" arena="" res="" engaged=0 i u a
   local -a IMP=(); [[ "$IMPURE" == 1 ]] && IMP=(--impure)
