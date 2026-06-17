@@ -28,13 +28,15 @@ drvPaths.
 bash src/libexpr-v3/research/autoresearch-cycle.sh --selftest
 
 # 2. Grade ONE candidate by hand (you've edited the engine; this rebuilds + gates it):
-bash src/libexpr-v3/research/autoresearch-cycle.sh --row foldl --metric cpu
+bash src/libexpr-v3/research/autoresearch-cycle.sh --row git --metric cpu
 #    → VERDICT  KEEP-CANDIDATE | NEUTRAL | REVERT-* | ABORT-NOT-ENGAGED
+#    (use a REAL row — git/hello/firefox/M5 — never the synthetic foldl/fib as the
+#     keep target; see program.md's REAL-WORLD-GAINS RULE. foldl/fib are proxies only.)
 
 # 3. Run the autonomous loop (ONLY on a clean tree — see safety rules):
 #    via the Workflow tool:
 #    Workflow({ scriptPath: "src/libexpr-v3/research/autoresearch-loop.workflow.js",
-#               args: { row: "foldl", metric: "cpu", width: 4 } })
+#               args: { row: "git", metric: "cpu", width: 4 } })
 ```
 
 ## Safety rules (non-negotiable)

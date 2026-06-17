@@ -1355,7 +1355,14 @@ struct Emitter
         // darwin-4 nixpkgs byte-equality sweep, mirroring the nursery-flip gate.
         static const bool s_nonRecAttrsInit =
             std::getenv("NIX_V3_NO_NONREC_ATTRS_INIT") == nullptr;
-        if (s_nonRecAttrsInit && e.nonRecursive) {
+        // `!e.isFunctionReturn`: the demotion must NOT win over the
+        // isFunctionReturn → OP_ATTRS_REC_INIT_TAIL selection below (emit.cc:1465),
+        // which publishes the partial Bindings to outer mid-force thunks (the
+        // #495/#498 `with self;` family).  No pass currently sets isFunctionReturn
+        // on a non-rec set (markTailReturnAttrSets is retired), so this is a no-op
+        // today — kept as a guard so reviving tail-return tagging can't silently
+        // drop the TAIL publish for a demoted set with no compile error.
+        if (s_nonRecAttrsInit && e.nonRecursive && !e.isFunctionReturn) {
             const size_t nn = e.entries.size();
             if (nn == 0) {
                 unit.code.push_back(encode(OP_ATTRS_INIT, 0));

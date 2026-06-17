@@ -64,6 +64,13 @@ while [[ $# -gt 0 ]]; do case "$1" in
   *) echo "autoresearch-cycle: unknown arg $1" >&2; exit 2;;
 esac; done
 
+# Per-process scratch dir.  The loop runs arms in PARALLEL git worktrees, each
+# its own process; a shared /tmp/arc.err + /tmp/arc.build would let one arm read
+# another arm's stderr → cross-contaminated CPU/arena/engaged values, i.e. the
+# verdict graded on the wrong measurement.  mktemp -d isolates per process.
+TMPD="$(mktemp -d "${TMPDIR:-/tmp}/arc.XXXXXX")"
+trap 'rm -rf "$TMPD"' EXIT
+
 # --- the 7 pinned-row workloads (kept in sync with bench/pin-seven-rows.sh) --
 row_expr() { case "$1" in
   attrNames) IMPURE=1; echo 'builtins.length (builtins.attrNames (import <nixpkgs> {}))';;
@@ -82,14 +89,17 @@ run_arm() {
   local -a IMP=(); [[ "$IMPURE" == 1 ]] && IMP=(--impure)
   for ((i=0;i<RUNS;i++)); do
     res="$(env $envp NIX_VM_STATS=1 NIX_V3_MAX_WALL_TIME=300s NIX_V3_MAX_HEAP=10G \
-        /usr/bin/time -l "$NIX" eval "${IMP[@]}" --expr "$EXPR" 2>/tmp/arc.err)"
-    u="$(grep -oE '[0-9]+\.[0-9]+ user' /tmp/arc.err | grep -oE '^[0-9.]+' | head -1)"
-    a="$(grep -oE 'v3_arena=[0-9.]+MB' /tmp/arc.err | grep -oE '[0-9.]+' | tail -1)"
-    grep -q 'v3-direct' /tmp/arc.err && engaged=1
+        /usr/bin/time -l "$NIX" eval "${IMP[@]}" --expr "$EXPR" 2>"$TMPD/err")"
+    u="$(grep -oE '[0-9]+\.[0-9]+ user' "$TMPD/err" | grep -oE '^[0-9.]+' | head -1)"
+    a="$(grep -oE 'v3_arena=[0-9.]+MB' "$TMPD/err" | grep -oE '[0-9.]+' | tail -1)"
+    grep -q 'v3-direct' "$TMPD/err" && engaged=1
     [[ -n "$u" ]] && { [[ -z "$best" ]] && best="$u" || best="$(awk "BEGIN{print ($u<$best)?$u:$best}")"; }
     [[ -n "$a" ]] && arena="$a"
   done
-  echo "${best:-NA} ${arena:-NA} ${res} ${engaged}"
+  # engaged FIRST (fixed field) and res LAST: `read`'s last-variable-gets-the-
+  # remainder rule then absorbs a result containing spaces without shifting the
+  # engaged flag onto a result word (which would mis-read ENGAGED).
+  echo "${engaged} ${best:-NA} ${arena:-NA} ${res}"
 }
 
 emit_verdict() {  # verdict ratio v3cpu twcpu v3arena reason
@@ -109,8 +119,8 @@ if [[ "$SELFTEST" == 1 ]]; then
   [[ -x "$NIX" ]] || { echo "selftest FAIL: no nix at $NIX"; exit 1; }
   EXPR='let f = n: if n < 2 then n else f (n - 1) + f (n - 2); in f 22'; IMPURE=0; ROW=selftest; METRIC=cpu
   RUNS=2
-  read -r v3cpu v3arena v3res v3eng < <(run_arm "NIX_V3_DIRECT_EVAL=1")
-  read -r twcpu twarena twres tweng < <(run_arm "")
+  read -r v3eng v3cpu v3arena v3res < <(run_arm "NIX_V3_DIRECT_EVAL=1")
+  read -r tweng twcpu twarena twres < <(run_arm "")
   echo "  v3: cpu=$v3cpu arena=$v3arena engaged=$v3eng result=$v3res" >&2
   echo "  tw: cpu=$twcpu result=$twres" >&2
   fail=0
@@ -142,18 +152,25 @@ fi
 # ── rebuild the candidate (stale-binary trap) ──
 if [[ "$NO_BUILD" != 1 ]]; then
   echo "autoresearch-cycle: building ($BUILD_CMD)…" >&2
-  ( cd "$ROOT" && eval "$BUILD_CMD" ) >/tmp/arc.build 2>&1 \
-    || { tail -15 /tmp/arc.build >&2; emit_verdict BUILD-FAIL NA NA NA NA "rebuild failed"; exit 1; }
+  ( cd "$ROOT" && eval "$BUILD_CMD" ) >"$TMPD/build" 2>&1 \
+    || { tail -15 "$TMPD/build" >&2; emit_verdict BUILD-FAIL NA NA NA NA "rebuild failed"; exit 1; }
 fi
 
 # ── measure ──
-read -r v3cpu v3arena v3res v3eng < <(run_arm "NIX_V3_DIRECT_EVAL=1")
-read -r twcpu twarena twres tweng < <(run_arm "")
+read -r v3eng v3cpu v3arena v3res < <(run_arm "NIX_V3_DIRECT_EVAL=1")
+read -r tweng twcpu twarena twres < <(run_arm "")
 ratio="$(awk "BEGIN{ if(\"$twcpu\"==\"NA\"||\"$v3cpu\"==\"NA\"||$twcpu==0) print \"NA\"; else printf \"%.2f\", $v3cpu/$twcpu }")"
 
 # ── verdict (precedence high→low) ──
 if [[ "$v3eng" != 1 ]]; then
   emit_verdict ABORT-NOT-ENGAGED "$ratio" "$v3cpu" "$twcpu" "$v3arena" "no v3-direct stats line — distrust"; exit 0
+fi
+# An empty result means the eval produced no stdout — a crash/OOM/wall-timeout
+# (possibly AFTER the v3-direct stats line, so engaged==1).  Two empty strings
+# compare EQUAL, which would otherwise sail past the byte-identity check and let
+# a double-crash be graded as a win.  Treat any empty arm as a hard revert.
+if [[ -z "$v3res" || -z "$twres" ]]; then
+  emit_verdict REVERT-DIVERGENT "$ratio" "$v3cpu" "$twcpu" "$v3arena" "empty result (crash/timeout) — cannot establish byte-identity"; exit 0
 fi
 if [[ "$v3res" != "$twres" ]]; then
   emit_verdict REVERT-DIVERGENT "$ratio" "$v3cpu" "$twcpu" "$v3arena" "v3 result != TW (correctness)"; exit 0

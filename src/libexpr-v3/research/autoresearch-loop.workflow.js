@@ -4,7 +4,7 @@
 //  Run via the Workflow tool ONLY when the working tree is CLEAN (no uncommitted
 //  engine edits) and you have explicitly opted into multi-agent orchestration:
 //      Workflow({ scriptPath: "src/libexpr-v3/research/autoresearch-loop.workflow.js",
-//                 args: { row: "foldl", metric: "cpu", width: 4 } })
+//                 args: { row: "git", metric: "cpu", width: 4 } })
 //
 //  It automates the tiered loop from lode/AUTORESEARCH_V3_DESIGN_2026-06-16.md:
 //    Scout    — one agent reads research/program.md + do-not-repropose.tsv + the
@@ -39,7 +39,11 @@ export const meta = {
   ],
 }
 
-const ROW    = (args && args.row)    || 'foldl'
+// Default to a REAL nixpkgs drvPath row, never the synthetic foldl/fib (see
+// program.md REAL-WORLD-GAINS RULE + do-not-repropose.tsv): a foldl win is
+// presumed benchmark-tuning and "does not count". The serial variant defaults
+// to 'git' too — keep them consistent.
+const ROW    = (args && args.row)    || 'git'
 const METRIC = (args && args.metric) || 'cpu'
 const WIDTH  = (args && args.width)  || 4
 
@@ -131,13 +135,19 @@ const graded = await pipeline(ideas,
 
 phase('Synthesize')
 const all = graded.filter(Boolean)
-const confirmed = all.filter(r => r.verdict && r.verdict.verdict === 'KEEP-CANDIDATE' && r.refute && !r.refute.refuted)
-const refuted   = all.filter(r => r.verdict && r.verdict.verdict === 'KEEP-CANDIDATE' && r.refute && r.refute.refuted)
-log(`confirmed ${confirmed.length}/${all.length} (refuted-keeps: ${refuted.length}). All keeps are PROVISIONAL — full flip-soak + human confirm before any default-flip.`)
+const isKeep = r => r.verdict && r.verdict.verdict === 'KEEP-CANDIDATE'
+const confirmed  = all.filter(r => isKeep(r) && r.refute && !r.refute.refuted)
+const refuted    = all.filter(r => isKeep(r) && r.refute && r.refute.refuted)
+// A KEEP-CANDIDATE whose verifier agent died (refute == null) must NOT vanish:
+// it matched none of confirmed/refuted/rejected before this bucket. Surface it
+// for human review rather than silently dropping an unverified candidate win.
+const needsReview = all.filter(r => isKeep(r) && !r.refute)
+log(`confirmed ${confirmed.length}/${all.length} (refuted-keeps: ${refuted.length}, needs-review: ${needsReview.length}). All keeps are PROVISIONAL — full flip-soak + human confirm before any default-flip.`)
 return {
   objective: { row: ROW, metric: METRIC },
   confirmed: confirmed.map(r => ({ id: r.idea.id, summary: r.verdict.summary, ratio: r.verdict.ratio, arena: r.verdict.arena })),
   refuted:   refuted.map(r => ({ id: r.idea.id, reason: r.refute.reason })),
-  rejected:  all.filter(r => !r.verdict || r.verdict.verdict !== 'KEEP-CANDIDATE').map(r => ({ id: r.idea && r.idea.id, verdict: r.verdict && r.verdict.verdict, summary: r.verdict && r.verdict.summary })),
+  needsReview: needsReview.map(r => ({ id: r.idea && r.idea.id, summary: r.verdict.summary, reason: 'verifier agent returned no verdict — review manually' })),
+  rejected:  all.filter(r => !isKeep(r)).map(r => ({ id: r.idea && r.idea.id, verdict: r.verdict && r.verdict.verdict, summary: r.verdict && r.verdict.summary })),
   note: 'Keeps are PROVISIONAL. Append every revert to research/do-not-repropose.tsv. Do NOT default-flip a GC/representation change without a full nixpkgs flip-soak + human sign-off.',
 }

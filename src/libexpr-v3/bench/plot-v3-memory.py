@@ -118,7 +118,10 @@ def read_heap_trace(path):
                 "t_ms": int(t_us) / 1000.0,
                 "heap_mb": int(heap) / 1e6,
                 "rss_mb": (int(rss) / 1e6) if rss is not None else None,
-                "cpu_ms": (int(cpu)) if cpu is not None else None,
+                # heap_trace.cc emits cpu_ms=-1 when getrusage fails; treat the
+                # sentinel as missing so cpu_percent_series doesn't difference it
+                # into a spurious CPU% spike.
+                "cpu_ms": (int(cpu)) if (cpu is not None and int(cpu) >= 0) else None,
             })
     return out
 

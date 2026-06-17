@@ -179,15 +179,20 @@ const verified = await parallel(graded.map(g => () => {
 
 phase('Synthesize')
 const all = verified.filter(Boolean)
-const confirmed = all.filter(r => r.verdict && r.verdict.verdict === 'KEEP-CANDIDATE' && r.refute && !r.refute.refuted)
-const refuted   = all.filter(r => r.verdict && r.verdict.verdict === 'KEEP-CANDIDATE' && r.refute && r.refute.refuted)
+const isKeep = r => r.verdict && r.verdict.verdict === 'KEEP-CANDIDATE'
+const confirmed = all.filter(r => isKeep(r) && r.refute && !r.refute.refuted)
+const refuted   = all.filter(r => isKeep(r) && r.refute && r.refute.refuted)
+// A KEEP-CANDIDATE whose verifier agent died (refute == null) must NOT vanish
+// from all three buckets — surface it for manual review.
+const needsReview = all.filter(r => isKeep(r) && !r.refute)
 const dirty     = all.filter(r => r.verdict && r.verdict.treeRestored === false)
-log(`confirmed ${confirmed.length}/${all.length} (refuted-keeps: ${refuted.length}; arms that left the tree dirty: ${dirty.length}). All keeps are PROVISIONAL — full flip-soak + darwin-4 + human confirm before any default-flip.`)
+log(`confirmed ${confirmed.length}/${all.length} (refuted-keeps: ${refuted.length}, needs-review: ${needsReview.length}; arms that left the tree dirty: ${dirty.length}). All keeps are PROVISIONAL — full flip-soak + darwin-4 + human confirm before any default-flip.`)
 return {
   objective: { row: ROW, metric: METRIC, variant: 'serial-main-tree' },
   confirmed: confirmed.map(r => ({ id: r.idea.id, summary: r.verdict.summary, ratio: r.verdict.ratio, arena: r.verdict.arena, diff: r.verdict.diff, extraByteId: r.verdict.extraByteId })),
   refuted:   refuted.map(r => ({ id: r.idea.id, reason: r.refute.reason })),
-  rejected:  all.filter(r => !r.verdict || r.verdict.verdict !== 'KEEP-CANDIDATE').map(r => ({ id: r.idea && r.idea.id, verdict: r.verdict && r.verdict.verdict, summary: r.verdict && r.verdict.summary })),
+  needsReview: needsReview.map(r => ({ id: r.idea && r.idea.id, summary: r.verdict.summary, reason: 'verifier agent returned no verdict — review manually' })),
+  rejected:  all.filter(r => !isKeep(r)).map(r => ({ id: r.idea && r.idea.id, verdict: r.verdict && r.verdict.verdict, summary: r.verdict && r.verdict.summary })),
   treeDirtyArms: dirty.map(r => r.idea && r.idea.id),
   note: 'SERIAL main-tree run. Keeps are PROVISIONAL (diff included for manual review). Append every revert to research/do-not-repropose.tsv. Re-measure any keeper on darwin-4 + a full nixpkgs flip-soak before committing/default-flipping. If treeDirtyArms is non-empty, manually `git restore -- src/` before trusting later results.',
 }
