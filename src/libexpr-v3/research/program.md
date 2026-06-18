@@ -29,6 +29,21 @@ dispatch-loop overhead**, not record-construction.  (Core-vm.cc → slow rebuild
 risk than the §"Where to look" sweet spot; treat as a careful manual-RCA target, or let
 the loop attack it via opt-passes that cut dispatch on real lib iteration.)
 
+**MEASURE git CACHE-OFF (2026-06-18, hard-won).** A drvPath CPU objective MUST run with
+`NIX_V3_NO_DISK_CACHE=1` (the grader's `--no-disk-cache` flag).  Cache-ON, v3 serves the
+derivation from its disk cache, so the measured CPU is cache-hit time the VM cannot move:
+git cache-ON ≈1.45s (the STALE seven-rows.tsv pin, ratio 1.54×) is a partial/served eval,
+while git cache-OFF ≈**4.88s vs TW 1.42s = 3.44×** is the real eval and the true headroom.
+Pass `--no-disk-cache --baseline-cpu 4.82` when grading git.  (The pinned seven-rows.tsv is
+cache-ON → NOT a valid cache-off baseline.)
+
+**Live promising lever (autoresearch run-1 L3, untested — grader bug blocked grading,
+now fixed):** extend the Stage-2 `reuseScope` (skip the redundant per-element active-VM
+re-push, already done for `primFoldl`/`primFoldlMap` in `callClosure2`) to the OTHER
+arity-1 strict primop callers — `primFilter`, `primMap`-style — via a
+`callClosureImpl(reuseScope)` refactor.  Byte-identical by construction; attacks exactly
+the callClosure/dispatch hot path the profile fingered.  Re-grade it cache-off.
+
 Alternative objectives (swap the `OBJECTIVE_ROW`/`OBJECTIVE_METRIC` below):
 - lower v3 arena (MB) on `firefox` / `M5` (deterministic metric — preferred for memory)
 - lower v3 CPU on `hello` / `firefox` / `M5`

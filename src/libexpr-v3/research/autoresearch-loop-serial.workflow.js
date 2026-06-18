@@ -43,9 +43,16 @@ export const meta = {
   ],
 }
 
-const ROW    = (args && args.row)    || 'git'
-const METRIC = (args && args.metric) || 'cpu'
-const WIDTH  = (args && args.width)  || 3
+const ROW      = (args && args.row)      || 'git'
+const METRIC   = (args && args.metric)   || 'cpu'
+const WIDTH    = (args && args.width)    || 3
+// drvPath CPU rows MUST be graded cache-off (cache-on measures disk-cache-hit
+// time the VM can't move). Default cache-off for the real rows; pass the
+// matching cache-off baseline (git ≈4.82s; pinned seven-rows.tsv is cache-ON).
+const CACHE_OFF    = (args && args.cacheOff !== undefined) ? args.cacheOff
+                   : !['fib', 'foldl'].includes(ROW)
+const BASELINE_CPU = (args && args.baselineCpu) || (ROW === 'git' ? '4.82' : '')
+const GRADE_FLAGS  = `${CACHE_OFF ? '--no-disk-cache ' : ''}${BASELINE_CPU ? `--baseline-cpu ${BASELINE_CPU} ` : ''}`.trim()
 
 const IDEAS_SCHEMA = {
   type: 'object',
@@ -100,7 +107,14 @@ const scouted = await agent(
    Objective: lower v3 ${METRIC} on the REAL '${ROW}' row (a nixpkgs drvPath eval).
    The real hot path (per the git.drvPath sample) is forceValue → callClosure → dispatchLoop,
    driven by primFoldl/primFilter running nixpkgs lib.foldl'/filter/map — i.e. PER-ELEMENT
-   DISPATCH, not record-construction. Favor ideas that cut dispatch/alloc on that path.
+   DISPATCH, not record-construction (real git cache-off ratio is 3.44× vs TW). Favor ideas
+   that cut dispatch/alloc on that path.
+   LEARNINGS FROM RUN-1 (do not repeat): (a) GET_LOCAL+ATTRS_SELECT superinstruction was
+   NEUTRAL — attr-SELECT dispatch is NOT the git bottleneck (it's the callClosure/lambda-apply
+   per element). (b) The PROMISING untested lever is extending Stage-2 reuseScope (skip the
+   per-element active-VM re-push, already in callClosure2 for primFoldl/primFoldlMap) to the
+   OTHER arity-1 strict primop callers — primFilter, primMap — via a callClosureImpl(reuseScope)
+   refactor; consider proposing/refining it. Prefer levers on the CLOSURE-apply dispatch.
    Propose exactly ${WIDTH} DISTINCT, LOCALIZED candidate levers, each touching a SMALL
    translation unit (prefer opt_*.cc / emit.cc / a GC or IC tuning knob — avoid header edits
    that rebuild the world, and NEVER touch the fenced-off areas: derivationStrict, FFI, the
@@ -132,9 +146,11 @@ for (let i = 0; i < ideas.length; i++) {
      no new ungated env var; prefer a single small .cc edit (NOT a header that rebuilds the world).
 
      Make the minimal change, then GRADE it:
-        bash src/libexpr-v3/research/autoresearch-cycle.sh --row ${ROW} --metric ${METRIC}
-     It rebuilds (incremental ninja), measures v3 vs TW on the '${ROW}' row, and emits a single
-     VERDICT line. Report the VERDICT fields (verdict / ratio / arena) and the unified diff.
+        bash src/libexpr-v3/research/autoresearch-cycle.sh --row ${ROW} --metric ${METRIC} ${GRADE_FLAGS}
+     It rebuilds (incremental ninja), measures v3 vs TW on the '${ROW}' row CACHE-OFF (the real
+     eval — git is ~4.8s/60s-wall, not the cache-served 1.45s), and emits a single VERDICT line.
+     Report the VERDICT fields (verdict / ratio / arena) and the unified diff. A real git eval
+     shows arena ≈200MB (NOT 16.8MB — that empty figure means the eval failed: check --impure).
 
      IF the verdict is KEEP-CANDIDATE: BEFORE reverting, also check byte-identity on a SECOND
      real row so a single-row win isn't masking a divergence — eval hello.drvPath under both
