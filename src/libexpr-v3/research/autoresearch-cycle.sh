@@ -50,7 +50,7 @@ BASELINE_TSV="${BASELINE_TSV:-$ROOT/src/libexpr-v3/bench/baselines/seven-rows.ts
 JOURNAL="${JOURNAL:-$SELF_DIR/run-journal.tsv}"
 CN_PATH="${CN_PATH:-/Users/angerman/Projects/iohk/cardano-node}"
 
-ROW=""; EXPR=""; IMPURE="0"; METRIC="cpu"; NO_BUILD=0; SELFTEST=0
+ROW=""; EXPR=""; IMPURE="0"; METRIC="cpu"; NO_BUILD=0; SELFTEST=0; NO_DISK_CACHE=0
 BASE_CPU=""; BASE_ARENA=""
 while [[ $# -gt 0 ]]; do case "$1" in
   --row) ROW="$2"; shift 2;;
@@ -60,6 +60,12 @@ while [[ $# -gt 0 ]]; do case "$1" in
   --baseline-cpu) BASE_CPU="$2"; shift 2;;
   --baseline-arena) BASE_ARENA="$2"; shift 2;;
   --no-build) NO_BUILD=1; shift;;
+  # --no-disk-cache: force a REAL eval by disabling v3's disk cache on BOTH arms.
+  # MANDATORY for any drvPath CPU objective (git/hello/firefox/M5): cache-ON, the
+  # drv is served from disk so the measured CPU is cache-hit time the VM cannot
+  # move (git cache-on ≈1.45s partial vs cache-off ≈4.82s real eval, 2026-06-18).
+  # Pair with a cache-off --baseline-cpu (the pinned seven-rows.tsv is cache-ON).
+  --no-disk-cache) NO_DISK_CACHE=1; shift;;
   --selftest) SELFTEST=1; shift;;
   *) echo "autoresearch-cycle: unknown arg $1" >&2; exit 2;;
 esac; done
@@ -90,6 +96,8 @@ esac; }
 run_arm() {
   local envp="$1" best="" arena="" res="" engaged=0 i u a
   local -a IMP=(); [[ "$IMPURE" == 1 ]] && IMP=(--impure)
+  # cache-off forces a real eval on BOTH arms (see --no-disk-cache above).
+  [[ "$NO_DISK_CACHE" == 1 ]] && envp="$envp NIX_V3_NO_DISK_CACHE=1"
   for ((i=0;i<RUNS;i++)); do
     res="$(env $envp NIX_VM_STATS=1 NIX_V3_MAX_WALL_TIME=300s NIX_V3_MAX_HEAP=10G \
         /usr/bin/time -l "$NIX" eval "${IMP[@]}" --expr "$EXPR" 2>"$TMPD/err")"
@@ -143,6 +151,16 @@ fi
 # ── resolve workload ──
 if [[ -n "$ROW" ]]; then
   EXPR="$(row_expr "$ROW")" || { echo "autoresearch-cycle: unknown --row $ROW" >&2; exit 2; }
+  # BUG FIX 2026-06-18 (found by the autoresearch L2 arm): row_expr sets IMPURE
+  # *inside* the `$(...)` command-substitution subshell, so the assignment never
+  # reaches this parent scope.  The impure rows (attrNames/hello/git/firefox/M5)
+  # were silently run WITHOUT --impure → `import <nixpkgs>` fails in pure-eval →
+  # empty result (cpu≈0.08s, arena≈16.8MB) → spurious REVERT-DIVERGENT, making
+  # every real-row run ungradeable.  Re-derive IMPURE here in the parent.
+  case "$ROW" in
+    fib|foldl) IMPURE=0;;                 # pure: no <nixpkgs>/currentSystem
+    *)         IMPURE=1;;                 # attrNames/hello/git/firefox/M5
+  esac
 fi
 [[ -n "$EXPR" ]] || { echo "autoresearch-cycle: need --row NAME or --expr EXPR" >&2; exit 2; }
 
