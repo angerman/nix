@@ -221,6 +221,32 @@ static_assert(sizeof(Thunk) == 24,
     "FP-2: Thunk header must be 24 B (state-word 8 + cell 8 + union 8). The "
     "optional capturedWiths lives at tail[nUpvalues] when hasWithsSlot==1.");
 
+// env-sharing (NIX_V3_ENV_SHARING): the `hasWithsSlot` byte is repurposed as a
+// FLAGS bitfield rather than adding a field — FP-2 keeps the header at 24 B, so
+// the thunk-side Env reference must NOT grow it.  Bit 0 (THUNK_WITHS_SLOT) is the
+// original capturedWiths-slot flag; bit 1 (THUNK_ENV_SHARED) marks env-sharing,
+// where the thunk's upvalues live in a shared tenured Env (`tail[0]` holds the
+// raw Env*) instead of inline in tail[0..nUpvalues).  When env-shared the tail is
+// just [Env* @ tail[0]] + [capturedWiths @ tail[1] iff THUNK_WITHS_SLOT] — so the
+// withs slot RELOCATES from tail[nUpvalues] to tail[1] (nUpvalues stays the
+// LOGICAL upvalue count, read from the Env).  This lets the per-force fakeClo
+// share the Env (fakeClo->upvalEnv = thunkUpvalEnv(t)) with NO upvalue copy.
+enum : uint8_t {
+    THUNK_WITHS_SLOT = 1,
+    THUNK_ENV_SHARED = 2,
+};
+[[gnu::always_inline]] inline bool thunkHasWithsSlot(const Thunk * t) noexcept
+{ return (t->hasWithsSlot & THUNK_WITHS_SLOT) != 0; }
+[[gnu::always_inline]] inline bool thunkEnvShared(const Thunk * t) noexcept
+{ return (t->hasWithsSlot & THUNK_ENV_SHARED) != 0; }
+/// Shared upvalue Env (env-sharing), or null on the default inline-tail path.
+[[gnu::always_inline]] inline Env * thunkUpvalEnv(const Thunk * t) noexcept
+{
+    return thunkEnvShared(t)
+        ? *reinterpret_cast<Env * const *>(&t->tail[0])
+        : nullptr;
+}
+
 // FP-2b SINGLE SOURCE OF TRUTH for a thunk's scanned/copied byte size.  EVERY GC
 // size computation (evac copy in Cheney/scavenge, line-marking, byte accounting)
 // MUST use this — if any under-counts, the evac copy drops the trailing withs
@@ -233,8 +259,13 @@ static_assert(sizeof(Thunk) == 24,
     switch (t->state) {
     case ThunkState::Suspended:
     case ThunkState::Blackhole:
+        // env-sharing: tail is [Env* @ 0] + [withs @ 1 iff WITHS_SLOT] — a fixed
+        // 1-or-2 slots regardless of the logical nUpvalues (which live in the Env).
+        if (thunkEnvShared(t))
+            return sizeof(Thunk)
+                 + sizeof(Value) * (1 + (thunkHasWithsSlot(t) ? 1 : 0));
         return sizeof(Thunk) + sizeof(Value) * t->nUpvalues
-             + (t->hasWithsSlot ? sizeof(Value) : 0);
+             + (thunkHasWithsSlot(t) ? sizeof(Value) : 0);
     case ThunkState::Native:
         return sizeof(Thunk) + sizeof(Value) * t->nUpvalues;
     case ThunkState::Evaluated:
@@ -255,15 +286,19 @@ static_assert(sizeof(Thunk) == 24,
     // tail[nUpvalues] would be out of bounds.  Only Suspended/Blackhole carry a
     // live slot.  (All real callers are already in those states; this is
     // defence-in-depth in a UAF-prone area, same cache line, zero behaviour change.)
-    return (t->hasWithsSlot
-            && (t->state == ThunkState::Suspended
-                || t->state == ThunkState::Blackhole))
-        ? *reinterpret_cast<ListVec * const *>(&t->tail[t->nUpvalues])
-        : nullptr;
+    if (!thunkHasWithsSlot(t)
+        || !(t->state == ThunkState::Suspended
+             || t->state == ThunkState::Blackhole))
+        return nullptr;
+    // env-sharing relocates the withs slot to tail[1] (tail[0] is the Env*);
+    // the default inline-tail path keeps it at tail[nUpvalues].
+    const std::size_t idx = thunkEnvShared(t) ? 1 : t->nUpvalues;
+    return *reinterpret_cast<ListVec * const *>(&t->tail[idx]);
 }
 [[gnu::always_inline]] inline void thunkSetCapturedWiths(Thunk * t, ListVec * w) noexcept
 {
-    *reinterpret_cast<ListVec **>(&t->tail[t->nUpvalues]) = w;
+    const std::size_t idx = thunkEnvShared(t) ? 1 : t->nUpvalues;
+    *reinterpret_cast<ListVec **>(&t->tail[idx]) = w;
 }
 
 // ---------------------------------------------------------------------------

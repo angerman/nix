@@ -4878,7 +4878,22 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             const bool willHaveWiths = (nWiths > 0)
                 || (vm.withStack.size()
                     > (vm.frames.empty() ? 0 : vm.frames.back().withStackBase));
-            Thunk * t = Alloc::allocThunkSuspended(nUp, willHaveWiths);
+            // env-sharing (NIX_V3_ENV_SHARING, default-off): store the thunk's
+            // upvalues in a shared tenured Env (tail[0]=Env*) so the per-force
+            // fakeClo shares it with NO upvalue copy (the forceValue lever).  See
+            // OP_MAKE_CLOSURE for the gate retirement criterion.  Header stays
+            // 24 B (ENV_SHARED flag in hasWithsSlot, not a new field).
+            static const bool s_envSharingThunk =
+                std::getenv("NIX_V3_ENV_SHARING") != nullptr;
+            Thunk * t;
+            Env * thunkEnv = nullptr;
+            if (__builtin_expect(s_envSharingThunk && nUp > 0, 0)) {
+                t = Alloc::allocThunkSuspendedShared(nUp, willHaveWiths);
+                thunkEnv = Alloc::allocEnv(nUp);
+                *reinterpret_cast<Env **>(&t->tail[0]) = thunkEnv;  // Env* @ tail[0]
+            } else {
+                t = Alloc::allocThunkSuspended(nUp, willHaveWiths);
+            }
             // The "descriptor" we use is the LambdaDescriptor for the
             // referenced function (treated as 0-arg for thunks).
             // Reuse the LambdaDescriptor pointer through suspended.desc.
@@ -5006,8 +5021,15 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                         t->suspended.desc->hasFormals);
                 }
             }
-            for (uint16_t i = nUp; i > 0; --i) t->tail[i - 1] = pop(vm);
-            if (__builtin_expect(g_dbgUpvalDup, 0) && nUp > 0)
+            // env-sharing: upvalues go into the shared Env, not the inline tail
+            // (tail[0] holds the Env*).  Stack order is identical (upvalues on
+            // top, withs below), so the withs-pop logic below is unaffected.
+            if (thunkEnv) {
+                for (uint16_t i = nUp; i > 0; --i) thunkEnv->values[i - 1] = pop(vm);
+            } else {
+                for (uint16_t i = nUp; i > 0; --i) t->tail[i - 1] = pop(vm);
+            }
+            if (__builtin_expect(g_dbgUpvalDup, 0) && nUp > 0 && !thunkEnv)
                 recordUpvalDup(t, nUp);  // workstream H sizing probe
             // FP-2b: capturedWiths now lives in the reserved tail slot
             // (tail[nUpvalues], present iff willHaveWiths).  Each branch that
@@ -5052,7 +5074,10 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 return v;
             };
             bool isStageRes = false;
-            if (t->suspended.desc && t->suspended.desc->name == "res"
+            // env-sharing: a shared thunk's tail is [Env*]+[withs] (1-2 slots), so
+            // tail[3] would be out of bounds — these #498 diagnostics read inline-
+            // tail upvalues and are skipped under env-sharing (debug-only trace).
+            if (!thunkEnv && t->suspended.desc && t->suspended.desc->name == "res"
                 && nUp == 4) {
                 Value uv3chased = chaseFn(t->tail[3], 4);
                 if (uv3chased.tag() == Tag::Attrs && uv3chased.asAttrs()
@@ -5073,7 +5098,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // at MAKE_THUNK time.
             static const bool s_dbgMakePrev =
                 std::getenv("V3_DBG_MAKE_PREV") != nullptr;
-            if (__builtin_expect(s_dbgMakePrev, 0)
+            if (__builtin_expect(s_dbgMakePrev, 0) && !thunkEnv
                 && t->suspended.desc && t->suspended.desc->name == "prev"
                 && nUp == 2) {
                 // Dump the maker frame's local[0] for comparison with
@@ -7445,8 +7470,18 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 // otherwise pinned by every per-attr selector thunk.
                 {
                     Thunk * t = fr.thunk;
-                    for (uint16_t ui = 0; ui < t->nUpvalues; ++ui)
-                        t->tail[ui] = Value{};
+                    // env-sharing: the upvalues live in the shared Env (tail[0]
+                    // is the Env*, tail size is 1-2 — NOT nUpvalues slots).  The
+                    // Suspended/Blackhole→Evaluated transition just below makes
+                    // thunkScanSize header-only, so the Env (and its upvalues)
+                    // drops out of the GC graph automatically — no per-slot clear,
+                    // which would corrupt tail[0] and run off the end.  Skipping
+                    // it also keeps tail[0] a valid Env* for the whole
+                    // Suspended/Blackhole lifetime (the GC walkers rely on that).
+                    if (!thunkEnvShared(t)) {
+                        for (uint16_t ui = 0; ui < t->nUpvalues; ++ui)
+                            t->tail[ui] = Value{};
+                    }
                     // Don't reset nUpvalues -- the FAM size was set at
                     // alloc time; reusing the slot would require the
                     // count.  Leaving it preserves alloc-time
@@ -8261,7 +8296,16 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             fakeClo->nUpvalues = t->nUpvalues;
             fakeClo->capturedWiths = thunkCapturedWiths(t);  // FP-2b: was suspended.capturedWiths
             fakeClo->cu = thunkCU(t);  // FP-2a: was t->suspended.cu
-            for (uint16_t i = 0; i < t->nUpvalues; ++i) fakeClo->upvalues[i] = t->tail[i];
+            // env-sharing: share the thunk's Env directly (NO per-force upvalue
+            // copy — this is the forceValue lever).  allocFakeClo reset upvalEnv to
+            // null; poison the unused inline FAM so the brute-scanner sees no stale
+            // pointers there (walkClosure skips the FAM when upvalEnv is set).
+            if (Env * te = thunkUpvalEnv(t)) {
+                fakeClo->upvalEnv = te;
+                for (uint16_t i = 0; i < t->nUpvalues; ++i) fakeClo->upvalues[i].mkUninitialized();
+            } else {
+                for (uint16_t i = 0; i < t->nUpvalues; ++i) fakeClo->upvalues[i] = t->tail[i];
+            }
             // Phase D coverage: fakeClo's upvalues now mirror t->tail[].
             // If the fakeClo itself is tenured (pool may return tenured)
             // and t->tail[] carries nursery payloads, dirty-list.
@@ -13819,7 +13863,14 @@ Value forceValue(VMState & vm, Value v)
         fakeClo->nUpvalues = t->nUpvalues;
         fakeClo->capturedWiths = thunkCapturedWiths(t);  // FP-2b: was suspended.capturedWiths
         fakeClo->cu = thunkCU(t);  // FP-2a: was t->suspended.cu
-        for (uint16_t i = 0; i < t->nUpvalues; ++i) fakeClo->upvalues[i] = t->tail[i];
+        // env-sharing: share the thunk's Env directly (no per-force copy); see
+        // the OP_FORCE path above for the FAM-poison rationale.
+        if (Env * te = thunkUpvalEnv(t)) {
+            fakeClo->upvalEnv = te;
+            for (uint16_t i = 0; i < t->nUpvalues; ++i) fakeClo->upvalues[i].mkUninitialized();
+        } else {
+            for (uint16_t i = 0; i < t->nUpvalues; ++i) fakeClo->upvalues[i] = t->tail[i];
+        }
         // Phase D coverage: same as the OP_FORCE fakeClo path above.
         closurePostConstructBarrier(fakeClo);
         ListVec * thunkWiths = thunkCapturedWiths(t);  // FP-2b: was suspended.capturedWiths

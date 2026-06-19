@@ -592,8 +592,19 @@ private:
         case ThunkState::Blackhole:
             if (ListVec * w = thunkCapturedWiths(t))  // FP-2b: tail slot
                 visitList(w);
-            for (uint16_t i = 0; i < t->nUpvalues; ++i)
-                visitValue(t->tail[i]);
+            if (Env * te = thunkUpvalEnv(t)) {
+                // env-sharing: upvalues live in the shared, tenured Env (tail[0]).
+                if (marker_.tryMark(te)) {
+                    if (arenaSetForSlot_)
+                        arenaSetForSlot_->markLinesForCell(
+                            te, sizeof(Env) + sizeof(Value) * te->nValues);
+                    for (uint16_t i = 0; i < te->nValues; ++i)
+                        visitValue(te->values[i]);
+                }
+            } else {
+                for (uint16_t i = 0; i < t->nUpvalues; ++i)
+                    visitValue(t->tail[i]);
+            }
             break;
         case ThunkState::Evaluated:
             visitValue(t->evaluated);
@@ -1322,7 +1333,12 @@ private:
             case ThunkState::Blackhole:
                 clearCU(thunkCU(t));  // FP-2a: was t->suspended.cu; evac moves IC'd Bindings
                 if (ListVec * w = thunkCapturedWiths(t)) visitList(w);  // FP-2b: tail slot
-                for (uint16_t i = 0; i < t->nUpvalues; ++i) visitValue(t->tail[i]);
+                // env-sharing: rewrite the shared (non-moving) Env's value ptrs.
+                if (Env * te = thunkUpvalEnv(t)) {
+                    for (uint16_t i = 0; i < te->nValues; ++i) visitValue(te->values[i]);
+                } else {
+                    for (uint16_t i = 0; i < t->nUpvalues; ++i) visitValue(t->tail[i]);
+                }
                 break;
             case ThunkState::Evaluated: visitValue(t->evaluated); break;
             case ThunkState::Native:
@@ -1794,6 +1810,12 @@ static void runEvacuation(VMState & vm, Arena & arena,
                         case ThunkState::Blackhole:
                         case ThunkState::Native:
                             if (ListVec * w = thunkCapturedWiths(t); w && inFreeable(reinterpret_cast<uintptr_t>(w))) note("Thunk.capturedWiths", cs);  // FP-2b: tail slot
+                            if (Env * te = thunkUpvalEnv(t)) {
+                                // env-sharing: upvalues live in the shared Env.
+                                if (inFreeable(reinterpret_cast<uintptr_t>(te))) note("Thunk.upvalEnv", cs);
+                                for (uint16_t i = 0; i < te->nValues; ++i)
+                                    if (refCand(te->values[i])) { note("Thunk.upvalEnv.value", cs); break; }
+                            } else
                             for (uint16_t i = 0; i < t->nUpvalues; ++i)
                                 if (refCand(t->tail[i])) { note("Thunk.tail", cs); break; }
                             break;

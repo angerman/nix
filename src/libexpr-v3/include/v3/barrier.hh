@@ -363,11 +363,21 @@ thunkPostConstructBarrier(Thunk * t) noexcept
         const Nursery & n = threadNursery();
         if (n.contains(t)) return;
         bool dirty = false;
-        // tail[i] for Suspended / Native / Blackhole carries upvalues.
-        // Native / Blackhole are rare; iterating tail is harmless if
-        // nUpvalues == 0 (e.g. Bridge).
-        for (uint16_t i = 0; i < t->nUpvalues; ++i) {
-            if (isNurseryPayload(t->tail[i], n)) { dirty = true; break; }
+        if (Env * te = thunkUpvalEnv(t)) {
+            // env-sharing: upvalues live in the shared Env (tail[0] is the Env*,
+            // NOT a Value — and the tail is only 1-2 slots, so iterating
+            // nUpvalues here would read garbage + run off the end).  Scan the
+            // Env; dirtying the thunk makes the scavenge gray the Env (walkThunk).
+            for (uint16_t i = 0; i < te->nValues; ++i) {
+                if (isNurseryPayload(te->values[i], n)) { dirty = true; break; }
+            }
+        } else {
+            // tail[i] for Suspended / Native / Blackhole carries upvalues.
+            // Native / Blackhole are rare; iterating tail is harmless if
+            // nUpvalues == 0 (e.g. Bridge).
+            for (uint16_t i = 0; i < t->nUpvalues; ++i) {
+                if (isNurseryPayload(t->tail[i], n)) { dirty = true; break; }
+            }
         }
         // Suspended-capturedWiths.  FP-2b: now in the tail slot (thunkCapturedWiths),
         // present only for Suspended/Blackhole with hasWithsSlot — so the state
