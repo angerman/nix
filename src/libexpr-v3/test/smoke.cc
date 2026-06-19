@@ -2394,6 +2394,10 @@ static int testBindingsChainLookup()
     // compares SymbolId values, so opaque ints are fine.
     Bindings * parent = makeSorted({{1, 1}, {2, 2}});
     Bindings * child  = makeSorted({{1, 10}, {3, 3}});  // overlay
+    parent->entries[0].pos = 101;
+    parent->entries[1].pos = 102;
+    child->entries[0].pos = 201;
+    child->entries[1].pos = 203;
     child->kind   = uint8_t(Bindings::Kind::Chain);
     child->parent = parent;
 
@@ -2450,10 +2454,39 @@ static int testBindingsChainLookup()
             "testBindingsChainLookup: child->lookupLocal(b) walked parent (shouldn't)\n");
         return 1;
     }
+    auto checkEntry = [&](const Bindings * b, SymbolId name, PosIdx32 expectPos,
+                          int64_t expectVal, const char * what) {
+        const Bindings::Entry * e = b->lookupEntry(name);
+        if (!e || e->pos != expectPos || !e->value.isInt()
+            || e->value.asInt() != expectVal) {
+            std::fprintf(stderr,
+                "testBindingsChainLookup: %s expected pos=%u val=%lld, "
+                "got %s\n",
+                what, expectPos, (long long)expectVal, e ? "mismatch" : "nullptr");
+            return 1;
+        }
+        return 0;
+    };
+    rc |= checkEntry(child, 1, 201, 10, "child.lookupEntry(a)");
+    rc |= checkEntry(child, 2, 102,  2, "child.lookupEntry(b)");
+    rc |= checkEntry(child, 3, 203,  3, "child.lookupEntry(c)");
+    if (child->lookupEntry(4) != nullptr) {
+        std::fprintf(stderr,
+            "testBindingsChainLookup: child.lookupEntry(d) expected nullptr\n");
+        return 1;
+    }
+    if (lookupAttrPos(child, 1) != 201
+        || lookupAttrPos(child, 2) != 102
+        || lookupAttrPos(child, 3) != 203
+        || lookupAttrPos(child, 4) != 0) {
+        std::fprintf(stderr,
+            "testBindingsChainLookup: lookupAttrPos chain semantics wrong\n");
+        return 1;
+    }
 
     if (rc == 0)
         std::fprintf(stderr,
-            "testBindingsChainLookup: OK (overlay shadow + parent fallback + miss)\n");
+            "testBindingsChainLookup: OK (overlay shadow + parent fallback + pos lookup)\n");
     return rc;
 }
 

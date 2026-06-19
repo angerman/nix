@@ -1946,9 +1946,6 @@ void primRemoveAttrs(EvalState & state, Value * args, Value & out)
     const Bindings * src = args[0].asAttrs();
     auto * names = args[1].asList();
     if (!src || !names || names->size == 0) { out = args[0]; return; }
-    // #825 Phase C SPIKE: iterating src->entries[] directly on a
-    // Chain would only see the overlay.  Materialise once at entry.
-    if (src->isChain()) src = src->materialize();
     std::unordered_set<SymbolId> toRemove;
     for (uint32_t i = 0; i < names->size; ++i) {
         // 2026-05-18: force each element to WHNF.  v3's lazy list
@@ -1973,17 +1970,18 @@ void primRemoveAttrs(EvalState & state, Value * args, Value & out)
     // size in the arena even when many entries were removed.
     // #746 attribution on hello.drvPath measured 17.4 % slack here.
     uint32_t kExact = 0;
-    for (uint32_t i = 0; i < src->size; ++i)
-        if (toRemove.count(src->entries[i].name) == 0)
+    src->forEach([&](const Bindings::Entry & e) {
+        if (toRemove.count(e.name) == 0)
             ++kExact;
+    });
     Bindings * result = Alloc::allocBindings(kExact);
     V3_STATS_INC(attrsetsAllocated);
     uint32_t k = 0;
-    for (uint32_t i = 0; i < src->size; ++i) {
-        if (toRemove.count(src->entries[i].name) == 0) {
-            bindingsSetEntry(result, k++, src->entries[i]);  // Phase D
+    src->forEach([&](const Bindings::Entry & e) {
+        if (toRemove.count(e.name) == 0) {
+            bindingsSetEntry(result, k++, e);  // Phase D
         }
-    }
+    });
     // k == kExact by construction; allocBindings already set the size.
     out.mkAttrs(result);
 }
@@ -2000,12 +1998,6 @@ void primIntersectAttrs(EvalState &, Value * args, Value & out)
         out.mkAttrs(b);
         return;
     }
-    // #825 Phase C SPIKE: the searches below index `keep->entries[]`
-    // and `src->entries[]` directly, which for a Chain Bindings sees
-    // only the overlay.  Materialise both inputs once at entry so both
-    // are Sorted (entries[] is the full sorted array).
-    if (keep->isChain()) keep = keep->materialize();
-    if (src->isChain())  src  = src->materialize();
     // PLAN_BEAT_TW_V2 §0.3.1 — iterate the SMALLER side, binary-search
     // the larger.  The dominant nixpkgs pattern is the callPackage
     // shape `intersectAttrs (functionArgs f) pkgs`: |keep| ≈ formals
@@ -2024,43 +2016,34 @@ void primIntersectAttrs(EvalState &, Value * args, Value & out)
     // Bindings regardless of which side drives the loop, and the
     // emitted entry (name, pos, value) is always copied from `src`.
     //
-    // Binary search over the full sorted entries[] of a (now Sorted)
-    // Bindings; returns the matched Entry* or nullptr.
-    auto bsearchEntry = [](const Bindings * b, SymbolId name)
-        -> const Bindings::Entry * {
-        uint32_t lo = 0, hi = b->size;
-        while (lo < hi) {
-            uint32_t mid = (lo + hi) >> 1;
-            const SymbolId mn = b->entries[mid].name;
-            if (mn < name)      lo = mid + 1;
-            else if (mn > name) hi = mid;
-            else                return &b->entries[mid];
-        }
-        return nullptr;
-    };
-    const bool iterKeep   = keep->size <= src->size;
+    const uint32_t keepN = keep->countDistinct();
+    const uint32_t srcN  = src->countDistinct();
+    const bool iterKeep   = keepN <= srcN;
     const Bindings * iter   = iterKeep ? keep : src;   // smaller — drives the loop
     const Bindings * search = iterKeep ? src  : keep;  // larger  — binary-searched
     // Pass 1: count the intersection (exact alloc, no arena slack —
     // #746/#747: a single-pass over-allocate of |src| was 386.3 MB of
     // pure waste from 1664 calls).
     uint32_t kExact = 0;
-    for (uint32_t i = 0; i < iter->size; ++i)
-        if (bsearchEntry(search, iter->entries[i].name)) ++kExact;
+    iter->forEach([&](const Bindings::Entry & e) {
+        if (search->lookupEntry(e.name)) ++kExact;
+    });
     Bindings * result = Alloc::allocBindings(kExact);
     V3_STATS_INC(attrsetsAllocated);
     // Pass 2: fill — always emit the `src` entry (e2's value wins).
     uint32_t k = 0;
     if (iterKeep) {
         // iter == keep: look the matched entry up in src (the value side).
-        for (uint32_t i = 0; i < iter->size; ++i)
-            if (const Bindings::Entry * se = bsearchEntry(src, iter->entries[i].name))
+        iter->forEach([&](const Bindings::Entry & e) {
+            if (const Bindings::Entry * se = src->lookupEntry(e.name))
                 bindingsSetEntry(result, k++, *se);  // Phase D
+        });
     } else {
         // iter == src: emit the src entry directly when its name is in keep.
-        for (uint32_t i = 0; i < iter->size; ++i)
-            if (bsearchEntry(keep, iter->entries[i].name))
-                bindingsSetEntry(result, k++, iter->entries[i]);  // Phase D
+        iter->forEach([&](const Bindings::Entry & e) {
+            if (keep->lookupEntry(e.name))
+                bindingsSetEntry(result, k++, e);  // Phase D
+        });
     }
     // k == kExact by construction; allocBindings already set the size.
     out.mkAttrs(result);
@@ -2072,18 +2055,12 @@ void primMapAttrs(EvalState & state, Value * args, Value & out)
     if (!args[1].isAttrs()) typeError("mapAttrs", "attrset");
     auto * src = args[1].asAttrs();
     if (!src) { out = args[1]; return; }
-    // ChainBindings (NIX_V3_CHAIN_BINDINGS): this loop walks src->entries[]
-    // directly over src->size, which for a Chain is the OVERLAY ONLY — it would
-    // silently drop the parent's entries (the isolated root cause of the 5×
-    // Chain Phase C falsification: nixpkgs mapAttrs over a chained package set
-    // returned a parent-less attrset → `buildPythonApplication missing`).
-    // Materialise to the full sorted view first (no-op for Sorted).
-    if (src->isChain()) src = const_cast<Bindings *>(src->materialize());
-    Bindings * result = Alloc::allocBindings(src->size);
+    Bindings * result = Alloc::allocBindings(src->countDistinct());
     V3_STATS_INC(attrsetsAllocated);
     recordBindingsOrigin(result, 0, "primMapAttrs");
-    for (uint32_t i = 0; i < src->size; ++i) {
-        SymbolId sym = src->entries[i].name;
+    uint32_t i = 0;
+    src->forEach([&](const Bindings::Entry & e) {
+        SymbolId sym = e.name;
         Value nameStr = mkStringValueOwned(std::string(vmSymName(state, sym)));
         // 2026-05-30 RESTORATION of Tag::App3 with separate memo slot.
         //
@@ -2107,14 +2084,16 @@ void primMapAttrs(EvalState & state, Value * args, Value & out)
         ValuePair * pp = Alloc::allocPair();
         pp->left   = fn;
         pp->right  = nameStr;
-        pp->third  = src->entries[i].value;
+        pp->third  = e.value;
         // `evaluated` stays Tag::Uninitialized (default-constructed)
         // — populated by App3 force-path memoization on first demand.
         pairPostConstructBarrier(pp);  // Phase D
         Value app3; app3.mkPair(Tag::App3, pp);
         result->entries[i].name = sym;
+        result->entries[i].pos = e.pos;
         bindingsSetValue(result, i, app3);  // Phase D
-    }
+        ++i;
+    });
     out.mkAttrs(result);
 }
 
@@ -2914,17 +2893,10 @@ void primZipAttrsWith(EvalState & state, Value * args, Value & out)
         for (uint32_t i = 0; i < lst->size; ++i) {
             Value attrs = forceValue(*state.vm, lst->elems[i]);
             if (!attrs.isAttrs() || !attrs.asAttrs()) continue;
-            // C-17 (CODEBASE_REVIEW_2026-06-11): a ChainBindings' entries[] is
-            // the OVERLAY ONLY; iterating it raw silently drops the parent
-            // layers of any `//`-composed input → missing names in the zipped
-            // result.  Materialise to the full sorted view first (no-op for a
-            // plain Sorted Bindings; memoised).
             const Bindings * ab = attrs.asAttrs();
-            if (ab->isChain()) ab = ab->materialize();
-            for (uint32_t j = 0; j < ab->size; ++j) {
-                auto & en = ab->entries[j];
+            ab->forEach([&](const Bindings::Entry & en) {
                 byName[en.name].push_back(en.value);
-            }
+            });
         }
     }
     std::vector<std::pair<SymbolId, Value>> entries;

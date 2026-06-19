@@ -183,16 +183,57 @@ struct Bindings
     bool isChain() const noexcept { return kind == uint8_t(Kind::Chain); }
 
     /// Binary search the entries array of `this` (does NOT walk parent).
-    /// Internal helper used by `lookup` to factor the chain walk.
-    const Value * lookupLocal(SymbolId name) const noexcept
+    /// Internal helper used by `lookupEntry` to factor the chain walk.
+    const Entry * lookupLocalEntry(SymbolId name) const noexcept
     {
         uint32_t lo = 0, hi = size;
         while (lo < hi) {
             uint32_t mid = (lo + hi) >> 1;
             SymbolId midName = entries[mid].name;
-            if (midName == name) return &entries[mid].value;
+            if (midName == name) return &entries[mid];
             if (midName < name) lo = mid + 1;
             else                hi = mid;
+        }
+        return nullptr;
+    }
+
+    Entry * lookupLocalEntry(SymbolId name) noexcept
+    {
+        return const_cast<Entry *>(
+            static_cast<const Bindings *>(this)->lookupLocalEntry(name));
+    }
+
+    const Value * lookupLocal(SymbolId name) const noexcept
+    {
+        if (const Entry * e = lookupLocalEntry(name))
+            return &e->value;
+        return nullptr;
+    }
+
+    Value * lookupLocal(SymbolId name) noexcept
+    {
+        if (Entry * e = lookupLocalEntry(name))
+            return &e->value;
+        return nullptr;
+    }
+
+    /// Chain-aware entry lookup.  Same overlay-then-parent precedence as
+    /// lookup(), but returns the full Entry so read-only consumers can copy
+    /// name/pos/value without materialising the entire chain.
+    const Entry * lookupEntry(SymbolId name) const noexcept
+    {
+        for (const Bindings * b = this; b; b = b->parent) {
+            const Entry * e = b->lookupLocalEntry(name);
+            if (e) return e;
+        }
+        return nullptr;
+    }
+
+    Entry * lookupEntry(SymbolId name) noexcept
+    {
+        for (Bindings * b = this; b; b = const_cast<Bindings *>(b->parent)) {
+            Entry * e = b->lookupLocalEntry(name);
+            if (e) return e;
         }
         return nullptr;
     }
@@ -203,10 +244,8 @@ struct Bindings
     /// the pre-#823 single-segment binary search.
     const Value * lookup(SymbolId name) const noexcept
     {
-        for (const Bindings * b = this; b; b = b->parent) {
-            const Value * v = b->lookupLocal(name);
-            if (v) return v;
-        }
+        if (const Entry * e = lookupEntry(name))
+            return &e->value;
         return nullptr;
     }
 
@@ -225,16 +264,8 @@ struct Bindings
     /// preserves that contract.
     Value * lookup(SymbolId name) noexcept
     {
-        for (Bindings * b = this; b; b = const_cast<Bindings *>(b->parent)) {
-            uint32_t lo = 0, hi = b->size;
-            while (lo < hi) {
-                uint32_t mid = (lo + hi) >> 1;
-                SymbolId midName = b->entries[mid].name;
-                if (midName == name) return &b->entries[mid].value;
-                if (midName < name) lo = mid + 1;
-                else                hi = mid;
-            }
-        }
+        if (Entry * e = lookupEntry(name))
+            return &e->value;
         return nullptr;
     }
 
@@ -249,9 +280,8 @@ struct Bindings
     //
     //   * `forEach(func)` — calls `func(entry)` once per distinct name
     //     in the chain, in ascending name order.  Overlay shadows
-    //     parent.  Today's implementation always materialises for
-    //     Chain (correct but loses the memory benefit).  Phase C may
-    //     refine to streaming merge for chain-depth == 1.
+    //     parent.  It streams via Cursor and does not materialise the
+    //     chain unless the safety depth cap is exceeded.
     //
     //   * `materialize()` — returns `this` if already Sorted; for
     //     Chain, walks the chain, dedups names (overlay wins), sorts,
@@ -3120,10 +3150,9 @@ namespace nix::v3 {
 //
 // These need Alloc::allocBindings (defined above) and <algorithm>+<vector>
 // (already pulled in via the header preamble), so we define them here
-// rather than inline in the Bindings struct.  Both are O(1) on Sorted
-// (the fast path), O(N log N) on Chain.  Hot iteration on Chain via
-// forEach pays one materialize() per call; Phase C may refine to a
-// streaming merge for chain-depth == 1.
+// rather than inline in the Bindings struct.  totalSize is O(1) on Sorted
+// and streams a Cursor on Chain.  materialize is O(1) on Sorted and copies
+// a Chain only for callers that require an indexed flat entries[] view.
 // ---------------------------------------------------------------------------
 
 inline uint32_t Bindings::totalSize() const noexcept
@@ -3153,21 +3182,13 @@ inline uint32_t Bindings::totalSize() const noexcept
 /// retired in #752 once every recordAttrPos call site was converted
 /// to write `b->entries[i].pos = ps` directly by index.
 ///
-/// #825 / A1a Phase B caveat: this binary search assumes Sorted
-/// representation.  For Chain Bindings, callers should materialise
-/// first (or use `Bindings::lookup()` which is chain-aware, then
-/// route through `entries[idx].pos` only on the materialised result).
+/// Chain-aware: walks overlay then parent and returns the winning
+/// entry's position without copying the chain.
 inline uint32_t lookupAttrPos(const Bindings * b, SymbolId name)
 {
-    if (!b || b->size == 0) return 0;
-    uint32_t lo = 0, hi = b->size;
-    while (lo < hi) {
-        uint32_t mid = (lo + hi) >> 1;
-        SymbolId midName = b->entries[mid].name;
-        if (midName == name) return b->entries[mid].pos;
-        if (midName < name) lo = mid + 1;
-        else                hi = mid;
-    }
+    if (!b) return 0;
+    if (const Bindings::Entry * e = b->lookupEntry(name))
+        return e->pos;
     return 0;
 }
 
