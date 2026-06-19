@@ -6282,9 +6282,6 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // deferred force fires while pkgs (= lib.fix slot) is still
             // Black, causing the WC-38 `with`-lookup miss.
             //
-            // NIX_V3_EAGER_ARG_FORCE=1 enables tree-walker semantics:
-            // force the arg attrset at call time.  Default off until
-            // validated against full lang + wc-laziness suites.
             if (desc->hasFormals) {
                 // #681 — for ANY formals lambda (including ellipsis-
                 // only), TW forces the arg and validates it's a set
@@ -6303,9 +6300,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 // since attrsets dominate the formals call sites,
                 // the force is usually a no-op (already WHNF).  The
                 // remaining cost is a tag check on a cached value.
-                static const bool s_eagerArgForce =
-                    std::getenv("NIX_V3_EAGER_ARG_FORCE") != nullptr;
-                bool needForce = true; (void)s_eagerArgForce;
+                // The former NIX_V3_EAGER_ARG_FORCE gate is retired:
+                // formals lambdas always force their argument to match TW.
+                constexpr bool needForce = true;
                 if (needForce) {
                     // STG-12 (#498) diagnostic: see what we're about to
                     // force at OP_CALL.  V3_DBG_OPCALL_FORCE=1 to enable.
@@ -6974,7 +6971,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             const LambdaDescriptor * tcDesc = tcCallee->desc;
             const CompilationUnit * tcCalleeCu = tcCallee->cu ? tcCallee->cu : cu;
 
-            // Same eager-arg-force as OP_CALL — see WC-38 explanation above.
+            // Same formals-argument force as OP_CALL — see WC-38 explanation above.
             if (tcDesc->hasFormals) {
                 // #680 — pre-force type check (mirror of OP_CALL site).
                 if (arg.tag() != Tag::Attrs
@@ -7004,9 +7001,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     msg += valueRepr(arg);
                     throw std::runtime_error(msg);
                 }
-                static const bool s_eagerArgForce =
-                    std::getenv("NIX_V3_EAGER_ARG_FORCE") != nullptr;
-                bool needForce = !tcDesc->ellipsis || s_eagerArgForce;
+                constexpr bool needForce = true;
                 if (needForce) {
                     // STG-12 (#498) diagnostic: see what we're about to
                     // force.  V3_DBG_TAIL_FORCE=1 to enable.

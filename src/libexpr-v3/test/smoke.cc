@@ -2865,6 +2865,91 @@ static std::string disasmFunction(const nix::v3::CompilationUnit & cu, size_t fu
 
 } // namespace
 
+// `wrapper arg = ({ ... }: 1) arg`; call wrapper with a thunk returning `[]`.
+// The wrapper body must compile to OP_TAIL_CALL, and the tail-call formals
+// path must still force the thunk argument and reject the list.
+static int testTailCallFormalsEllipsisForcesThunkArg()
+{
+    auto m = ir::makeModule();
+
+    auto listFid = addFunction(m);
+    auto listEntry = m.freshBlock();
+    {
+        auto & f = funcOf(m, listFid);
+        f.entryBlock = listEntry;
+        f.name = "list-thunk";
+        auto emptyList = addBinding(m, listEntry, ir::ListExpr{{}});
+        setReturn(m, listEntry, emptyList);
+    }
+
+    auto innerFid = addFunction(m);
+    auto innerEntry = m.freshBlock();
+    auto innerParam = m.freshVar();
+    {
+        auto & f = funcOf(m, innerFid);
+        f.entryBlock = innerEntry;
+        f.paramVar = innerParam;
+        f.hasFormals = true;
+        f.ellipsis = true;
+        f.name = "ellipsis-formals";
+        auto one = addBinding(m, innerEntry, ir::LitInt{1});
+        setReturn(m, innerEntry, one);
+    }
+
+    auto topEntry = m.freshBlock();
+    funcOf(m, 0).entryBlock = topEntry;
+    auto innerClo = addBinding(m, topEntry, ir::Lambda{innerFid, /*freeVars*/ {}});
+
+    auto wrapperFid = addFunction(m);
+    auto wrapperEntry = m.freshBlock();
+    auto wrapperParam = m.freshVar();
+    {
+        auto & f = funcOf(m, wrapperFid);
+        f.entryBlock = wrapperEntry;
+        f.argName = m.internSymbol("arg");
+        f.paramVar = wrapperParam;
+        f.name = "tail-wrapper";
+        auto tailCall = addBinding(m, wrapperEntry, ir::App{innerClo, wrapperParam});
+        setReturn(m, wrapperEntry, tailCall);
+    }
+
+    auto wrapperClo = addBinding(m, topEntry, ir::Lambda{wrapperFid, /*freeVars*/ {}});
+    auto listThunk = addBinding(m, topEntry, ir::MkThunk{listFid, /*freeVars*/ {}});
+    auto call = addBinding(m, topEntry, ir::App{wrapperClo, listThunk});
+    setReturn(m, topEntry, call);
+
+    ir::computeFreeVars(m);
+    auto cu = compile(m);
+    std::string dis = disasmFunction(cu, wrapperFid);
+    if (dis.find("OP_TAIL_CALL") == std::string::npos) {
+        std::fprintf(stderr,
+            "testTailCallFormalsEllipsisForcesThunkArg: wrapper did not compile "
+            "to OP_TAIL_CALL\n%s\n", dis.c_str());
+        return 1;
+    }
+
+    try {
+        Value r = run(cu);
+        std::fprintf(stderr,
+            "testTailCallFormalsEllipsisForcesThunkArg: expected type error, "
+            "got tag=%d\n", (int)r.tag());
+        return 1;
+    } catch (const std::exception & e) {
+        std::string msg = e.what();
+        if (msg.find("expected a set but found a list") == std::string::npos) {
+            std::fprintf(stderr,
+                "testTailCallFormalsEllipsisForcesThunkArg: wrong error: %s\n",
+                e.what());
+            return 1;
+        }
+    }
+
+    std::fprintf(stderr,
+        "testTailCallFormalsEllipsisForcesThunkArg: OK "
+        "(tail-call formals force thunk arg before body)\n");
+    return 0;
+}
+
 // Positive case: the fib-cond shape `Less(force(k), 2)` should compile
 // to GET_LOCAL_FORCE; LIT_INT; LESS — no SET_LOCAL or GET_LOCAL of
 // intermediate slots (the OnceLinear bindings T_force_k and T_lit2
@@ -3550,6 +3635,7 @@ int main()
     rc |= testFusePrimOpChainArity2();
     rc |= testLambdaCall();
     rc |= testClosureCapture();
+    rc |= testTailCallFormalsEllipsisForcesThunkArg();
     rc |= testCallNPrimOpNoPap();
     rc |= testCallClosure2PrimOpNoPap();
     rc |= testForceApp3Arity2NoPap();
