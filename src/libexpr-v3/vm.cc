@@ -4546,7 +4546,14 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 break;
             }
 
-            Closure * c = Alloc::allocClosure(nUp);
+            static const bool s_envSharing = []{
+                if (std::getenv("NIX_V3_NO_ENV_SHARING")) return false;
+                const char * e = std::getenv("NIX_V3_ENV_SHARING");
+                if (e) return e[0] != '0';
+                return true;
+            }();
+            const bool shareUpvalues = s_envSharing && nUp > 0;
+            Closure * c = Alloc::allocClosure(shareUpvalues ? 0 : nUp);
             V3_STATS_INC(closuresAllocated);
             c->desc = &cu->lambdas[funcIdx];
             c->cu   = cu;
@@ -4555,26 +4562,18 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // the with-target block beneath.  Build capturedWiths
             // outermost-first by filling reverse into the ListVec.
             //
-            // env-sharing (NIX_V3_ENV_SHARING) bring-up gate (default OFF): store
+            // env-sharing (default ON, NIX_V3_NO_ENV_SHARING opts out): store
             // the upvalues in a shared, tenured Env (Closure::upvalEnv) rather than
-            // the inline FAM, so closures reference one Env instead of copying
-            // upvalues.  RETIREMENT: removed when env-sharing either ships default-
-            // on (after the darwin-4 CPU/arena + --brute + nixpkgs grade in
-            // ES-IMPL-3) or is falsified below-bar and the whole upvalEnv path is
-            // deleted.  Bring-up builds ONE fresh Env per closure (interning — the
-            // actual win — is a follow-up that must add shared-Env evac dedup) and
-            // keeps allocClosure(nUp) so the cell size is unchanged; the now-unused
-            // inline FAM is poisoned to Uninitialized so the conservative brute-
-            // scanner never mistakes stale words there for live nursery pointers.
+            // the inline FAM.  The closure is allocated with a zero-length FAM
+            // when shared; nUpvalues remains the logical count and
+            // closureUpvalue() reads the Env.  This removes the bring-up path's
+            // double storage (closure FAM plus Env).
             // Env-aware GC: scavenge walkClosure grays the Env; mark/evac/auditor +
             // closurePostConstructBarrier all branch on upvalEnv (gc.cc/mark_sweep.cc).
-            static const bool s_envSharing =
-                std::getenv("NIX_V3_ENV_SHARING") != nullptr;
-            if (__builtin_expect(s_envSharing && nUp > 0, 0)) {
+            if (__builtin_expect(shareUpvalues, 1)) {
                 Env * env = Alloc::allocEnv(nUp);
                 for (uint16_t i = nUp; i > 0; --i) env->values[i - 1] = pop(vm);
                 c->upvalEnv = env;
-                for (uint16_t i = 0; i < nUp; ++i) c->upvalues[i].mkUninitialized();
             } else {
                 for (uint16_t i = nUp; i > 0; --i) c->upvalues[i - 1] = pop(vm);
             }
@@ -4675,7 +4674,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     "frames=%zu\n",
                     (void *)cu, c->desc->codeOffset, vm.frames.size());
                 for (uint16_t i = 0; i < nUp; ++i) {
-                    Value uv = c->upvalues[i];
+                    Value uv = closureUpvalue(c, i);
                     Value chased = chase(uv, 4);
                     std::fprintf(stderr,
                         "  upvalue[%u]: tag=%d", i, (int)uv.tag());
@@ -4878,13 +4877,17 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             const bool willHaveWiths = (nWiths > 0)
                 || (vm.withStack.size()
                     > (vm.frames.empty() ? 0 : vm.frames.back().withStackBase));
-            // env-sharing (NIX_V3_ENV_SHARING, default-off): store the thunk's
+            // env-sharing (default ON, NIX_V3_NO_ENV_SHARING opts out): store the thunk's
             // upvalues in a shared tenured Env (tail[0]=Env*) so the per-force
             // fakeClo shares it with NO upvalue copy (the forceValue lever).  See
             // OP_MAKE_CLOSURE for the gate retirement criterion.  Header stays
             // 24 B (ENV_SHARED flag in hasWithsSlot, not a new field).
-            static const bool s_envSharingThunk =
-                std::getenv("NIX_V3_ENV_SHARING") != nullptr;
+            static const bool s_envSharingThunk = []{
+                if (std::getenv("NIX_V3_NO_ENV_SHARING")) return false;
+                const char * e = std::getenv("NIX_V3_ENV_SHARING");
+                if (e) return e[0] != '0';
+                return true;
+            }();
             Thunk * t;
             Env * thunkEnv = nullptr;
             if (__builtin_expect(s_envSharingThunk && nUp > 0, 0)) {
@@ -10848,26 +10851,27 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                             const Closure * cl = fr.closure;
                             const Thunk * th = fr.thunk;
                             uint16_t nUp = 0;
-                            const Value * uvs = nullptr;
-                            if (cl) { nUp = cl->nUpvalues; uvs = cl->upvalues; }
-                            else if (th) { nUp = th->nUpvalues; uvs = th->tail; }
+                            if (cl) nUp = cl->nUpvalues;
+                            else if (th) nUp = th->nUpvalues;
                             std::fprintf(stderr,
                                 "  current-frame nUpvalues=%u\n", nUp);
                             for (uint16_t i = 0; i < nUp && i < 8; ++i) {
+                                Value uv = cl ? closureUpvalue(cl, i)
+                                    : (thunkUpvalEnv(th) ? thunkUpvalEnv(th)->values[i] : th->tail[i]);
                                 std::fprintf(stderr,
                                     "    upvalue[%u] tag=%u",
-                                    i, (unsigned)uvs[i].tag());
-                                if (uvs[i].tag() == Tag::Closure
-                                    && uvs[i].asClosure()
-                                    && uvs[i].asClosure()->desc) {
+                                    i, (unsigned)uv.tag());
+                                if (uv.tag() == Tag::Closure
+                                    && uv.asClosure()
+                                    && uv.asClosure()->desc) {
                                     std::fprintf(stderr, " closure=%s nUp=%u",
-                                        !uvs[i].asClosure()->desc->name.empty()
-                                            ? uvs[i].asClosure()->desc->name.c_str()
+                                        !uv.asClosure()->desc->name.empty()
+                                            ? uv.asClosure()->desc->name.c_str()
                                             : "<anon>",
-                                        uvs[i].asClosure()->nUpvalues);
-                                } else if (uvs[i].tag() == Tag::Attrs
-                                           && uvs[i].asAttrs()) {
-                                    auto * b2 = uvs[i].asAttrs();
+                                        uv.asClosure()->nUpvalues);
+                                } else if (uv.tag() == Tag::Attrs
+                                           && uv.asAttrs()) {
+                                    auto * b2 = uv.asAttrs();
                                     std::fprintf(stderr, " attrs size=%u {",
                                         (unsigned)b2->size);
                                     const auto & st2 = ir::globalSymbolTable();
@@ -14311,8 +14315,8 @@ Value callClosure(VMState & vm, Value fun, Value arg)
             && (uint16_t)desc->intrinsicVar0 < callee->nUpvalues
             && (uint16_t)desc->intrinsicVar1 < callee->nUpvalues) {
             allocStats().intrinsicExtendsCalls++;
-            Value overlay = callee->upvalues[(uint16_t)desc->intrinsicVar0];
-            Value f       = callee->upvalues[(uint16_t)desc->intrinsicVar1];
+            Value overlay = closureUpvalue(callee, (uint16_t)desc->intrinsicVar0);
+            Value f       = closureUpvalue(callee, (uint16_t)desc->intrinsicVar1);
             Value final_  = arg;
             Value prev = callClosure(vm, f, final_);
             prev = forceValue(vm, prev);
@@ -14341,9 +14345,9 @@ Value callClosure(VMState & vm, Value fun, Value arg)
             && (uint16_t)desc->intrinsicVar1 < callee->nUpvalues
             && (uint16_t)desc->intrinsicVar2 < callee->nUpvalues) {
             allocStats().intrinsicComposeCalls++;
-            Value f       = callee->upvalues[(uint16_t)desc->intrinsicVar0];
-            Value g       = callee->upvalues[(uint16_t)desc->intrinsicVar1];
-            Value final_  = callee->upvalues[(uint16_t)desc->intrinsicVar2];
+            Value f       = closureUpvalue(callee, (uint16_t)desc->intrinsicVar0);
+            Value g       = closureUpvalue(callee, (uint16_t)desc->intrinsicVar1);
+            Value final_  = closureUpvalue(callee, (uint16_t)desc->intrinsicVar2);
             Value prev_   = arg;
             Value f_partial = callClosure(vm, f, final_);
             Value fApplied  = callClosure(vm, f_partial, prev_);
