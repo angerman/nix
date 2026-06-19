@@ -788,9 +788,13 @@ void Scavenger::walkList(ListVec * l)
 void Scavenger::walkBindings(Bindings * b)
 {
     recordLiveTenured(b, sizeof(Bindings) + sizeof(Bindings::Entry) * b->size, CellType::Bindings);
+    if (b->isMapAttrs())
+        visitValue(b->aux);
     for (uint32_t i = 0; i < b->size; ++i) {
         visitValue(b->entries[i].value);
     }
+    if (b->parent)
+        fwdBindings(const_cast<Bindings *>(b->parent));
     // Phase E v0.2 post-walk barrier — see walkList.
     if (n.isPhaseEActive()) bindingsPostConstructBarrier(b);
 }
@@ -1295,6 +1299,8 @@ struct Auditor {
         // NIX_V3_DBG_BINDINGS_ORIGIN tag when enabled.
         const BindingsOrigin * origin = lookupBindingsOrigin(b);
         const char * originSrc = origin ? origin->source : "(no-origin)";
+        if (b->isMapAttrs())
+            visitValue(b->aux, "Bindings.mapAttrs.fn");
         for (uint32_t i = 0; i < b->size; ++i) {
             // Build a per-entry site string so the audit message
             // identifies which Bindings + which entry + origin.
@@ -1313,6 +1319,8 @@ struct Auditor {
                 (const void *)b, originSrc, i, lastWriter);
             visitValue(b->entries[i].value, ebuf);
         }
+        if (b->parent)
+            visitBindings(b->parent, "Bindings.parent");
     }
 
     void visitList(const ListVec * l, const char * site)

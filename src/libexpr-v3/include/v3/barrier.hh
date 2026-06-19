@@ -453,6 +453,10 @@ bindingsPostConstructBarrier(Bindings * b) noexcept
         const Nursery & n = threadNursery();
         // Defensive double-check: Bindings always tenured today.
         if (n.contains(b)) return;
+        if (b->isMapAttrs() && isNurseryPayload(b->aux, n)) {
+            dirtyContainers().push_back({DirtyKind::Bindings, b});
+            return;
+        }
         for (uint32_t i = 0; i < b->size; ++i) {
             if (isNurseryPayload(b->entries[i].value, n)) {
                 dirtyContainers().push_back({DirtyKind::Bindings, b});

@@ -714,8 +714,7 @@ void primAttrNames(EvalState &, Value * args, Value & out)
     V3_STATS_INC(listsAllocated);
     auto & symTab = ir::globalSymbolTable();
     uint32_t i = 0;
-    src->forEach([&](const Bindings::Entry & e) {
-        SymbolId sid = e.name;
+    src->forEachName([&](SymbolId sid) {
         lv->elems[i++] = mkStringValueOwned(
             sid < symTab.size() ? symTab[sid] : std::to_string(sid));
     });
@@ -2075,51 +2074,33 @@ void primIntersectAttrs(EvalState &, Value * args, Value & out)
     out.mkAttrs(result);
 }
 
-void primMapAttrs(EvalState & state, Value * args, Value & out)
+void primMapAttrs(EvalState &, Value * args, Value & out)
 {
     Value fn = args[0];
     if (!args[1].isAttrs()) typeError("mapAttrs", "attrset");
     auto * src = args[1].asAttrs();
     if (!src) { out = args[1]; return; }
-    Bindings * result = Alloc::allocBindings(src->countDistinct());
+    uint32_t n = src->countDistinct();
+    if (n == 0) { out.mkAttrs(Alloc::allocBindings(0)); return; }
+    Bindings * result = Alloc::allocBindings(n);
+    result->kind = uint8_t(Bindings::Kind::MapAttrs);
+    result->parent = src;
+    result->aux = fn;
     V3_STATS_INC(attrsetsAllocated);
     recordBindingsOrigin(result, 0, "primMapAttrs");
     uint32_t i = 0;
     src->forEach([&](const Bindings::Entry & e) {
         SymbolId sym = e.name;
-        Value nameStr = mkStringValueOwned(std::string(vmSymName(state, sym)));
-        // 2026-05-30 RESTORATION of Tag::App3 with separate memo slot.
-        //
-        // Day 9-11 (2026-05-29) attempt packed `fn name value` into
-        // one Tag::App3 ValuePair (saves 1 ValuePair vs the legacy
-        // `App(App(fn,k),v)` 2-pair chain).  That attempt overloaded
-        // `pair->evaluated` to hold arg2, LOSING App-result memoization
-        // (#696 sink).  HNE regressed wall 11.9 s → 49.4 s, arena
-        // +1644 MB.  Rolled back commit a9912f0fb.
-        //
-        // 2026-05-30 (EXIT_GC_SPIRAL Day 4 option A): ValuePair now has
-        // a SEPARATE `third` slot for Tag::App3's arg2.  `evaluated`
-        // stays as the memoization sink — same memo behavior as
-        // Tag::App.  The regression of the prior attempt is structurally
-        // impossible: memo writes to `evaluated` no longer collide
-        // with arg2 storage.
-        //
-        // Net memory: 1 ValuePair per entry (64 B) vs 2 ValuePairs
-        // (96 B); savings = 32 B × N_entries.  Other-App pairs pay
-        // +16 B each.  Projected net on HNE: ~ -29 MB.
-        ValuePair * pp = Alloc::allocPair();
-        pp->left   = fn;
-        pp->right  = nameStr;
-        pp->third  = e.value;
-        // `evaluated` stays Tag::Uninitialized (default-constructed)
-        // — populated by App3 force-path memoization on first demand.
-        pairPostConstructBarrier(pp);  // Phase D
-        Value app3; app3.mkPair(Tag::App3, pp);
         result->entries[i].name = sym;
-        result->entries[i].pos = e.pos;
-        bindingsSetValue(result, i, app3);  // Phase D
+        result->entries[i].pos =
+            (e.pos & Bindings::kPosMask) | Bindings::kMapAttrsUnrealizedPosBit;
+        // Preserve the old mapAttrs snapshot semantics: the source value is
+        // captured at construction time.  The attr-name string is synthesized
+        // only if this mapped entry is actually demanded.
+        result->entries[i].value = e.value;
         ++i;
     });
+    bindingsPostConstructBarrier(result);
     out.mkAttrs(result);
 }
 

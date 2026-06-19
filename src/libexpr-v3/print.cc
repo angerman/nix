@@ -185,6 +185,8 @@ Value forceDeep(VMState & vm, Value v, std::set<const void *> & seen)
             }
             const uint32_t size = pb->size;
             for (uint32_t i = 0; i < size; ++i) {
+                if (pb->isMapAttrs())
+                    pb->realizeMapAttrsEntry(&pb->entries[i]);
                 Value child = forceValue(vm, pb->entries[i].value);
                 bindingsSetValue(pb, i, child);  // Phase D barrier
                 maybeEnqueue(child);

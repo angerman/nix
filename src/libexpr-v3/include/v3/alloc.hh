@@ -134,6 +134,8 @@ struct Bindings
     /// allocate ourselves — `entry.pos` IS the position.  Default
     /// 0 means "no position info."
     struct Entry { SymbolId name; PosIdx32 pos; Value value; };
+    static constexpr PosIdx32 kMapAttrsUnrealizedPosBit = 0x80000000u;
+    static constexpr PosIdx32 kPosMask = ~kMapAttrsUnrealizedPosBit;
 
     /// #823 / A1a Phase A (2026-05-26) — ChainBindings discriminator.
     ///
@@ -170,17 +172,19 @@ struct Bindings
     /// sites.  Phase C enables Chain creation in mergeBindings under
     /// `NIX_V3_CHAIN_BINDINGS=1`.  Phase D promotes to default after
     /// the falsifier (≥ 200 MB recovered on HNE) is met.
-    enum class Kind : uint8_t { Sorted = 0, Chain = 1 };
+    enum class Kind : uint8_t { Sorted = 0, Chain = 1, MapAttrs = 2 };
 
     uint8_t  kind = uint8_t(Kind::Sorted);   // offset 0
     uint8_t  _pad8[3] = {};                  // offset 1..3
     uint32_t size;                           // offset 4 — Sorted: count of entries[]
                                              //         — Chain:  count of overlay entries[]
     const Bindings * parent = nullptr;       // offset 8 — nullptr for Sorted
-    Entry    entries[];                      // offset 16 — FAM, sorted ascending by name
+    Value    aux;                            // offset 16 — MapAttrs: mapping function
+    Entry    entries[];                      // offset 24 — FAM, sorted ascending by name
                                              //          (overlay-only for Chain)
 
     bool isChain() const noexcept { return kind == uint8_t(Kind::Chain); }
+    bool isMapAttrs() const noexcept { return kind == uint8_t(Kind::MapAttrs); }
 
     /// Binary search the entries array of `this` (does NOT walk parent).
     /// Internal helper used by `lookupEntry` to factor the chain walk.
@@ -205,15 +209,22 @@ struct Bindings
 
     const Value * lookupLocal(SymbolId name) const noexcept
     {
-        if (const Entry * e = lookupLocalEntry(name))
+        if (const Entry * e = lookupLocalEntry(name)) {
+            if (isMapAttrs())
+                const_cast<Bindings *>(this)->realizeMapAttrsEntry(
+                    const_cast<Entry *>(e));
             return &e->value;
+        }
         return nullptr;
     }
 
     Value * lookupLocal(SymbolId name) noexcept
     {
-        if (Entry * e = lookupLocalEntry(name))
+        if (Entry * e = lookupLocalEntry(name)) {
+            if (isMapAttrs())
+                realizeMapAttrsEntry(e);
             return &e->value;
+        }
         return nullptr;
     }
 
@@ -222,18 +233,27 @@ struct Bindings
     /// name/pos/value without materialising the entire chain.
     const Entry * lookupEntry(SymbolId name) const noexcept
     {
-        for (const Bindings * b = this; b; b = b->parent) {
+        for (const Bindings * b = this; b; b = b->isChain() ? b->parent : nullptr) {
             const Entry * e = b->lookupLocalEntry(name);
-            if (e) return e;
+            if (e) {
+                if (b->isMapAttrs())
+                    const_cast<Bindings *>(b)->realizeMapAttrsEntry(
+                        const_cast<Entry *>(e));
+                return e;
+            }
         }
         return nullptr;
     }
 
     Entry * lookupEntry(SymbolId name) noexcept
     {
-        for (Bindings * b = this; b; b = const_cast<Bindings *>(b->parent)) {
+        for (Bindings * b = this; b; b = b->isChain() ? const_cast<Bindings *>(b->parent) : nullptr) {
             Entry * e = b->lookupLocalEntry(name);
-            if (e) return e;
+            if (e) {
+                if (b->isMapAttrs())
+                    b->realizeMapAttrsEntry(e);
+                return e;
+            }
         }
         return nullptr;
     }
@@ -269,7 +289,19 @@ struct Bindings
         return nullptr;
     }
 
-    bool has(SymbolId name) const noexcept { return lookup(name) != nullptr; }
+    bool has(SymbolId name) const noexcept {
+        for (const Bindings * b = this; b; b = b->isChain() ? b->parent : nullptr) {
+            if (b->lookupLocalEntry(name)) return true;
+        }
+        return false;
+    }
+
+    /// MapAttrs lazy-entry realization.  `primMapAttrs` stores each output
+    /// entry's captured source value in `entry.value` as the initial cache
+    /// state.  On first value demand this synthesizes the attr-name string and
+    /// replaces the entry with App3(fn, name, srcValue).
+    /// Defined in value.cc because it needs write barriers.
+    void realizeMapAttrsEntry(Entry * e) noexcept;
 
     // -----------------------------------------------------------------
     // #825 / A1a Phase B (2026-05-26) — chain-aware iteration helpers.
@@ -299,7 +331,7 @@ struct Bindings
 
     uint32_t chainDepth() const noexcept {
         uint32_t d = 0;
-        for (const Bindings * b = this; b; b = b->parent) ++d;
+        for (const Bindings * b = this; b; b = b->isChain() ? b->parent : nullptr) ++d;
         return d;
     }
 
@@ -351,7 +383,7 @@ struct Bindings
         explicit Cursor(const Bindings * b) noexcept
         {
             nLayers_ = 0;
-            for (const Bindings * p = b; p; p = p->parent) {
+            for (const Bindings * p = b; p; p = p->isChain() ? p->parent : nullptr) {
                 if (p->size == 0) continue;            // empty layer — skip
                 if (nLayers_ == kMaxLayers) {
                     // Deeper than the inline array can hold: collapse the
@@ -402,7 +434,9 @@ struct Bindings
     /// sort, used where a count is needed to size an output array).
     uint32_t countDistinct() const noexcept
     {
-        if (kind == uint8_t(Kind::Sorted)) return size;
+        if (kind == uint8_t(Kind::Sorted)
+            || kind == uint8_t(Kind::MapAttrs))
+            return size;
         Cursor c(this);
         uint32_t n = 0;
         while (c.next()) ++n;
@@ -418,8 +452,30 @@ struct Bindings
             for (uint32_t i = 0; i < size; ++i) func(entries[i]);
             return;
         }
+        if (kind == uint8_t(Kind::MapAttrs)) {
+            auto * self = const_cast<Bindings *>(this);
+            for (uint32_t i = 0; i < size; ++i) {
+                self->realizeMapAttrsEntry(&self->entries[i]);
+                func(self->entries[i]);
+            }
+            return;
+        }
         Cursor c(this);
         while (const Entry * e = c.next()) func(*e);
+    }
+
+    /// Name-only iteration.  Unlike forEach(), this does not realize MapAttrs
+    /// lazy value caches, so attrNames/has-style consumers do not allocate
+    /// App3 cells just to inspect keys.
+    template <typename F>
+    void forEachName(F && func) const {
+        if (kind == uint8_t(Kind::Sorted)
+            || kind == uint8_t(Kind::MapAttrs)) {
+            for (uint32_t i = 0; i < size; ++i) func(entries[i].name);
+            return;
+        }
+        Cursor c(this);
+        while (const Entry * e = c.next()) func(e->name);
     }
 };
 
@@ -2826,6 +2882,7 @@ struct Alloc
         b->_pad8[0] = b->_pad8[1] = b->_pad8[2] = 0;
         b->size = overlaySize;
         b->parent = parent;
+        b->aux.mkUninitialized();
         // Histogram bucketing same as Sorted.
         V3_STATS_BLOCK {
             auto & buckets = allocStats().attrsetSizeBuckets;
@@ -2887,6 +2944,7 @@ struct Alloc
         b->_pad8[0] = b->_pad8[1] = b->_pad8[2] = 0;
         b->size = n;
         b->parent = nullptr;
+        b->aux.mkUninitialized();
         // Track size distribution for VM-2 sizing decisions.  Cheap
         // (one branch + one increment) — runs once per attrset.
         //
@@ -3188,7 +3246,7 @@ inline uint32_t lookupAttrPos(const Bindings * b, SymbolId name)
 {
     if (!b) return 0;
     if (const Bindings::Entry * e = b->lookupEntry(name))
-        return e->pos;
+        return e->pos & Bindings::kPosMask;
     return 0;
 }
 

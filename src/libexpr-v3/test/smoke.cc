@@ -1274,6 +1274,105 @@ static int testPrimGenListIdentityNoApps()
     return 0;
 }
 
+static void smokeReturnSecond(EvalState &, Value * args, Value & out)
+{
+    out = args[1];
+}
+
+static int testPrimMapAttrsNamesDoNotRealize()
+{
+    const PrimOp * mapAttrsPo = findPrimOp("mapAttrs");
+    const PrimOp * attrNamesPo = findPrimOp("attrNames");
+    if (!mapAttrsPo || !attrNamesPo) {
+        std::fprintf(stderr,
+            "testPrimMapAttrsNamesDoNotRealize: missing mapAttrs/attrNames primop\n");
+        return 1;
+    }
+    static const PrimOp returnSecondPo{
+        "__smokeReturnSecond", 2, smokeReturnSecond
+    };
+
+    SymbolId aSym = ir::globalInternSymbol("a");
+    SymbolId bSym = ir::globalInternSymbol("b");
+    Bindings * src = Alloc::allocBindings(2);
+    src->entries[0].name = aSym;
+    src->entries[0].pos = 0;
+    src->entries[0].value.mkInt(10);
+    src->entries[1].name = bSym;
+    src->entries[1].pos = 0;
+    src->entries[1].value.mkInt(20);
+
+    Value fn;
+    fn.mkPrimOp(&returnSecondPo);
+    Value srcV;
+    srcV.mkAttrs(src);
+
+    VMState vm;
+    EvalState st;
+    st.vm = &vm;
+
+    Value mapArgs[2] = {fn, srcV};
+    uint64_t beforeMap = allocStats().pairsAllocated;
+    Value mapped;
+    mapAttrsPo->fn(st, mapArgs, mapped);
+    uint64_t afterMap = allocStats().pairsAllocated;
+    if (afterMap != beforeMap) {
+        std::fprintf(stderr,
+            "testPrimMapAttrsNamesDoNotRealize: mapAttrs allocated %llu pairs\n",
+            (unsigned long long)(afterMap - beforeMap));
+        return 1;
+    }
+    if (!mapped.isAttrs() || !mapped.asAttrs() || !mapped.asAttrs()->isMapAttrs()) {
+        std::fprintf(stderr,
+            "testPrimMapAttrsNamesDoNotRealize: mapped result is not MapAttrs bindings\n");
+        return 1;
+    }
+
+    Value namesArgs[1] = {mapped};
+    Value names;
+    attrNamesPo->fn(st, namesArgs, names);
+    uint64_t afterNames = allocStats().pairsAllocated;
+    if (afterNames != beforeMap) {
+        std::fprintf(stderr,
+            "testPrimMapAttrsNamesDoNotRealize: attrNames allocated %llu pairs\n",
+            (unsigned long long)(afterNames - beforeMap));
+        return 1;
+    }
+    if (!names.isList() || !names.asList() || names.asList()->size != 2) {
+        std::fprintf(stderr,
+            "testPrimMapAttrsNamesDoNotRealize: unexpected attrNames result\n");
+        return 1;
+    }
+
+    Value * av = mapped.asAttrs()->lookup(aSym);
+    uint64_t afterLookup = allocStats().pairsAllocated;
+    if (!av || afterLookup != beforeMap + 1) {
+        std::fprintf(stderr,
+            "testPrimMapAttrsNamesDoNotRealize: first lookup allocated %llu pairs\n",
+            (unsigned long long)(afterLookup - beforeMap));
+        return 1;
+    }
+    vm.frames.push_back(CallFrame{
+        .cu = nullptr,
+        .closure = nullptr,
+        .thunk = nullptr,
+        .ip = 0,
+        .stackBaseOffset = 0,
+        .withStackBase = 0,
+        .flags = 0,
+    });
+    Value forced = forceValue(vm, *av);
+    if (!forced.isInt() || forced.asInt() != 10) {
+        std::fprintf(stderr,
+            "testPrimMapAttrsNamesDoNotRealize: forced a expected 10, got tag=%d\n",
+            (int)forced.tag());
+        return 1;
+    }
+    std::fprintf(stderr,
+        "testPrimMapAttrsNamesDoNotRealize: OK (name-only mapAttrs stays pair-free)\n");
+    return 0;
+}
+
 // `builtins.head (builtins.tail [10 20 30])` -> 20
 static int testPrimOpHeadTail()
 {
@@ -2958,6 +3057,7 @@ int main()
     rc |= testPrimOpLength();
     rc |= testPrimMapIdentityNoApps();
     rc |= testPrimGenListIdentityNoApps();
+    rc |= testPrimMapAttrsNamesDoNotRealize();
     rc |= testPrimOpHeadTail();
     rc |= testFibonacciSelfApp();
     rc |= testStrictnessRewritesForceOverLit();

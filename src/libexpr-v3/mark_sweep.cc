@@ -622,6 +622,8 @@ private:
             arenaSetForSlot_->markLinesForCell(
                 b, sizeof(Bindings) + sizeof(Bindings::Entry) * b->size);
         }
+        if (b->isMapAttrs())
+            visitValue(b->aux);
         for (uint32_t i = 0; i < b->size; ++i)
             visitValue(b->entries[i].value);
         if (b->parent)
@@ -1348,6 +1350,7 @@ private:
         }
         case CellType::Bindings: {
             auto * b = static_cast<Bindings *>(cell);
+            if (b->isMapAttrs()) visitValue(b->aux);
             for (uint32_t i = 0; i < b->size; ++i) visitValue(b->entries[i].value);
             if (b->parent) visitBindings(const_cast<Bindings * &>(b->parent));
             break;
@@ -1784,6 +1787,7 @@ static void runEvacuation(VMState & vm, Arena & arena,
                     switch (arena.cellTypeAt(cs)) {
                     case CellType::Bindings: {
                         auto * bn = reinterpret_cast<const Bindings *>(cs);
+                        if (bn->isMapAttrs() && refCand(bn->aux)) { note("Bindings.aux", cs); break; }
                         for (uint32_t i = 0; i < bn->size; ++i)
                             if (refCand(bn->entries[i].value)) { note("Bindings.entry", cs); break; }
                         if (bn->parent && inFreeable(reinterpret_cast<uintptr_t>(bn->parent))) note("Bindings.parent", cs);

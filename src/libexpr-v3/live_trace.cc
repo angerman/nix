@@ -333,6 +333,8 @@ private:
             e.bindingsBytes += bytes;
             ++e.bindingsCount;
         }
+        if (b->isMapAttrs())
+            auditAndVisit(b->aux);
         for (uint32_t i = 0; i < b->size; ++i)
             auditAndVisit(b->entries[i].value);
         // Chain bindings: walk parent.  Each segment of the chain
@@ -812,6 +814,8 @@ private:
     void walkBindings(Bindings * b)
     {
         account(sizeof(Bindings) + sizeof(Bindings::Entry) * b->size);
+        if (b->isMapAttrs())
+            visitValue(b->aux);
         for (uint32_t i = 0; i < b->size; ++i) visitValue(b->entries[i].value);
         if (b->parent) enqueue(const_cast<Bindings *>(b->parent), GK_BINDINGS);
     }
@@ -1697,6 +1701,8 @@ private:
     }
     void walkBindings(Bindings * b) noexcept
     {
+        if (b->isMapAttrs())
+            visitValue(b->aux);
         for (uint32_t i = 0; i < b->size; ++i)
             visitValue(b->entries[i].value);
         if (b->parent)

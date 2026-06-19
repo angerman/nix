@@ -7,12 +7,16 @@
 #include "v3/value.hh"
 #include "v3/alloc.hh"
 #include "v3/barrier.hh"
+#include "v3/ir.hh"
 
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <dlfcn.h>
+#include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -123,6 +127,39 @@ void Bindings::clearMaterializeMemo()
     s_matMemo.clear();
 }
 
+void Bindings::realizeMapAttrsEntry(Entry * e) noexcept
+{
+    if (!e || !isMapAttrs()) return;
+    // Initial cache state: primMapAttrs stored the original source value here
+    // and tagged the pos word.  Do not key on Value shape: the mapped result may
+    // legitimately force to any tag later.
+    if ((e->pos & kMapAttrsUnrealizedPosBit) == 0) return;
+    const auto & symTab = ir::globalSymbolTable();
+    std::string fallback;
+    std::string_view name =
+        e->name < symTab.size()
+            ? std::string_view(symTab[e->name])
+            : std::string_view(fallback = std::to_string(e->name));
+    char * nameBuf = Alloc::allocChars(name.size() + 1);
+    std::memcpy(nameBuf, name.data(), name.size());
+    nameBuf[name.size()] = '\0';
+    Value nameStr;
+    nameStr.mkString(nameBuf);
+    Value src = e->value;
+
+    ValuePair * pp = Alloc::allocPair();
+    pp->left = aux;
+    pp->right = nameStr;
+    pp->third = src;
+    pairPostConstructBarrier(pp);
+
+    Value app3;
+    app3.mkPair(Tag::App3, pp);
+    e->pos &= kPosMask;
+    uint32_t idx = static_cast<uint32_t>(e - entries);
+    bindingsSetValue(this, idx, app3);
+}
+
 const Bindings * Bindings::materialize() const
 {
     if (kind == uint8_t(Kind::Sorted)) return this;
@@ -136,17 +173,30 @@ const Bindings * Bindings::materialize() const
     if (auto it = s_matMemo.find(this); it != s_matMemo.end())
         return it->second;
 
+    if (kind == uint8_t(Kind::MapAttrs)) {
+        Bindings * out = Alloc::allocBindings(size);
+        auto * self = const_cast<Bindings *>(this);
+        for (uint32_t i = 0; i < size; ++i) {
+            self->realizeMapAttrsEntry(&self->entries[i]);
+            bindingsSetEntry(out, i, self->entries[i]);
+        }
+        bindingsPostConstructBarrier(out);
+        s_matMemo.emplace(this, out);
+        return out;
+    }
+
     // Walk the chain leaf-first (overlay-first); collect (level, entry)
     // pairs into a flat vector; sort by (name, level); keep the first
     // occurrence of each name (which is overlay-winning because lower
     // level == closer to leaf == overlay).
     struct LevelEntry { uint16_t level; Entry e; };
     uint32_t cap = 0;
-    for (const Bindings * b = this; b; b = b->parent) cap += b->size;
+    for (const Bindings * b = this; b; b = b->isChain() ? b->parent : nullptr)
+        cap += b->size;
     std::vector<LevelEntry> all;
     all.reserve(cap);
     uint16_t lvl = 0;
-    for (const Bindings * b = this; b; b = b->parent, ++lvl) {
+    for (const Bindings * b = this; b; b = b->isChain() ? b->parent : nullptr, ++lvl) {
         for (uint32_t i = 0; i < b->size; ++i) {
             all.push_back({lvl, b->entries[i]});
         }

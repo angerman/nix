@@ -554,20 +554,20 @@ bool valuesEqual(const Value & a, const Value & b) noexcept
     case Tag::Attrs: {
         const Bindings * ba = a.asAttrs();
         const Bindings * bb = b.asAttrs();
-        const bool anyChain = (ba && ba->isChain()) || (bb && bb->isChain());
-        uint32_t sa = ba ? (anyChain ? ba->countDistinct() : ba->size) : 0;
-        uint32_t sb = bb ? (anyChain ? bb->countDistinct() : bb->size) : 0;
+        const bool anyNonSorted = (ba && !ba->isSorted()) || (bb && !bb->isSorted());
+        uint32_t sa = ba ? (anyNonSorted ? ba->countDistinct() : ba->size) : 0;
+        uint32_t sb = bb ? (anyNonSorted ? bb->countDistinct() : bb->size) : 0;
         if (sa != sb) return false;
         if (sa == 0) return true;
-        if (anyChain) {
-            Bindings::Cursor ca(ba);
-            Bindings::Cursor cb(bb);
-            while (const Bindings::Entry * ea = ca.next()) {
-                const Bindings::Entry * eb = cb.next();
-                if (!eb || ea->name != eb->name) return false;
-                if (!valuesEqual(ea->value, eb->value)) return false;
+        if (anyNonSorted) {
+            const Bindings * ma = ba->materialize();
+            const Bindings * mb = bb->materialize();
+            for (uint32_t i = 0; i < sa; ++i) {
+                if (ma->entries[i].name != mb->entries[i].name) return false;
+                if (!valuesEqual(ma->entries[i].value, mb->entries[i].value))
+                    return false;
             }
-            return cb.next() == nullptr;
+            return true;
         }
         // Bindings are SymbolId-sorted; same SymbolId space for both
         // (we deserialise via globalInternSymbol so the input names

@@ -1445,6 +1445,11 @@ inline Bindings * mergeBindings(const Bindings * a, const Bindings * b,
                                 MergeBindingsSite siteId =
                                     MergeBindingsSite::AttrsUpdate)
 {
+    if (a && a->isMapAttrs())
+        a = a->materialize();
+    if (b && b->isMapAttrs())
+        b = b->materialize();
+
     // #821 per-site call counter — bumped at function entry so the
     // empty-operand short-circuit (below) contributes to the call
     // count even though it doesn't allocate; the BYTES counter is
@@ -9577,6 +9582,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 }
             }
             if (hitSlot != UINT32_MAX) {
+                if (b->isMapAttrs())
+                    b->realizeMapAttrsEntry(&b->entries[hitSlot]);
                 Value & slot = b->entries[hitSlot].value;
                 // 2026-05-17: iterative force + memoizing writeback for
                 // mapAttrs/genList App entries.  Previously this site
@@ -9776,6 +9783,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 evicted.slot     = lo;
                 ic.evictIdx = (ic.evictIdx + 1)
                     % CompilationUnit::AttrSelectIC::kWays;
+                if (b->isMapAttrs())
+                    b->realizeMapAttrsEntry(&b->entries[lo]);
                 Value & slot = b->entries[lo].value;
                 // 2026-05-17: iterative force + memoizing writeback
                 // (IC install path).  Mirror of the IC HIT path above —
