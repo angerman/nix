@@ -8368,6 +8368,45 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // V3_DBG_HOT_FORCE: count total dispatches + unique thunk
             // pointers at the configured source position suffix.
             hotForceCheck(t);
+            // TT-1 falsifier (2026-06-19, NIX_V3_DBG_THUNK_BODYSIZE): histogram
+            // forced-thunk body sizes (code-words from codeOffset to the first
+            // body terminator) to size the trivial-thunk inline-force lever —
+            // what % of forced thunks have a tiny (≤2-4-word) body that could
+            // run inline, skipping this frame-push + dispatchLoop re-entry?
+            {
+                static const bool s_bs = std::getenv("NIX_V3_DBG_THUNK_BODYSIZE") != nullptr;
+                if (__builtin_expect(s_bs, 0)) {
+                    struct Hist {
+                        uint64_t b[6] = {}; uint64_t total = 0;
+                        ~Hist() { std::fprintf(stderr,
+                            "v3 TT-1 forced-thunk body-size (words to terminator): "
+                            "1-2=%llu 3-4=%llu 5-8=%llu 9-16=%llu 17-32=%llu 33+=%llu total=%llu "
+                            "(trivial[1-4]=%.1f%%)\n",
+                            (unsigned long long)b[0],(unsigned long long)b[1],(unsigned long long)b[2],
+                            (unsigned long long)b[3],(unsigned long long)b[4],(unsigned long long)b[5],
+                            (unsigned long long)total,
+                            total? 100.0*(b[0]+b[1])/total : 0.0); }
+                    };
+                    static Hist hist;
+                    static std::unordered_map<uint64_t,uint32_t> cache;
+                    uint64_t key = (reinterpret_cast<uintptr_t>(thunkCu) << 24) ^ desc->codeOffset;
+                    auto it = cache.find(key);
+                    uint32_t words;
+                    if (it != cache.end()) words = it->second;
+                    else {
+                        words = 0;
+                        for (uint32_t p = desc->codeOffset;
+                             p < thunkCu->code.size() && words < 100000; ++p) {
+                            Op o = decodeOp(thunkCu->code[p]); ++words;
+                            if (o==OP_RETURN||o==OP_R_RETURN||o==OP_HALT
+                                ||o==OP_TAIL_CALL||o==OP_TAIL_CALL_N) break;
+                        }
+                        cache[key] = words;
+                    }
+                    int bk = words<=2?0 : words<=4?1 : words<=8?2 : words<=16?3 : words<=32?4 : 5;
+                    hist.b[bk]++; hist.total++;
+                }
+            }
             vm.frames.push_back(CallFrame{
                 .cu = thunkCu,
                 .closure = fakeClo,
