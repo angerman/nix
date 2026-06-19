@@ -253,7 +253,7 @@ Closure * Scavenger::fwdClosure(Closure * c)
         if (n.inYoung(c)) {
             auto it = forward.find(c);
             if (it != forward.end()) return static_cast<Closure *>(it->second);
-            const size_t bytes = sizeof(Closure) + sizeof(Value) * c->nUpvalues;
+            const size_t bytes = closureAllocatedSize(c);
             void * dst = n.targetSurvivorAlloc(bytes);
             const bool toSurv = (dst != nullptr);
             if (!dst) dst = threadArena().alloc(bytes);  // S overflow → T
@@ -268,7 +268,7 @@ Closure * Scavenger::fwdClosure(Closure * c)
         if (n.inActiveSurvivor(c)) {
             auto it = forward.find(c);
             if (it != forward.end()) return static_cast<Closure *>(it->second);
-            const size_t bytes = sizeof(Closure) + sizeof(Value) * c->nUpvalues;
+            const size_t bytes = closureAllocatedSize(c);
             void * dst = threadArena().alloc(bytes);
             std::memcpy(dst, c, bytes);
             forward.emplace(c, dst);
@@ -282,7 +282,7 @@ Closure * Scavenger::fwdClosure(Closure * c)
         // Legacy Phase D single-region path: every survivor → tenured.
         auto it = forward.find(c);
         if (it != forward.end()) return static_cast<Closure *>(it->second);
-        const size_t bytes = sizeof(Closure) + sizeof(Value) * c->nUpvalues;
+        const size_t bytes = closureAllocatedSize(c);
         void * dst = threadArena().alloc(bytes);
         std::memcpy(dst, c, bytes);
         forward.emplace(c, dst);
@@ -635,7 +635,7 @@ void Scavenger::walkClosure(Closure * c)
     // BRUTE-refinement (Phase 1.7 R1): record this object's tenured
     // byte range so postScavengeBruteScan can filter hits to live
     // (reachable-from-roots) objects only.
-    recordLiveTenured(c, sizeof(Closure) + sizeof(Value) * c->nUpvalues, CellType::Closure);
+    recordLiveTenured(c, closureScanSize(c), CellType::Closure);
     if (c->cu && walkedCUs.insert(c->cu).second) {
         for (const auto & ic : c->cu->attrSelectCache) {
             for (int w = 0; w < CompilationUnit::AttrSelectIC::kWays; ++w) {

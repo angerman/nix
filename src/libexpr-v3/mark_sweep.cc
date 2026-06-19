@@ -533,11 +533,11 @@ private:
 
     void walkClosure(Closure * c) noexcept
     {
-        // Step 11′ (Immix, 2026-05-29): mark the lines this Closure
-        // occupies.  Cell size = sizeof(Closure) + nUpvalues * sizeof(Value).
+        // Step 11′ (Immix, 2026-05-29): mark the allocated Closure range.
+        // Real env-shared closures have no FAM; fake closures keep their pool
+        // bucket capacity even when the FAM is semantically unused.
         if (arenaSetForSlot_) {
-            arenaSetForSlot_->markLinesForCell(
-                c, sizeof(Closure) + sizeof(Value) * c->nUpvalues);
+            arenaSetForSlot_->markLinesForCell(c, closureAllocatedSize(c));
         }
         if (c->capturedWiths)
             visitList(c->capturedWiths);
@@ -1029,8 +1029,7 @@ static size_t evacCellSize(const void * p, CellType t) noexcept
     switch (t) {
     case CellType::Value:    return sizeof(Value);
     case CellType::Closure:
-        return sizeof(Closure)
-             + sizeof(Value) * static_cast<const Closure *>(p)->nUpvalues;
+        return closureAllocatedSize(static_cast<const Closure *>(p));
     case CellType::Thunk:
         return thunkScanSize(static_cast<const Thunk *>(p));  // FP-2b: incl. withs slot
     case CellType::Bindings:

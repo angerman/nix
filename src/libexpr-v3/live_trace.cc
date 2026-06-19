@@ -227,11 +227,16 @@ private:
     {
         ++counts.closures;
         counts.bytesClosures += sizeof(Closure)
-                              + size_t(c->nUpvalues) * sizeof(Value);
+                              + (c->upvalEnv ? 0 : size_t(c->nUpvalues) * sizeof(Value));
         if (c->capturedWiths)
             enqueue(c->capturedWiths, GK_LIST);
-        for (uint16_t i = 0; i < c->nUpvalues; ++i)
-            auditAndVisit(c->upvalues[i]);
+        if (c->upvalEnv) {
+            for (uint16_t i = 0; i < c->upvalEnv->nValues; ++i)
+                auditAndVisit(c->upvalEnv->values[i]);
+        } else {
+            for (uint16_t i = 0; i < c->nUpvalues; ++i)
+                auditAndVisit(c->upvalues[i]);
+        }
     }
 
     /// Walk a Thunk.  State-dependent: Suspended/Native/Blackhole have
@@ -773,9 +778,15 @@ private:
 
     void walkClosure(Closure * c)
     {
-        account(sizeof(Closure) + size_t(c->nUpvalues) * sizeof(Value));
+        account(sizeof(Closure)
+            + (c->upvalEnv ? 0 : size_t(c->nUpvalues) * sizeof(Value)));
         if (c->capturedWiths) enqueue(c->capturedWiths, GK_LIST);
-        for (uint16_t i = 0; i < c->nUpvalues; ++i) visitValue(c->upvalues[i]);
+        if (c->upvalEnv) {
+            for (uint16_t i = 0; i < c->upvalEnv->nValues; ++i)
+                visitValue(c->upvalEnv->values[i]);
+        } else {
+            for (uint16_t i = 0; i < c->nUpvalues; ++i) visitValue(c->upvalues[i]);
+        }
     }
     void walkThunk(Thunk * t)
     {
@@ -1096,7 +1107,7 @@ public:
         };
 
         for (Closure   * c : markedClosures_)
-            credit(c, sizeof(Closure) + sizeof(Value) * c->nUpvalues);
+            credit(c, closureScanSize(c));
         for (Thunk     * t : markedThunks_) {
             size_t bytes = thunkScanSize(t);  // FP-2b: incl. withs slot
             credit(t, bytes);
@@ -1388,8 +1399,7 @@ private:
 
         // Walk every marked set; mark lines.
         for (Closure * c : markedClosures_)
-            markRange(c,
-                sizeof(Closure) + sizeof(Value) * c->nUpvalues);
+            markRange(c, closureScanSize(c));
         for (Thunk * t : markedThunks_) {
             size_t bytes = thunkScanSize(t);  // FP-2b: incl. withs slot
             markRange(t, bytes);
@@ -1656,8 +1666,13 @@ private:
     void walkClosure(Closure * c) noexcept
     {
         if (c->capturedWiths) visitList(c->capturedWiths);
-        for (uint16_t i = 0; i < c->nUpvalues; ++i)
-            visitValue(c->upvalues[i]);
+        if (c->upvalEnv) {
+            for (uint16_t i = 0; i < c->upvalEnv->nValues; ++i)
+                visitValue(c->upvalEnv->values[i]);
+        } else {
+            for (uint16_t i = 0; i < c->nUpvalues; ++i)
+                visitValue(c->upvalues[i]);
+        }
     }
     void walkThunk(Thunk * t) noexcept
     {
@@ -1749,7 +1764,7 @@ void dumpV3LiveBlockProbe() noexcept
     // during reportBlocks; we just re-aggregate from sets here cheaply.
     size_t liveBytesApprox = 0;
     for (Closure * c : pr.markedClosuresPub())
-        liveBytesApprox += sizeof(Closure) + sizeof(Value) * c->nUpvalues;
+        liveBytesApprox += closureScanSize(c);
     for (Thunk * t : pr.markedThunksPub()) {
         size_t b = thunkScanSize(t);  // FP-2b: incl. withs slot
         liveBytesApprox += b;

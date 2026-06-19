@@ -70,12 +70,12 @@ struct Closure
     /// closure is invoked, the dispatcher re-pushes these onto the
     /// runtime with-stack so OP_WITH_LOOKUP inside the body finds them.
     ListVec *                capturedWiths;
-    /// Env-sharing (NIX_V3_ENV_SHARING, opt-in bring-up): when non-null, the
+    /// Env-sharing: when non-null, the
     /// upvalues live in this shared (tenured) Env's values[] instead of the
     /// inline FAM below — multiple closures from the same capture-set share one
     /// Env, cutting the per-closure upvalue-copy alloc. GET_UPVALUE reads
-    /// `upvalEnv->values[n]` when set, else `upvalues[n]`. null in the default
-    /// (inline-FAM) path, so the field is inert unless the gate built an Env.
+    /// `upvalEnv->values[n]` when set, else `upvalues[n]`. The inline-FAM path
+    /// remains available via NIX_V3_NO_ENV_SHARING / NIX_V3_ENV_SHARING=0.
     Env *                    upvalEnv;
     uint16_t                 nUpvalues;
     uint16_t                 _pad;
@@ -99,6 +99,22 @@ inline Value * closureUpvaluePtr(Closure * c, uint32_t i) noexcept
 inline const Value * closureUpvaluePtr(const Closure * c, uint32_t i) noexcept
 {
     return c->upvalEnv ? &c->upvalEnv->values[i] : &c->upvalues[i];
+}
+
+[[gnu::always_inline]] inline std::size_t closureScanSize(const Closure * c) noexcept
+{
+    return sizeof(Closure)
+         + (c->upvalEnv ? 0 : sizeof(Value) * c->nUpvalues);
+}
+
+[[gnu::always_inline]] inline std::size_t closureAllocatedSize(const Closure * c) noexcept
+{
+    // Real env-shared closures are allocated with a zero-length FAM.  Fake
+    // closures keep their pool bucket capacity in the FAM even when upvalEnv is
+    // set, but that tail is semantically dead and must not be scanned for roots.
+    const bool hasInlineStorage = !c->upvalEnv || c->_pad != 0;
+    return sizeof(Closure)
+         + (hasInlineStorage ? sizeof(Value) * c->nUpvalues : 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -221,7 +237,7 @@ static_assert(sizeof(Thunk) == 24,
     "FP-2: Thunk header must be 24 B (state-word 8 + cell 8 + union 8). The "
     "optional capturedWiths lives at tail[nUpvalues] when hasWithsSlot==1.");
 
-// env-sharing (NIX_V3_ENV_SHARING): the `hasWithsSlot` byte is repurposed as a
+// env-sharing: the `hasWithsSlot` byte is repurposed as a
 // FLAGS bitfield rather than adding a field — FP-2 keeps the header at 24 B, so
 // the thunk-side Env reference must NOT grow it.  Bit 0 (THUNK_WITHS_SLOT) is the
 // original capturedWiths-slot flag; bit 1 (THUNK_ENV_SHARED) marks env-sharing,

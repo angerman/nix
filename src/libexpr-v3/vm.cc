@@ -12439,7 +12439,9 @@ inline Value runOnExistingVm(VMState & vm,
     // Plain tail call enables compiler TCO — no try/catch in this
     // wrapper means runOnExistingVm's frame can be elided in favor
     // of dispatchLoop's directly.
-    return dispatchLoop(vm, exitDepth);
+    Value r = dispatchLoop(vm, exitDepth);
+    if (fakeClo) Alloc::recycleFakeClo(fakeClo);
+    return r;
 }
 
 Value run(const CompilationUnit & rootCu)
@@ -12591,7 +12593,9 @@ Value runFunctionWithUpvalues(const CompilationUnit & cu, uint32_t funcIdx,
 
     vm.valueStack.resize(desc.nLocals);
 
-    return dispatchAndClear(vm);
+    Value r = dispatchAndClear(vm);
+    Alloc::recycleFakeClo(fakeClo);
+    return r;
 }
 
 /// #426: invoke a v3 lambda body Function with one supplied argument.
@@ -12712,7 +12716,9 @@ Value runLambda(const CompilationUnit & cu, uint32_t funcIdx,
     });
     pushCapturedWiths(vm, capturedWiths);
 
-    return dispatchAndClear(vm);
+    Value r = dispatchAndClear(vm);
+    Alloc::recycleFakeClo(fakeClo);
+    return r;
 }
 
 // v3ValueTypeName, v3ThunkTracePos and v3DescTracePos: hoisted above
