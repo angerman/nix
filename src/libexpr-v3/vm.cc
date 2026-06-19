@@ -8202,6 +8202,53 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // reclamation: fresh closures land in nursery, scavenge
             // collects unreferenced ones at next cycle.  Pool was
             // load-bearing only before nursery + Phase D landed.
+            // TT-2 (2026-06-19): trivial-thunk inline-force.  TT-1 found ~28%
+            // of forced thunks have ≤4-word bodies; the safest pattern is
+            // `GET_UPVALUE n; RETURN` — a thunk that just returns a captured
+            // upvalue.  Compute the result + memoize INLINE, replicating
+            // OP_RETURN's CFF_THUNK_RETURN writeback EXACTLY (chase Evaluated
+            // chains + self-cycle→vBlackhole + thunkSetEvaluated Phase-D barrier
+            // + cell update), then DELIVER via `push + goto op_force_slow` (the
+            // established re-force idiom).  NB this site is AFTER op_force_slow's
+            // while(true) chase loop (it closes ~L7898), so a `continue` here
+            // would wrongly target the OUTER dispatch loop and skip delivery.
+            // Skips allocFakeClo + the frame-push + dispatchLoop re-entry +
+            // OP_RETURN.  Byte-identical by construction: GET_UPVALUE n pushes
+            // fakeClo->upvalues[n]==t->tail[n] and RETURN pops it, so the inline
+            // result + memoization match the bytecode path exactly.  Opt-out
+            // NIX_V3_NO_INLINE_FORCE=1 (A/B + bisect; retire after a darwin-4
+            // --brute + nixpkgs byte-equality soak).
+            {
+                static const bool s_inlineForce =
+                    std::getenv("NIX_V3_NO_INLINE_FORCE") == nullptr;
+                if (__builtin_expect(s_inlineForce, 1)) {
+                    const CompilationUnit * tcu = thunkCU(t);
+                    if (!tcu) tcu = cu;
+                    uint32_t boff = desc->codeOffset;
+                    if (boff + 1 < tcu->code.size()
+                        && decodeOp(tcu->code[boff])     == OP_GET_UPVALUE
+                        && decodeOp(tcu->code[boff + 1]) == OP_RETURN) {
+                        uint32_t un = decodeOperand(tcu->code[boff]);
+                        if (un < t->nUpvalues) {
+                            Value retVal = t->tail[un];
+                            // Match OP_RETURN/CFF_THUNK_RETURN (vm.cc ~7243):
+                            while (retVal.isThunk()
+                                   && retVal.asThunk()->state == ThunkState::Evaluated)
+                                retVal = retVal.asThunk()->evaluated;
+                            if (retVal.isThunk() && retVal.asThunk() == t)
+                                retVal = Value::vBlackhole;          // self-cycle defer
+                            t->state = ThunkState::Evaluated;
+                            thunkSetEvaluated(t, retVal);            // Phase D barrier
+                            if (Value * cell = t->cell) {            // STG-8 cell update
+                                cellWrite(cell, retVal, nullptr);
+                                t->cell = nullptr;
+                            }
+                            push(vm, retVal);                        // deliver via the
+                            goto op_force_slow;                      //   re-force machinery
+                        }
+                    }
+                }
+            }
             // EXIT_GC_SPIRAL Day 6-8 wire-back (2026-05-29): use the
             // fakeClo pool (`allocFakeClo`) instead of fresh
             // `allocClosure`.  The pool is gated by
