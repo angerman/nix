@@ -809,17 +809,19 @@ void primAttrValues(EvalState &, Value * args, Value & out)
             lv->elems[i] = e.value;
         }
     } else {
-        // A chain cursor does not expose the owning Bindings layer, so keep the
-        // existing entry-copying path here.  This preserves the chain streaming
-        // semantics while the hot Sorted/MapAttrs path avoids the Value copies.
-        std::vector<std::pair<std::string_view, Value>> pairs;
-        pairs.reserve(n);
-        src->forEach([&](const Bindings::Entry & e) {
-            pairs.emplace_back(nameView(e.name), e.value);
-        });
-        std::sort(pairs.begin(), pairs.end(),
-            [](const auto & x, const auto & y) { return x.first < y.first; });
-        for (uint32_t i = 0; i < n; ++i) lv->elems[i] = pairs[i].second;
+        // Sort entry refs, not (name,value) pairs.  Chain attrValues can be a
+        // large read-only consumer; copying every Value into a transient C++
+        // vector adds work before we copy the same Values into the final ListVec.
+        std::vector<const Bindings::Entry *> order;
+        order.reserve(n);
+        Bindings::Cursor c(src);
+        while (const Bindings::Entry * e = c.next())
+            order.push_back(e);
+        std::sort(order.begin(), order.end(),
+            [&](const Bindings::Entry * x, const Bindings::Entry * y) {
+                return nameView(x->name) < nameView(y->name);
+            });
+        for (uint32_t i = 0; i < n; ++i) lv->elems[i] = order[i]->value;
     }
     listPostConstructBarrier(lv);  // Phase D coverage (primAttrValues; PhD-6)
     out.mkList(lv);
