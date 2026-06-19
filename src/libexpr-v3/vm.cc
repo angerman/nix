@@ -520,6 +520,113 @@ inline void dump()
 }
 } // namespace upvaldup
 
+// Env tuple interning -------------------------------------------------------
+//
+// Env-sharing moved closure/thunk captures out of inline FAM tails, but the
+// first implementation still allocated one fresh Env per runtime object.  This
+// weak, epoch-local table shares byte-identical capture tuples across closures
+// and thunks, which recovers the common "many lazy siblings close over the same
+// lexical state" shape without changing the public object model.
+//
+// The table is deliberately NOT a GC root.  It is cleared at the outermost
+// major-GC safepoint before mark/sweep, just like the Bindings materialize memo,
+// so no stale Env* survives a collection.  Minor scavenges may rewrite values
+// inside an Env, which can make a bucket miss later; that only loses sharing
+// until the next equal tuple is inserted, not correctness.
+namespace envintern {
+using Bucket = std::vector<Env *>;
+
+inline bool enabled() noexcept
+{
+    static const bool s_enabled = [] {
+        if (std::getenv("NIX_V3_NO_ENV_INTERN")) return false;
+        const char * e = std::getenv("NIX_V3_ENV_INTERN");
+        if (e) return e[0] != '0';
+        return true;
+    }();
+    return s_enabled;
+}
+
+inline std::unordered_map<uint64_t, Bucket> & table()
+{
+    static thread_local std::unordered_map<uint64_t, Bucket> t;
+    return t;
+}
+
+template <typename Stack>
+inline uint64_t hashStackTuple(const Stack & stack,
+                               size_t base,
+                               uint16_t nUp) noexcept
+{
+    uint64_t h = 0x9E3779B97F4A7C15ull ^ (uint64_t(nUp) * 0xC2B2AE3D27D4EB4Full);
+    for (uint16_t i = 0; i < nUp; ++i) {
+        uint64_t x = stack[base + i].rawWord();
+        x ^= x >> 33; x *= 0xff51afd7ed558ccdull; x ^= x >> 33;
+        h ^= x; h *= 0x100000001B3ull;
+    }
+    return h;
+}
+
+template <typename Stack>
+inline bool sameTuple(const Env * env,
+                      const Stack & stack,
+                      size_t base,
+                      uint16_t nUp) noexcept
+{
+    if (!env || env->nValues != nUp) return false;
+    for (uint16_t i = 0; i < nUp; ++i)
+        if (env->values[i].rawWord() != stack[base + i].rawWord())
+            return false;
+    return true;
+}
+
+Env * internFromStack(VMState & vm, uint16_t nUp)
+{
+    assert(nUp > 0);
+    assert(vm.valueStack.size() >= nUp);
+    const size_t base = vm.valueStack.size() - nUp;
+
+    if (__builtin_expect(enabled(), 1)) {
+        uint64_t h = hashStackTuple(vm.valueStack, base, nUp);
+        Bucket & b = table()[h];
+        for (Env * env : b) {
+            if (sameTuple(env, vm.valueStack, base, nUp)) {
+                vm.valueStack.resize(base);
+                return env;
+            }
+        }
+
+        Env * env = Alloc::allocEnv(nUp);
+        for (uint16_t i = 0; i < nUp; ++i)
+            env->values[i] = vm.valueStack[base + i];
+        vm.valueStack.resize(base);
+        b.push_back(env);
+        return env;
+    }
+
+    Env * env = Alloc::allocEnv(nUp);
+    for (uint16_t i = 0; i < nUp; ++i)
+        env->values[i] = vm.valueStack[base + i];
+    vm.valueStack.resize(base);
+    return env;
+}
+
+inline void clear() noexcept
+{
+    table().clear();
+}
+} // namespace envintern
+
+static Env * internUpvalueEnvFromStack(VMState & vm, uint16_t nUp)
+{
+    return envintern::internFromStack(vm, nUp);
+}
+
+static void clearEnvInternTable() noexcept
+{
+    envintern::clear();
+}
+
 // (FP-2b sizing probe V3_DBG_THUNK_WITHS retired 2026-06-14 — it measured the
 // capturedWiths null-fraction (firefox 74% / M5 97%) to greenlight FP-2b's
 // tail-relocation; FP-2b landed byte-identical with M5 arena −151 MB, so the
@@ -3737,6 +3844,10 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     // as the ICs above.  Clear it before the mark/sweep so no
                     // stale chain pointer survives a collection.
                     Bindings::clearMaterializeMemo();
+                    // Env tuple interning is a weak per-epoch cache, not a root.
+                    // Clear it before mark/sweep so dead Envs can be reclaimed and
+                    // no stale Env* remains in the side table after collection.
+                    clearEnvInternTable();
                     const MajorGcResult gcr = runMajorMarkSweep(vm);
                     // Frame pointers may have been forwarded.
                     // Re-read dispatch locals.
@@ -4771,9 +4882,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // Env-aware GC: scavenge walkClosure grays the Env; mark/evac/auditor +
             // closurePostConstructBarrier all branch on upvalEnv (gc.cc/mark_sweep.cc).
             if (__builtin_expect(shareUpvalues, 1)) {
-                Env * env = Alloc::allocEnv(nUp);
-                for (uint16_t i = nUp; i > 0; --i) env->values[i - 1] = pop(vm);
-                c->upvalEnv = env;
+                c->upvalEnv = internUpvalueEnvFromStack(vm, nUp);
             } else {
                 for (uint16_t i = nUp; i > 0; --i) c->upvalues[i - 1] = pop(vm);
             }
@@ -5092,7 +5201,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             Env * thunkEnv = nullptr;
             if (__builtin_expect(s_envSharingThunk && nUp > 0, 0)) {
                 t = Alloc::allocThunkSuspendedShared(nUp, willHaveWiths);
-                thunkEnv = Alloc::allocEnv(nUp);
+                thunkEnv = internUpvalueEnvFromStack(vm, nUp);
                 *reinterpret_cast<Env **>(&t->tail[0]) = thunkEnv;  // Env* @ tail[0]
             } else {
                 t = Alloc::allocThunkSuspended(nUp, willHaveWiths);
@@ -5227,9 +5336,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // env-sharing: upvalues go into the shared Env, not the inline tail
             // (tail[0] holds the Env*).  Stack order is identical (upvalues on
             // top, withs below), so the withs-pop logic below is unaffected.
-            if (thunkEnv) {
-                for (uint16_t i = nUp; i > 0; --i) thunkEnv->values[i - 1] = pop(vm);
-            } else {
+            if (!thunkEnv) {
                 for (uint16_t i = nUp; i > 0; --i) t->tail[i - 1] = pop(vm);
             }
             if (__builtin_expect(g_dbgUpvalDup, 0) && nUp > 0 && !thunkEnv)

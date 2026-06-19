@@ -2734,6 +2734,7 @@ struct Alloc
     static Env * allocEnv(uint16_t nValues) noexcept
     {
         const size_t bytes = sizeof(Env) + sizeof(Value) * nValues;
+        V3_STATS_INC(envsAllocated);
         V3_STATS_BUMP(bytesEnvs, bytes);
         auto * e = static_cast<Env *>(threadArena().alloc(bytes, CellType::Env));
         e->parent = nullptr;
