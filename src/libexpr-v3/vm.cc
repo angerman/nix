@@ -6810,10 +6810,6 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                             ? tcDesc->contextualName
                             : std::string("anonymous lambda");
                         const Bindings * b = forcedArg.asAttrs();
-                        // #825 Phase C SPIKE: materialise Chain — see
-                        // the matching note in the OP_CALL formals path
-                        // above (~line 4895).
-                        if (b && b->isChain()) b = b->materialize();
                         const auto & tbl = ir::globalSymbolTable();
                         // #809: same NIX_V3_PERMISSIVE_FORMALS gate as
                         // the call-site path above.  Both OP_CALL and
@@ -6821,27 +6817,32 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                         // the gate or the diagnostic isn't honest.
                         static const bool s_permissiveFormalsTC =
                             std::getenv("NIX_V3_PERMISSIVE_FORMALS") != nullptr;
+                        auto hasFormal = [&](SymbolId name) noexcept {
+                            size_t lo = 0, hi = tcDesc->formals.size();
+                            while (lo < hi) {
+                                size_t mid = (lo + hi) >> 1;
+                                SymbolId midName = tcDesc->formals[mid].name;
+                                if (midName == name) return true;
+                                if (midName < name) lo = mid + 1;
+                                else hi = mid;
+                            }
+                            return false;
+                        };
                         if (!tcDesc->ellipsis && !s_permissiveFormalsTC) {
-                            for (uint32_t i = 0; i < b->size; ++i) {
-                                SymbolId name = b->entries[i].name;
-                                bool found = false;
-                                for (auto & f : tcDesc->formals)
-                                    if (f.name == name) { found = true; break; }
-                                if (!found) {
+                            b->forEach([&](const Bindings::Entry & entry) {
+                                SymbolId name = entry.name;
+                                if (!hasFormal(name)) {
                                     std::string nm = (name < tbl.size()) ? tbl[name] : "?";
                                     throw std::runtime_error(
                                         "function '" + lambdaName
                                         + "' called with unexpected argument '"
                                         + nm + "'");
                                 }
-                            }
+                            });
                         }
                         for (auto & f : tcDesc->formals) {
                             if (f.hasDefault) continue;
-                            bool found = false;
-                            for (uint32_t i = 0; i < b->size; ++i)
-                                if (b->entries[i].name == f.name) { found = true; break; }
-                            if (!found) {
+                            if (!b->lookup(f.name)) {
                                 std::string nm = (f.name < tbl.size()) ? tbl[f.name] : "?";
                                 throw std::runtime_error(
                                     "function '" + lambdaName
