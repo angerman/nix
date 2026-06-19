@@ -8292,16 +8292,11 @@ void primScopedImport(EvalState & state, Value * args, Value & out)
     std::string wrapped;
     wrapped += "__scope__: let ";
     auto * sb = scope.asAttrs();
-    // ChainBindings: the scope is built by iterating sb->entries[] into the
-    // lowering scope; a Chain = overlay only would drop the parent's names
-    // (e.g. `range` from `overrides // import ./lib.nix`) → lower-time
-    // 'unbound variable'.  Materialise the full view.
-    if (sb && sb->isChain()) sb = const_cast<Bindings *>(sb->materialize());
     auto & symTab = ir::globalSymbolTable();
-    for (uint32_t i = 0; i < sb->size; ++i) {
-        SymbolId sid = sb->entries[i].name;
+    sb->forEach([&](const Bindings::Entry & e) {
+        SymbolId sid = e.name;
         std::string n = sid < symTab.size() ? symTab[sid] : "";
-        if (n.empty()) continue;
+        if (n.empty()) return;
         // Quote names that can't be plain identifiers.  Conservative:
         // allow [a-zA-Z_][a-zA-Z0-9_'-]*.
         bool plain = !n.empty() &&
@@ -8314,10 +8309,10 @@ void primScopedImport(EvalState & state, Value * args, Value & out)
         // Skip reserved keywords.
         if (n == "if" || n == "then" || n == "else" || n == "assert"
             || n == "with" || n == "let" || n == "in" || n == "rec"
-            || n == "inherit" || n == "or") continue;
-        if (!plain) continue;
+            || n == "inherit" || n == "or") return;
+        if (!plain) return;
         wrapped += n + " = __scope__." + n + "; ";
-    }
+    });
     wrapped += "in (\n" + src + "\n)";
 
     // PARSER_PROJECT_PLAN §5.3 site 3: native-parse+lower the synthetic
@@ -9317,10 +9312,7 @@ static ffi::FetchTreeInput extractFetchTreeInput(
     };
 
     if (a.isAttrs() && a.asAttrs()) {
-        // Materialise Chain overlays so we iterate the FULL attrset (matches
-        // TW's flat `for (auto & attr : *args[0]->attrs())`; see primAttrNames).
         const Bindings * b = a.asAttrs();
-        if (b->isChain()) b = b->materialize();
         static const SymbolId sidType = ir::globalInternSymbol("type");
 
         if (const Value * tv = b->lookup(sidType)) {
@@ -9339,11 +9331,11 @@ static ffi::FetchTreeInput extractFetchTreeInput(
 
         in.attrs.push_back({"type", *type});
 
-        for (uint32_t i = 0; i < b->size; ++i) {
-            const SymbolId nameId = b->entries[i].name;
-            if (nameId == sidType) continue;
+        b->forEach([&](const Bindings::Entry & e) {
+            const SymbolId nameId = e.name;
+            if (nameId == sidType) return;
             std::string name(nameId < symTab.size() ? symTab[nameId] : std::to_string(nameId));
-            Value v = forceValue(*state.vm, b->entries[i].value);
+            Value v = forceValue(*state.vm, e.value);
             Tag t = v.tag();
             if (t == Tag::String || t == Tag::Path) {
                 std::string s = (t == Tag::String)
@@ -9368,7 +9360,7 @@ static ffi::FetchTreeInput extractFetchTreeInput(
                     "argument '" + name + "' to '" + std::string(fetcher)
                     + "' is the wrong type (a string, Boolean or integer is expected)");
             }
-        }
+        });
 
         // fetchGit exportIgnore default + fetchTree shallow default + name gating.
         if (isFetchGit && !has("exportIgnore") && (!has("submodules") || !boolVal("submodules")))
@@ -9445,20 +9437,19 @@ static void v3Fetch(EvalState & s, Value * a, Value & o,
 
     if (arg.isAttrs() && arg.asAttrs()) {
         const Bindings * b = arg.asAttrs();
-        if (b->isChain()) b = b->materialize();
         auto & symTab = ir::globalSymbolTable();
-        for (uint32_t i = 0; i < b->size; ++i) {
-            const SymbolId nid = b->entries[i].name;
+        b->forEach([&](const Bindings::Entry & e) {
+            const SymbolId nid = e.name;
             std::string n(nid < symTab.size() ? symTab[nid] : std::to_string(nid));
             if (n == "url")
-                url = v3ForceStringNoCtx(s, b->entries[i].value, "while evaluating the url we should fetch");
+                url = v3ForceStringNoCtx(s, e.value, "while evaluating the url we should fetch");
             else if (n == "sha256")
-                sha256 = v3ForceStringNoCtx(s, b->entries[i].value, "while evaluating the sha256 of the content we should fetch");
+                sha256 = v3ForceStringNoCtx(s, e.value, "while evaluating the sha256 of the content we should fetch");
             else if (n == "name")
-                name = v3ForceStringNoCtx(s, b->entries[i].value, "while evaluating the name of the content we should fetch");
+                name = v3ForceStringNoCtx(s, e.value, "while evaluating the name of the content we should fetch");
             else
                 throw std::runtime_error("unsupported argument '" + n + "' to '" + std::string(who) + "'");
-        }
+        });
         if (!url)
             throw std::runtime_error("'url' argument required");
     } else {
@@ -9516,23 +9507,22 @@ void primFetchMercurial(EvalState & s, Value * a, Value & o) {
 
     if (arg.isAttrs() && arg.asAttrs()) {
         const Bindings * b = arg.asAttrs();
-        if (b->isChain()) b = b->materialize();
         auto & symTab = ir::globalSymbolTable();
-        for (uint32_t i = 0; i < b->size; ++i) {
-            const SymbolId nid = b->entries[i].name;
+        b->forEach([&](const Bindings::Entry & e) {
+            const SymbolId nid = e.name;
             std::string n(nid < symTab.size() ? symTab[nid] : std::to_string(nid));
             if (n == "url")
-                url = readUrl(forceValue(*s.vm, b->entries[i].value),
+                url = readUrl(forceValue(*s.vm, e.value),
                               "while evaluating the `url` attribute passed to builtins.fetchMercurial");
             else if (n == "rev")
-                revOrRef = v3ForceStringNoCtx(s, b->entries[i].value,
+                revOrRef = v3ForceStringNoCtx(s, e.value,
                               "while evaluating the `rev` attribute passed to builtins.fetchMercurial");
             else if (n == "name")
-                name = v3ForceStringNoCtx(s, b->entries[i].value,
+                name = v3ForceStringNoCtx(s, e.value,
                               "while evaluating the `name` attribute passed to builtins.fetchMercurial");
             else
                 throw std::runtime_error("unsupported argument '" + n + "' to 'fetchMercurial'");
-        }
+        });
         if (url.empty())
             throw std::runtime_error("'url' argument required");
     } else {
@@ -9577,7 +9567,6 @@ void primFetchClosure(EvalState & s, Value * a, Value & o) {
         throw std::runtime_error(
             "while evaluating the argument passed to builtins.fetchClosure: expected an attribute set");
     const Bindings * b = arg.asAttrs();
-    if (b->isChain()) b = b->materialize();
     auto & symTab = ir::globalSymbolTable();
 
     auto strOf = [&](const Value & vIn) -> std::string {
@@ -9589,24 +9578,24 @@ void primFetchClosure(EvalState & s, Value * a, Value & o) {
 
     std::optional<std::string> fromStore, fromPath, toPath;
     std::optional<bool> inputAddressed;
-    for (uint32_t i = 0; i < b->size; ++i) {
-        const SymbolId nid = b->entries[i].name;
+    b->forEach([&](const Bindings::Entry & e) {
+        const SymbolId nid = e.name;
         std::string n(nid < symTab.size() ? symTab[nid] : std::to_string(nid));
         if (n == "fromStore")
-            fromStore = v3ForceStringNoCtx(s, b->entries[i].value,
+            fromStore = v3ForceStringNoCtx(s, e.value,
                           "while evaluating the 'fromStore' attribute passed to builtins.fetchClosure");
         else if (n == "fromPath")
-            fromPath = strOf(b->entries[i].value);       // coerceToStorePath (ffi parses)
+            fromPath = strOf(e.value);       // coerceToStorePath (ffi parses)
         else if (n == "toPath")
-            toPath = strOf(b->entries[i].value);         // "" ⇒ gap
+            toPath = strOf(e.value);         // "" ⇒ gap
         else if (n == "inputAddressed") {
-            Value fv = forceValue(*s.vm, b->entries[i].value);
+            Value fv = forceValue(*s.vm, e.value);
             if (fv.tag() != Tag::Bool)
                 throw std::runtime_error("fetchClosure: 'inputAddressed' must be a Boolean");
             inputAddressed = (fv.asInt() == 1);
         } else
             throw std::runtime_error("attribute '" + n + "' isn't supported in call to 'fetchClosure'");
-    }
+    });
     if (!fromPath)
         throw std::runtime_error("attribute 'fromPath' is missing in call to 'fetchClosure'");
     if (!fromStore)
