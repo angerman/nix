@@ -14194,7 +14194,8 @@ Value forceValue(VMState & vm, Value v)
 // callClosure2 enters the arity-2 closure body ONCE with both args already in
 // slots 0..1 — no intermediate PAP, one dispatch prologue instead of two.  It
 // mirrors callClosure's arity>1 saturated-entry block (the `papBase` path) for
-// the total==arity==2 case.  Any other callee shape (PAP / primop / __functor /
+// the total==arity==2 case.  Saturated arity-2 primops take the same shortcut
+// through invokePrimOpDirect.  Any other callee shape (PAP / __functor /
 // arity!=2 / under- or over-application) falls back to the exact curried form,
 // so the result is byte-identical to `callClosure ∘ callClosure`.
 Value callClosure2(VMState & vm, Value fun, Value arg1, Value arg2)
@@ -14214,6 +14215,13 @@ Value callClosure2(VMState & vm, Value fun, Value arg1, Value arg2)
             if (__builtin_expect(ft == Tag::Thunk || ft == Tag::App
                                  || ft == Tag::App3 || ft == Tag::Slot, 0))
                 fun = forceValue(vm, fun);
+        }
+        if (fun.isPrimOp() || fun.tag() == Tag::PrimOpApp) {
+            Value newArgs[2] = {arg1, arg2};
+            Value buf[8];
+            const PrimOp * po = nullptr;
+            if (collectSaturatedPrimOpArgs(fun, newArgs, 2, po, buf))
+                return invokePrimOpDirect(vm, po, buf, false);
         }
         // Plain arity-2 closure: enter the body directly with both args.
         // (Intrinsics are arity-1 / handled in the curried path below; the

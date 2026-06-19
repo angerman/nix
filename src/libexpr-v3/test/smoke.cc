@@ -720,6 +720,43 @@ static int testCallNPrimOpNoPap()
     return 0;
 }
 
+static int testCallClosure2PrimOpNoPap()
+{
+    const PrimOp * addPo = findPrimOp("add");
+    if (!addPo) {
+        std::fprintf(stderr, "testCallClosure2PrimOpNoPap: add not registered\n");
+        return 1;
+    }
+
+    Value fun;
+    fun.mkPrimOp(addPo);
+    Value a;
+    a.mkInt(1);
+    Value b;
+    b.mkInt(2);
+
+    VMState vm;
+    uint64_t pairsBefore = allocStats().pairsAllocated;
+    Value r = callClosure2(vm, fun, a, b);
+    uint64_t pairsAfter = allocStats().pairsAllocated;
+
+    if (!r.isInt() || r.asInt() != 3) {
+        std::fprintf(stderr,
+            "testCallClosure2PrimOpNoPap: expected 3, got tag=%d val=%lld\n",
+            (int)r.tag(), r.isInt() ? (long long)r.asInt() : 0LL);
+        return 1;
+    }
+    if (pairsAfter != pairsBefore) {
+        std::fprintf(stderr,
+            "testCallClosure2PrimOpNoPap: saturated primop allocated %llu ValuePair(s)\n",
+            (unsigned long long)(pairsAfter - pairsBefore));
+        return 1;
+    }
+    std::fprintf(stderr,
+        "testCallClosure2PrimOpNoPap: OK (callClosure2 primop saturates without PAP)\n");
+    return 0;
+}
+
 static int testForceApp3Arity2NoPap()
 {
     CompilationUnit cu;
@@ -2798,6 +2835,7 @@ int main()
     rc |= testLambdaCall();
     rc |= testClosureCapture();
     rc |= testCallNPrimOpNoPap();
+    rc |= testCallClosure2PrimOpNoPap();
     rc |= testForceApp3Arity2NoPap();
     rc |= testCallClosureApp3PapSaturates();
     rc |= testIf();
