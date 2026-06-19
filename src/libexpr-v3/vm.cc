@@ -8979,31 +8979,20 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             uint32_t nDyn    = operand & 0xFFFu;
             // Stack layout (bottom-up): [static values...][dyn name+value pairs...].
             // Inline layout: nStatic*(name, pos) pairs followed by nDyn pos words.
-            // Build directly into one scratch entry array; null dynamic names are
-            // skipped by compacting `nEntries`.
-            constexpr uint32_t kSmall = 16;
-            Bindings::Entry smallBuf[kSmall];
-            std::vector<Bindings::Entry> bigBuf;
-            const uint32_t maxEntries = nStatic + nDyn;
-            Bindings::Entry * entries;
-            if (maxEntries <= kSmall) {
-                entries = smallBuf;
-            } else {
-                bigBuf.resize(maxEntries);
-                entries = bigBuf.data();
-            }
-            for (uint32_t i = 0; i < nStatic; ++i) {
-                entries[i].name = static_cast<SymbolId>(cu->code[ip + 2 * i]);
-                entries[i].pos  = cu->code[ip + 2 * i + 1];
-            }
+            // Peek the operand stack first, count non-null dynamic names, then
+            // allocate the final Bindings at the exact logical size.  This avoids
+            // both the old transient std::vector<Bindings::Entry> and the
+            // over-allocation slack from allocating at nStatic+nDyn capacity.
+            const size_t stackBaseDyn =
+                vm.valueStack.size() - (static_cast<size_t>(nStatic) + 2u * nDyn);
+            const uint32_t staticMetaBase = ip;
             ip += 2 * nStatic;
             const uint32_t dynPosBase = ip;
             ip += nDyn;
 
             uint32_t nEntries = nStatic;
-            for (uint32_t i = nDyn; i > 0; --i) {
-                Value valV  = pop(vm);
-                Value nameV = pop(vm);
+            for (uint32_t i = 0; i < nDyn; ++i) {
+                Value nameV = vm.valueStack[stackBaseDyn + nStatic + 2u * i];
                 // null-named dynamic attrs are silently dropped — Nix
                 // semantics so things like `{ ${if cond then "k" else null}
                 // = v; }` work as a conditional add.
@@ -9013,42 +9002,50 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 // #685 — TW rejects dynamic attr names with string
                 // context (libexpr/eval.cc:2826 forceStringNoCtx).
                 requireNoStringContextRuntime(nameV, "OP_ATTRS_INIT_DYN");
+                ++nEntries;
+            }
+
+            Bindings * b = Alloc::allocBindings(nEntries);
+            V3_STATS_INC(attrsetsAllocated);
+            for (uint32_t i = 0; i < nStatic; ++i) {
+                b->entries[i].name =
+                    static_cast<SymbolId>(cu->code[staticMetaBase + 2 * i]);
+                b->entries[i].pos  = cu->code[staticMetaBase + 2 * i + 1];
+                b->entries[i].value = vm.valueStack[stackBaseDyn + i];
+            }
+            uint32_t outIdx = nStatic;
+            for (uint32_t i = 0; i < nDyn; ++i) {
+                Value nameV = vm.valueStack[stackBaseDyn + nStatic + 2u * i];
+                if (nameV.isNull()) continue;
                 // Use the global symbol table — IDs from any CU stay
                 // consistent so attrset lookups across CUs work.
                 SymbolId id = ir::globalInternSymbol(nameV.asString());
-                entries[nEntries].name = id;
-                entries[nEntries].pos  = cu->code[dynPosBase + i - 1];
-                entries[nEntries].value = valV;
-                ++nEntries;
+                b->entries[outIdx].name = id;
+                b->entries[outIdx].pos  = cu->code[dynPosBase + i];
+                b->entries[outIdx].value =
+                    vm.valueStack[stackBaseDyn + nStatic + 2u * i + 1];
+                ++outIdx;
             }
-            for (uint32_t i = nStatic; i > 0; --i)
-                entries[i - 1].value = pop(vm);
+            vm.valueStack.resize(stackBaseDyn);
 
-            std::sort(entries, entries + nEntries,
+            std::sort(b->entries, b->entries + nEntries,
                       [](const Bindings::Entry & a, const Bindings::Entry & b) {
                           return a.name < b.name;
                       });
             // Dup-attr detection: after sort, duplicates are adjacent.
             for (uint32_t i = 1; i < nEntries; ++i) {
-                if (entries[i].name == entries[i - 1].name) {
+                if (b->entries[i].name == b->entries[i - 1].name) {
                     const auto & tbl = ir::globalSymbolTable();
-                    SymbolId nm = entries[i].name;
+                    SymbolId nm = b->entries[i].name;
                     std::string s = (nm < tbl.size()) ? tbl[nm] : "?";
                     throw std::runtime_error("v3 OP_ATTRS_INIT_DYN: attribute '" + s +
                                               "' already defined");
                 }
             }
-            Bindings * b = Alloc::allocBindings(nEntries);
-            V3_STATS_INC(attrsetsAllocated);
-            for (uint32_t i = 0; i < nEntries; ++i) {
-                b->entries[i].name = entries[i].name;
-                b->entries[i].pos  = entries[i].pos;  // #752 inline
-                b->entries[i].value = entries[i].value;
-            }
             bindingsPostConstructBarrier(b);  // Phase D batch barrier
             // Phase A1: origin tracking.
             recordBindingsOrigin(b,
-                nEntries == 0 ? 0 : entries[0].pos,
+                nEntries == 0 ? 0 : b->entries[0].pos,
                 "OP_ATTRS_INIT_DYN");
             Value v;
             v.mkAttrs(b);

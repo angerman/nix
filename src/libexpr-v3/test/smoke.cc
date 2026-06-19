@@ -1006,6 +1006,66 @@ static int testAttrSelect()
     return 0;
 }
 
+// Large dynamic attrsets use the direct-in-final-Bindings path.  Include one
+// null dynamic name to verify the logical size is compacted below capacity.
+static int testAttrSetDynLargeNullCompacts()
+{
+    auto m = ir::makeModule();
+    auto entry = m.freshBlock();
+    funcOf(m, 0).entryBlock = entry;
+
+    std::vector<std::string> names;
+    names.reserve(20);
+    ir::AttrSetDyn dyn;
+    for (uint32_t i = 0; i < 20; ++i) {
+        char buf[8];
+        std::snprintf(buf, sizeof buf, "k%02u", i);
+        names.emplace_back(buf);
+        ir::VarId nameVar;
+        if (i == 5)
+            nameVar = addBinding(m, entry, ir::LitNull{});
+        else
+            nameVar = addBinding(m, entry, ir::LitString{names.back()});
+        auto value = addBinding(m, entry, ir::LitInt{static_cast<int64_t>(i)});
+        dyn.dynamics.push_back({nameVar, value, i + 1});
+    }
+    auto attrs = addBinding(m, entry, std::move(dyn));
+    setReturn(m, entry, attrs);
+
+    ir::computeFreeVars(m);
+    auto cu = compile(m);
+    Value r = run(cu);
+    if (!r.isAttrs() || !r.asAttrs()) {
+        std::fprintf(stderr,
+            "testAttrSetDynLargeNullCompacts: expected attrs, got tag=%d\n",
+            (int)r.tag());
+        return 1;
+    }
+    const Bindings * b = r.asAttrs();
+    if (b->size != 19) {
+        std::fprintf(stderr,
+            "testAttrSetDynLargeNullCompacts: expected size 19, got %u\n",
+            b->size);
+        return 1;
+    }
+    SymbolId k05 = m.internSymbol("k05");
+    if (b->lookup(k05)) {
+        std::fprintf(stderr,
+            "testAttrSetDynLargeNullCompacts: null dynamic name produced k05\n");
+        return 1;
+    }
+    SymbolId k19 = m.internSymbol("k19");
+    const Value * v19 = b->lookup(k19);
+    if (!v19 || !v19->isInt() || v19->asInt() != 19) {
+        std::fprintf(stderr,
+            "testAttrSetDynLargeNullCompacts: k19 mismatch\n");
+        return 1;
+    }
+    std::fprintf(stderr,
+        "testAttrSetDynLargeNullCompacts: OK (large dynamic attrset compacted)\n");
+    return 0;
+}
+
 // `({a=1;}//{b=2;}).b` -> 2
 static int testAttrUpdate()
 {
@@ -3643,6 +3703,7 @@ int main()
     rc |= testIf();
     rc |= testListConcat();
     rc |= testAttrSelect();
+    rc |= testAttrSetDynLargeNullCompacts();
     rc |= testAttrUpdate();
     rc |= testWith();
     rc |= testThunkForce();
