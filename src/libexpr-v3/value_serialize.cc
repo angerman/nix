@@ -253,46 +253,32 @@ static void serializeAttrs(const Value & v, std::string & out)
 {
     writeU8(out, kTagAttrs);
     const Bindings * b = v.asAttrs();
-    // #826 / A1a Phase C v3 (2026-05-26): materialise Chain before
-    // serialise.  This was the v2 failure root cause: the chain
-    // spike in mergeBindings produced Chain Bindings whose
-    // `entries[]` covers only the overlay, but `serializeAttrs`
-    // writes `b->size` + `b->entries[i]` directly.  A chain was
-    // therefore being persisted to the Phase 5 drvHash disk cache as
-    // a Sorted-of-overlay-only blob; subsequent cache loads
-    // deserialised this corrupted form and returned the wrong
-    // attrset to the consumer (e.g. `{override, overrideDerivation}`
-    // instead of `result // {override, overrideDerivation}`).
-    // Materialising at entry costs one O(N log N) chain walk per
-    // attrset persisted; for the Phase 5 EvalResults cache this
-    // happens at most once per drvHash insert.
-    if (b && b->isChain()) b = b->materialize();
-    uint32_t n = b ? b->size : 0;
+    uint32_t n = b ? b->countDistinct() : 0;
     writeU32(out, n);
     if (!b) return;
     // Bindings::entries are sorted ascending by SymbolId.  Determinism
     // requires sorting by NAME-string instead, since SymbolId numbering
-    // varies across processes (interning order).  We sort name->index
-    // pairs once and emit in name order.
+    // varies across processes (interning order).  Stream visible chain
+    // entries and sort name->value pairs once before emitting.
     const auto & gst = ir::globalSymbolTable();
-    struct NameIdx { std::string_view name; uint32_t idx; };
-    std::vector<NameIdx> ordered;
+    struct NameValue { std::string_view name; Value value; };
+    std::vector<NameValue> ordered;
     ordered.reserve(n);
-    for (uint32_t i = 0; i < n; ++i) {
-        SymbolId sid = b->entries[i].name;
+    b->forEach([&](const Bindings::Entry & e) {
+        SymbolId sid = e.name;
         std::string_view nm = sid < gst.size()
             ? std::string_view(gst[sid])
             : std::string_view{};
-        ordered.push_back({nm, i});
-    }
+        ordered.push_back({nm, e.value});
+    });
     std::sort(ordered.begin(), ordered.end(),
-        [](const NameIdx & a, const NameIdx & b) { return a.name < b.name; });
+        [](const NameValue & a, const NameValue & b) { return a.name < b.name; });
     for (const auto & e : ordered) {
         if (e.name.size() > 0x7FFFFFFFu)
             throw SerializeError("attr name too large to serialise");
         writeU32(out, static_cast<uint32_t>(e.name.size()));
         writeBytes(out, e.name);
-        serializeOne(b->entries[e.idx].value, out);
+        serializeOne(e.value, out);
     }
 }
 
@@ -568,17 +554,21 @@ bool valuesEqual(const Value & a, const Value & b) noexcept
     case Tag::Attrs: {
         const Bindings * ba = a.asAttrs();
         const Bindings * bb = b.asAttrs();
-        // #826 / A1a Phase C v3: materialise Chain so positional walk
-        // sees full entry set (see serializeAttrs above for the same
-        // rationale).  Without this, two equal attrsets with one
-        // stored as Chain and the other as Sorted would compare
-        // unequal (different `size` from overlay-only vs full).
-        if (ba && ba->isChain()) ba = ba->materialize();
-        if (bb && bb->isChain()) bb = bb->materialize();
-        uint32_t sa = ba ? ba->size : 0;
-        uint32_t sb = bb ? bb->size : 0;
+        const bool anyChain = (ba && ba->isChain()) || (bb && bb->isChain());
+        uint32_t sa = ba ? (anyChain ? ba->countDistinct() : ba->size) : 0;
+        uint32_t sb = bb ? (anyChain ? bb->countDistinct() : bb->size) : 0;
         if (sa != sb) return false;
         if (sa == 0) return true;
+        if (anyChain) {
+            Bindings::Cursor ca(ba);
+            Bindings::Cursor cb(bb);
+            while (const Bindings::Entry * ea = ca.next()) {
+                const Bindings::Entry * eb = cb.next();
+                if (!eb || ea->name != eb->name) return false;
+                if (!valuesEqual(ea->value, eb->value)) return false;
+            }
+            return cb.next() == nullptr;
+        }
         // Bindings are SymbolId-sorted; same SymbolId space for both
         // (we deserialise via globalInternSymbol so the input names
         // map to the SAME SymbolIds as the original).  Therefore a
