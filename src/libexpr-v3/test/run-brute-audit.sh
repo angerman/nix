@@ -250,7 +250,7 @@ run_case_nix "hello-name"     "hello-2.12.3"               '(import <nixpkgs> { 
 run_case_nix "hello-drvPath"  "hello-2.12.3.drv"           '(import <nixpkgs> { }).hello.drvPath'
 run_case_nix "hello-outPath"  "hello-2.12.3"               '(import <nixpkgs> { }).hello.outPath'
 run_case_nix "gcc-name"       "gcc-wrapper"                '(import <nixpkgs> { }).gcc.name'
-run_case_nix "firefox-name"   "firefox-151.0.4"            '(import <nixpkgs> { }).firefox.name'
+run_case_nix "firefox-name"   "firefox-152.0.1"            '(import <nixpkgs> { }).firefox.name'
 
 # 8) PhD-6 regression — the nursery-flip blocker (2026-06-15).  git.drvPath is
 #    the workload that exposed the unbarriered primZipAttrsWith list
