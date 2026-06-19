@@ -1053,44 +1053,45 @@ void Scavenger::run()
     {
         auto & dirty = dirtyContainers();
         for (const DirtyEntry & e : dirty) {
-            switch (e.kind) {
+            void * ptr = e.ptr();
+            switch (e.kind()) {
             case DirtyKind::Bindings: {
-                auto * b = static_cast<Bindings *>(e.ptr);
+                auto * b = static_cast<Bindings *>(ptr);
                 if (walked.insert(b).second) {
                     graylist.push_back({b, GK_BINDINGS});
                 }
                 break;
             }
             case DirtyKind::Pair: {
-                auto * p = static_cast<ValuePair *>(e.ptr);
+                auto * p = static_cast<ValuePair *>(ptr);
                 if (walked.insert(p).second) {
                     graylist.push_back({p, GK_PAIR});
                 }
                 break;
             }
             case DirtyKind::Thunk: {
-                auto * t = static_cast<Thunk *>(e.ptr);
+                auto * t = static_cast<Thunk *>(ptr);
                 if (walked.insert(t).second) {
                     graylist.push_back({t, GK_THUNK});
                 }
                 break;
             }
             case DirtyKind::Closure: {
-                auto * c = static_cast<Closure *>(e.ptr);
+                auto * c = static_cast<Closure *>(ptr);
                 if (walked.insert(c).second) {
                     graylist.push_back({c, GK_CLOSURE});
                 }
                 break;
             }
             case DirtyKind::List: {
-                auto * l = static_cast<ListVec *>(e.ptr);
+                auto * l = static_cast<ListVec *>(ptr);
                 if (walked.insert(l).second) {
                     graylist.push_back({l, GK_LIST});
                 }
                 break;
             }
             case DirtyKind::Env: {
-                auto * env = static_cast<Env *>(e.ptr);
+                auto * env = static_cast<Env *>(ptr);
                 if (walked.insert(env).second) {
                     graylist.push_back({env, GK_ENV});
                 }
@@ -1487,30 +1488,31 @@ void postScavengeAudit(const Nursery & n, const VMState & vm)
     // The list will normally be empty by the time auditor runs.
     {
         for (const DirtyEntry & e : dirtyContainers()) {
-            switch (e.kind) {
+            void * ptr = e.ptr();
+            switch (e.kind()) {
             case DirtyKind::Bindings:
-                if (a.visited.insert(e.ptr).second)
-                    a.visitBindings(static_cast<Bindings *>(e.ptr), "dirty.Bindings");
+                if (a.visited.insert(ptr).second)
+                    a.visitBindings(static_cast<Bindings *>(ptr), "dirty.Bindings");
                 break;
             case DirtyKind::Pair:
-                if (a.visited.insert(e.ptr).second)
-                    a.visitPair(static_cast<ValuePair *>(e.ptr), "dirty.Pair");
+                if (a.visited.insert(ptr).second)
+                    a.visitPair(static_cast<ValuePair *>(ptr), "dirty.Pair");
                 break;
             case DirtyKind::Thunk:
-                if (a.visited.insert(e.ptr).second)
-                    a.visitThunk(static_cast<Thunk *>(e.ptr), "dirty.Thunk");
+                if (a.visited.insert(ptr).second)
+                    a.visitThunk(static_cast<Thunk *>(ptr), "dirty.Thunk");
                 break;
             case DirtyKind::Closure:
-                if (a.visited.insert(e.ptr).second)
-                    a.visitClosure(static_cast<Closure *>(e.ptr), "dirty.Closure");
+                if (a.visited.insert(ptr).second)
+                    a.visitClosure(static_cast<Closure *>(ptr), "dirty.Closure");
                 break;
             case DirtyKind::List:
-                if (a.visited.insert(e.ptr).second)
-                    a.visitList(static_cast<ListVec *>(e.ptr), "dirty.List");
+                if (a.visited.insert(ptr).second)
+                    a.visitList(static_cast<ListVec *>(ptr), "dirty.List");
                 break;
             case DirtyKind::Env:
-                if (a.visited.insert(e.ptr).second)
-                    a.visitEnv(static_cast<Env *>(e.ptr), "dirty.Env");
+                if (a.visited.insert(ptr).second)
+                    a.visitEnv(static_cast<Env *>(ptr), "dirty.Env");
                 break;
             }
         }

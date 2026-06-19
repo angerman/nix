@@ -1383,7 +1383,7 @@ RootResult runRootExprModule(nix::EvalState & state, ir::Module module)
             const size_t gstEst = gst.capacity() * sizeof(std::string)
                                 + gstStringBytes
                                 + gst.size() * (24 + 4 + 2 * sizeof(void*));
-            const size_t dirtyEst      = dirty.capacity() * sizeof(void *) * 2;
+            const size_t dirtyEst      = dirty.capacity() * sizeof(DirtyEntry);
             const size_t standaloneEst = standalone.capacity() * sizeof(void *);
             // Phase 3 attribution (2026-05-28): account for the
             // mark-sweep infrastructure that lives outside arena/Boehm.

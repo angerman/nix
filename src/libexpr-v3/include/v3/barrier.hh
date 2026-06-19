@@ -67,14 +67,32 @@ enum class DirtyKind : uint8_t {
     Env      = 5,  ///< Env (env-sharing: shared upvalue Env's values[] holds nursery payloads)
 };
 
-/// One dirty-list entry: which kind + raw container pointer.
-/// Constructed at barrier-hit time; consumed by the scavenger's
-/// dirty-drain pass.  Two pointer-sized fields → 16 bytes per
-/// entry, packs well for the thread-local vector.
+/// One dirty-list entry: which kind + raw container pointer.  Container
+/// pointers are v3-allocator aligned, so the low three bits can carry
+/// DirtyKind and the vector pays one word per remembered edge instead of two.
 struct DirtyEntry {
-    DirtyKind   kind;
-    void *      ptr;
+    uintptr_t tagged;
+
+    static constexpr uintptr_t kindMask = 0x7u;
+
+    DirtyEntry() noexcept : tagged(0) {}
+    DirtyEntry(DirtyKind kind, void * ptr) noexcept
+        : tagged(reinterpret_cast<uintptr_t>(ptr)
+              | static_cast<uintptr_t>(kind))
+    {}
+
+    DirtyKind kind() const noexcept
+    {
+        return static_cast<DirtyKind>(tagged & kindMask);
+    }
+
+    void * ptr() const noexcept
+    {
+        return reinterpret_cast<void *>(tagged & ~kindMask);
+    }
 };
+static_assert(sizeof(DirtyEntry) == sizeof(void *),
+              "DirtyEntry must remain pointer-sized");
 
 /// Thread-local list of tenured containers that received an
 /// inter-gen pointer write since the last scavenge.  Walked + cleared
