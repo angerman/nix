@@ -302,6 +302,7 @@ struct Bindings
     /// replaces the entry with App3(fn, name, srcValue).
     /// Defined in value.cc because it needs write barriers.
     void realizeMapAttrsEntry(Entry * e) noexcept;
+    Value mapAttrsEntrySource(Entry * e) noexcept;
     static Value makeMapAttrsNameValue(SymbolId name) noexcept;
 
     // -----------------------------------------------------------------

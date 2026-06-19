@@ -3059,7 +3059,7 @@ enum class MapAttrsSelectResult : uint8_t {
         return MapAttrsSelectResult::NotHandled;
 
     Value nameStr = Bindings::makeMapAttrsNameValue(e.name);
-    Value src = e.value;
+    Value src = b->mapAttrsEntrySource(&e);
     Value mapped = callClosure2(vm, b->aux, nameStr, src);
     e.pos &= Bindings::kPosMask;
     bindingsSetValue(b, slotIdx, mapped);

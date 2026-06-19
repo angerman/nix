@@ -151,7 +151,7 @@ void Bindings::realizeMapAttrsEntry(Entry * e) noexcept
     // legitimately force to any tag later.
     if ((e->pos & kMapAttrsUnrealizedPosBit) == 0) return;
     Value nameStr = makeMapAttrsNameValue(e->name);
-    Value src = e->value;
+    Value src = mapAttrsEntrySource(e);
 
     ValuePair * pp = Alloc::allocPair();
     pp->left = aux;
@@ -164,6 +164,29 @@ void Bindings::realizeMapAttrsEntry(Entry * e) noexcept
     e->pos &= kPosMask;
     uint32_t idx = static_cast<uint32_t>(e - entries);
     bindingsSetValue(this, idx, app3);
+}
+
+Value Bindings::mapAttrsEntrySource(Entry * e) noexcept
+{
+    if (!e) {
+        Value v;
+        v.mkUninitialized();
+        return v;
+    }
+    Value src = e->value;
+    if (!isMapAttrs() || !parent || !parent->isMapAttrs())
+        return src;
+
+    // MapAttrs composition: primMapAttrs can now build
+    // `mapAttrs f (mapAttrs g src)` without realizing every `g` entry.
+    // On demand, first turn the corresponding parent entry into its lazy
+    // mapped value, then pass that value as the source argument to `f`.
+    Bindings * p = const_cast<Bindings *>(parent);
+    if (Entry * pe = p->lookupLocalEntry(e->name)) {
+        p->realizeMapAttrsEntry(pe);
+        src = pe->value;
+    }
+    return src;
 }
 
 const Bindings * Bindings::materialize() const

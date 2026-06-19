@@ -2168,17 +2168,24 @@ void primMapAttrs(EvalState &, Value * args, Value & out)
     V3_STATS_INC(attrsetsAllocated);
     recordBindingsOrigin(result, 0, "primMapAttrs");
     uint32_t i = 0;
-    src->forEach([&](const Bindings::Entry & e) {
-        SymbolId sym = e.name;
-        result->entries[i].name = sym;
+    auto copyEntry = [&](const Bindings::Entry & e) {
+        result->entries[i].name = e.name;
         result->entries[i].pos =
             (e.pos & Bindings::kPosMask) | Bindings::kMapAttrsUnrealizedPosBit;
         // Preserve the old mapAttrs snapshot semantics: the source value is
         // captured at construction time.  The attr-name string is synthesized
-        // only if this mapped entry is actually demanded.
+        // only if this mapped entry is actually demanded.  When the source is
+        // itself MapAttrs, this copies the raw lazy entry; realization resolves
+        // the parent entry on demand so mapAttrs composition stays lazy.
         result->entries[i].value = e.value;
         ++i;
-    });
+    };
+    if (src->isMapAttrs()) {
+        for (uint32_t j = 0; j < src->size; ++j)
+            copyEntry(src->entries[j]);
+    } else {
+        src->forEach(copyEntry);
+    }
     bindingsPostConstructBarrier(result);
     out.mkAttrs(result);
 }

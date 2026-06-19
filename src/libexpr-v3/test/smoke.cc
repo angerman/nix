@@ -1279,6 +1279,16 @@ static void smokeReturnSecond(EvalState &, Value * args, Value & out)
     out = args[1];
 }
 
+static void smokeSecondPlusOne(EvalState & state, Value * args, Value & out)
+{
+    Value v = args[1];
+    if (v.isAppLike() || v.tag() == Tag::Thunk || v.tag() == Tag::Slot)
+        v = forceValue(*state.vm, v);
+    if (!v.isInt())
+        throw std::runtime_error("__smokeSecondPlusOne: expected int");
+    out.mkInt(v.asInt() + 1);
+}
+
 static int testPrimMapAttrsNamesDoNotRealize()
 {
     const PrimOp * mapAttrsPo = findPrimOp("mapAttrs");
@@ -1373,6 +1383,109 @@ static int testPrimMapAttrsNamesDoNotRealize()
     return 0;
 }
 
+static int testPrimMapAttrsNestedNamesDoNotRealize()
+{
+    const PrimOp * mapAttrsPo = findPrimOp("mapAttrs");
+    const PrimOp * attrNamesPo = findPrimOp("attrNames");
+    if (!mapAttrsPo || !attrNamesPo) {
+        std::fprintf(stderr,
+            "testPrimMapAttrsNestedNamesDoNotRealize: missing mapAttrs/attrNames primop\n");
+        return 1;
+    }
+    static const PrimOp plusOnePo{
+        "__smokeSecondPlusOneNestedNames", 2, smokeSecondPlusOne
+    };
+    static const PrimOp returnSecondPo{
+        "__smokeReturnSecondNestedNames", 2, smokeReturnSecond
+    };
+
+    SymbolId aSym = ir::globalInternSymbol("a");
+    SymbolId bSym = ir::globalInternSymbol("b");
+    Bindings * src = Alloc::allocBindings(2);
+    src->entries[0].name = aSym;
+    src->entries[0].pos = 0;
+    src->entries[0].value.mkInt(10);
+    src->entries[1].name = bSym;
+    src->entries[1].pos = 0;
+    src->entries[1].value.mkInt(20);
+
+    Value plusOne;
+    plusOne.mkPrimOp(&plusOnePo);
+    Value returnSecond;
+    returnSecond.mkPrimOp(&returnSecondPo);
+    Value srcV;
+    srcV.mkAttrs(src);
+
+    VMState vm;
+    EvalState st;
+    st.vm = &vm;
+
+    uint64_t before = allocStats().pairsAllocated;
+    Value inner;
+    Value innerArgs[2] = {plusOne, srcV};
+    mapAttrsPo->fn(st, innerArgs, inner);
+    Value outer;
+    Value outerArgs[2] = {returnSecond, inner};
+    mapAttrsPo->fn(st, outerArgs, outer);
+    uint64_t afterMaps = allocStats().pairsAllocated;
+    if (afterMaps != before) {
+        std::fprintf(stderr,
+            "testPrimMapAttrsNestedNamesDoNotRealize: nested mapAttrs allocated %llu pairs\n",
+            (unsigned long long)(afterMaps - before));
+        return 1;
+    }
+    if (!inner.isAttrs() || !inner.asAttrs() || !inner.asAttrs()->isMapAttrs()
+        || !outer.isAttrs() || !outer.asAttrs() || !outer.asAttrs()->isMapAttrs()) {
+        std::fprintf(stderr,
+            "testPrimMapAttrsNestedNamesDoNotRealize: expected nested MapAttrs results\n");
+        return 1;
+    }
+    if ((inner.asAttrs()->entries[0].pos & Bindings::kMapAttrsUnrealizedPosBit) == 0) {
+        std::fprintf(stderr,
+            "testPrimMapAttrsNestedNamesDoNotRealize: inner entry was realized during composition\n");
+        return 1;
+    }
+
+    Value names;
+    Value namesArgs[1] = {outer};
+    attrNamesPo->fn(st, namesArgs, names);
+    uint64_t afterNames = allocStats().pairsAllocated;
+    if (afterNames != before) {
+        std::fprintf(stderr,
+            "testPrimMapAttrsNestedNamesDoNotRealize: attrNames allocated %llu pairs\n",
+            (unsigned long long)(afterNames - before));
+        return 1;
+    }
+
+    Value * av = outer.asAttrs()->lookup(aSym);
+    uint64_t afterLookup = allocStats().pairsAllocated;
+    if (!av || afterLookup != before + 2) {
+        std::fprintf(stderr,
+            "testPrimMapAttrsNestedNamesDoNotRealize: first nested lookup allocated %llu pairs\n",
+            (unsigned long long)(afterLookup - before));
+        return 1;
+    }
+    vm.frames.push_back(CallFrame{
+        .cu = nullptr,
+        .closure = nullptr,
+        .thunk = nullptr,
+        .ip = 0,
+        .stackBaseOffset = 0,
+        .withStackBase = 0,
+        .flags = 0,
+    });
+    Value forced = forceValue(vm, *av);
+    if (!forced.isInt() || forced.asInt() != 11) {
+        std::fprintf(stderr,
+            "testPrimMapAttrsNestedNamesDoNotRealize: forced a expected 11, got tag=%d val=%lld\n",
+            (int)forced.tag(), forced.isInt() ? (long long)forced.asInt() : 0LL);
+        return 1;
+    }
+    std::fprintf(stderr,
+        "testPrimMapAttrsNestedNamesDoNotRealize: OK (nested mapAttrs stays lazy)\n");
+    return 0;
+}
+
 static int runPrimMapAttrsSelectNoApp3(bool dynamicName)
 {
     const PrimOp * mapAttrsPo = findPrimOp("mapAttrs");
@@ -1435,6 +1548,57 @@ static int testPrimMapAttrsSelectNoApp3()
         std::fprintf(stderr,
             "testPrimMapAttrsSelectNoApp3: OK (select stays pair-free)\n");
     return rc;
+}
+
+static int testPrimMapAttrsNestedSelectUsesMappedValue()
+{
+    const PrimOp * mapAttrsPo = findPrimOp("mapAttrs");
+    if (!mapAttrsPo) {
+        std::fprintf(stderr,
+            "testPrimMapAttrsNestedSelectUsesMappedValue: missing mapAttrs primop\n");
+        return 1;
+    }
+    static const PrimOp plusOnePo{
+        "__smokeSecondPlusOneNestedSelect", 2, smokeSecondPlusOne
+    };
+    static const PrimOp returnSecondPo{
+        "__smokeReturnSecondNestedSelect", 2, smokeReturnSecond
+    };
+
+    auto m = ir::makeModule();
+    auto entry = m.freshBlock();
+    funcOf(m, 0).entryBlock = entry;
+
+    auto plusOne = addBinding(m, entry, ir::LitPrimOp{&plusOnePo});
+    auto returnSecond = addBinding(m, entry, ir::LitPrimOp{&returnSecondPo});
+    auto aVal = addBinding(m, entry, ir::LitInt{10});
+    auto aSym = m.internSymbol("a");
+    auto attrs = addBinding(m, entry, ir::AttrSet{ { {aSym, aVal} } });
+    auto inner = addBinding(m, entry, ir::PrimOpCall{mapAttrsPo, {plusOne, attrs}});
+    auto outer = addBinding(m, entry, ir::PrimOpCall{mapAttrsPo, {returnSecond, inner}});
+    auto selected = addBinding(m, entry, ir::AttrSelect{outer, aSym});
+    setReturn(m, entry, selected);
+
+    ir::computeFreeVars(m);
+    auto cu = compile(m);
+    uint64_t pairsBefore = allocStats().pairsAllocated;
+    Value res = run(cu);
+    uint64_t pairsAfter = allocStats().pairsAllocated;
+    if (!res.isInt() || res.asInt() != 11) {
+        std::fprintf(stderr,
+            "testPrimMapAttrsNestedSelectUsesMappedValue: expected 11, got tag=%d val=%lld\n",
+            (int)res.tag(), res.isInt() ? (long long)res.asInt() : 0LL);
+        return 1;
+    }
+    if (pairsAfter != pairsBefore + 1) {
+        std::fprintf(stderr,
+            "testPrimMapAttrsNestedSelectUsesMappedValue: expected one inner App3 pair, got %llu\n",
+            (unsigned long long)(pairsAfter - pairsBefore));
+        return 1;
+    }
+    std::fprintf(stderr,
+        "testPrimMapAttrsNestedSelectUsesMappedValue: OK (nested select uses mapped source)\n");
+    return 0;
 }
 
 static int runPrimMapAttrsSetOpNoApp3(const PrimOp * po, const char * name)
@@ -3263,7 +3427,9 @@ int main()
     rc |= testPrimMapIdentityNoApps();
     rc |= testPrimGenListIdentityNoApps();
     rc |= testPrimMapAttrsNamesDoNotRealize();
+    rc |= testPrimMapAttrsNestedNamesDoNotRealize();
     rc |= testPrimMapAttrsSelectNoApp3();
+    rc |= testPrimMapAttrsNestedSelectUsesMappedValue();
     rc |= testPrimMapAttrsSetOpsNoApp3();
     rc |= testPrimMapAttrsValueIdentityNoApps();
     rc |= testPrimOpHeadTail();
