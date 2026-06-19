@@ -1340,6 +1340,9 @@ void primConcatLists(EvalState & state, Value * args, Value & out)
     // `concatLists (map f xs)` where map returns Apps that downstream
     // forces have already resolved).  Skip the forceValue function-call
     // cost for those.
+    Value singleNonEmpty = Value::vEmptyList;
+    bool haveNonEmpty = false;
+    bool multipleNonEmpty = false;
     for (uint32_t i = 0; i < outer.asList()->size; ++i) {
         Value & e = outer.asList()->elems[i];
         Tag et = e.tag();
@@ -1348,7 +1351,23 @@ void primConcatLists(EvalState & state, Value * args, Value & out)
                              || et == Tag::Slot, 0))
             e = forceValue(*state.vm, e);
         if (!e.isList()) typeError("concatLists", "list of lists");
-        total += e.asList() ? e.asList()->size : 0;
+        uint32_t n = e.asList() ? e.asList()->size : 0;
+        total += n;
+        if (n != 0) {
+            if (haveNonEmpty) multipleNonEmpty = true;
+            else {
+                singleNonEmpty = e;
+                haveNonEmpty = true;
+            }
+        }
+    }
+    if (total == 0) {
+        out = Value::vEmptyList;
+        return;
+    }
+    if (!multipleNonEmpty) {
+        out = singleNonEmpty;
+        return;
     }
     ListVec * result = Alloc::allocList(total);
     V3_STATS_INC(listsAllocated);
@@ -1496,8 +1515,7 @@ void primMap(EvalState & state, Value * args, Value & out)
     if (!lst.isList()) typeError("map", "list");
     auto * src = lst.asList();
     if (!src || src->size == 0) {
-        out.mkList(Alloc::allocList(0));
-        V3_STATS_INC(listsAllocated);
+        out = lst;
         return;
     }
     Value fun = args[0];
@@ -1528,8 +1546,7 @@ void primFilter(EvalState & state, Value * args, Value & out)
     if (!args[1].isList()) typeError("filter", "list");
     auto * src = args[1].asList();
     if (!src || src->size == 0) {
-        out.mkList(Alloc::allocList(0));
-        V3_STATS_INC(listsAllocated);
+        out = args[1];
         return;
     }
     Value pred = args[0];
@@ -1547,6 +1564,14 @@ void primFilter(EvalState & state, Value * args, Value & out)
         }
         if (!r.isBool()) typeError("filter", "predicate returning bool");
         if (r.asInt() == 1) kept.push_back(src->elems[i]);
+    }
+    if (kept.empty()) {
+        out = Value::vEmptyList;
+        return;
+    }
+    if (kept.size() == src->size) {
+        out = args[1];
+        return;
     }
     ListVec * result = Alloc::allocList(static_cast<uint32_t>(kept.size()));
     V3_STATS_INC(listsAllocated);

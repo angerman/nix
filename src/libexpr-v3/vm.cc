@@ -8876,6 +8876,14 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             Value rhs = pop(vm), lhs = pop(vm);
             if (!lhs.isList() || !rhs.isList())
                 throw std::runtime_error("v3 OP_LIST_CONCAT: not lists");
+            if (lhs.asList()->size == 0) {
+                push(vm, rhs);
+                break;
+            }
+            if (rhs.asList()->size == 0) {
+                push(vm, lhs);
+                break;
+            }
             uint32_t n = lhs.asList()->size + rhs.asList()->size;
             ListVec * out = Alloc::allocList(n);
             V3_STATS_INC(listsAllocated);
