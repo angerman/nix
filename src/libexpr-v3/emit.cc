@@ -2485,6 +2485,13 @@ struct Emitter
             desc.formals.reserve(f.formals.size());
             for (auto & fm : f.formals)
                 desc.formals.push_back({fm.name, fm.hasDefault, fm.pos});
+            if (desc.formals.size() > 1) {
+                std::sort(desc.formals.begin(), desc.formals.end(),
+                    [](const LambdaDescriptor::Formal & a,
+                       const LambdaDescriptor::Formal & b) {
+                        return a.name < b.name;
+                    });
+            }
         }
 
         // #424: selector lambda specialisation peephole.  Detect the

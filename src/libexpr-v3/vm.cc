@@ -6084,14 +6084,6 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                             ? desc->contextualName
                             : std::string("anonymous lambda");
                         const Bindings * b = forcedArg.asAttrs();
-                        // #825 Phase C SPIKE: materialise Chain for the
-                        // formals destructure loops below — both the
-                        // extra-arg scan (a) and the missing-arg scan
-                        // (b) iterate `b->entries[]` directly, which
-                        // for Chain Bindings sees only the overlay.
-                        // Materialise once at entry; downstream code
-                        // operates on the Sorted view.
-                        if (b && b->isChain()) b = b->materialize();
                         const auto & tbl = ir::globalSymbolTable();
                         // #809 (2026-05-24): diagnostic gate.  When
                         // NIX_V3_PERMISSIVE_FORMALS=1, treat every
@@ -6106,6 +6098,17 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                         // mode).
                         static const bool s_permissiveFormals =
                             std::getenv("NIX_V3_PERMISSIVE_FORMALS") != nullptr;
+                        auto hasFormal = [&](SymbolId name) noexcept {
+                            size_t lo = 0, hi = desc->formals.size();
+                            while (lo < hi) {
+                                size_t mid = (lo + hi) >> 1;
+                                SymbolId midName = desc->formals[mid].name;
+                                if (midName == name) return true;
+                                if (midName < name) lo = mid + 1;
+                                else hi = mid;
+                            }
+                            return false;
+                        };
                         // (a) Extra-arg check for non-ellipsis lambdas.
                         // #803 (2026-05-24): print FIRST (under
                         // V3_DBG_FORMALS_DIAG), THEN gate the throw under
@@ -6114,11 +6117,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                         // captures the H10 divergent call across the long
                         // haskell.nix run.
                         if (!desc->ellipsis) {
-                            for (uint32_t i = 0; i < b->size; ++i) {
-                                SymbolId name = b->entries[i].name;
-                                bool found = false;
-                                for (auto & f : desc->formals)
-                                    if (f.name == name) { found = true; break; }
+                            b->forEach([&](const Bindings::Entry & entry) {
+                                SymbolId name = entry.name;
+                                bool found = hasFormal(name);
                                 if (!found) {
                                     std::string nm = (name < tbl.size()) ? tbl[name] : "?";
                                     // #802 Phase C diag: dump formals +
@@ -6160,12 +6161,15 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                                             callerPs ? callerPs->line : 0,
                                             callerPs ? callerPs->column : 0,
                                             nm.c_str());
-                                        for (uint32_t k = 0; k < b->size && k < 24; ++k) {
-                                            SymbolId sk = b->entries[k].name;
+                                        uint32_t printedAttrs = 0;
+                                        b->forEach([&](const Bindings::Entry & e) {
+                                            if (printedAttrs >= 24) return;
+                                            SymbolId sk = e.name;
                                             std::string_view sn = (sk < tbl.size()) ? std::string_view(tbl[sk]) : "?";
                                             std::fprintf(stderr, "%s%.*s",
-                                                k ? "," : "", (int)sn.size(), sn.data());
-                                        }
+                                                printedAttrs ? "," : "", (int)sn.size(), sn.data());
+                                            ++printedAttrs;
+                                        });
                                         std::fprintf(stderr, "] formals=[");
                                         for (size_t k = 0; k < desc->formals.size() && k < 24; ++k) {
                                             SymbolId sk = desc->formals[k].name;
@@ -6216,7 +6220,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                                     // — keep scanning further extras
                                     // for diagnostic but don't throw.
                                 }
-                            }
+                            });
                         }
                         // (b) Missing-arg check: every formal without
                         // a default must be in the input bindings.  TW
@@ -6227,10 +6231,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                         // with the function-specific phrasing.
                         for (auto & f : desc->formals) {
                             if (f.hasDefault) continue;
-                            bool found = false;
-                            for (uint32_t i = 0; i < b->size; ++i)
-                                if (b->entries[i].name == f.name) { found = true; break; }
-                            if (!found) {
+                            if (!b->lookup(f.name)) {
                                 std::string nm = (f.name < tbl.size()) ? tbl[f.name] : "?";
                                 throw std::runtime_error(
                                     "function '" + lambdaName
