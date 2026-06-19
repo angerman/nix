@@ -1651,7 +1651,8 @@ inline Bindings * mergeBindings(const Bindings * a, const Bindings * b,
         && a->chainDepth() < Bindings::Cursor::kMaxLayers) {
         Bindings * c = Alloc::allocChainBindings(a, b->size);
         for (uint32_t j = 0; j < b->size; ++j)
-            bindingsSetEntry(c, j, b->entries[j]);  // overlay sorted; Phase D
+            c->entries[j] = b->entries[j];  // overlay sorted
+        bindingsPostConstructBarrier(c);    // Phase D batch barrier
         if (__builtin_expect(g_sharedWbDetect, 0)) ++chainChildCount()[a];  // WS-A detector
         return c;
     }
@@ -1671,8 +1672,9 @@ inline Bindings * mergeBindings(const Bindings * a, const Bindings * b,
             Bindings * c = Alloc::allocChainBindings(a, nbVisible);
             uint32_t j = 0;
             b->forEach([&](const Bindings::Entry & e) {
-                bindingsSetEntry(c, j++, e);  // visible RHS entries sorted; Phase D
+                c->entries[j++] = e;  // visible RHS entries sorted
             });
+            bindingsPostConstructBarrier(c);  // Phase D batch barrier
             if (__builtin_expect(g_sharedWbDetect, 0)) ++chainChildCount()[a];  // WS-A detector
             return c;
         }
@@ -1723,11 +1725,11 @@ inline Bindings * mergeBindings(const Bindings * a, const Bindings * b,
         const Bindings::Entry * eb = cb.next();
         uint32_t k = 0;
         auto copyA = [&]() {
-            bindingsSetEntry(out, k++, *ea);  // Phase D
+            out->entries[k++] = *ea;
             ea = ca.next();
         };
         auto copyB = [&]() {
-            bindingsSetEntry(out, k++, *eb);  // Phase D
+            out->entries[k++] = *eb;
             eb = cb.next();
         };
         while (ea && eb) {
@@ -1742,6 +1744,7 @@ inline Bindings * mergeBindings(const Bindings * a, const Bindings * b,
         }
         while (ea) copyA();
         while (eb) copyB();
+        bindingsPostConstructBarrier(out);  // Phase D batch barrier
         return out;
     };
 
@@ -1811,7 +1814,8 @@ inline Bindings * mergeBindings(const Bindings * a, const Bindings * b,
     if (s_chain && nb <= s_maxNb && na >= s_minNa) {
         Bindings * c = Alloc::allocChainBindings(a, nb);
         for (uint32_t j = 0; j < nb; ++j)
-            bindingsSetEntry(c, j, b->entries[j]);  // overlay sorted; Phase D
+            c->entries[j] = b->entries[j];  // overlay sorted
+        bindingsPostConstructBarrier(c);    // Phase D batch barrier
         if (__builtin_expect(g_sharedWbDetect, 0)) ++chainChildCount()[a];  // WS-A detector
         return c;
     }
@@ -1914,17 +1918,16 @@ inline Bindings * mergeBindings(const Bindings * a, const Bindings * b,
                 += uint64_t(kExact) * sizeof(Bindings::Entry);
     }
     uint32_t i = 0, j = 0, k = 0;
-    // #752: bindingsSetEntry now copies the entire Entry struct
-    // including the inline `pos` field, so the per-attr position is
-    // forwarded by the Entry copy itself.  The old explicit
-    // recordAttrPos call (which used the side-table) is no longer
-    // needed and would be a no-op anyway.
+    // #752: Entry copies include the inline `pos` field, so the
+    // per-attr position is forwarded by the raw Entry copy itself.
+    // The old explicit recordAttrPos call (which used the side-table)
+    // is no longer needed and would be a no-op anyway.
     auto copyA = [&]() {
-        bindingsSetEntry(out, k, a->entries[i]);  // Phase D
+        out->entries[k] = a->entries[i];
         ++k; ++i;
     };
     auto copyB = [&]() {
-        bindingsSetEntry(out, k, b->entries[j]);  // Phase D
+        out->entries[k] = b->entries[j];
         ++k; ++j;
     };
     while (i < na && j < nb) {
@@ -1941,6 +1944,7 @@ inline Bindings * mergeBindings(const Bindings * a, const Bindings * b,
     while (j < nb) copyB();
     // Invariant: k == kExact by construction (the two passes share
     // identical branch arithmetic).  No need to rewrite out->size.
+    bindingsPostConstructBarrier(out);  // Phase D batch barrier
     return out;
 }
 
@@ -8953,8 +8957,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             for (uint32_t i = 0; i < n; ++i) {
                 b->entries[i].name = entries[i].name;
                 b->entries[i].pos  = entries[i].pos;  // #752 inline
-                bindingsSetValue(b, i, entries[i].value);  // Phase D barrier
+                b->entries[i].value = entries[i].value;
             }
+            bindingsPostConstructBarrier(b);  // Phase D batch barrier
             // Phase A1: origin tracking (NIX_V3_DBG_BINDINGS_ORIGIN=1).
             // Use the first entry's posHandle as a representative source
             // location — the attrset literal's `{` is unattributed at IR
@@ -9035,8 +9040,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             for (uint32_t i = 0; i < nEntries; ++i) {
                 b->entries[i].name = entries[i].name;
                 b->entries[i].pos  = entries[i].pos;  // #752 inline
-                bindingsSetValue(b, i, entries[i].value);  // Phase D barrier
+                b->entries[i].value = entries[i].value;
             }
+            bindingsPostConstructBarrier(b);  // Phase D batch barrier
             // Phase A1: origin tracking.
             recordBindingsOrigin(b,
                 nEntries == 0 ? 0 : entries[0].pos,
