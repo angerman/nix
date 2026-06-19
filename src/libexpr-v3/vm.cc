@@ -14338,10 +14338,12 @@ Value callClosure(VMState & vm, Value fun, Value arg)
         size_t papDepth = 0;
         if (fun.tag() == Tag::Closure && fun.asClosure()) {
             papBase = fun.asClosure();
-        } else if (fun.tag() == Tag::App && fun.asPair()) {
+        } else if (fun.isAppLike() && fun.asPair()) {
             const Value * cur = &fun;
-            while (cur->tag() == Tag::App && cur->asPair()) {
-                ++papDepth; cur = &cur->asPair()->left;
+            while ((cur->tag() == Tag::App || cur->tag() == Tag::App3)
+                   && cur->asPair()) {
+                papDepth += (cur->tag() == Tag::App3) ? 2 : 1;
+                cur = &cur->asPair()->left;
             }
             if (cur->tag() == Tag::Closure && cur->asClosure())
                 papBase = cur->asClosure();
@@ -14359,11 +14361,41 @@ Value callClosure(VMState & vm, Value fun, Value arg)
             }
             if (A > 16) throw std::runtime_error("v3 callClosure: arity > 16");
             Value argbuf[16];
-            argbuf[total - 1] = arg;
-            Value chain = fun;
-            for (size_t i = total - 1; i > 0; --i) {
-                argbuf[i - 1] = chain.asPair()->right;
-                chain = chain.asPair()->left;
+            constexpr size_t kInlinePapArgs = 16;
+            Value revInline[kInlinePapArgs];
+            std::vector<Value> revOverflow;
+            size_t nRev = 0;
+            auto pushRev = [&](const Value & val) {
+                if (nRev < kInlinePapArgs) revInline[nRev] = val;
+                else revOverflow.push_back(val);
+                ++nRev;
+            };
+            auto revAt = [&](size_t i) -> const Value & {
+                return i < kInlinePapArgs ? revInline[i]
+                                          : revOverflow[i - kInlinePapArgs];
+            };
+            const Value * chain = &fun;
+            while ((chain->tag() == Tag::App || chain->tag() == Tag::App3)
+                   && chain->asPair()) {
+                const ValuePair * p = chain->asPair();
+                if (chain->tag() == Tag::App3)
+                    pushRev(p->third);
+                pushRev(p->right);
+                chain = &p->left;
+            }
+            if (__builtin_expect(total > A, 0)) {
+                Value f = *chain;
+                for (size_t ri = nRev; ri > 0; --ri)
+                    f = callClosure(vm, f, revAt(ri - 1));
+                return callClosure(vm, f, arg);
+            }
+            size_t out = 0;
+            for (size_t ri = nRev; ri > 0; --ri)
+                argbuf[out++] = revAt(ri - 1);
+            argbuf[out++] = arg;
+            if (__builtin_expect(out != total, 0)) {
+                throw std::runtime_error(
+                    "v3 callClosure: PAP arg gather mismatch");
             }
             const LambdaDescriptor * d = papBase->desc;
             const CompilationUnit * ccu =
