@@ -9353,9 +9353,10 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 // writeback (the App/Thunk self-memoises at its own level; only
                 // slot-flattening is lost, and nothing is written into the
                 // SHARED parent — the 2026-06-07 C-1 corruption mechanism).
-                // v1 skips the inline cache for chain operands.  A miss falls
-                // through to materialize() so the existing missing-attr error
-                // path is reused unchanged.
+                // v1 skips the inline cache for chain operands.  A miss throws
+                // directly with the same user-facing text as the flat path;
+                // there is no reason to allocate a flat copy only to fail a
+                // binary search.
                 if (g_chainLookupSelect) {
                     const Bindings * ownerLayer = nullptr;
                     Value * lslot = nullptr;
@@ -9389,8 +9390,15 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                         push(vm, s);
                         break;
                     }
-                    // miss → fall through to the materialize/error path.
+                    const auto & symTab = ir::globalSymbolTable();
+                    SymbolId want = static_cast<SymbolId>(operand);
+                    std::string nm = want < symTab.size()
+                        ? symTab[want]
+                        : std::string("<sid=") + std::to_string(want) + ">";
+                    throw std::runtime_error("attribute '" + nm + "' missing");
                 }
+                // Explicit opt-out path: preserve the old flat search/IC
+                // behavior when NIX_V3_CHAIN_LOOKUP_SELECT=0.
                 b = const_cast<Bindings *>(b->materialize());
             }
             // V3_DBG_PREHOOK diagnostic: log every ATTRS_SELECT preHook
