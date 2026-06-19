@@ -559,7 +559,7 @@ bool valuesEqual(const Value & a, const Value & b) noexcept
         uint32_t sb = bb ? (anyNonSorted ? bb->countDistinct() : bb->size) : 0;
         if (sa != sb) return false;
         if (sa == 0) return true;
-        if (anyNonSorted) {
+        if (anyNonSorted && ((ba && ba->isMapAttrs()) || (bb && bb->isMapAttrs()))) {
             const Bindings * ma = ba->materialize();
             const Bindings * mb = bb->materialize();
             for (uint32_t i = 0; i < sa; ++i) {
@@ -568,6 +568,20 @@ bool valuesEqual(const Value & a, const Value & b) noexcept
                     return false;
             }
             return true;
+        }
+        if (anyNonSorted) {
+            Bindings::Cursor ca(ba);
+            Bindings::Cursor cb(bb);
+            const Bindings::Entry * ea = ca.next();
+            const Bindings::Entry * eb = cb.next();
+            for (uint32_t i = 0; i < sa; ++i) {
+                if (!ea || !eb) return false;
+                if (ea->name != eb->name) return false;
+                if (!valuesEqual(ea->value, eb->value)) return false;
+                ea = ca.next();
+                eb = cb.next();
+            }
+            return !ea && !eb;
         }
         // Bindings are SymbolId-sorted; same SymbolId space for both
         // (we deserialise via globalInternSymbol so the input names
