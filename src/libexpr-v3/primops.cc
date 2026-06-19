@@ -477,7 +477,7 @@ inline Bindings * copyMapAttrsSubset(const Bindings * src, uint32_t n, Keep && k
     for (uint32_t i = 0; i < src->size; ++i) {
         const Bindings::Entry & e = src->entries[i];
         if (keep(e.name))
-            bindingsSetEntry(result, k++, e);
+            result->entries[k++] = e;
     }
     bindingsPostConstructBarrier(result);
     return result;
@@ -1978,8 +1978,10 @@ void primListToAttrs(EvalState & state, Value * args, Value & out)
     V3_STATS_INC(attrsetsAllocated);
     for (size_t i = 0; i < dedup.size(); ++i) {
         b->entries[i].name  = dedup[i].first;
-        bindingsSetValue(b, static_cast<uint32_t>(i), dedup[i].second);  // Phase D
+        b->entries[i].pos   = 0;
+        b->entries[i].value = dedup[i].second;
     }
+    bindingsPostConstructBarrier(b);  // Phase D batch barrier
     out.mkAttrs(b);
 }
 
@@ -2109,10 +2111,11 @@ void primRemoveAttrs(EvalState & state, Value * args, Value & out)
     uint32_t k = 0;
     src->forEach([&](const Bindings::Entry & e) {
         if (toRemove.count(e.name) == 0) {
-            bindingsSetEntry(result, k++, e);  // Phase D
+            result->entries[k++] = e;
         }
     });
     // k == kExact by construction; allocBindings already set the size.
+    bindingsPostConstructBarrier(result);  // Phase D batch barrier
     out.mkAttrs(result);
 }
 
@@ -2172,16 +2175,17 @@ void primIntersectAttrs(EvalState &, Value * args, Value & out)
         forEachEntryNoMapAttrsRealize(iter, [&](const Bindings::Entry & e) {
             if (const Bindings::Entry * se =
                     lookupEntryNoMapAttrsRealize(src, e.name))
-                bindingsSetEntry(result, k++, *se);  // Phase D
+                result->entries[k++] = *se;
         });
     } else {
         // iter == src: emit the src entry directly when its name is in keep.
         forEachEntryNoMapAttrsRealize(iter, [&](const Bindings::Entry & e) {
             if (keep->has(e.name))
-                bindingsSetEntry(result, k++, e);  // Phase D
+                result->entries[k++] = e;
         });
     }
     // k == kExact by construction; allocBindings already set the size.
+    bindingsPostConstructBarrier(result);  // Phase D batch barrier
     out.mkAttrs(result);
 }
 
@@ -2205,7 +2209,7 @@ void primMapAttrs(EvalState &, Value * args, Value & out)
             result->aux = src->aux;
         }
         for (uint32_t i = 0; i < src->size; ++i)
-            bindingsSetEntry(result, i, src->entries[i]);
+            result->entries[i] = src->entries[i];
         bindingsPostConstructBarrier(result);
         V3_STATS_INC(attrsetsAllocated);
         recordBindingsOrigin(result, 0, "primMapAttrs.identity");
