@@ -1600,7 +1600,7 @@ inline Bindings * mergeBindings(const Bindings * a, const Bindings * b,
     // Chain knobs — hoisted so both the composition path (just below)
     // and the construction path (further down) share them.  Function-
     // local statics: each initialises once on first call.
-    //   NIX_V3_CHAIN_MIN_NA=16   — parent must be "large" to chain-construct.
+    //   NIX_V3_CHAIN_MIN_NA=1    — parent must be non-empty to chain-construct.
     //   NIX_V3_CHAIN_MAX_NB=8192 — overlay cap; high enough to catch the
     //                               real nixpkgs `//` volume, finite enough
     //                               to avoid unbounded-chain materialization
@@ -1625,7 +1625,7 @@ inline Bindings * mergeBindings(const Bindings * a, const Bindings * b,
     }();
     static const uint32_t s_minNa = []{
         const char * e = std::getenv("NIX_V3_CHAIN_MIN_NA");
-        return e ? (uint32_t) std::strtoul(e, nullptr, 10) : 16u;
+        return e ? (uint32_t) std::strtoul(e, nullptr, 10) : 1u;
     }();
     static const uint32_t s_maxNb = []{
         const char * e = std::getenv("NIX_V3_CHAIN_MAX_NB");
