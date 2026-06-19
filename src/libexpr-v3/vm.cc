@@ -9038,11 +9038,12 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // Chain, privatize a flat Sorted copy and operate on THAT, so an
             // in-place override can never leak into a shared parent.
             if (dst->isChain()) {
-                const Bindings * flat = dst->materialize();
-                Bindings * priv = Alloc::allocBindings(flat->size);
+                Bindings * priv = Alloc::allocBindings(dst->countDistinct());
                 V3_STATS_INC(attrsetsAllocated);
-                for (uint32_t i = 0; i < flat->size; ++i)
-                    bindingsSetEntry(priv, i, flat->entries[i]);  // Phase D
+                uint32_t i = 0;
+                dst->forEach([&](const Bindings::Entry & e) {
+                    bindingsSetEntry(priv, i++, e);  // Phase D
+                });
                 top.mkAttrs(priv);   // replace the chain on the stack
                 dst = priv;          // overrides now write into our private copy
             }
