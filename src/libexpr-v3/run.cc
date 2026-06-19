@@ -548,7 +548,7 @@ RootResult runRootExprModule(nix::EvalState & state, ir::Module module)
                             : 0.0);
                 }
             }
-            // #821 — (na, nb) histograms for site 1 (UPDATE_TAIL).
+            // #821 — (na, nb) histograms for `//` UPDATE / UPDATE_TAIL.
             // If the overlay (nb) histogram is heavily skewed toward
             // small buckets while parent (na) is large, ChainBindings
             // is the right architectural lever.
@@ -562,13 +562,13 @@ RootResult runRootExprModule(nix::EvalState & state, ir::Module module)
                     "0", "1", "2-4", "5-8", "9-16",
                     "17-32", "33-64", "65-128", "129-256", "257+"};
                 std::fprintf(stderr,
-                    "  (UPDATE_TAIL na histogram, total=%llu):\n",
+                    "  (UPDATE/UPDATE_TAIL na histogram, total=%llu):\n",
                     (unsigned long long)naTotal);
                 for (int i = 0; i < 10; ++i)
                     std::fprintf(stderr, "    na %-8s = %llu\n",
                         labels[i], (unsigned long long)a.mergeBindingsNaHist[i]);
                 std::fprintf(stderr,
-                    "  (UPDATE_TAIL nb histogram, total=%llu):\n",
+                    "  (UPDATE/UPDATE_TAIL nb histogram, total=%llu):\n",
                     (unsigned long long)nbTotal);
                 for (int i = 0; i < 10; ++i)
                     std::fprintf(stderr, "    nb %-8s = %llu\n",

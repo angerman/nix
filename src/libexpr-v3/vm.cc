@@ -1568,14 +1568,13 @@ inline Bindings * mergeBindings(const Bindings * a, const Bindings * b,
             ++allocStats().mergeBindingsCallsBySite[s];
     }
 
-    // #821 — input-size histograms (na, nb).  Only sampled on
-    // site 1 (OP_ATTRS_UPDATE_TAIL) since that's the 98 %-dominant
-    // caller on HNE and we want to know whether `b` (the overlay)
-    // is small enough to justify a ChainBindings/persistent-overlay
-    // representation.  Other sites can be added later if data shows
-    // they shift the workload.  Bucket via a small switch (5 cmps
-    // avg) — negligible cost compared to the merge itself.
-    if (siteId == MergeBindingsSite::AttrsUpdateTail) {
+    // #821 — input-size histograms (na, nb).  Sample both `//`
+    // opcodes: older HNE profiles were UPDATE_TAIL-dominant, while the
+    // current register VM profile routes the hot path through
+    // OP_ATTRS_UPDATE.  Bucket via a small switch (5 cmps avg) —
+    // negligible cost compared to the merge itself.
+    if (siteId == MergeBindingsSite::AttrsUpdate
+        || siteId == MergeBindingsSite::AttrsUpdateTail) {
         // #821 follow-on: split the 0..1 bucket into nb=0 (short-
         // circuit) vs nb=1 (single-key patch).  The two have very
         // different optimisation implications: nb=0 is already free
@@ -1601,10 +1600,14 @@ inline Bindings * mergeBindings(const Bindings * a, const Bindings * b,
     // Chain knobs — hoisted so both the composition path (just below)
     // and the construction path (further down) share them.  Function-
     // local statics: each initialises once on first call.
-    //   NIX_V3_CHAIN_MIN_NA=16 — parent must be "large" to chain-construct.
-    //   NIX_V3_CHAIN_MAX_NB=4  — overlay must be "small" (override-delta).
-    // The audit can run with AGGRESSIVE chains (MIN_NA=2 MAX_NB=999) to
-    // exercise every attrset op against the TW oracle without a rebuild.
+    //   NIX_V3_CHAIN_MIN_NA=16   — parent must be "large" to chain-construct.
+    //   NIX_V3_CHAIN_MAX_NB=8192 — overlay cap; high enough to catch the
+    //                               real nixpkgs `//` volume, finite enough
+    //                               to avoid unbounded-chain materialization
+    //                               regressions.
+    // The audit can still override these at runtime (e.g. MAX_NB=0 to
+    // suppress fresh chains, or a huge value to stress every attrset op
+    // against the TW oracle without a rebuild).
     //
     // Lever A default-ON (2026-06-07, MEMORY_REPRESENTATION §10): chains are
     // a measured pure-refactor of `//` (firefox.drvPath −268 MB; 0 real
@@ -1626,7 +1629,7 @@ inline Bindings * mergeBindings(const Bindings * a, const Bindings * b,
     }();
     static const uint32_t s_maxNb = []{
         const char * e = std::getenv("NIX_V3_CHAIN_MAX_NB");
-        return e ? (uint32_t) std::strtoul(e, nullptr, 10) : 4u;
+        return e ? (uint32_t) std::strtoul(e, nullptr, 10) : 8192u;
     }();
 
     // Lever A Step 4 (MEMORY_REPRESENTATION §6) — CHAIN COMPOSITION.
