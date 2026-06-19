@@ -85,6 +85,27 @@ This materially lowers the risk + effort of the original blueprint.
 **Stage 3 (ES-IMPL-3) — grade + flip.** darwin-4 CPU+arena, byte-id, full --brute,
 nixpkgs byte-equality sweep; provisional → soak → flip (gen-major discipline).
 
+## CLOSURE vs THUNK target (found mid-increment-2, 2026-06-19)
+
+The directive ("the #1-leaf forceValue feeds on it") points at THUNKS, not closures:
+`forceValue` forces thunks, and the per-force cost is the fakeClo copy of `t->tail[]`
+(vm.cc:8241) + the MAKE_THUNK construction copy (896K thunks on git). CLOSURE
+env-sharing (increment-1's `Closure.upvalEnv` foundation, ~84K closures) addresses
+MAKE_CLOSURE alloc — a smaller, *different* lever that does NOT touch forceValue.
+So the directive-relevant work is THUNK env-sharing (harder: the thunk tail layout +
+the fakeClo force path). Increment-1 (committed, validated) is the closure-side
+foundation; the forceValue payoff needs the thunk-side equivalent.
+
+REMAINING WORK (both sides multi-day):
+- Closure increment-2: ~15 `closure->upvalues[]` reader sites (vm.cc 3988/4063/4072/
+  4655/5753-5803/10546/10616/14240-14272) each need the `upvalEnv ? env->values[i] :
+  upvalues[i]` null-check (a `closureUpvalue(c,i)` helper centralizes it); + walkEnv +
+  walkClosure-walks-upvalEnv + envPostConstructBarrier + DirtyKind::Env + the two
+  dirty-set switches (gc.cc 1017/1411) + mark_sweep closure→Env mark + gated
+  MAKE_CLOSURE Env-build. Miss any reader → wrong value under gate-on.
+- Thunk env-sharing (the forceValue target): the analogous rework on Thunk + the
+  fakeClo force path — the higher-payoff, harder half.
+
 ## Byte-identity strategy
 
 A captured value is the same whether read from an inline FAM or a shared Env at
