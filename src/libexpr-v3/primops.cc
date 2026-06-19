@@ -60,6 +60,7 @@
 #include <toml.hpp>
 
 #include <algorithm>
+#include <cassert>
 #include <cctype>
 #include <cmath>
 #include <cstdio>
@@ -71,6 +72,7 @@
 #include <filesystem>
 #include <fstream>
 #include <list>
+#include <limits>
 #include <mutex>
 #include <sys/stat.h>
 #include <optional>
@@ -1983,20 +1985,29 @@ void primListToAttrs(EvalState & state, Value * args, Value & out)
     // encounter survives the dedupe pass below.
     std::stable_sort(entries.begin(), entries.end(),
         [](auto & a, auto & b) { return a.first < b.first; });
-    std::vector<std::pair<SymbolId, Value>> dedup;
-    dedup.reserve(entries.size());
+    uint32_t uniqueCount = 0;
+    SymbolId prev = std::numeric_limits<SymbolId>::max();
     for (auto & p : entries) {
-        if (!dedup.empty() && dedup.back().first == p.first)
+        if (uniqueCount != 0 && p.first == prev)
             continue; // keep the first occurrence
-        dedup.push_back(p);
+        prev = p.first;
+        ++uniqueCount;
     }
-    Bindings * b = Alloc::allocBindings(static_cast<uint32_t>(dedup.size()));
+
+    Bindings * b = Alloc::allocBindings(uniqueCount);
     V3_STATS_INC(attrsetsAllocated);
-    for (size_t i = 0; i < dedup.size(); ++i) {
-        b->entries[i].name  = dedup[i].first;
-        b->entries[i].pos   = 0;
-        b->entries[i].value = dedup[i].second;
+    size_t outIdx = 0;
+    prev = std::numeric_limits<SymbolId>::max();
+    for (auto & p : entries) {
+        if (outIdx != 0 && p.first == prev)
+            continue; // keep the first occurrence
+        prev = p.first;
+        b->entries[outIdx].name  = p.first;
+        b->entries[outIdx].pos   = 0;
+        b->entries[outIdx].value = p.second;
+        ++outIdx;
     }
+    assert(outIdx == uniqueCount);
     bindingsPostConstructBarrier(b);  // Phase D batch barrier
     out.mkAttrs(b);
 }
