@@ -1434,6 +1434,12 @@ void primMap(EvalState & state, Value * args, Value & out)
         return;
     }
     Value fun = args[0];
+    if (fun.tag() == Tag::Closure && fun.asClosure()
+        && fun.asClosure()->desc
+        && fun.asClosure()->desc->identityLambda) {
+        out = lst;
+        return;
+    }
     ListVec * result = Alloc::allocList(src->size);
     V3_STATS_INC(listsAllocated);
     for (uint32_t i = 0; i < src->size; ++i) {
@@ -1570,6 +1576,14 @@ void primGenList(EvalState & state, Value * args, Value & out)
     Value gen = args[0];
     ListVec * result = Alloc::allocList(static_cast<uint32_t>(n));
     V3_STATS_INC(listsAllocated);
+    if (gen.tag() == Tag::Closure && gen.asClosure()
+        && gen.asClosure()->desc
+        && gen.asClosure()->desc->identityLambda) {
+        for (int64_t i = 0; i < n; ++i)
+            result->elems[i].mkInt(i);
+        out.mkList(result);
+        return;
+    }
     for (int64_t i = 0; i < n; ++i) {
         // Build App(gen, idx_int) — lazy.
         Value idx; idx.mkInt(i);

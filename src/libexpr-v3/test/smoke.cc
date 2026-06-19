@@ -1164,6 +1164,116 @@ static int testPrimOpLength()
     return 0;
 }
 
+static int testPrimMapIdentityNoApps()
+{
+    const PrimOp * mapPo = findPrimOp("map");
+    if (!mapPo) {
+        std::fprintf(stderr, "testPrimMapIdentityNoApps: missing 'map' primop\n");
+        return 1;
+    }
+
+    auto m = ir::makeModule();
+    auto idFid = addFunction(m);
+    auto idEntry = m.freshBlock();
+    auto idParam = m.freshVar();
+    {
+        auto & f = funcOf(m, idFid);
+        f.entryBlock = idEntry;
+        f.argName = m.internSymbol("x");
+        f.paramVar = idParam;
+        f.name = "id";
+        setReturn(m, idEntry, idParam);
+    }
+
+    auto entry = m.freshBlock();
+    funcOf(m, 0).entryBlock = entry;
+    auto fun = addBinding(m, entry, ir::Lambda{idFid, {}});
+    auto a = addBinding(m, entry, ir::LitInt{1});
+    auto b = addBinding(m, entry, ir::LitInt{2});
+    auto c = addBinding(m, entry, ir::LitInt{3});
+    auto lst = addBinding(m, entry, ir::ListExpr{{a, b, c}});
+    auto mapped = addBinding(m, entry, ir::PrimOpCall{mapPo, {fun, lst}});
+    setReturn(m, entry, mapped);
+
+    ir::computeFreeVars(m);
+    auto cu = compile(m);
+    uint64_t pairsBefore = allocStats().pairsAllocated;
+    Value res = run(cu);
+    uint64_t pairsAfter = allocStats().pairsAllocated;
+    if (!res.isList() || !res.asList() || res.asList()->size != 3
+        || !res.asList()->elems[0].isInt() || res.asList()->elems[0].asInt() != 1
+        || !res.asList()->elems[1].isInt() || res.asList()->elems[1].asInt() != 2
+        || !res.asList()->elems[2].isInt() || res.asList()->elems[2].asInt() != 3) {
+        std::fprintf(stderr, "testPrimMapIdentityNoApps: unexpected mapped result\n");
+        return 1;
+    }
+    if (pairsAfter != pairsBefore) {
+        std::fprintf(stderr,
+            "testPrimMapIdentityNoApps: map identity allocated %llu ValuePair(s)\n",
+            (unsigned long long)(pairsAfter - pairsBefore));
+        return 1;
+    }
+    std::fprintf(stderr,
+        "testPrimMapIdentityNoApps: OK (map identity reuses list without Apps)\n");
+    return 0;
+}
+
+static int testPrimGenListIdentityNoApps()
+{
+    const PrimOp * genListPo = findPrimOp("genList");
+    if (!genListPo) {
+        std::fprintf(stderr, "testPrimGenListIdentityNoApps: missing 'genList' primop\n");
+        return 1;
+    }
+
+    auto m = ir::makeModule();
+    auto idFid = addFunction(m);
+    auto idEntry = m.freshBlock();
+    auto idParam = m.freshVar();
+    {
+        auto & f = funcOf(m, idFid);
+        f.entryBlock = idEntry;
+        f.argName = m.internSymbol("x");
+        f.paramVar = idParam;
+        f.name = "id";
+        setReturn(m, idEntry, idParam);
+    }
+
+    auto entry = m.freshBlock();
+    funcOf(m, 0).entryBlock = entry;
+    auto fun = addBinding(m, entry, ir::Lambda{idFid, {}});
+    auto n = addBinding(m, entry, ir::LitInt{9});
+    auto generated = addBinding(m, entry, ir::PrimOpCall{genListPo, {fun, n}});
+    setReturn(m, entry, generated);
+
+    ir::computeFreeVars(m);
+    auto cu = compile(m);
+    uint64_t pairsBefore = allocStats().pairsAllocated;
+    Value res = run(cu);
+    uint64_t pairsAfter = allocStats().pairsAllocated;
+    if (!res.isList() || !res.asList() || res.asList()->size != 9) {
+        std::fprintf(stderr, "testPrimGenListIdentityNoApps: unexpected list shape\n");
+        return 1;
+    }
+    for (uint32_t i = 0; i < 9; ++i) {
+        if (!res.asList()->elems[i].isInt()
+            || res.asList()->elems[i].asInt() != static_cast<int64_t>(i)) {
+            std::fprintf(stderr,
+                "testPrimGenListIdentityNoApps: elem[%u] mismatch\n", i);
+            return 1;
+        }
+    }
+    if (pairsAfter != pairsBefore) {
+        std::fprintf(stderr,
+            "testPrimGenListIdentityNoApps: genList identity allocated %llu ValuePair(s)\n",
+            (unsigned long long)(pairsAfter - pairsBefore));
+        return 1;
+    }
+    std::fprintf(stderr,
+        "testPrimGenListIdentityNoApps: OK (genList identity emits ints without Apps)\n");
+    return 0;
+}
+
 // `builtins.head (builtins.tail [10 20 30])` -> 20
 static int testPrimOpHeadTail()
 {
@@ -2846,6 +2956,8 @@ int main()
     rc |= testThunkForce();
     rc |= testShortCircuit();
     rc |= testPrimOpLength();
+    rc |= testPrimMapIdentityNoApps();
+    rc |= testPrimGenListIdentityNoApps();
     rc |= testPrimOpHeadTail();
     rc |= testFibonacciSelfApp();
     rc |= testStrictnessRewritesForceOverLit();
