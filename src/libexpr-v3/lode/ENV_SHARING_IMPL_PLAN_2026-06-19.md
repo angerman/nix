@@ -23,7 +23,28 @@ nursery makes alloc bump-cheap and the live-byte reduction is ~2.9%. **So env-
 sharing may land sub-bar on both axes.** Stage 1 is built to MEASURE this before
 the high-risk GC stages — the honest off-ramp.
 
-## KEY DE-RISKER (found 2026-06-19): the Env GC infrastructure already exists
+## CORRECTION (2026-06-19, accurate scoping): the de-risk is PARTIAL; the hard part is UPFRONT
+
+The v3 `Env` type is **VESTIGIAL** — `allocEnv` has ZERO callers (only the decl +
+docstring), `envsAllocated`=0 at runtime, `OP_ENTER_LET`/`OP_PUSH_WITH` don't exist
+in vm.cc (the closure.hh comment describes an intended design never wired). What
+EXISTS: the major-GC MARK handles `CellType::Env` (mark_sweep.cc). What does NOT:
+the **nursery SCAVENGER has no `GK_ENV` walker** (gc.cc has GK_CLOSURE/GK_THUNK/…
+only) and there's no Env remembered-set barrier. CRUCIAL CONSEQUENCE: the nursery
+is now MANDATORY (its opt-out retired), so a tenured upvalue-Env holding
+nursery-payload upvalues would have its nursery pointers go stale at scavenge → UAF
+(the PhD-6 class). There is **no way to run/measure even a "non-moving" Env stage
+under the unavoidable nursery** without first building the scavenger Env support.
+∴ env-sharing's MINIMAL RUNNABLE UNIT = representation rework + MAKE_CLOSURE/
+MAKE_THUNK + GET_UPVALUE + **`GK_ENV` scavenger walker (mirror walkClosure) +
+envPostConstructBarrier (mirror closurePostConstructBarrier)** — i.e. the
+highest-UAF-risk moving-GC work is REQUIRED UPFRONT, not deferrable to a later
+stage. This is the honest reason env-sharing is a multi-day careful effort with no
+safe runnable partial: the mandatory nursery forces the PhD-6-class barrier work
+into stage 1. (The earlier "stage 2 largely done" claim was wrong — only the
+major-mark side existed; the moving/scavenge side does not.)
+
+## (superseded) KEY DE-RISKER (found 2026-06-19): the Env GC infrastructure already exists
 
 v3 already has `struct Env { Env* parent; bool isWithEnv; uint16_t nValues; Value
 values[]; }` (closure.hh:46) — currently used ONLY for let/with scopes (OP_ENTER_LET
