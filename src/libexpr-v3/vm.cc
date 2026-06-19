@@ -8052,7 +8052,14 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     // substitutes directly with no frame setup needed.
                     // This collapses the App spine to a tight loop
                     // inside this OP_FORCE handler.
-                    for (size_t i = nRights; i > 0; --i) {
+                    size_t i = nRights;
+                    if (i >= 2) {
+                        // Apply the first two source-order args together when
+                        // possible; callClosure2 falls back to exact currying.
+                        v = callClosure2(vm, v, rightAt(i - 1), rightAt(i - 2));
+                        i -= 2;
+                    }
+                    for (; i > 0; --i) {
                         if (v.tag() == Tag::Closure
                             && v.asClosure()
                             && v.asClosure()->desc
@@ -13373,7 +13380,14 @@ Value forceValue(VMState & vm, Value v)
                 || v.tag() == Tag::Thunk
                 || v.isAppLike())
                 v = forceValue(vm, v);
-            for (size_t i = nRights; i > 0; --i)
+            size_t i = nRights;
+            if (i >= 2) {
+                // Apply the first two source-order args together when
+                // possible; callClosure2 falls back to exact currying.
+                v = callClosure2(vm, v, rightAt(i - 1), rightAt(i - 2));
+                i -= 2;
+            }
+            for (; i > 0; --i)
                 v = callClosure(vm, v, rightAt(i - 1));
             // Memoize: store the result in the outermost App / App3
             // pair's evaluated field so the next force short-circuits.

@@ -21,6 +21,7 @@
 #include "v3/bytecode.hh"
 #include "v3/vm.hh"
 #include "v3/alloc.hh"
+#include "v3/barrier.hh"
 #include "v3/primop.hh"
 #include "v3/serialize.hh"
 #include "v3/disk_cache.hh"
@@ -716,6 +717,81 @@ static int testCallNPrimOpNoPap()
     }
     std::fprintf(stderr,
         "testCallNPrimOpNoPap: OK (OP_CALL_N primop saturates without PAP)\n");
+    return 0;
+}
+
+static int testForceApp3Arity2NoPap()
+{
+    CompilationUnit cu;
+    cu.entryOffset = 0;
+    cu.lambdas.push_back(LambdaDescriptor{
+        .codeOffset = 0,
+        .prologueOffset = 0,
+        .nUpvalues = 0,
+        .nLocals = 2,
+        .arity = 2,
+        .hasFormals = 0,
+        .ellipsis = 0,
+    });
+    cu.lambdaCodeOffsets.push_back(0);
+    cu.code.push_back(encode(OP_GET_LOCAL, 0));
+    cu.code.push_back(encode(OP_GET_LOCAL, 1));
+    cu.code.push_back(encode(OP_ADD));
+    cu.code.push_back(encode(OP_RETURN));
+
+    Closure * c = Alloc::allocClosure(0);
+    c->desc = &cu.lambdas[0];
+    c->cu = &cu;
+    c->nUpvalues = 0;
+    c->capturedWiths = nullptr;
+    closurePostConstructBarrier(c);
+
+    Value fun;
+    fun.mkClosure(c);
+    Value a;
+    a.mkInt(40);
+    Value b;
+    b.mkInt(2);
+
+    ValuePair * pp = Alloc::allocPair();
+    pp->left = fun;
+    pp->right = a;
+    pp->third = b;
+    pairPostConstructBarrier(pp);
+    Value app3;
+    app3.mkPair(Tag::App3, pp);
+
+    VMState vm;
+    vm.valueStack.reserve(16);
+    vm.frames.reserve(4);
+    vm.frames.push_back(CallFrame{
+        .cu = &cu,
+        .closure = nullptr,
+        .thunk = nullptr,
+        .ip = 0,
+        .stackBaseOffset = 0,
+        .withStackBase = 0,
+        .flags = 0,
+    });
+
+    uint64_t pairsBefore = allocStats().pairsAllocated;
+    Value r = forceValue(vm, app3);
+    uint64_t pairsAfter = allocStats().pairsAllocated;
+
+    if (!r.isInt() || r.asInt() != 42) {
+        std::fprintf(stderr,
+            "testForceApp3Arity2NoPap: expected 42, got tag=%d val=%lld\n",
+            (int)r.tag(), r.isInt() ? (long long)r.asInt() : 0LL);
+        return 1;
+    }
+    if (pairsAfter != pairsBefore) {
+        std::fprintf(stderr,
+            "testForceApp3Arity2NoPap: forcing App3 allocated %llu ValuePair(s)\n",
+            (unsigned long long)(pairsAfter - pairsBefore));
+        return 1;
+    }
+    std::fprintf(stderr,
+        "testForceApp3Arity2NoPap: OK (lazy App3 force saturates without PAP)\n");
     return 0;
 }
 
@@ -2643,6 +2719,7 @@ int main()
     rc |= testLambdaCall();
     rc |= testClosureCapture();
     rc |= testCallNPrimOpNoPap();
+    rc |= testForceApp3Arity2NoPap();
     rc |= testIf();
     rc |= testListConcat();
     rc |= testAttrSelect();
