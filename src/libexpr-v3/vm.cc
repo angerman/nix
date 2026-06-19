@@ -1778,6 +1778,66 @@ inline Value autoCallArity0(VMState & vm, const Value & v)
     return v;
 }
 
+[[gnu::always_inline]] inline bool primopArgNeedsForce(const Value & v) noexcept
+{
+    Tag t = v.tag();
+    return t == Tag::Thunk || t == Tag::App || t == Tag::App3
+        || t == Tag::Slot;
+}
+
+inline Value invokePrimOpDirect(
+    VMState & vm,
+    const PrimOp * po,
+    Value * args,
+    bool bumpStats)
+{
+    if (po->arity > 8)
+        throw std::runtime_error("v3 primop call: arity > 8");
+    for (uint32_t i = 0; i < po->arity; ++i) {
+        if (po->lazyArgs & (1u << i)) continue;
+        if (__builtin_expect(primopArgNeedsForce(args[i]), 0))
+            args[i] = forceValue(vm, args[i]);
+    }
+    if (bumpStats) bumpPrimOpCallCount(po);
+    EvalState state;
+    state.vm = &vm;
+    state.nixEvalState = getNixEvalState();
+    Value out;
+    po->fn(state, args, out);
+    return out;
+}
+
+inline bool collectSaturatedPrimOpArgs(
+    Value fun,
+    const Value * newArgs,
+    uint32_t nNew,
+    const PrimOp *& po,
+    Value * out)
+{
+    Value cur = fun;
+    size_t depth = 0;
+    while (cur.tag() == Tag::PrimOpApp) {
+        ++depth;
+        cur = cur.asPair()->left;
+    }
+    if (!cur.isPrimOp())
+        throw std::runtime_error("v3 primop call: PrimOpApp chain doesn't terminate in a PrimOp");
+    po = cur.asPrimOp();
+    const size_t total = depth + nNew;
+    if (total != po->arity) return false;
+    if (po->arity > 8)
+        throw std::runtime_error("v3 primop call: arity > 8");
+
+    Value chain = fun;
+    for (size_t i = depth; i > 0; --i) {
+        out[i - 1] = chain.asPair()->right;
+        chain = chain.asPair()->left;
+    }
+    for (uint32_t i = 0; i < nNew; ++i)
+        out[depth + i] = newArgs[i];
+    return true;
+}
+
 inline Value withLookup(VMState & vm, SymbolId name)
 {
     // REVIEW §2.8: track whether any with-stack entry blackholed.  If
@@ -5402,46 +5462,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     chain = chain.asPair()->left;
                 }
                 vm.frames.back().ip = ip;
-                // PrimOpApp accumulates args lazily — primops expect
-                // WHNF, so force each here before invoking, EXCEPT for
-                // args the primop has explicitly opted out of via its
-                // `lazyArgs` bitmask (e.g., addErrorContext's value arg
-                // — see lib/modules.nix's
-                // `config = addErrorContext "..." config` cycle).
-                //
-                // Fast-path: skip forceValue function call if the arg
-                // is already in WHNF (Tag is not Thunk/App/Slot).
-                // CPU sample showed forceValue+424 (chase loop entry)
-                // at 5% of CPU under THUNK_ALL on nixpkgs — most of
-                // those are no-op calls for WHNF args.  Inline the
-                // tag check saves CALL/RET + setup per skipped arg.
-                for (uint32_t i = 0; i < po->arity; ++i) {
-                    if (po->lazyArgs & (1u << i)) continue;
-                    Tag at = buf[i].tag();
-                    if (__builtin_expect(at == Tag::Thunk
-                                         || at == Tag::App || at == Tag::App3
-                                         || at == Tag::Slot, 0))
-                        buf[i] = forceValue(vm, buf[i]);
-                }
-                bumpPrimOpCallCount(po);
-                // Wire nixEvalState so primops that touch the
-                // store / file system (toString-on-path, import,
-                // path coercion) can reach the live nix::EvalState.
-                // 2026-05-19 #665 root cause: this path is the
-                // hot OP_CALL fall-through when the callee is a
-                // PrimOp/PrimOpApp (e.g. the derivationStrict
-                // bytecode wrapper's `builtins.toString args.X`
-                // calls).  Without nixEvalState, toStringCoerceCtx
-                // hits its `!state.nixEvalState` early-return and
-                // produces raw source-tree paths instead of
-                // copying them to /nix/store, causing every
-                // derivation that interpolates a `${./X.sh}`-style
-                // path to diverge from TW (drv hash mismatch
-                // cascading through bash → stdenv → all packages).
-                EvalState state; state.vm = &vm;
-                state.nixEvalState = getNixEvalState();
-                Value out;
-                po->fn(state, buf, out);
+                Value out = invokePrimOpDirect(vm, po, buf, true);
                 push(vm, out);
                 break;
             }
@@ -6981,6 +7002,15 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 stackBase = newBase;
                 break;
             }
+            if (fun.isPrimOp() || fun.tag() == Tag::PrimOpApp) {
+                const PrimOp * po = nullptr;
+                Value buf[8];
+                if (collectSaturatedPrimOpArgs(fun, argbuf, n, po, buf)) {
+                    Value out = invokePrimOpDirect(vm, po, buf, false);
+                    push(vm, out);
+                    break;
+                }
+            }
             // Fallback: n curried applications (callClosure resolves thunk/
             // slot/PAP/primop/functor fun and builds PAPs for under-arity).
             Value f = fun;
@@ -7034,6 +7064,15 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 cu = baseCu;
                 closure = c;
                 break;
+            }
+            if (fun.isPrimOp() || fun.tag() == Tag::PrimOpApp) {
+                const PrimOp * po = nullptr;
+                Value buf[8];
+                if (collectSaturatedPrimOpArgs(fun, argbuf, n, po, buf)) {
+                    Value out = invokePrimOpDirect(vm, po, buf, false);
+                    push(vm, out);
+                    break;
+                }
             }
             // Non-saturated: build the value, push it, fall through to the
             // trailing OP_RETURN (which returns it to our caller).
@@ -14160,30 +14199,7 @@ Value callClosure(VMState & vm, Value fun, Value arg)
             buf[i - 1] = chain.asPair()->right;
             chain = chain.asPair()->left;
         }
-        // Phase 1.2 (action plan): mirror OP_CALL's primop-arg force loop
-        // (vm.cc:2708-2715) — fast-path the WHNF case inline so that
-        // arg-forcing on an already-resolved Value doesn't pay the
-        // forceValue function-call + chase-loop setup cost.  callClosure
-        // is the entry point primops use for callback lambdas (map,
-        // filter, foldl', etc.), so this fires on the dominant
-        // `(p: p.name)`-style nixpkgs callbacks AND on every recursive
-        // primop-from-primop call.  Without this fast path, callClosure
-        // diverged from OP_CALL on the same workload.
-        //
-        // Audit category B1 (see ITERATIVE_FORCE_AUDIT_2026-05-18.md):
-        // first scoped iterative-force conversion landed.
-        for (uint32_t i = 0; i < po->arity; ++i) {
-            if (po->lazyArgs & (1u << i)) continue;
-            Tag at = buf[i].tag();
-            if (__builtin_expect(at == Tag::Thunk
-                                 || at == Tag::App || at == Tag::App3
-                                 || at == Tag::Slot, 0))
-                buf[i] = forceValue(vm, buf[i]);
-        }
-        EvalState state; state.vm = &vm; state.nixEvalState = getNixEvalState();
-        Value out;
-        po->fn(state, buf, out);
-        return out;
+        return invokePrimOpDirect(vm, po, buf, false);
     }
 
     // eval/apply (#3, gate-on only): arity-N closure / Tag::App PAP — the

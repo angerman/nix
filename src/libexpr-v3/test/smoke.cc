@@ -18,6 +18,7 @@
 
 #include "v3/ir.hh"
 #include "v3/ir_dump.hh"
+#include "v3/bytecode.hh"
 #include "v3/vm.hh"
 #include "v3/alloc.hh"
 #include "v3/primop.hh"
@@ -668,6 +669,53 @@ static int testClosureCapture()
         return 1;
     }
     std::fprintf(stderr, "testClosureCapture: OK ((let n=10; f=x:x+n; in f 32) = 42)\n");
+    return 0;
+}
+
+static int testCallNPrimOpNoPap()
+{
+    const PrimOp * addPo = findPrimOp("add");
+    if (!addPo) {
+        std::fprintf(stderr, "testCallNPrimOpNoPap: add not registered\n");
+        return 1;
+    }
+
+    CompilationUnit cu;
+    cu.primops.push_back(addPo);
+    cu.entryOffset = 0;
+    cu.lambdas.push_back(LambdaDescriptor{
+        .codeOffset = 0,
+        .prologueOffset = 0,
+        .nUpvalues = 0,
+        .nLocals = 0,
+        .arity = 0,
+        .hasFormals = 0,
+        .ellipsis = 0,
+    });
+    cu.lambdaCodeOffsets.push_back(0);
+    cu.code.push_back(encode(OP_LIT_PRIMOP, 0));
+    cu.code.push_back(encode(OP_LIT_INT, 1));
+    cu.code.push_back(encode(OP_LIT_INT, 2));
+    cu.code.push_back(encode(OP_CALL_N, 2));
+    cu.code.push_back(encode(OP_HALT));
+
+    uint64_t pairsBefore = allocStats().pairsAllocated;
+    Value r = run(cu);
+    uint64_t pairsAfter = allocStats().pairsAllocated;
+    if (!r.isInt() || r.asInt() != 3) {
+        std::fprintf(stderr,
+            "testCallNPrimOpNoPap: expected 3, got tag=%d val=%lld\n",
+            (int)r.tag(), (long long)r.asInt());
+        return 1;
+    }
+    if (pairsAfter != pairsBefore) {
+        std::fprintf(stderr,
+            "testCallNPrimOpNoPap: OP_CALL_N primop allocated %llu ValuePair(s)\n",
+            (unsigned long long)(pairsAfter - pairsBefore));
+        return 1;
+    }
+    std::fprintf(stderr,
+        "testCallNPrimOpNoPap: OK (OP_CALL_N primop saturates without PAP)\n");
     return 0;
 }
 
@@ -2561,6 +2609,7 @@ int main()
     rc |= testFusePrimOpChainArity2();
     rc |= testLambdaCall();
     rc |= testClosureCapture();
+    rc |= testCallNPrimOpNoPap();
     rc |= testIf();
     rc |= testListConcat();
     rc |= testAttrSelect();
