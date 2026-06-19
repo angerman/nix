@@ -7690,13 +7690,7 @@ static void valueToXml(EvalState & state, std::string & out, Value v, int indent
         return;
     case Tag::Attrs: {
         out += "<attrs>\n";
-        // C-18 (CODEBASE_REVIEW_2026-06-11): materialise a ChainBindings
-        // (entries[] is the overlay only) so the XML carries parent-layer attrs
-        // too — iterating the chain raw silently dropped them.  (TW's
-        // printValueAsXML additionally emits a <derivation> element for drv
-        // attrsets; that cosmetic special-case is a separate follow-up.)
         const Bindings * ab = v.asAttrs();
-        if (ab && ab->isChain()) ab = ab->materialize();
         if (ab) {
             // Sort by name for stable output.
             // #670/#671 follow-on: store names as OWNING std::string,
@@ -7707,14 +7701,13 @@ static void valueToXml(EvalState & state, std::string & out, Value v, int indent
             // structuredAttrs branch (commit bcc8d6cf1).
             auto & symTab = ir::globalSymbolTable();
             std::vector<std::pair<std::string, Value>> entries;
-            entries.reserve(ab->size);
-            for (uint32_t i = 0; i < ab->size; ++i) {
-                SymbolId sid = ab->entries[i].name;
+            entries.reserve(ab->countDistinct());
+            ab->forEach([&](const Bindings::Entry & e) {
+                SymbolId sid = e.name;
                 std::string nm = sid < symTab.size()
                     ? std::string(symTab[sid]) : std::string();
-                entries.emplace_back(std::move(nm),
-                    ab->entries[i].value);
-            }
+                entries.emplace_back(std::move(nm), e.value);
+            });
             std::sort(entries.begin(), entries.end(),
                 [](auto & a, auto & b) { return a.first < b.first; });
             for (auto & [nm, val] : entries) {
@@ -8550,13 +8543,8 @@ nlohmann::json valueToJson(EvalState & state, const Value & vRaw)
         }
         json obj = json::object();
         if (v.asAttrs()) {
-            // Lever A: chain guard (same as valueToJsonWithContext).  A
-            // Chain's entries[] is the overlay only; materialise to the
-            // full sorted view so JSON includes the whole attrset.
             const Bindings * jb = v.asAttrs();
-            if (jb->isChain()) jb = jb->materialize();
-            for (uint32_t i = 0; i < jb->size; ++i) {
-                auto & en = jb->entries[i];
+            jb->forEach([&](const Bindings::Entry & en) {
                 // #670/#671 follow-on: capture the key as std::string
                 // BEFORE valueToJson runs.  valueToJson's recursive
                 // forceValue may intern new symbols, which grows the
@@ -8568,7 +8556,7 @@ nlohmann::json valueToJson(EvalState & state, const Value & vRaw)
                 // as the structuredAttrs branch (commit bcc8d6cf1).
                 std::string k = std::string(vmSymName(state, en.name));
                 obj[std::move(k)] = valueToJson(state, en.value);
-            }
+            });
         }
         return obj;
     }
@@ -8682,20 +8670,8 @@ nlohmann::json valueToJsonWithContext(
         }
         json obj = json::object();
         if (v.asAttrs()) {
-            // Lever A: store-hash-critical chain guard.  This serializer
-            // feeds the native derivationStrict __structuredAttrs path
-            // (the `env`/`manifest` JSON).  A Chain's `entries[]` is the
-            // OVERLAY ONLY; iterating it directly drops every parent
-            // entry → a structured-attrs derivation hashed from a partial
-            // attrset → silently wrong .drv hash (e.g. python3.withPackages
-            // collapsed to a constant hash regardless of its package list).
-            // Materialise to the full sorted view first (no-op for Sorted;
-            // memoised so it shares derivationStrict's own materialise of
-            // the same attrset).
             const Bindings * jb = v.asAttrs();
-            if (jb->isChain()) jb = jb->materialize();
-            for (uint32_t i = 0; i < jb->size; ++i) {
-                auto & en = jb->entries[i];
+            jb->forEach([&](const Bindings::Entry & en) {
                 // #670/#671 follow-on (same as valueToJson above): copy
                 // the key to an OWNING std::string before the recursive
                 // valueToJsonWithContext, whose forceValue can grow
@@ -8703,7 +8679,7 @@ nlohmann::json valueToJsonWithContext(
                 std::string k = std::string(vmSymName(state, en.name));
                 obj[std::move(k)] = valueToJsonWithContext(
                     state, en.value, context);
-            }
+            });
         }
         return obj;
     }
