@@ -3985,7 +3985,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 std::fflush(stderr);
                 throw std::runtime_error("v3 OP_GET_UPVALUE: index out of range");
             }
-            push(vm, closure->upvalues[operand]);
+            push(vm, closureUpvalue(closure, operand));   // env-sharing: FAM or shared Env
             // Phase A5: frame-focused upvalue trace.  When
             // V3_DBG_SELECT_AT_CODEOFF=<codeoff> is set, log every
             // OP_GET_UPVALUE in matching frames.  Logs the tag of the
@@ -4060,7 +4060,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // Hot path: tag != Thunk/App/Slot.  Diagnostics and the
             // NIX_V3_NO_GETFORCE_SUPER gate live below the bail-out so
             // they don't pay the load + branch on every iteration.
-            const Value & v = closure->upvalues[operand];
+            Value v = closureUpvalue(closure, operand);   // env-sharing: FAM or shared Env
             Tag t = v.tag();
             if (__builtin_expect(t != Tag::Thunk && t != Tag::App && t != Tag::App3
                                  && t != Tag::Slot, 1)) {
@@ -4069,7 +4069,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             }
             // V3_DBG_FORCE_SITE trace; see OP_GET_LOCAL_FORCE.
             dbgLogForceSite(cu, ip - 1,
-                operand < closure->nUpvalues ? &closure->upvalues[operand] : nullptr);
+                operand < closure->nUpvalues ? closureUpvaluePtr(closure, operand) : nullptr);
             // See OP_GET_LOCAL_FORCE — same NIX_V3_NO_GETFORCE_SUPER gate.
             static const bool s_skipForceUv =
                 std::getenv("NIX_V3_NO_GETFORCE_SUPER") != nullptr;

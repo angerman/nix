@@ -82,6 +82,19 @@ struct Closure
     Value                    upvalues[]; // FAM (unused when upvalEnv != null)
 };
 
+/// Env-sharing upvalue accessors: read upvalue `i` from the shared Env when one
+/// was built (gate-on), else from the inline FAM.  Centralizes the null-check so
+/// every reader is consistent; until a gate builds an Env (`upvalEnv` always
+/// null) these are exactly the inline-FAM path (byte-identical).
+inline Value closureUpvalue(const Closure * c, uint32_t i) noexcept
+{
+    return c->upvalEnv ? c->upvalEnv->values[i] : c->upvalues[i];
+}
+inline Value * closureUpvaluePtr(Closure * c, uint32_t i) noexcept
+{
+    return c->upvalEnv ? &c->upvalEnv->values[i] : &c->upvalues[i];
+}
+
 // ---------------------------------------------------------------------------
 // Thunk
 // ---------------------------------------------------------------------------
