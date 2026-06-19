@@ -94,6 +94,12 @@ inline Value * closureUpvaluePtr(Closure * c, uint32_t i) noexcept
 {
     return c->upvalEnv ? &c->upvalEnv->values[i] : &c->upvalues[i];
 }
+/// const overload: diagnostic/trace readers hold a `const Closure *` and only
+/// need a `const Value *` (e.g. dbgLogForceSite).  Mirrors the mutable variant.
+inline const Value * closureUpvaluePtr(const Closure * c, uint32_t i) noexcept
+{
+    return c->upvalEnv ? &c->upvalEnv->values[i] : &c->upvalues[i];
+}
 
 // ---------------------------------------------------------------------------
 // Thunk

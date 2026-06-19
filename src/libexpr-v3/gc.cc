@@ -68,6 +68,7 @@ enum GrayKind : uint8_t {
     GK_LIST     = 2,
     GK_BINDINGS = 3,
     GK_PAIR     = 4,
+    GK_ENV      = 5,  ///< env-sharing: a shared upvalue Env (tenured, non-moving)
 };
 
 struct Gray { void * ptr; uint8_t kind; };
@@ -232,6 +233,7 @@ struct Scavenger
     void walkList    (ListVec  * l);
     void walkBindings(Bindings * b);
     void walkPair    (ValuePair * p);
+    void walkEnv     (Env      * e);  ///< env-sharing: walk a shared upvalue Env
 
     // -- top-level driver ---------------------------------------
 
@@ -643,11 +645,33 @@ void Scavenger::walkClosure(Closure * c)
         }
     }
     if (c->capturedWiths) c->capturedWiths = fwdList(c->capturedWiths);
-    for (uint16_t i = 0; i < c->nUpvalues; ++i) {
-        visitValue(c->upvalues[i]);
+    // env-sharing (NIX_V3_ENV_SHARING): upvalues live in a shared Env rather than
+    // the inline FAM.  The Env is TENURED (allocEnv → threadArena), so it never
+    // moves — we don't forward c->upvalEnv, only gray the Env so walkEnv forwards
+    // the nursery payloads it holds.  When upvalEnv is set the inline FAM is unused.
+    if (c->upvalEnv) {
+        if (walked.insert(c->upvalEnv).second)
+            graylist.push_back({c->upvalEnv, GK_ENV});
+    } else {
+        for (uint16_t i = 0; i < c->nUpvalues; ++i) {
+            visitValue(c->upvalues[i]);
+        }
     }
     // #738 Phase E v0.2 post-walk barrier — see walkList.
     if (n.isPhaseEActive()) closurePostConstructBarrier(c);
+}
+
+// env-sharing: forward the nursery payloads a shared upvalue Env holds.  The Env
+// itself is tenured (non-moving) so there is no Env relocation; we only walk the
+// values[] FAM (mirror of walkClosure's upvalue loop) and re-arm the post-walk
+// barrier so a survivor Env that still references the nursery is remembered.
+void Scavenger::walkEnv(Env * e)
+{
+    recordLiveTenured(e, sizeof(Env) + sizeof(Value) * e->nValues, CellType::Env);
+    for (uint16_t i = 0; i < e->nValues; ++i) {
+        visitValue(e->values[i]);
+    }
+    if (n.isPhaseEActive()) envPostConstructBarrier(e);
 }
 
 void Scavenger::walkThunk(Thunk * t)
@@ -790,6 +814,7 @@ void Scavenger::drain()
         case GK_LIST:     walkList    (static_cast<ListVec  *>(g.ptr)); break;
         case GK_BINDINGS: walkBindings(static_cast<Bindings *>(g.ptr)); break;
         case GK_PAIR:     walkPair    (static_cast<ValuePair *>(g.ptr)); break;
+        case GK_ENV:      walkEnv     (static_cast<Env      *>(g.ptr)); break;
         }
     }
 }
@@ -1049,6 +1074,13 @@ void Scavenger::run()
                 }
                 break;
             }
+            case DirtyKind::Env: {
+                auto * env = static_cast<Env *>(e.ptr);
+                if (walked.insert(env).second) {
+                    graylist.push_back({env, GK_ENV});
+                }
+                break;
+            }
             }
         }
         // Clear retaining capacity — typical steady-state list size
@@ -1171,8 +1203,21 @@ struct Auditor {
             for (uint32_t i = 0; i < c->capturedWiths->size; ++i)
                 visitValue(c->capturedWiths->elems[i], "Closure.capturedWiths.elem");
         }
-        for (uint16_t i = 0; i < c->nUpvalues; ++i)
-            visitValue(c->upvalues[i], "Closure.upvalues[]");
+        // env-sharing: upvalues live in a shared Env, not the inline FAM.
+        if (c->upvalEnv)
+            visitEnv(c->upvalEnv, "Closure.upvalEnv");
+        else
+            for (uint16_t i = 0; i < c->nUpvalues; ++i)
+                visitValue(c->upvalues[i], "Closure.upvalues[]");
+    }
+
+    void visitEnv(const Env * e, const char * site)
+    {
+        if (!e) return;
+        check(e, "Env", site);
+        if (!visited.insert(e).second) return;
+        for (uint16_t i = 0; i < e->nValues; ++i)
+            visitValue(e->values[i], "Env.values[]");
     }
 
     void visitThunk(const Thunk * t, const char * site)
@@ -1427,6 +1472,10 @@ void postScavengeAudit(const Nursery & n, const VMState & vm)
             case DirtyKind::List:
                 if (a.visited.insert(e.ptr).second)
                     a.visitList(static_cast<ListVec *>(e.ptr), "dirty.List");
+                break;
+            case DirtyKind::Env:
+                if (a.visited.insert(e.ptr).second)
+                    a.visitEnv(static_cast<Env *>(e.ptr), "dirty.Env");
                 break;
             }
         }

@@ -541,8 +541,22 @@ private:
         }
         if (c->capturedWiths)
             visitList(c->capturedWiths);
-        for (uint16_t i = 0; i < c->nUpvalues; ++i)
-            visitValue(c->upvalues[i]);
+        // env-sharing (NIX_V3_ENV_SHARING): upvalues live in a shared, tenured
+        // (non-moving) Env rather than the inline FAM.  Mark the Env's lines and
+        // visit its values precisely; the inline FAM is unused when upvalEnv is set.
+        if (c->upvalEnv) {
+            Env * e = c->upvalEnv;
+            if (marker_.tryMark(e)) {
+                if (arenaSetForSlot_)
+                    arenaSetForSlot_->markLinesForCell(
+                        e, sizeof(Env) + sizeof(Value) * e->nValues);
+                for (uint16_t i = 0; i < e->nValues; ++i)
+                    visitValue(e->values[i]);
+            }
+        } else {
+            for (uint16_t i = 0; i < c->nUpvalues; ++i)
+                visitValue(c->upvalues[i]);
+        }
     }
     void walkThunk(Thunk * t) noexcept
     {
@@ -1278,7 +1292,17 @@ private:
             auto * c = static_cast<Closure *>(cell);
             clearCU(c->cu);  // evac moves IC'd Bindings → invalidate the IC
             if (c->capturedWiths) visitList(c->capturedWiths);
-            for (uint16_t i = 0; i < c->nUpvalues; ++i) visitValue(c->upvalues[i]);
+            // env-sharing: rewrite the shared Env's value pointers to their
+            // forwarded locations.  The Env cell itself is non-moving (CellType::
+            // Env is never relocated), so only its values[] need the rewrite.
+            // (Bring-up builds one fresh Env per closure → no shared-Env double-
+            // visit; interning, a follow-up, must add evac dedup before sharing.)
+            if (c->upvalEnv) {
+                Env * e = c->upvalEnv;
+                for (uint16_t i = 0; i < e->nValues; ++i) visitValue(e->values[i]);
+            } else {
+                for (uint16_t i = 0; i < c->nUpvalues; ++i) visitValue(c->upvalues[i]);
+            }
             break;
         }
         case CellType::Thunk: {
@@ -1752,6 +1776,12 @@ static void runEvacuation(VMState & vm, Arena & arena,
                     case CellType::Closure: {
                         auto * c = reinterpret_cast<const Closure *>(cs);
                         if (c->capturedWiths && inFreeable(reinterpret_cast<uintptr_t>(c->capturedWiths))) note("Closure.capturedWiths", cs);
+                        if (c->upvalEnv) {
+                            // env-sharing: upvalues live in the shared Env.
+                            if (inFreeable(reinterpret_cast<uintptr_t>(c->upvalEnv))) note("Closure.upvalEnv", cs);
+                            for (uint16_t i = 0; i < c->upvalEnv->nValues; ++i)
+                                if (refCand(c->upvalEnv->values[i])) { note("Closure.upvalEnv.value", cs); break; }
+                        } else
                         for (uint16_t i = 0; i < c->nUpvalues; ++i)
                             if (refCand(c->upvalues[i])) { note("Closure.upvalue", cs); break; }
                         break; }

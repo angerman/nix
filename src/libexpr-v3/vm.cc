@@ -4554,7 +4554,30 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // Pop upvalues first (they sit on TOP of stack), then pop
             // the with-target block beneath.  Build capturedWiths
             // outermost-first by filling reverse into the ListVec.
-            for (uint16_t i = nUp; i > 0; --i) c->upvalues[i - 1] = pop(vm);
+            //
+            // env-sharing (NIX_V3_ENV_SHARING) bring-up gate (default OFF): store
+            // the upvalues in a shared, tenured Env (Closure::upvalEnv) rather than
+            // the inline FAM, so closures reference one Env instead of copying
+            // upvalues.  RETIREMENT: removed when env-sharing either ships default-
+            // on (after the darwin-4 CPU/arena + --brute + nixpkgs grade in
+            // ES-IMPL-3) or is falsified below-bar and the whole upvalEnv path is
+            // deleted.  Bring-up builds ONE fresh Env per closure (interning — the
+            // actual win — is a follow-up that must add shared-Env evac dedup) and
+            // keeps allocClosure(nUp) so the cell size is unchanged; the now-unused
+            // inline FAM is poisoned to Uninitialized so the conservative brute-
+            // scanner never mistakes stale words there for live nursery pointers.
+            // Env-aware GC: scavenge walkClosure grays the Env; mark/evac/auditor +
+            // closurePostConstructBarrier all branch on upvalEnv (gc.cc/mark_sweep.cc).
+            static const bool s_envSharing =
+                std::getenv("NIX_V3_ENV_SHARING") != nullptr;
+            if (__builtin_expect(s_envSharing && nUp > 0, 0)) {
+                Env * env = Alloc::allocEnv(nUp);
+                for (uint16_t i = nUp; i > 0; --i) env->values[i - 1] = pop(vm);
+                c->upvalEnv = env;
+                for (uint16_t i = 0; i < nUp; ++i) c->upvalues[i].mkUninitialized();
+            } else {
+                for (uint16_t i = nUp; i > 0; --i) c->upvalues[i - 1] = pop(vm);
+            }
             if (nWiths == 1) {
                 // Day 13-15 (2026-05-29): singleton interning for the
                 // overwhelmingly-dominant 1-element case (avg 1.04 on
@@ -5750,8 +5773,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     allocStats().intrinsicExtendsCalls++;
                     static const bool s_dbg =
                         std::getenv("V3_DBG_INTRINSIC") != nullptr;
-                    Value overlay = callee->upvalues[(uint16_t)desc->intrinsicVar0];
-                    Value f       = callee->upvalues[(uint16_t)desc->intrinsicVar1];
+                    Value overlay = closureUpvalue(callee, (uint16_t)desc->intrinsicVar0);
+                    Value f       = closureUpvalue(callee, (uint16_t)desc->intrinsicVar1);
                     Value final_  = arg;
                     if (s_dbg) std::fprintf(stderr,
                         "v3 intrinsic ExtendsBody dispatch [#%llu]: "
@@ -5798,9 +5821,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     allocStats().intrinsicComposeCalls++;
                     static const bool s_dbg =
                         std::getenv("V3_DBG_INTRINSIC") != nullptr;
-                    Value f       = callee->upvalues[(uint16_t)desc->intrinsicVar0];
-                    Value g       = callee->upvalues[(uint16_t)desc->intrinsicVar1];
-                    Value final_  = callee->upvalues[(uint16_t)desc->intrinsicVar2];
+                    Value f       = closureUpvalue(callee, (uint16_t)desc->intrinsicVar0);
+                    Value g       = closureUpvalue(callee, (uint16_t)desc->intrinsicVar1);
+                    Value final_  = closureUpvalue(callee, (uint16_t)desc->intrinsicVar2);
                     Value prev_   = arg;
                     if (s_dbg) std::fprintf(stderr,
                         "v3 intrinsic ComposeBody dispatch [#%llu]: "
@@ -10543,7 +10566,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             if (upvalIdx >= closure->nUpvalues)
                 throw std::runtime_error(
                     "v3 OP_GET_UPVALUE_REC_BINDING: upvalue index out of range");
-            Value attrs = closure->upvalues[upvalIdx];
+            Value attrs = closureUpvalue(closure, upvalIdx);
             // Force to WHNF if the rec-attrset isn't materialised yet
             // (Slot/Thunk/App).  forceValue runs a nested eval, but `closure`
             // and `cu` are heap-stable across it and `attrs` is a C-stack
@@ -10613,7 +10636,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             if (upvalIdx >= closure->nUpvalues)
                 throw std::runtime_error(
                     "v3 OP_GET_UPVALUE_REC_BINDING_SLOT: upvalue index out of range");
-            Value attrs = closure->upvalues[upvalIdx];
+            Value attrs = closureUpvalue(closure, upvalIdx);
             if (attrs.isAppLike()
                 || attrs.tag() == Tag::Thunk
                 || attrs.tag() == Tag::Slot)
