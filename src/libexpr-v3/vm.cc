@@ -534,7 +534,13 @@ inline void dump()
 // inside an Env, which can make a bucket miss later; that only loses sharing
 // until the next equal tuple is inserted, not correctness.
 namespace envintern {
-using Bucket = std::vector<Env *>;
+struct Entry {
+    Env * env = nullptr;
+    uint32_t observations = 0;
+    uint16_t nUp = 0;
+};
+
+using Bucket = std::vector<Entry>;
 
 inline bool enabled() noexcept
 {
@@ -551,6 +557,27 @@ inline std::unordered_map<uint64_t, Bucket> & table()
 {
     static thread_local std::unordered_map<uint64_t, Bucket> t;
     return t;
+}
+
+inline uint32_t shareAfter(uint16_t nUp) noexcept
+{
+    static const uint32_t s_override = [] {
+        const char * e = std::getenv("NIX_V3_ENV_SHARE_AFTER");
+        if (!e || !*e) return 0u;
+        char * end = nullptr;
+        unsigned long v = std::strtoul(e, &end, 10);
+        return end != e ? static_cast<uint32_t>(v) : 0u;
+    }();
+    if (s_override) return s_override;
+
+    // A shared Env wins only when the same capture tuple is reused.  The first
+    // default-on implementation allocated an Env for every nUp>0 thunk/closure;
+    // on python3.drvPath that added ~9.9 MB of Envs while most captures had
+    // only one or two upvalues.  Make sharing pay its way: small captures stay
+    // inline by default so they do not even touch the intern table; wider
+    // repeated tuples share from the second observation.
+    if (nUp <= 8) return UINT32_MAX;
+    return 2;
 }
 
 template <typename Stack>
@@ -580,35 +607,46 @@ inline bool sameTuple(const Env * env,
     return true;
 }
 
-Env * internFromStack(VMState & vm, uint16_t nUp)
+Env * maybeInternFromStack(VMState & vm, uint16_t nUp)
 {
     assert(nUp > 0);
     assert(vm.valueStack.size() >= nUp);
     const size_t base = vm.valueStack.size() - nUp;
+    const uint32_t threshold = shareAfter(nUp);
+    if (threshold == UINT32_MAX)
+        return nullptr;
 
     if (__builtin_expect(enabled(), 1)) {
         uint64_t h = hashStackTuple(vm.valueStack, base, nUp);
         Bucket & b = table()[h];
-        for (Env * env : b) {
-            if (sameTuple(env, vm.valueStack, base, nUp)) {
+        Entry * seed = nullptr;
+        for (Entry & e : b) {
+            if (e.env && sameTuple(e.env, vm.valueStack, base, nUp)) {
+                ++e.observations;
                 vm.valueStack.resize(base);
-                return env;
+                return e.env;
             }
+            if (!e.env && e.nUp == nUp && !seed)
+                seed = &e;
         }
+
+        if (!seed) {
+            b.push_back(Entry{nullptr, 0, nUp});
+            seed = &b.back();
+        }
+        ++seed->observations;
+        if (seed->observations < threshold)
+            return nullptr;
 
         Env * env = Alloc::allocEnv(nUp);
         for (uint16_t i = 0; i < nUp; ++i)
             env->values[i] = vm.valueStack[base + i];
         vm.valueStack.resize(base);
-        b.push_back(env);
+        seed->env = env;
         return env;
     }
 
-    Env * env = Alloc::allocEnv(nUp);
-    for (uint16_t i = 0; i < nUp; ++i)
-        env->values[i] = vm.valueStack[base + i];
-    vm.valueStack.resize(base);
-    return env;
+    return nullptr;
 }
 
 inline void clear() noexcept
@@ -617,9 +655,9 @@ inline void clear() noexcept
 }
 } // namespace envintern
 
-static Env * internUpvalueEnvFromStack(VMState & vm, uint16_t nUp)
+static Env * maybeInternUpvalueEnvFromStack(VMState & vm, uint16_t nUp)
 {
-    return envintern::internFromStack(vm, nUp);
+    return envintern::maybeInternFromStack(vm, nUp);
 }
 
 static void clearEnvInternTable() noexcept
@@ -5011,7 +5049,10 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 if (e) return e[0] != '0';
                 return true;
             }();
-            const bool shareUpvalues = s_envSharing && nUp > 0;
+            Env * closureEnv = nullptr;
+            if (__builtin_expect(s_envSharing && nUp > 0, 0))
+                closureEnv = maybeInternUpvalueEnvFromStack(vm, nUp);
+            const bool shareUpvalues = closureEnv != nullptr;
             Closure * c = Alloc::allocClosure(shareUpvalues ? 0 : nUp);
             V3_STATS_INC(closuresAllocated);
             c->desc = &cu->lambdas[funcIdx];
@@ -5021,16 +5062,18 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // the with-target block beneath.  Build capturedWiths
             // outermost-first by filling reverse into the ListVec.
             //
-            // env-sharing (default ON, NIX_V3_NO_ENV_SHARING opts out): store
-            // the upvalues in a shared, tenured Env (Closure::upvalEnv) rather than
-            // the inline FAM.  The closure is allocated with a zero-length FAM
-            // when shared; nUpvalues remains the logical count and
-            // closureUpvalue() reads the Env.  This removes the bring-up path's
-            // double storage (closure FAM plus Env).
+            // env-sharing (default ON, NIX_V3_NO_ENV_SHARING opts out): when a
+            // capture tuple recurs enough to pay for the Env header, store the
+            // upvalues in a shared, tenured Env (Closure::upvalEnv) rather than
+            // the inline FAM.  One-off low-arity captures stay inline so the
+            // sharing layer does not add memory relative to the old v3 path.
+            // The closure is allocated with a zero-length FAM when shared;
+            // nUpvalues remains the logical count and closureUpvalue() reads
+            // the Env.
             // Env-aware GC: scavenge walkClosure grays the Env; mark/evac/auditor +
             // closurePostConstructBarrier all branch on upvalEnv (gc.cc/mark_sweep.cc).
             if (__builtin_expect(shareUpvalues, 1)) {
-                c->upvalEnv = internUpvalueEnvFromStack(vm, nUp);
+                c->upvalEnv = closureEnv;
             } else {
                 for (uint16_t i = nUp; i > 0; --i) c->upvalues[i - 1] = pop(vm);
             }
@@ -5347,9 +5390,10 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             }();
             Thunk * t;
             Env * thunkEnv = nullptr;
-            if (__builtin_expect(s_envSharingThunk && nUp > 0, 0)) {
+            if (__builtin_expect(s_envSharingThunk && nUp > 0, 0))
+                thunkEnv = maybeInternUpvalueEnvFromStack(vm, nUp);
+            if (__builtin_expect(thunkEnv != nullptr, 0)) {
                 t = Alloc::allocThunkSuspendedShared(nUp, willHaveWiths);
-                thunkEnv = internUpvalueEnvFromStack(vm, nUp);
                 *reinterpret_cast<Env **>(&t->tail[0]) = thunkEnv;  // Env* @ tail[0]
             } else {
                 t = Alloc::allocThunkSuspended(nUp, willHaveWiths);
