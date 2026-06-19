@@ -911,6 +911,92 @@ static int testCallClosureApp3PapSaturates()
     return 0;
 }
 
+static int testForceAppArity3NoPap()
+{
+    CompilationUnit cu;
+    cu.entryOffset = 0;
+    cu.lambdas.push_back(LambdaDescriptor{
+        .codeOffset = 0,
+        .prologueOffset = 0,
+        .nUpvalues = 0,
+        .nLocals = 3,
+        .arity = 3,
+        .hasFormals = 0,
+        .ellipsis = 0,
+    });
+    cu.lambdaCodeOffsets.push_back(0);
+    cu.code.push_back(encode(OP_GET_LOCAL, 0));
+    cu.code.push_back(encode(OP_GET_LOCAL, 1));
+    cu.code.push_back(encode(OP_ADD));
+    cu.code.push_back(encode(OP_GET_LOCAL, 2));
+    cu.code.push_back(encode(OP_ADD));
+    cu.code.push_back(encode(OP_RETURN));
+
+    Closure * clo = Alloc::allocClosure(0);
+    clo->desc = &cu.lambdas[0];
+    clo->cu = &cu;
+    clo->nUpvalues = 0;
+    clo->capturedWiths = nullptr;
+    closurePostConstructBarrier(clo);
+
+    Value fun;
+    fun.mkClosure(clo);
+    Value a;
+    a.mkInt(40);
+    Value b;
+    b.mkInt(1);
+    Value c;
+    c.mkInt(1);
+
+    ValuePair * inner = Alloc::allocPair();
+    inner->left = fun;
+    inner->right = a;
+    inner->third = b;
+    pairPostConstructBarrier(inner);
+    Value app3Pap;
+    app3Pap.mkPair(Tag::App3, inner);
+
+    ValuePair * outer = Alloc::allocPair();
+    outer->left = app3Pap;
+    outer->right = c;
+    pairPostConstructBarrier(outer);
+    Value app;
+    app.mkPair(Tag::App, outer);
+
+    VMState vm;
+    vm.valueStack.reserve(16);
+    vm.frames.reserve(4);
+    vm.frames.push_back(CallFrame{
+        .cu = &cu,
+        .closure = nullptr,
+        .thunk = nullptr,
+        .ip = 0,
+        .stackBaseOffset = 0,
+        .withStackBase = 0,
+        .flags = 0,
+    });
+
+    uint64_t pairsBefore = allocStats().pairsAllocated;
+    Value r = forceValue(vm, app);
+    uint64_t pairsAfter = allocStats().pairsAllocated;
+
+    if (!r.isInt() || r.asInt() != 42) {
+        std::fprintf(stderr,
+            "testForceAppArity3NoPap: expected 42, got tag=%d val=%lld\n",
+            (int)r.tag(), r.isInt() ? (long long)r.asInt() : 0LL);
+        return 1;
+    }
+    if (pairsAfter != pairsBefore) {
+        std::fprintf(stderr,
+            "testForceAppArity3NoPap: forcing arity-3 App spine allocated %llu ValuePair(s)\n",
+            (unsigned long long)(pairsAfter - pairsBefore));
+        return 1;
+    }
+    std::fprintf(stderr,
+        "testForceAppArity3NoPap: OK (lazy arity-3 App spine saturates without PAP)\n");
+    return 0;
+}
+
 // `if 1 < 2 then 100 else 200` → 100
 static int testIf()
 {
@@ -3700,6 +3786,7 @@ int main()
     rc |= testCallClosure2PrimOpNoPap();
     rc |= testForceApp3Arity2NoPap();
     rc |= testCallClosureApp3PapSaturates();
+    rc |= testForceAppArity3NoPap();
     rc |= testIf();
     rc |= testListConcat();
     rc |= testAttrSelect();

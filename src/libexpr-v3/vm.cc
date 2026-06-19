@@ -3464,6 +3464,13 @@ namespace nix::v3 {
 }
 
 namespace nix::v3 {
+static bool callClosureNExact(
+    VMState & vm,
+    Value fun,
+    const Value * args,
+    uint32_t nArgs,
+    Value & out);
+
 namespace { // re-open anon ns
 
 Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
@@ -8258,6 +8265,16 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     // This collapses the App spine to a tight loop
                     // inside this OP_FORCE handler.
                     size_t i = nRights;
+                    if (i > 2 && i <= kInlineRights) {
+                        Value args[kInlineRights];
+                        for (size_t ai = 0; ai < i; ++ai)
+                            args[ai] = rightAt(i - 1 - ai);
+                        Value exactOut;
+                        if (callClosureNExact(vm, v, args, static_cast<uint32_t>(i), exactOut)) {
+                            v = exactOut;
+                            i = 0;
+                        }
+                    }
                     if (i >= 2) {
                         // Apply the first two source-order args together when
                         // possible; callClosure2 falls back to exact currying.
@@ -13623,6 +13640,16 @@ Value forceValue(VMState & vm, Value v)
                 || v.isAppLike())
                 v = forceValue(vm, v);
             size_t i = nRights;
+            if (i > 2 && i <= kInlineRights) {
+                Value args[kInlineRights];
+                for (size_t ai = 0; ai < i; ++ai)
+                    args[ai] = rightAt(i - 1 - ai);
+                Value exactOut;
+                if (callClosureNExact(vm, v, args, static_cast<uint32_t>(i), exactOut)) {
+                    v = exactOut;
+                    i = 0;
+                }
+            }
             if (i >= 2) {
                 // Apply the first two source-order args together when
                 // possible; callClosure2 falls back to exact currying.
@@ -14421,6 +14448,78 @@ Value forceValue(VMState & vm, Value v)
             thunkSetEvaluated(compressChain[i], v);  // Phase D barrier
     }
     return v;
+}
+
+static bool callClosureNExact(
+    VMState & vm,
+    Value fun,
+    const Value * args,
+    uint32_t nArgs,
+    Value & out)
+{
+    // App-spine force can collect all source-order args at once.  When that
+    // count exactly saturates a closure/primop, enter it directly instead of
+    // building transient PAPs through repeated callClosure().
+    static const bool s_saturatedCall =
+        std::getenv("NIX_V3_NO_SATURATED_CALL") == nullptr;
+    if (!s_saturatedCall || nArgs == 0 || nArgs > 16) return false;
+
+    {
+        Tag ft = fun.tag();
+        if (__builtin_expect(ft == Tag::Thunk || ft == Tag::App
+                             || ft == Tag::App3 || ft == Tag::Slot, 0))
+            fun = forceValue(vm, fun);
+    }
+
+    if (fun.isPrimOp() || fun.tag() == Tag::PrimOpApp) {
+        Value buf[8];
+        const PrimOp * po = nullptr;
+        if (!collectSaturatedPrimOpArgs(fun, args, nArgs, po, buf))
+            return false;
+        out = invokePrimOpDirect(vm, po, buf, false);
+        return true;
+    }
+
+    if (fun.tag() != Tag::Closure || !fun.asClosure()
+        || !fun.asClosure()->desc
+        || fun.asClosure()->desc->arity != nArgs)
+        return false;
+
+    if (__builtin_expect(vm.frames.size() >= kMaxCallDepth, 0))
+        throw std::runtime_error(
+            "v3 callClosureNExact: stack overflow; call depth exceeded "
+            + std::to_string(kMaxCallDepth));
+
+    const Closure * c = fun.asClosure();
+    const LambdaDescriptor * d = c->desc;
+    if (__builtin_expect(nArgs == 2 && d->secondArgIdentityLambda, 0)) {
+        out = args[1];
+        return true;
+    }
+
+    const CompilationUnit * ccu = c->cu ? c->cu : vm.frames.back().cu;
+    size_t exitDepth = vm.frames.size();
+    size_t newBase = vm.valueStack.size();
+    vm.valueStack.resize(newBase + d->nLocals);
+    for (uint32_t i = 0; i < nArgs; ++i)
+        vm.valueStack[newBase + i] = args[i];
+    uint32_t newWithBase = static_cast<uint32_t>(vm.withStack.size());
+    vm.frames.push_back(CallFrame{
+        .cu = ccu,
+        .closure = c,
+        .thunk = nullptr,
+        .ip = d->codeOffset,
+        .stackBaseOffset = static_cast<uint32_t>(newBase),
+        .withStackBase = newWithBase,
+        .flags = 0,
+    });
+    pushCapturedWiths(vm, c->capturedWiths);
+
+    static const bool s_leafCallFast =
+        std::getenv("NIX_V3_NO_LEAFCALL_FAST") == nullptr;
+    const bool reuseScope = s_leafCallFast && currentDispatchVM() == &vm;
+    out = dispatchLoop(vm, exitDepth, reuseScope);
+    return true;
 }
 
 // T1 (LIST_ITERATION_FIX_PLAN_2026-06-08) — saturated 2-arg call.
