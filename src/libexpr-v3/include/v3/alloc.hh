@@ -380,7 +380,7 @@ struct Bindings
     // never depends on the bound.
     class Cursor {
     public:
-        static constexpr uint32_t kMaxLayers = 8;
+        static constexpr uint32_t kMaxLayers = 16;
 
         explicit Cursor(const Bindings * b) noexcept
         {

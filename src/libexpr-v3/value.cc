@@ -10,6 +10,7 @@
 #include "v3/ir.hh"
 
 #include <algorithm>
+#include <cassert>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -209,6 +210,19 @@ const Bindings * Bindings::materialize() const
             self->realizeMapAttrsEntry(&self->entries[i]);
             out->entries[i] = self->entries[i];
         }
+        bindingsPostConstructBarrier(out);
+        s_matMemo.emplace(this, out);
+        return out;
+    }
+
+    if (chainDepth() <= Cursor::kMaxLayers) {
+        const uint32_t kExact = countDistinct();
+        Bindings * out = Alloc::allocBindings(kExact);
+        Cursor c(this);
+        uint32_t k = 0;
+        while (const Entry * e = c.next())
+            out->entries[k++] = *e;
+        assert(k == kExact);
         bindingsPostConstructBarrier(out);
         s_matMemo.emplace(this, out);
         return out;
