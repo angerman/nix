@@ -3035,6 +3035,52 @@ inline bool applyForceWriteback(VMState & vm)
     return true;
 }
 
+enum class MapAttrsSelectResult : uint8_t {
+    NotHandled,
+    Pushed,
+    Force,
+};
+
+[[gnu::always_inline]] inline bool shouldForceSelectedEntry(
+    const Bindings * b, const Value & slot) noexcept
+{
+    if (__builtin_expect(b && b->isMapAttrs(), 0))
+        return needsForce(slot);
+    return slot.isAppLike() && !isUnderappliedClosurePap(slot);
+}
+
+[[gnu::always_inline]] inline MapAttrsSelectResult tryPushDirectMapAttrsEntry(
+    VMState & vm, Bindings * b, uint32_t slotIdx, uint32_t resumeIp)
+{
+    if (__builtin_expect(!b || !b->isMapAttrs() || slotIdx >= b->size, 1))
+        return MapAttrsSelectResult::NotHandled;
+    Bindings::Entry & e = b->entries[slotIdx];
+    if (__builtin_expect((e.pos & Bindings::kMapAttrsUnrealizedPosBit) == 0, 0))
+        return MapAttrsSelectResult::NotHandled;
+
+    Value nameStr = Bindings::makeMapAttrsNameValue(e.name);
+    Value src = e.value;
+    Value mapped = callClosure2(vm, b->aux, nameStr, src);
+    e.pos &= Bindings::kPosMask;
+    bindingsSetValue(b, slotIdx, mapped);
+
+    Value & slot = b->entries[slotIdx].value;
+    if (shouldForceSelectedEntry(b, slot)) {
+        push(vm, slot);
+        CallFrame & f = vm.frames.back();
+        armKeepBeltCheck(f);
+        f.forceWriteTarget = &slot;
+        f.flags |= CFF_FORCE_WB_PTR_KEEP | CFF_FORCE_RETRY;
+        if (__builtin_expect(g_sharedWbDetect, 0))
+            armedWritebackValue()[f.forceWriteTarget] = *f.forceWriteTarget;
+        f.ip = resumeIp;
+        return MapAttrsSelectResult::Force;
+    }
+
+    push(vm, slot);
+    return MapAttrsSelectResult::Pushed;
+}
+
 /// NIX_TRACE_EVAL helpers used by OP_FORCE / OP_RETURN to emit
 /// F / W events whenever a CFF_THUNK_RETURN frame is pushed or
 /// popped.  Definitions hoisted here so both dispatchLoop (which
@@ -9582,8 +9628,12 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 }
             }
             if (hitSlot != UINT32_MAX) {
-                if (b->isMapAttrs())
-                    b->realizeMapAttrsEntry(&b->entries[hitSlot]);
+                MapAttrsSelectResult mapAttrsSelect =
+                    tryPushDirectMapAttrsEntry(vm, b, hitSlot, ip);
+                if (mapAttrsSelect == MapAttrsSelectResult::Force)
+                    goto op_force_slow;
+                if (mapAttrsSelect == MapAttrsSelectResult::Pushed)
+                    break;
                 Value & slot = b->entries[hitSlot].value;
                 // 2026-05-17: iterative force + memoizing writeback for
                 // mapAttrs/genList App entries.  Previously this site
@@ -9606,8 +9656,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 // derivationStrict fell back to /v3-fake-store/, diverging the
                 // drvPath of every package that depends on python3.  Push the PAP
                 // directly (no force, no writeback) — mirrors OP_FORCE (vm.cc:7161).
-                if (__builtin_expect(slot.isAppLike(), 0)
-                    && !isUnderappliedClosurePap(slot)) {
+                if (__builtin_expect(shouldForceSelectedEntry(b, slot), 0)) {
                     push(vm, slot);
                     CallFrame & f = vm.frames.back();
                     armKeepBeltCheck(f);  // C-1 belt
@@ -9783,15 +9832,18 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 evicted.slot     = lo;
                 ic.evictIdx = (ic.evictIdx + 1)
                     % CompilationUnit::AttrSelectIC::kWays;
-                if (b->isMapAttrs())
-                    b->realizeMapAttrsEntry(&b->entries[lo]);
+                MapAttrsSelectResult mapAttrsSelect =
+                    tryPushDirectMapAttrsEntry(vm, b, lo, ip);
+                if (mapAttrsSelect == MapAttrsSelectResult::Force)
+                    goto op_force_slow;
+                if (mapAttrsSelect == MapAttrsSelectResult::Pushed)
+                    break;
                 Value & slot = b->entries[lo].value;
                 // 2026-05-17: iterative force + memoizing writeback
                 // (IC install path).  Mirror of the IC HIT path above —
                 // see comment there for rationale (incl. the 2026-06-11
                 // under-applied-PAP writeback-poisoning guard).
-                if (__builtin_expect(slot.isAppLike(), 0)
-                    && !isUnderappliedClosurePap(slot)) {
+                if (__builtin_expect(shouldForceSelectedEntry(b, slot), 0)) {
                     push(vm, slot);
                     CallFrame & f = vm.frames.back();
                     armKeepBeltCheck(f);  // C-1 belt
@@ -10059,6 +10111,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // a parent-layer hit pushes without arming (no shared-parent write).
             Value * found = nullptr;
             bool dynLeafSafe = true;
+            Bindings * directMapAttrsB = nullptr;
+            uint32_t directMapAttrsSlot = UINT32_MAX;
             if (__builtin_expect(dynB->isChain(), 0)) {
                 if (g_chainLookupSelect) {
                     for (const Bindings * L = dynB; L; L = L->parent) {
@@ -10073,7 +10127,16 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     found = dynB->lookup(id);
                 }
             } else {
-                found = dynB->lookup(id);
+                if (__builtin_expect(dynB->isMapAttrs(), 0)) {
+                    if (Bindings::Entry * e = dynB->lookupLocalEntry(id)) {
+                        directMapAttrsB = dynB;
+                        directMapAttrsSlot =
+                            static_cast<uint32_t>(e - dynB->entries);
+                        found = &e->value;
+                    }
+                } else {
+                    found = dynB->lookup(id);
+                }
             }
             if (!found)
                 // #678 — match TW phrasing
@@ -10094,8 +10157,17 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // it to its result type and poisons the (shared) entry (the python3
             // passthru.pythonAtLeast / firefox optionalString PAP->result bug).
             // Mirrors OP_FORCE (vm.cc:7161) + the OP_ATTRS_SELECT sites above.
-            if (__builtin_expect(found->isAppLike(), 0)
-                && !isUnderappliedClosurePap(*found)
+            if (directMapAttrsB) {
+                MapAttrsSelectResult mapAttrsSelect =
+                    tryPushDirectMapAttrsEntry(
+                        vm, directMapAttrsB, directMapAttrsSlot, ip);
+                if (mapAttrsSelect == MapAttrsSelectResult::Force)
+                    goto op_force_slow;
+                if (mapAttrsSelect == MapAttrsSelectResult::Pushed)
+                    break;
+                found = &directMapAttrsB->entries[directMapAttrsSlot].value;
+            }
+            if (__builtin_expect(shouldForceSelectedEntry(directMapAttrsB, *found), 0)
                 && dynLeafSafe) {   // WS-A step 3: no writeback into a shared parent
                 push(vm, *found);
                 CallFrame & f = vm.frames.back();
@@ -14241,6 +14313,8 @@ Value callClosure2(VMState & vm, Value fun, Value arg1, Value arg2)
             && fun.asClosure()->desc->arity == 2) {
             const Closure * c = fun.asClosure();
             const LambdaDescriptor * d = c->desc;
+            if (__builtin_expect(d->secondArgIdentityLambda, 0))
+                return arg2;
             const CompilationUnit * ccu = c->cu ? c->cu : vm.frames.back().cu;
             size_t exitDepth = vm.frames.size();
             size_t newBase = vm.valueStack.size();

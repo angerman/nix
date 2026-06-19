@@ -1373,6 +1373,211 @@ static int testPrimMapAttrsNamesDoNotRealize()
     return 0;
 }
 
+static int runPrimMapAttrsSelectNoApp3(bool dynamicName)
+{
+    const PrimOp * mapAttrsPo = findPrimOp("mapAttrs");
+    if (!mapAttrsPo) {
+        std::fprintf(stderr,
+            "testPrimMapAttrsSelectNoApp3: missing mapAttrs primop\n");
+        return 1;
+    }
+    static const PrimOp returnSecondPo{
+        "__smokeReturnSecondSelect", 2, smokeReturnSecond
+    };
+
+    auto m = ir::makeModule();
+    auto entry = m.freshBlock();
+    funcOf(m, 0).entryBlock = entry;
+
+    auto fn = addBinding(m, entry, ir::LitPrimOp{&returnSecondPo});
+    auto aVal = addBinding(m, entry, ir::LitInt{10});
+    auto bVal = addBinding(m, entry, ir::LitInt{20});
+    auto aSym = m.internSymbol("a");
+    auto bSym = m.internSymbol("b");
+    auto attrs = addBinding(m, entry, ir::AttrSet{ { {aSym, aVal}, {bSym, bVal} } });
+    auto mapped = addBinding(m, entry, ir::PrimOpCall{mapAttrsPo, {fn, attrs}});
+    ir::VarId selected;
+    if (dynamicName) {
+        auto name = addBinding(m, entry, ir::LitString{"a"});
+        selected = addBinding(m, entry, ir::AttrSelectDyn{mapped, name});
+    } else {
+        selected = addBinding(m, entry, ir::AttrSelect{mapped, aSym});
+    }
+    setReturn(m, entry, selected);
+
+    ir::computeFreeVars(m);
+    auto cu = compile(m);
+    uint64_t pairsBefore = allocStats().pairsAllocated;
+    Value res = run(cu);
+    uint64_t pairsAfter = allocStats().pairsAllocated;
+    if (!res.isInt() || res.asInt() != 10) {
+        std::fprintf(stderr,
+            "testPrimMapAttrsSelectNoApp3: expected 10 from %s select, got tag=%d\n",
+            dynamicName ? "dynamic" : "static", (int)res.tag());
+        return 1;
+    }
+    if (pairsAfter != pairsBefore) {
+        std::fprintf(stderr,
+            "testPrimMapAttrsSelectNoApp3: %s select allocated %llu ValuePair(s)\n",
+            dynamicName ? "dynamic" : "static",
+            (unsigned long long)(pairsAfter - pairsBefore));
+        return 1;
+    }
+    return 0;
+}
+
+static int testPrimMapAttrsSelectNoApp3()
+{
+    int rc = 0;
+    rc |= runPrimMapAttrsSelectNoApp3(false);
+    rc |= runPrimMapAttrsSelectNoApp3(true);
+    if (rc == 0)
+        std::fprintf(stderr,
+            "testPrimMapAttrsSelectNoApp3: OK (select stays pair-free)\n");
+    return rc;
+}
+
+static int runPrimMapAttrsSetOpNoApp3(const PrimOp * po, const char * name)
+{
+    const PrimOp * mapAttrsPo = findPrimOp("mapAttrs");
+    if (!mapAttrsPo || !po) {
+        std::fprintf(stderr,
+            "testPrimMapAttrsSetOpsNoApp3: missing primop for %s\n", name);
+        return 1;
+    }
+    static const PrimOp returnSecondPo{
+        "__smokeReturnSecondSetOp", 2, smokeReturnSecond
+    };
+
+    auto m = ir::makeModule();
+    auto entry = m.freshBlock();
+    funcOf(m, 0).entryBlock = entry;
+
+    auto fn = addBinding(m, entry, ir::LitPrimOp{&returnSecondPo});
+    auto aVal = addBinding(m, entry, ir::LitInt{10});
+    auto bVal = addBinding(m, entry, ir::LitInt{20});
+    auto aSym = m.internSymbol("a");
+    auto bSym = m.internSymbol("b");
+    auto attrs = addBinding(m, entry, ir::AttrSet{ { {aSym, aVal}, {bSym, bVal} } });
+    auto mapped = addBinding(m, entry, ir::PrimOpCall{mapAttrsPo, {fn, attrs}});
+
+    ir::VarId result;
+    if (std::strcmp(name, "removeAttrs") == 0) {
+        auto removeName = addBinding(m, entry, ir::LitString{"b"});
+        auto removeList = addBinding(m, entry, ir::ListExpr{{removeName}});
+        result = addBinding(m, entry, ir::PrimOpCall{po, {mapped, removeList}});
+    } else {
+        auto keepVal = addBinding(m, entry, ir::LitInt{0});
+        auto keep = addBinding(m, entry, ir::AttrSet{ { {aSym, keepVal} } });
+        result = addBinding(m, entry, ir::PrimOpCall{po, {keep, mapped}});
+    }
+    setReturn(m, entry, result);
+
+    ir::computeFreeVars(m);
+    auto cu = compile(m);
+    uint64_t pairsBefore = allocStats().pairsAllocated;
+    Value res = run(cu);
+    uint64_t pairsAfter = allocStats().pairsAllocated;
+    SymbolId aGlobal = ir::globalInternSymbol("a");
+    if (!res.isAttrs() || !res.asAttrs() || res.asAttrs()->size != 1
+        || !res.asAttrs()->isMapAttrs()
+        || res.asAttrs()->entries[0].name != aGlobal) {
+        std::fprintf(stderr,
+            "testPrimMapAttrsSetOpsNoApp3: unexpected %s result\n", name);
+        return 1;
+    }
+    if (pairsAfter != pairsBefore) {
+        std::fprintf(stderr,
+            "testPrimMapAttrsSetOpsNoApp3: %s allocated %llu ValuePair(s)\n",
+            name, (unsigned long long)(pairsAfter - pairsBefore));
+        return 1;
+    }
+    return 0;
+}
+
+static int testPrimMapAttrsSetOpsNoApp3()
+{
+    int rc = 0;
+    rc |= runPrimMapAttrsSetOpNoApp3(findPrimOp("removeAttrs"), "removeAttrs");
+    rc |= runPrimMapAttrsSetOpNoApp3(findPrimOp("intersectAttrs"), "intersectAttrs");
+    if (rc == 0)
+        std::fprintf(stderr,
+            "testPrimMapAttrsSetOpsNoApp3: OK (set ops preserve lazy MapAttrs)\n");
+    return rc;
+}
+
+static int testPrimMapAttrsValueIdentityNoApps()
+{
+    const PrimOp * mapAttrsPo = findPrimOp("mapAttrs");
+    if (!mapAttrsPo) {
+        std::fprintf(stderr,
+            "testPrimMapAttrsValueIdentityNoApps: missing mapAttrs primop\n");
+        return 1;
+    }
+
+    auto m = ir::makeModule();
+    auto mapperFid = addFunction(m);
+    auto mapperEntry = m.freshBlock();
+    auto nameParam = m.freshVar();
+    auto valueParam = m.freshVar();
+    {
+        auto & f = funcOf(m, mapperFid);
+        f.entryBlock = mapperEntry;
+        f.argName = m.internSymbol("name");
+        f.paramVar = nameParam;
+        f.extraParams.push_back(valueParam);
+        f.name = "mapAttrs-value-identity";
+        setReturn(m, mapperEntry, valueParam);
+    }
+
+    auto entry = m.freshBlock();
+    funcOf(m, 0).entryBlock = entry;
+
+    auto fn = addBinding(m, entry, ir::Lambda{ mapperFid, /*freeVars*/ {} });
+    auto aVal = addBinding(m, entry, ir::LitInt{10});
+    auto bVal = addBinding(m, entry, ir::LitInt{20});
+    auto aSym = m.internSymbol("a");
+    auto bSym = m.internSymbol("b");
+    auto attrs = addBinding(m, entry, ir::AttrSet{ { {aSym, aVal}, {bSym, bVal} } });
+    auto mapped = addBinding(m, entry, ir::PrimOpCall{mapAttrsPo, {fn, attrs}});
+    setReturn(m, entry, mapped);
+
+    ir::computeFreeVars(m);
+    auto cu = compile(m);
+    if (!cu.lambdas[mapperFid].secondArgIdentityLambda) {
+        std::fprintf(stderr,
+            "testPrimMapAttrsValueIdentityNoApps: descriptor flag not set\n");
+        return 1;
+    }
+
+    uint64_t pairsBefore = allocStats().pairsAllocated;
+    Value res = run(cu);
+    uint64_t pairsAfter = allocStats().pairsAllocated;
+    if (pairsAfter != pairsBefore) {
+        std::fprintf(stderr,
+            "testPrimMapAttrsValueIdentityNoApps: allocated %llu ValuePair(s)\n",
+            (unsigned long long)(pairsAfter - pairsBefore));
+        return 1;
+    }
+    if (!res.isAttrs() || !res.asAttrs() || res.asAttrs()->isMapAttrs()
+        || res.asAttrs()->size != 2) {
+        std::fprintf(stderr,
+            "testPrimMapAttrsValueIdentityNoApps: unexpected result shape\n");
+        return 1;
+    }
+    const Value * a = res.asAttrs()->lookup(aSym);
+    const Value * b = res.asAttrs()->lookup(bSym);
+    if (!a || !a->isInt() || a->asInt() != 10
+        || !b || !b->isInt() || b->asInt() != 20) {
+        std::fprintf(stderr,
+            "testPrimMapAttrsValueIdentityNoApps: unexpected values\n");
+        return 1;
+    }
+    std::fprintf(stderr,
+        "testPrimMapAttrsValueIdentityNoApps: OK (value identity copies attrs without Apps)\n");
+    return 0;
+}
+
 // `builtins.head (builtins.tail [10 20 30])` -> 20
 static int testPrimOpHeadTail()
 {
@@ -3058,6 +3263,9 @@ int main()
     rc |= testPrimMapIdentityNoApps();
     rc |= testPrimGenListIdentityNoApps();
     rc |= testPrimMapAttrsNamesDoNotRealize();
+    rc |= testPrimMapAttrsSelectNoApp3();
+    rc |= testPrimMapAttrsSetOpsNoApp3();
+    rc |= testPrimMapAttrsValueIdentityNoApps();
     rc |= testPrimOpHeadTail();
     rc |= testFibonacciSelfApp();
     rc |= testStrictnessRewritesForceOverLit();

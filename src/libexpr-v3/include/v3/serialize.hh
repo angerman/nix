@@ -168,7 +168,12 @@ namespace nix::v3::serialize {
 /// bytecode-incompatible with old (lower.cc) cache entries — bump to
 /// invalidate them.  OPERATING RULE: bump on any incompatible native-
 /// lowering change (the rule that previously covered lower.cc edits).
-constexpr uint32_t kSchemaVersion = 16;
+///
+/// 17 (2026-06-19): LambdaDescriptor serialises
+/// `secondArgIdentityLambda` for the arity-2 `name: value: value`
+/// peephole used by mapAttrs/callClosure2.  Cache-loaded CUs must not
+/// silently lose the flag and fall back to per-entry App3 allocation.
+constexpr uint32_t kSchemaVersion = 17;
 
 /// 8-byte magic prefix at the start of every serialized blob.
 /// Includes a discriminator so format mismatches are detected early.

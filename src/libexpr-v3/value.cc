@@ -127,6 +127,22 @@ void Bindings::clearMaterializeMemo()
     s_matMemo.clear();
 }
 
+Value Bindings::makeMapAttrsNameValue(SymbolId nameId) noexcept
+{
+    const auto & symTab = ir::globalSymbolTable();
+    std::string fallback;
+    std::string_view name =
+        nameId < symTab.size()
+            ? std::string_view(symTab[nameId])
+            : std::string_view(fallback = std::to_string(nameId));
+    char * nameBuf = Alloc::allocChars(name.size() + 1);
+    std::memcpy(nameBuf, name.data(), name.size());
+    nameBuf[name.size()] = '\0';
+    Value nameStr;
+    nameStr.mkString(nameBuf);
+    return nameStr;
+}
+
 void Bindings::realizeMapAttrsEntry(Entry * e) noexcept
 {
     if (!e || !isMapAttrs()) return;
@@ -134,17 +150,7 @@ void Bindings::realizeMapAttrsEntry(Entry * e) noexcept
     // and tagged the pos word.  Do not key on Value shape: the mapped result may
     // legitimately force to any tag later.
     if ((e->pos & kMapAttrsUnrealizedPosBit) == 0) return;
-    const auto & symTab = ir::globalSymbolTable();
-    std::string fallback;
-    std::string_view name =
-        e->name < symTab.size()
-            ? std::string_view(symTab[e->name])
-            : std::string_view(fallback = std::to_string(e->name));
-    char * nameBuf = Alloc::allocChars(name.size() + 1);
-    std::memcpy(nameBuf, name.data(), name.size());
-    nameBuf[name.size()] = '\0';
-    Value nameStr;
-    nameStr.mkString(nameBuf);
+    Value nameStr = makeMapAttrsNameValue(e->name);
     Value src = e->value;
 
     ValuePair * pp = Alloc::allocPair();

@@ -441,6 +441,48 @@ std::mutex & registryMutex()
 // <value>` phrasing in place of the v3-internal typeError.
 static std::string expectedTypeButFound(const char * expected, const Value & v);
 
+template <typename F>
+inline void forEachEntryNoMapAttrsRealize(const Bindings * b, F && f)
+{
+    if (!b) return;
+    if (b->isChain()) {
+        Bindings::Cursor c(b);
+        while (const Bindings::Entry * e = c.next()) f(*e);
+        return;
+    }
+    for (uint32_t i = 0; i < b->size; ++i) f(b->entries[i]);
+}
+
+inline const Bindings::Entry * lookupEntryNoMapAttrsRealize(
+    const Bindings * b, SymbolId name) noexcept
+{
+    for (const Bindings * cur = b; cur;
+         cur = cur->isChain() ? cur->parent : nullptr) {
+        if (const Bindings::Entry * e = cur->lookupLocalEntry(name))
+            return e;
+    }
+    return nullptr;
+}
+
+template <typename Keep>
+inline Bindings * copyMapAttrsSubset(const Bindings * src, uint32_t n, Keep && keep)
+{
+    Bindings * result = Alloc::allocBindings(n);
+    if (n > 0) {
+        result->kind = uint8_t(Bindings::Kind::MapAttrs);
+        result->parent = src->parent;
+        result->aux = src->aux;
+    }
+    uint32_t k = 0;
+    for (uint32_t i = 0; i < src->size; ++i) {
+        const Bindings::Entry & e = src->entries[i];
+        if (keep(e.name))
+            bindingsSetEntry(result, k++, e);
+    }
+    bindingsPostConstructBarrier(result);
+    return result;
+}
+
 inline bool valueEqual(VMState & vm, Value a0, Value b0)
 {
     // A12b (2026-05-22): iterative valueEqual via explicit work
@@ -1989,6 +2031,18 @@ void primRemoveAttrs(EvalState & state, Value * args, Value & out)
         requireNoStringContext(state, el, "removeAttrs");
         toRemove.insert(vmIntern(state, el.asString()));
     }
+    if (src->isMapAttrs()) {
+        uint32_t kExact = 0;
+        for (uint32_t i = 0; i < src->size; ++i)
+            if (toRemove.count(src->entries[i].name) == 0)
+                ++kExact;
+        Bindings * result = copyMapAttrsSubset(
+            src, kExact,
+            [&](SymbolId name) { return toRemove.count(name) == 0; });
+        V3_STATS_INC(attrsetsAllocated);
+        out.mkAttrs(result);
+        return;
+    }
     // #747 two-pass to avoid arena slack: pass 1 counts kept
     // entries, pass 2 allocates exact and fills.  Without this, the
     // original allocBindings(src->size) call pinned the full src
@@ -2050,23 +2104,29 @@ void primIntersectAttrs(EvalState &, Value * args, Value & out)
     // #746/#747: a single-pass over-allocate of |src| was 386.3 MB of
     // pure waste from 1664 calls).
     uint32_t kExact = 0;
-    iter->forEach([&](const Bindings::Entry & e) {
-        if (search->lookupEntry(e.name)) ++kExact;
+    forEachEntryNoMapAttrsRealize(iter, [&](const Bindings::Entry & e) {
+        if (search->has(e.name)) ++kExact;
     });
     Bindings * result = Alloc::allocBindings(kExact);
+    if (src->isMapAttrs() && kExact > 0) {
+        result->kind = uint8_t(Bindings::Kind::MapAttrs);
+        result->parent = src->parent;
+        result->aux = src->aux;
+    }
     V3_STATS_INC(attrsetsAllocated);
     // Pass 2: fill — always emit the `src` entry (e2's value wins).
     uint32_t k = 0;
     if (iterKeep) {
         // iter == keep: look the matched entry up in src (the value side).
-        iter->forEach([&](const Bindings::Entry & e) {
-            if (const Bindings::Entry * se = src->lookupEntry(e.name))
+        forEachEntryNoMapAttrsRealize(iter, [&](const Bindings::Entry & e) {
+            if (const Bindings::Entry * se =
+                    lookupEntryNoMapAttrsRealize(src, e.name))
                 bindingsSetEntry(result, k++, *se);  // Phase D
         });
     } else {
         // iter == src: emit the src entry directly when its name is in keep.
-        iter->forEach([&](const Bindings::Entry & e) {
-            if (keep->lookupEntry(e.name))
+        forEachEntryNoMapAttrsRealize(iter, [&](const Bindings::Entry & e) {
+            if (keep->has(e.name))
                 bindingsSetEntry(result, k++, e);  // Phase D
         });
     }
@@ -2082,6 +2142,25 @@ void primMapAttrs(EvalState &, Value * args, Value & out)
     if (!src) { out = args[1]; return; }
     uint32_t n = src->countDistinct();
     if (n == 0) { out.mkAttrs(Alloc::allocBindings(0)); return; }
+    if (!src->isChain()
+        && fn.tag() == Tag::Closure
+        && fn.asClosure()
+        && fn.asClosure()->desc
+        && fn.asClosure()->desc->secondArgIdentityLambda) {
+        Bindings * result = Alloc::allocBindings(src->size);
+        if (src->isMapAttrs()) {
+            result->kind = uint8_t(Bindings::Kind::MapAttrs);
+            result->parent = src->parent;
+            result->aux = src->aux;
+        }
+        for (uint32_t i = 0; i < src->size; ++i)
+            bindingsSetEntry(result, i, src->entries[i]);
+        bindingsPostConstructBarrier(result);
+        V3_STATS_INC(attrsetsAllocated);
+        recordBindingsOrigin(result, 0, "primMapAttrs.identity");
+        out.mkAttrs(result);
+        return;
+    }
     Bindings * result = Alloc::allocBindings(n);
     result->kind = uint8_t(Bindings::Kind::MapAttrs);
     result->parent = src;

@@ -2600,6 +2600,39 @@ struct Emitter
                 unit.lambdas[fid].identityLambda = true;
         }
 
+        // mapAttrs identity-value callback detection.  The common
+        // `name: value: value` mapper is an arity-2 closure after eval/apply
+        // collapse and compiles to a direct return of slot 1.  Mark it so
+        // primMapAttrs can copy the binding table without installing one lazy
+        // App3/MapAttrs cell per entry.
+        if (fid != 0
+            && f.argName != ir::kInvalidSymbol
+            && f.extraParams.size() == 1
+            && !f.hasFormals
+            && f.freeVars.empty()
+            && unit.code.size() == codeStart + 2)
+        {
+            const Instruction i0 = unit.code[codeStart];
+            const Instruction i1 = unit.code[codeStart + 1];
+            if (decodeOp(i0) == OP_GET_LOCAL
+                && decodeOperand(i0) == 1
+                && decodeOp(i1) == OP_RETURN)
+            {
+                unit.lambdas[fid].secondArgIdentityLambda = true;
+            }
+        }
+        if (fid != 0
+            && f.argName != ir::kInvalidSymbol
+            && f.extraParams.size() == 1
+            && !f.hasFormals
+            && f.freeVars.empty()
+            && unit.code.size() == codeStart + 1)
+        {
+            const Instruction i0 = unit.code[codeStart];
+            if (decodeOp(i0) == OP_R_RETURN && decodeOperand(i0) == 1)
+                unit.lambdas[fid].secondArgIdentityLambda = true;
+        }
+
         unit.lambdaCodeOffsets[fid] = codeStart;
 
         ctx = nullptr;

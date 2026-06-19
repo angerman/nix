@@ -852,6 +852,7 @@ std::string serializeCU(const CompilationUnit & cu)
         // serialize.hh kSchemaVersion comment for rationale.
         w.u32(l.selectorSym);
         w.u8(l.identityLambda ? 1 : 0);
+        w.u8(l.secondArgIdentityLambda ? 1 : 0);
     }
 
     // Section: lambdaCodeOffsets.
@@ -1054,6 +1055,7 @@ CompilationUnit deserializeCU(std::string_view blob)
             // Schema 12 (#814): emit-time peephole flags.
             l.selectorSym    = r.u32();
             l.identityLambda = (r.u8() != 0);
+            l.secondArgIdentityLambda = (r.u8() != 0);
             cu.lambdas.push_back(std::move(l));
         }
     }

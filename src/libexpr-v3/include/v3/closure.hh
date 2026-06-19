@@ -459,6 +459,10 @@ struct LambdaDescriptor
     /// Set in emit.cc next to the selectorSym detection block.
     bool identityLambda = false;
 
+    /// MapAttrs/callClosure2 projection fast path.  True only for a simple
+    /// arity-2 lambda whose body is exactly `name: value: value`.
+    bool secondArgIdentityLambda = false;
+
     /// #495: native intrinsic kind.  When recognised at lower-time,
     /// the lambda's body matches a canonical Nix-stdlib pattern (lib.fix,
     /// lib.extends, lib.composeExtensions, ...) and OP_CALL dispatches
