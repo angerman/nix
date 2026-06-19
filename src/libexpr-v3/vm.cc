@@ -1571,13 +1571,67 @@ inline Bindings * mergeBindings(const Bindings * a, const Bindings * b,
     // construction, but the guard keeps the invariant explicit).
     if (!b->isChain() && b->size == 0) return const_cast<Bindings *>(a);
 
-    // Not composing — materialise any Chain input so the two-pass
-    // sorted-merge below (and the fresh-chain construction) see flat
-    // `entries[]`.  `(big_chain) // {x}` only reaches here when the
-    // depth cap is hit or `b` is itself a chain; the common deep-stack
-    // case is handled by composition above.
-    if (a->isChain()) a = a->materialize();
-    if (b->isChain()) b = b->materialize();
+    // Not composing and at least one input is still a Chain.  Stream the
+    // visible entries from both inputs with Cursor and build the final Sorted
+    // merge directly, instead of first materialising flat copies of the
+    // inputs and then copying again into `out`.
+    auto mergeByCursor = [&]() -> Bindings * {
+        const uint32_t naVisible = a->countDistinct();
+        const uint32_t nbVisible = b->countDistinct();
+        if (naVisible == 0 && nbVisible > 0) return const_cast<Bindings *>(b);
+        if (nbVisible == 0 && naVisible > 0) return const_cast<Bindings *>(a);
+
+        uint32_t kExact = 0;
+        {
+            Bindings::Cursor ca(a), cb(b);
+            const Bindings::Entry * ea = ca.next();
+            const Bindings::Entry * eb = cb.next();
+            while (ea && eb) {
+                if (ea->name < eb->name)      { ++kExact; ea = ca.next(); }
+                else if (ea->name > eb->name) { ++kExact; eb = cb.next(); }
+                else                          { ++kExact; ea = ca.next(); eb = cb.next(); }
+            }
+            while (ea) { ++kExact; ea = ca.next(); }
+            while (eb) { ++kExact; eb = cb.next(); }
+        }
+
+        Bindings * out = Alloc::allocBindings(kExact);
+        {
+            const uint8_t s = static_cast<uint8_t>(siteId);
+            if (s < AllocStats::kMergeBindingsSiteSlots)
+                allocStats().mergeBindingsBytesBySite[s]
+                    += uint64_t(kExact) * sizeof(Bindings::Entry);
+        }
+
+        Bindings::Cursor ca(a), cb(b);
+        const Bindings::Entry * ea = ca.next();
+        const Bindings::Entry * eb = cb.next();
+        uint32_t k = 0;
+        auto copyA = [&]() {
+            bindingsSetEntry(out, k++, *ea);  // Phase D
+            ea = ca.next();
+        };
+        auto copyB = [&]() {
+            bindingsSetEntry(out, k++, *eb);  // Phase D
+            eb = cb.next();
+        };
+        while (ea && eb) {
+            if (ea->name < eb->name) {
+                copyA();
+            } else if (ea->name > eb->name) {
+                copyB();
+            } else {
+                copyB();       // duplicate; b wins (incl. its position)
+                ea = ca.next();
+            }
+        }
+        while (ea) copyA();
+        while (eb) copyB();
+        return out;
+    };
+
+    if (a->isChain() || b->isChain())
+        return mergeByCursor();
 
     // Sorted-merge two attrsets (b wins on duplicate keys).  Per-attr
     // positions in attrPosTable are keyed by (Bindings*, SymbolId), so
