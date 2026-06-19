@@ -1640,6 +1640,54 @@ static int testPrimMapAttrsSelectNoApp3()
     return rc;
 }
 
+static int testPrimMapAttrsEmptyUpdateNoApp3()
+{
+    const PrimOp * mapAttrsPo = findPrimOp("mapAttrs");
+    if (!mapAttrsPo) {
+        std::fprintf(stderr,
+            "testPrimMapAttrsEmptyUpdateNoApp3: missing mapAttrs primop\n");
+        return 1;
+    }
+    static const PrimOp returnSecondPo{
+        "__smokeReturnSecondEmptyUpdate", 2, smokeReturnSecond
+    };
+
+    auto m = ir::makeModule();
+    auto entry = m.freshBlock();
+    funcOf(m, 0).entryBlock = entry;
+
+    auto fn = addBinding(m, entry, ir::LitPrimOp{&returnSecondPo});
+    auto aVal = addBinding(m, entry, ir::LitInt{10});
+    auto bVal = addBinding(m, entry, ir::LitInt{20});
+    auto aSym = m.internSymbol("a");
+    auto bSym = m.internSymbol("b");
+    auto attrs = addBinding(m, entry, ir::AttrSet{ { {aSym, aVal}, {bSym, bVal} } });
+    auto mapped = addBinding(m, entry, ir::PrimOpCall{mapAttrsPo, {fn, attrs}});
+    auto empty = addBinding(m, entry, ir::AttrSet{/*entries*/ {}});
+    auto updated = addBinding(m, entry, ir::Update{mapped, empty});
+    setReturn(m, entry, updated);
+
+    ir::computeFreeVars(m);
+    auto cu = compile(m);
+    uint64_t pairsBefore = allocStats().pairsAllocated;
+    Value res = run(cu);
+    uint64_t pairsAfter = allocStats().pairsAllocated;
+    if (!res.isAttrs() || !res.asAttrs() || !res.asAttrs()->isMapAttrs()) {
+        std::fprintf(stderr,
+            "testPrimMapAttrsEmptyUpdateNoApp3: result did not preserve MapAttrs\n");
+        return 1;
+    }
+    if (pairsAfter != pairsBefore) {
+        std::fprintf(stderr,
+            "testPrimMapAttrsEmptyUpdateNoApp3: empty update allocated %llu ValuePair(s)\n",
+            (unsigned long long)(pairsAfter - pairsBefore));
+        return 1;
+    }
+    std::fprintf(stderr,
+        "testPrimMapAttrsEmptyUpdateNoApp3: OK (empty // keeps MapAttrs lazy)\n");
+    return 0;
+}
+
 static int testPrimMapAttrsNestedSelectUsesMappedValue()
 {
     const PrimOp * mapAttrsPo = findPrimOp("mapAttrs");
@@ -3520,6 +3568,7 @@ int main()
     rc |= testPrimMapAttrsNestedNamesDoNotRealize();
     rc |= testPrimAttrValuesMapAttrsSortsWithOneAppPerValue();
     rc |= testPrimMapAttrsSelectNoApp3();
+    rc |= testPrimMapAttrsEmptyUpdateNoApp3();
     rc |= testPrimMapAttrsNestedSelectUsesMappedValue();
     rc |= testPrimMapAttrsSetOpsNoApp3();
     rc |= testPrimMapAttrsValueIdentityNoApps();

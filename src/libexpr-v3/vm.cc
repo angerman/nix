@@ -1552,11 +1552,6 @@ inline Bindings * mergeBindings(const Bindings * a, const Bindings * b,
                                 MergeBindingsSite siteId =
                                     MergeBindingsSite::AttrsUpdate)
 {
-    if (a && a->isMapAttrs())
-        a = a->materialize();
-    if (b && b->isMapAttrs())
-        b = b->materialize();
-
     // #821 per-site call counter — bumped at function entry so the
     // empty-operand short-circuit (below) contributes to the call
     // count even though it doesn't allocate; the BYTES counter is
@@ -1596,6 +1591,19 @@ inline Bindings * mergeBindings(const Bindings * a, const Bindings * b,
         ++allocStats().mergeBindingsNaHist[bucket_of(a ? a->size : 0)];
         ++allocStats().mergeBindingsNbHist[bucket_of(b ? b->size : 0)];
     }
+
+    // `a // {}` / `{} // b`: return the non-empty operand before
+    // materialising MapAttrs inputs.  The previous ordering flattened a lazy
+    // mapped attrset even when the other operand was empty, paying a full
+    // Bindings copy plus one App3 cell per mapped entry for a merge whose result
+    // is just the original operand.
+    if (b && !b->isChain() && b->size == 0) return const_cast<Bindings *>(a);
+    if (a && !a->isChain() && a->size == 0) return const_cast<Bindings *>(b);
+
+    if (a && a->isMapAttrs())
+        a = a->materialize();
+    if (b && b->isMapAttrs())
+        b = b->materialize();
 
     // Chain knobs — hoisted so both the composition path (just below)
     // and the construction path (further down) share them.  Function-
