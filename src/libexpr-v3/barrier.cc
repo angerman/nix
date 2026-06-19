@@ -49,6 +49,12 @@ thread_local std::vector<Value *> tl_standaloneCells;
 /// the same lambda reads a stale cached pointer.
 thread_local std::vector<Closure **> tl_singletonClosureRegistry;
 
+/// Captured-withs singleton cache slots are process-global in vm.cc, so this
+/// registry is process-global too.  The VM already treats that cache as a
+/// single-threaded evaluation cache; matching its storage avoids missing slots
+/// when a second thread touches the thread-local barrier state first.
+std::vector<ListVec **> g_singletonCapturedWithsRegistry;
+
 // PhD-6 last-writer instrument (gated): cell address -> the barrier setter that
 // last wrote it.  Consulted by the post-scavenge AUDIT to report HOW an offending
 // Bindings entry was last written (pins the missed-root write path vs reasoning).
@@ -69,6 +75,11 @@ std::vector<Value *> & standaloneCellRoots() noexcept
 std::vector<Closure **> & singletonClosureRegistry() noexcept
 {
     return tl_singletonClosureRegistry;
+}
+
+std::vector<ListVec **> & singletonCapturedWithsRegistry() noexcept
+{
+    return g_singletonCapturedWithsRegistry;
 }
 
 // PhD-6 last-writer instrument: storage accessor + gate (on under the AUDIT

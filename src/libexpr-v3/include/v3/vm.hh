@@ -214,5 +214,8 @@ Value runLambda(const CompilationUnit & cu, uint32_t funcIdx,
 uint64_t getCapWithsHits()   noexcept;
 uint64_t getCapWithsMisses() noexcept;
 uint64_t getCapWithsEvicts() noexcept;
+/// Called by the minor scavenger after walking forwarded cached ListVecs.
+/// Refreshes raw lookup keys so reused nursery addresses cannot false-hit.
+void refreshCapWithsCacheAfterScavenge() noexcept;
 
 } // namespace nix::v3

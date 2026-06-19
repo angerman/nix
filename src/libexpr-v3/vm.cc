@@ -2652,30 +2652,24 @@ inline Value withLookup(VMState & vm, SymbolId name)
 // for 1-element capturedWiths ListVecs.
 //
 // T1_3_PAIRS_LISTS_ATTR_2026-05-27 measured 544 K MAKE_THUNK allocs on HNE
-// with avg-size 1.04, max 2 — overwhelmingly nWiths==1.  Each 1-element
-// ListVec is 32 B (16 B header + 16 B element).  Interning shares one
-// tenured-arena ListVec across all Thunks/Closures capturing the same
+// with avg-size 1.04, max 2 — overwhelmingly nWiths==1.  After the 8-byte
+// Value flip, each 1-element ListVec is 16 B before allocator rounding.
+// Interning shares one ListVec across all Thunks/Closures capturing the same
 // with-target, eliminating ~95% of the per-call alloc cost.
 //
 // Correctness model:
 //   * ListVec is set-once at MAKE time and read-only thereafter.
 //     pushCapturedWiths only READS via ->size / ->elems[i].  Sharing
 //     is therefore safe — no inter-thunk mutation.
-//   * Allocated arena-resident (Alloc::allocList).  Arena pointers
-//     are stable for the process lifetime (no compaction).
-//   * Phase D / nursery generational correctness: first miss installs
-//     the ListVec and calls listPostConstructBarrier() — if the
-//     with-target was a nursery Value, the ListVec lands on
-//     dirtyContainers and the next scavenge forwards the embedded
-//     payload.  Subsequent cache hits return the SAME pointer, whose
-//     elems[0] has already been forwarded (or will be by the pending
-//     scavenge).  No additional barriers required.
-//   * Cache orphans: when a Value is forwarded by scavenge, ALL live
-//     references to it are updated (it's a root walk).  Cache KEYS
-//     (uint64 copies) are NOT updated; orphaned entries have stale
-//     keys.  No correctness issue (next lookup with the new key
-//     misses → allocates fresh).  Orphan footprint is bounded by
-//     the fixed bucket count.
+//   * Allocated through Alloc::allocList(), so the ListVec itself may live in
+//     the moving nursery.  Cache bucket slots are registered as minor-GC roots;
+//     scavenge forwards them in place before resetting the nursery.
+//   * Phase D / nursery generational correctness: first miss installs the
+//     ListVec and calls listPostConstructBarrier().  If the ListVec is tenured
+//     and its element is young, the dirty list makes the next scavenge walk it.
+//   * Cache keys are refreshed after every scavenge from the forwarded
+//     ListVec::elems[0].  This avoids stale young-address keys false-hitting
+//     after the nursery reuses an old address for a different object.
 //
 // Memory footprint of the cache itself: 4096 buckets * 24 B = 96 KB.
 //
@@ -2710,6 +2704,47 @@ inline size_t hashCapWithsKey(uint64_t tp, uint64_t pr) noexcept
     return static_cast<size_t>(h) & (kCapWithsCacheBuckets - 1);
 }
 
+inline void registerCapWithsCacheSlotsOnce() noexcept
+{
+    static const bool s_registered = [] {
+        auto & roots = singletonCapturedWithsRegistry();
+        roots.reserve(roots.size() + kCapWithsCacheBuckets);
+        for (CapWithsCacheEntry & e : s_capWithsCache)
+            roots.push_back(&e.value);
+        return true;
+    }();
+    (void)s_registered;
+}
+
+inline void clearCapWithsCache() noexcept
+{
+    for (CapWithsCacheEntry & e : s_capWithsCache) {
+        e.key_tag_payload = 0;
+        e.key_payload_raw = 0;
+        e.value = nullptr;
+    }
+}
+
+inline void internalRefreshCapWithsCacheAfterScavenge() noexcept
+{
+    for (CapWithsCacheEntry & e : s_capWithsCache) {
+        if (!e.value) {
+            e.key_tag_payload = 0;
+            e.key_payload_raw = 0;
+            continue;
+        }
+        if (e.value->size != 1) {
+            e.key_tag_payload = 0;
+            e.key_payload_raw = 0;
+            e.value = nullptr;
+            continue;
+        }
+        const Value & v = e.value->elems[0];
+        e.key_tag_payload = v.rawWord();
+        e.key_payload_raw = reinterpret_cast<uint64_t>(v.asRaw());
+    }
+}
+
 /// Intern-or-allocate a 1-element ListVec capturing `v`.  Hit returns
 /// the existing arena pointer in O(1); miss allocates fresh, installs
 /// (overwriting any colliding entry — collisions are cheaper than
@@ -2718,23 +2753,17 @@ inline ListVec * internOrAllocSingletonCapWiths(const Value & v) noexcept
 {
     static const bool s_disabled =
         std::getenv("NIX_V3_NO_CAPWITHS_INTERN") != nullptr;
-    // PhD-6 (2026-06-14): the cache stores raw ListVec* across calls but is NOT a
-    // scavenge root (a C++ static, not arena/VM-stack).  Under a MOVING nursery a
-    // cached entry goes stale the moment its ListVec is forwarded out of the
-    // nursery; a later cache HIT returns the stale pointer (a reused/zeroed slot →
-    // size 0), so `pushCapturedWiths` pushes nothing → the body runs with an empty
-    // captured-`with` scope → "undefined variable" (reproduced as `gnuabi64` on
-    // hello.drvPath under the aggressive 1 MB nursery; BRUTE+AUDIT both miss it
-    // because neither scans this static).  Bypass the cache when the nursery is
-    // active — nursery allocs are cheap bump-pointer (the cache's own retirement
-    // criterion, §"Retirement").  Under the non-moving major-GC default the cache
-    // stays correct AND valuable, so the fast path is unchanged there.
-    if (__builtin_expect(s_disabled || phaseDActive(), 0)) {
+    if (__builtin_expect(s_disabled, 0)) {
         ListVec * lws = Alloc::allocList(1);
         lws->elems[0] = v;
         listPostConstructBarrier(lws);
         return lws;
     }
+    // Under the moving nursery, the cache's static slots are explicit scavenge
+    // roots: gc.cc forwards each ListVec* and then asks vm.cc to refresh the key
+    // from the forwarded element.  That keeps the cache sound without falling
+    // back to one ListVec allocation per captured `with`.
+    registerCapWithsCacheSlotsOnce();
     const uint64_t tp = v.rawWord();
     const uint64_t pr = reinterpret_cast<uint64_t>(v.asRaw());
     const size_t idx = hashCapWithsKey(tp, pr);
@@ -3353,6 +3382,10 @@ namespace nix::v3 {
     uint64_t getCapWithsHits()   noexcept { return internalCapWithsHits(); }
     uint64_t getCapWithsMisses() noexcept { return internalCapWithsMisses(); }
     uint64_t getCapWithsEvicts() noexcept { return internalCapWithsEvicts(); }
+    void refreshCapWithsCacheAfterScavenge() noexcept
+    {
+        internalRefreshCapWithsCacheAfterScavenge();
+    }
 
     thread_local VMState * tlCurrentDispatchVM = nullptr;
     VMState * currentDispatchVM() { return tlCurrentDispatchVM; }
@@ -3848,6 +3881,10 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     // Clear it before mark/sweep so dead Envs can be reclaimed and
                     // no stale Env* remains in the side table after collection.
                     clearEnvInternTable();
+                    // Captured-withs singleton interning is also a weak cache.
+                    // Minor GC forwards/rekeys it, but major GC should not keep
+                    // cache-only ListVecs alive.
+                    clearCapWithsCache();
                     const MajorGcResult gcr = runMajorMarkSweep(vm);
                     // Frame pointers may have been forwarded.
                     // Re-read dispatch locals.

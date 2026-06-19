@@ -1141,9 +1141,19 @@ void Scavenger::run()
         }
     }
 
+    // Captured-withs singleton cache slots.  These are libc/static slots in
+    // vm.cc, not arena objects and not visible from the VM stacks.  Forward the
+    // cached ListVec pointers in place so the singleton cache remains sound
+    // under the moving nursery.
+    for (ListVec ** slot : singletonCapturedWithsRegistry()) {
+        if (slot && *slot)
+            *slot = fwdList(*slot);
+    }
+
     // -- Stage 2: walk graylist ---------------------------------
 
     drain();
+    refreshCapWithsCacheAfterScavenge();
 
     // -- Stage 3: reset bump pointer ----------------------------
     // forward / walked / graylist live in `threadScavengeBuffers()`
@@ -1507,6 +1517,13 @@ void postScavengeAudit(const Nursery & n, const VMState & vm)
         for (Value * cell : standaloneCellRoots()) {
             a.visitValue(*cell, "dirty.cell");
         }
+    }
+
+    // 6d. Captured-withs singleton cache slots.  Mirrors the scavenger's
+    // explicit slot forwarding above.
+    for (ListVec ** slot : singletonCapturedWithsRegistry()) {
+        if (slot && *slot)
+            a.visitList(*slot, "capWithsCache");
     }
 
     // 7. AttrSelectIC entries via reached Closures / Thunks.

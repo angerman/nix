@@ -98,6 +98,11 @@ std::vector<Value *> & standaloneCellRoots() noexcept;
 /// across arena sweeps.
 std::vector<Closure **> & singletonClosureRegistry() noexcept;
 
+/// Registry of singleton captured-withs cache slots.  Each entry is the address
+/// of a `ListVec *` bucket in vm.cc's cache.  Minor scavenge forwards these
+/// slots in place so the cache can stay enabled under the moving nursery.
+std::vector<ListVec **> & singletonCapturedWithsRegistry() noexcept;
+
 // PhD-6 last-writer instrument (gated on V3_DBG_NURSERY_AUDIT via
 // detail::g_dbgCellWriteSite).  Maps a cell address to a string naming the
 // barrier setter that last wrote it AND whether the inter-gen branch fired.

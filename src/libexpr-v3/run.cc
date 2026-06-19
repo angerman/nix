@@ -589,14 +589,17 @@ RootResult runRootExprModule(nix::EvalState & state, ir::Module module)
             uint64_t e = getCapWithsEvicts();
             if (h + m > 0) {
                 double hitRate = 100.0 * (double)h / (double)(h + m);
+                constexpr double oneElemListBytes =
+                    double(sizeof(ListVec) + sizeof(Value));
                 std::fprintf(stderr,
                     "v3-direct capWiths-intern: hits=%llu misses=%llu "
                     "evicts=%llu hitRate=%.1f%% (estimated savings ~%.1f MB "
-                    "@ 32 B/hit)\n",
+                    "@ %.0f B/hit)\n",
                     (unsigned long long)h, (unsigned long long)m,
                     (unsigned long long)e,
                     hitRate,
-                    h * 32.0 / 1e6);
+                    h * oneElemListBytes / 1e6,
+                    oneElemListBytes);
             }
         }
         // #719 (#702 falsifier chain, 2026-05-21): three-way RSS
