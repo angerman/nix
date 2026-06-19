@@ -23,6 +23,21 @@ nursery makes alloc bump-cheap and the live-byte reduction is ~2.9%. **So env-
 sharing may land sub-bar on both axes.** Stage 1 is built to MEASURE this before
 the high-risk GC stages — the honest off-ramp.
 
+## KEY DE-RISKER (found 2026-06-19): the Env GC infrastructure already exists
+
+v3 already has `struct Env { Env* parent; bool isWithEnv; uint16_t nValues; Value
+values[]; }` (closure.hh:46) — currently used ONLY for let/with scopes (OP_ENTER_LET
+/OP_PUSH_WITH/OP_INHERIT_FROM_INIT), NOT closure upvalues (the comment states the
+design chose inline-FAM upvalues for closures/thunks deliberately). Crucially the
+**GC plumbing for an Env-holding-a-Value[]-FAM is already built + battle-tested**:
+CellType::Env (alloc.hh:1012), allocEnv (alloc.hh:2618), and the mark-sweep + Cheney
+walkers handle CellType::Env (mark_sweep.cc:334/474/1019/1329/1533/1791, gc.cc:1511).
+⇒ stage 2's "make Env a moving-GC object" is LARGELY DONE — env-sharing reuses the
+existing traced Env type instead of introducing a new one. The remaining work is the
+REPRESENTATION rework (closures/thunks reference an upvalue-Env instead of inline FAM)
++ MAKE_CLOSURE/MAKE_THUNK construction + GET_UPVALUE access + the build/share logic.
+This materially lowers the risk + effort of the original blueprint.
+
 ## Staging (each stage: byte-identical + --brute-clean + gated)
 
 **Stage 1 (ES-IMPL-1) — NON-MOVING Env + measure (the off-ramp gate).**
