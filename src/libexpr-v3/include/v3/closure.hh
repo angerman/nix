@@ -70,9 +70,16 @@ struct Closure
     /// closure is invoked, the dispatcher re-pushes these onto the
     /// runtime with-stack so OP_WITH_LOOKUP inside the body finds them.
     ListVec *                capturedWiths;
+    /// Env-sharing (NIX_V3_ENV_SHARING, opt-in bring-up): when non-null, the
+    /// upvalues live in this shared (tenured) Env's values[] instead of the
+    /// inline FAM below — multiple closures from the same capture-set share one
+    /// Env, cutting the per-closure upvalue-copy alloc. GET_UPVALUE reads
+    /// `upvalEnv->values[n]` when set, else `upvalues[n]`. null in the default
+    /// (inline-FAM) path, so the field is inert unless the gate built an Env.
+    Env *                    upvalEnv;
     uint16_t                 nUpvalues;
     uint16_t                 _pad;
-    Value                    upvalues[]; // FAM
+    Value                    upvalues[]; // FAM (unused when upvalEnv != null)
 };
 
 // ---------------------------------------------------------------------------
