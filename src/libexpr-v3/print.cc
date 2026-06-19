@@ -81,6 +81,28 @@ void walkDeepForceRoots(const std::function<void(Value &)> & visit)
     for (auto & v : tlDeepForceRoots) visit(v);
 }
 
+static std::string attrNameString(const std::vector<std::string> & symTab,
+                                  SymbolId name)
+{
+    return name < symTab.size()
+        ? symTab[name]
+        : std::to_string(name);
+}
+
+static std::vector<std::pair<std::string, const Value *>>
+sortedAttrItems(const Bindings * b, const std::vector<std::string> & symTab)
+{
+    std::vector<std::pair<std::string, const Value *>> items;
+    if (!b) return items;
+    items.reserve(b->countDistinct());
+    b->forEach([&](const Bindings::Entry & en) {
+        items.emplace_back(attrNameString(symTab, en.name), &en.value);
+    });
+    std::sort(items.begin(), items.end(),
+              [](auto & a, auto & b) { return a.first < b.first; });
+    return items;
+}
+
 Value forceDeep(VMState & vm, Value v, std::set<const void *> & seen)
 {
     // A12b (2026-05-22): iterative tree walk via `tlDeepForceRoots`
@@ -264,20 +286,15 @@ nlohmann::json toJsonValue(VMState & vm, Value v,
             // stack slot is uniform and zero-cost; it makes the JSON
             // walk match the printer / forceDeep discipline.
             DeepForceGuard g(v);
-            // ChainBindings: materialise so JSON includes the full attrset.
             const Bindings * jb = g.ref().asAttrs();
-            if (jb->isChain()) jb = jb->materialize();
-            for (uint32_t i = 0; i < jb->size; ++i) {
-                auto & en = jb->entries[i];
+            jb->forEach([&](const Bindings::Entry & en) {
                 // #670/#671 follow-on: copy key to owning std::string
                 // before recursive toJsonValue — recursion may force
                 // values that intern new symbols, invalidating any
                 // string_view into the global symbol table.
-                std::string key = (en.name < symTab.size())
-                    ? std::string(symTab[en.name])
-                    : std::to_string(en.name);
+                std::string key = attrNameString(symTab, en.name);
                 obj[std::move(key)] = toJsonValue(vm, en.value, symTab);
-            }
+            });
         }
         return obj;
     }
@@ -384,21 +401,8 @@ void printNixValue(std::ostream & out, const Value & v,
         }
         out << "{ ";
         if (v.asAttrs()) {
-            // ChainBindings: materialise so we print the FULL attrset (overlay
-            // + parent), not just the overlay (no-op for Sorted).
-            const Bindings * pb = v.asAttrs();
-            if (pb->isChain()) pb = pb->materialize();
             // Sort by symbol name for deterministic order matching tw output.
-            std::vector<std::pair<std::string, const Value *>> items;
-            items.reserve(pb->size);
-            for (uint32_t i = 0; i < pb->size; ++i) {
-                auto & en = pb->entries[i];
-                std::string key = (en.name < symTab.size())
-                    ? symTab[en.name] : std::to_string(en.name);
-                items.emplace_back(std::move(key), &en.value);
-            }
-            std::sort(items.begin(), items.end(),
-                      [](auto & a, auto & b) { return a.first < b.first; });
+            auto items = sortedAttrItems(v.asAttrs(), symTab);
             for (auto & [name, val] : items) {
                 printAttrName(out, name);
                 out << " = ";
@@ -470,14 +474,15 @@ static bool tryGetDerivationDrvPath(const Value & v,
     // resolving every SymbolId first).  Derivations have ~5-10 attrs at this
     // level so the linear cost is negligible.
     auto find = [&](std::string_view want) -> const Value * {
-        for (uint32_t i = 0; i < b->size; ++i) {
-            auto & en = b->entries[i];
+        const Value * found = nullptr;
+        b->forEach([&](const Bindings::Entry & en) {
+            if (found) return;
             std::string_view nm = (en.name < symTab.size())
                 ? std::string_view(symTab[en.name])
                 : std::string_view{};
-            if (nm == want) return &en.value;
-        }
-        return nullptr;
+            if (nm == want) found = &en.value;
+        });
+        return found;
     };
     const Value * typeV = find("type");
     if (!typeV || typeV->tag() != Tag::String) return false;
@@ -566,18 +571,7 @@ void printNixValueRich(std::ostream & out, const Value & v,
         }
         out << "{ ";
         if (v.asAttrs()) {
-            const Bindings * pb = v.asAttrs();  // ChainBindings: full view
-            if (pb->isChain()) pb = pb->materialize();
-            std::vector<std::pair<std::string, const Value *>> items;
-            items.reserve(pb->size);
-            for (uint32_t i = 0; i < pb->size; ++i) {
-                auto & en = pb->entries[i];
-                std::string key = (en.name < symTab.size())
-                    ? symTab[en.name] : std::to_string(en.name);
-                items.emplace_back(std::move(key), &en.value);
-            }
-            std::sort(items.begin(), items.end(),
-                      [](auto & a, auto & b) { return a.first < b.first; });
+            auto items = sortedAttrItems(v.asAttrs(), symTab);
             for (auto & [name, val] : items) {
                 printAttrName(out, name);
                 out << " = ";
@@ -726,16 +720,14 @@ void printNixValueRich(std::ostream & out, VMState & vm, const Value & v,
             // Inline force-then-check; can't reuse the const helper
             // because we need to mutate-in-place for cache and the
             // helper's signature is `const Value &`.
-            auto findEntry = [&](std::string_view want) -> Value * {
-                for (uint32_t i = 0; i < b->size; ++i) {
-                    std::string_view nm = (b->entries[i].name < symTab.size())
-                        ? std::string_view(symTab[b->entries[i].name])
-                        : std::string_view{};
-                    if (nm == want) return &b->entries[i].value;
-                }
+            auto findEntry = [&](SymbolId want) -> Value * {
+                if (Bindings::Entry * e = b->lookupEntry(want))
+                    return &e->value;
                 return nullptr;
             };
-            Value * typeV = findEntry("type");
+            static const SymbolId typeId = ir::globalInternSymbol("type");
+            static const SymbolId drvPathId = ir::globalInternSymbol("drvPath");
+            Value * typeV = findEntry(typeId);
             if (typeV) {
                 try { *typeV = forceValue(vm, *typeV); }
                 catch (const std::exception &) { typeV = nullptr; }
@@ -744,7 +736,7 @@ void printNixValueRich(std::ostream & out, VMState & vm, const Value & v,
                 && typeV->asString()
                 && std::string_view(typeV->asString()) == "derivation")
             {
-                Value * drvPathV = findEntry("drvPath");
+                Value * drvPathV = findEntry(drvPathId);
                 if (drvPathV) {
                     try { *drvPathV = forceValue(vm, *drvPathV); }
                     catch (const std::exception &) { drvPathV = nullptr; }
@@ -763,18 +755,7 @@ void printNixValueRich(std::ostream & out, VMState & vm, const Value & v,
         }
         out << "{ ";
         if (forced.asAttrs()) {
-            const Bindings * pb = forced.asAttrs();  // ChainBindings
-            if (pb->isChain()) pb = pb->materialize();
-            std::vector<std::pair<std::string, const Value *>> items;
-            items.reserve(pb->size);
-            for (uint32_t i = 0; i < pb->size; ++i) {
-                auto & en = pb->entries[i];
-                std::string key = (en.name < symTab.size())
-                    ? symTab[en.name] : std::to_string(en.name);
-                items.emplace_back(std::move(key), &en.value);
-            }
-            std::sort(items.begin(), items.end(),
-                      [](auto & a, auto & b) { return a.first < b.first; });
+            auto items = sortedAttrItems(forced.asAttrs(), symTab);
             for (auto & [name, val] : items) {
                 printAttrName(out, name);
                 out << " = ";
