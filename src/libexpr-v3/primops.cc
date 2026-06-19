@@ -780,21 +780,47 @@ void primAttrValues(EvalState &, Value * args, Value & out)
     // Lever A: stream the chain via Cursor (see primAttrNames above).
     const Bindings * src = a.asAttrs();
     uint32_t n = src->totalSize();
-    // Build (name, value) pairs, sort by name, then drop the name.
     auto & symTab = ir::globalSymbolTable();
-    std::vector<std::pair<std::string_view, Value>> pairs;
-    pairs.reserve(n);
-    src->forEach([&](const Bindings::Entry & e) {
-        SymbolId sid = e.name;
-        std::string_view nm = sid < symTab.size()
+    auto nameView = [&](SymbolId sid) -> std::string_view {
+        return sid < symTab.size()
             ? std::string_view(symTab[sid]) : std::string_view("");
-        pairs.emplace_back(nm, e.value);
-    });
-    std::sort(pairs.begin(), pairs.end(),
-        [](const auto & x, const auto & y) { return x.first < y.first; });
+    };
     ListVec * lv = Alloc::allocList(n);
     V3_STATS_INC(listsAllocated);
-    for (uint32_t i = 0; i < n; ++i) lv->elems[i] = pairs[i].second;
+    if (!src->isChain()) {
+        // Sorted/MapAttrs entries are already in SymbolId order, not
+        // tree-walker's lexical string order.  Sort compact indices instead of
+        // transient (name,value) pairs so attrValues over large MapAttrs does
+        // not copy every Value into a temporary C++ vector before producing the
+        // ListVec.  MapAttrs entries are still realized only because the value
+        // list actually demands every mapped value.
+        std::vector<uint32_t> order;
+        order.reserve(n);
+        for (uint32_t i = 0; i < n; ++i) order.push_back(i);
+        std::sort(order.begin(), order.end(),
+            [&](uint32_t x, uint32_t y) {
+                return nameView(src->entries[x].name) < nameView(src->entries[y].name);
+            });
+        auto * mut = const_cast<Bindings *>(src);
+        for (uint32_t i = 0; i < n; ++i) {
+            Bindings::Entry & e = mut->entries[order[i]];
+            if (mut->isMapAttrs())
+                mut->realizeMapAttrsEntry(&e);
+            lv->elems[i] = e.value;
+        }
+    } else {
+        // A chain cursor does not expose the owning Bindings layer, so keep the
+        // existing entry-copying path here.  This preserves the chain streaming
+        // semantics while the hot Sorted/MapAttrs path avoids the Value copies.
+        std::vector<std::pair<std::string_view, Value>> pairs;
+        pairs.reserve(n);
+        src->forEach([&](const Bindings::Entry & e) {
+            pairs.emplace_back(nameView(e.name), e.value);
+        });
+        std::sort(pairs.begin(), pairs.end(),
+            [](const auto & x, const auto & y) { return x.first < y.first; });
+        for (uint32_t i = 0; i < n; ++i) lv->elems[i] = pairs[i].second;
+    }
     listPostConstructBarrier(lv);  // Phase D coverage (primAttrValues; PhD-6)
     out.mkList(lv);
 }

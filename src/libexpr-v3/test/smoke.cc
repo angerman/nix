@@ -1486,6 +1486,96 @@ static int testPrimMapAttrsNestedNamesDoNotRealize()
     return 0;
 }
 
+static int testPrimAttrValuesMapAttrsSortsWithOneAppPerValue()
+{
+    const PrimOp * mapAttrsPo = findPrimOp("mapAttrs");
+    const PrimOp * attrValuesPo = findPrimOp("attrValues");
+    if (!mapAttrsPo || !attrValuesPo) {
+        std::fprintf(stderr,
+            "testPrimAttrValuesMapAttrsSortsWithOneAppPerValue: missing mapAttrs/attrValues primop\n");
+        return 1;
+    }
+    static const PrimOp plusOnePo{
+        "__smokeSecondPlusOneAttrValues", 2, smokeSecondPlusOne
+    };
+
+    SymbolId zSym = ir::globalInternSymbol("__zz_attrValues_smoke");
+    SymbolId aSym = ir::globalInternSymbol("__aa_attrValues_smoke");
+    if (!(zSym < aSym)) {
+        std::fprintf(stderr,
+            "testPrimAttrValuesMapAttrsSortsWithOneAppPerValue: expected fresh symbol id order\n");
+        return 1;
+    }
+    Bindings * src = Alloc::allocBindings(2);
+    src->entries[0].name = zSym;
+    src->entries[0].pos = 0;
+    src->entries[0].value.mkInt(20);
+    src->entries[1].name = aSym;
+    src->entries[1].pos = 0;
+    src->entries[1].value.mkInt(10);
+
+    Value plusOne;
+    plusOne.mkPrimOp(&plusOnePo);
+    Value srcV;
+    srcV.mkAttrs(src);
+
+    VMState vm;
+    EvalState st;
+    st.vm = &vm;
+
+    Value mapped;
+    Value mapArgs[2] = {plusOne, srcV};
+    mapAttrsPo->fn(st, mapArgs, mapped);
+    uint64_t beforeValues = allocStats().pairsAllocated;
+
+    Value values;
+    Value valuesArgs[1] = {mapped};
+    attrValuesPo->fn(st, valuesArgs, values);
+    uint64_t afterValues = allocStats().pairsAllocated;
+    if (!values.isList() || !values.asList() || values.asList()->size != 2) {
+        std::fprintf(stderr,
+            "testPrimAttrValuesMapAttrsSortsWithOneAppPerValue: unexpected attrValues shape\n");
+        return 1;
+    }
+    if (afterValues != beforeValues + 2) {
+        std::fprintf(stderr,
+            "testPrimAttrValuesMapAttrsSortsWithOneAppPerValue: expected two mapped App3 pairs, got %llu\n",
+            (unsigned long long)(afterValues - beforeValues));
+        return 1;
+    }
+
+    vm.frames.push_back(CallFrame{
+        .cu = nullptr,
+        .closure = nullptr,
+        .thunk = nullptr,
+        .ip = 0,
+        .stackBaseOffset = 0,
+        .withStackBase = 0,
+        .flags = 0,
+    });
+    Value first = forceValue(vm, values.asList()->elems[0]);
+    Value second = forceValue(vm, values.asList()->elems[1]);
+    uint64_t afterForce = allocStats().pairsAllocated;
+    if (!first.isInt() || first.asInt() != 11
+        || !second.isInt() || second.asInt() != 21) {
+        std::fprintf(stderr,
+            "testPrimAttrValuesMapAttrsSortsWithOneAppPerValue: unexpected forced values tag=(%d,%d) val=(%lld,%lld)\n",
+            (int)first.tag(), (int)second.tag(),
+            first.isInt() ? (long long)first.asInt() : 0LL,
+            second.isInt() ? (long long)second.asInt() : 0LL);
+        return 1;
+    }
+    if (afterForce != afterValues) {
+        std::fprintf(stderr,
+            "testPrimAttrValuesMapAttrsSortsWithOneAppPerValue: forcing allocated %llu extra pairs\n",
+            (unsigned long long)(afterForce - afterValues));
+        return 1;
+    }
+    std::fprintf(stderr,
+        "testPrimAttrValuesMapAttrsSortsWithOneAppPerValue: OK (lexical order, one App3/value)\n");
+    return 0;
+}
+
 static int runPrimMapAttrsSelectNoApp3(bool dynamicName)
 {
     const PrimOp * mapAttrsPo = findPrimOp("mapAttrs");
@@ -3428,6 +3518,7 @@ int main()
     rc |= testPrimGenListIdentityNoApps();
     rc |= testPrimMapAttrsNamesDoNotRealize();
     rc |= testPrimMapAttrsNestedNamesDoNotRealize();
+    rc |= testPrimAttrValuesMapAttrsSortsWithOneAppPerValue();
     rc |= testPrimMapAttrsSelectNoApp3();
     rc |= testPrimMapAttrsNestedSelectUsesMappedValue();
     rc |= testPrimMapAttrsSetOpsNoApp3();
