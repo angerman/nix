@@ -207,7 +207,7 @@ const Bindings * Bindings::materialize() const
         auto * self = const_cast<Bindings *>(this);
         for (uint32_t i = 0; i < size; ++i) {
             self->realizeMapAttrsEntry(&self->entries[i]);
-            bindingsSetEntry(out, i, self->entries[i]);
+            out->entries[i] = self->entries[i];
         }
         bindingsPostConstructBarrier(out);
         s_matMemo.emplace(this, out);
