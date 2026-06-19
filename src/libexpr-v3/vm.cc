@@ -8627,33 +8627,33 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
         case OP_ATTRS_INIT_DYN: {
             uint32_t nStatic = (operand >> 12) & 0xFFFu;
             uint32_t nDyn    = operand & 0xFFFu;
-            // Stack layout (bottom-up): [static values...][dyn name+value pairs...]
-            uint32_t totalDynVals = nDyn * 2;
-            std::vector<Value> dynPairs(totalDynVals);
-            for (uint32_t i = totalDynVals; i > 0; --i) dynPairs[i - 1] = pop(vm);
-            std::vector<Value> staticVals(nStatic);
-            for (uint32_t i = nStatic; i > 0; --i) staticVals[i - 1] = pop(vm);
-            // Inline layout: nStatic*(name, pos) pairs followed by nDyn
-            // pos words for the dynamic entries.
-            std::vector<SymbolId> staticNames(nStatic);
-            std::vector<uint32_t> staticPoses(nStatic);
+            // Stack layout (bottom-up): [static values...][dyn name+value pairs...].
+            // Inline layout: nStatic*(name, pos) pairs followed by nDyn pos words.
+            // Build directly into one scratch entry array; null dynamic names are
+            // skipped by compacting `nEntries`.
+            constexpr uint32_t kSmall = 16;
+            Bindings::Entry smallBuf[kSmall];
+            std::vector<Bindings::Entry> bigBuf;
+            const uint32_t maxEntries = nStatic + nDyn;
+            Bindings::Entry * entries;
+            if (maxEntries <= kSmall) {
+                entries = smallBuf;
+            } else {
+                bigBuf.resize(maxEntries);
+                entries = bigBuf.data();
+            }
             for (uint32_t i = 0; i < nStatic; ++i) {
-                staticNames[i] = static_cast<SymbolId>(cu->code[ip + 2 * i]);
-                staticPoses[i] = cu->code[ip + 2 * i + 1];
+                entries[i].name = static_cast<SymbolId>(cu->code[ip + 2 * i]);
+                entries[i].pos  = cu->code[ip + 2 * i + 1];
             }
             ip += 2 * nStatic;
-            std::vector<uint32_t> dynPoses(nDyn);
-            for (uint32_t i = 0; i < nDyn; ++i)
-                dynPoses[i] = cu->code[ip + i];
+            const uint32_t dynPosBase = ip;
             ip += nDyn;
 
-            std::vector<std::tuple<SymbolId, Value, uint32_t>> entries;
-            entries.reserve(nStatic + nDyn);
-            for (uint32_t i = 0; i < nStatic; ++i)
-                entries.emplace_back(staticNames[i], staticVals[i], staticPoses[i]);
-            for (uint32_t i = 0; i < nDyn; ++i) {
-                Value & nameV = dynPairs[i * 2];
-                Value & valV  = dynPairs[i * 2 + 1];
+            uint32_t nEntries = nStatic;
+            for (uint32_t i = nDyn; i > 0; --i) {
+                Value valV  = pop(vm);
+                Value nameV = pop(vm);
                 // null-named dynamic attrs are silently dropped — Nix
                 // semantics so things like `{ ${if cond then "k" else null}
                 // = v; }` work as a conditional add.
@@ -8666,31 +8666,38 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 // Use the global symbol table — IDs from any CU stay
                 // consistent so attrset lookups across CUs work.
                 SymbolId id = ir::globalInternSymbol(nameV.asString());
-                entries.emplace_back(id, valV, dynPoses[i]);
+                entries[nEntries].name = id;
+                entries[nEntries].pos  = cu->code[dynPosBase + i - 1];
+                entries[nEntries].value = valV;
+                ++nEntries;
             }
-            std::sort(entries.begin(), entries.end(),
-                      [](auto & a, auto & b) { return std::get<0>(a) < std::get<0>(b); });
+            for (uint32_t i = nStatic; i > 0; --i)
+                entries[i - 1].value = pop(vm);
+
+            std::sort(entries, entries + nEntries,
+                      [](const Bindings::Entry & a, const Bindings::Entry & b) {
+                          return a.name < b.name;
+                      });
             // Dup-attr detection: after sort, duplicates are adjacent.
-            for (size_t i = 1; i < entries.size(); ++i) {
-                if (std::get<0>(entries[i]) == std::get<0>(entries[i - 1])) {
+            for (uint32_t i = 1; i < nEntries; ++i) {
+                if (entries[i].name == entries[i - 1].name) {
                     const auto & tbl = ir::globalSymbolTable();
-                    SymbolId nm = std::get<0>(entries[i]);
+                    SymbolId nm = entries[i].name;
                     std::string s = (nm < tbl.size()) ? tbl[nm] : "?";
                     throw std::runtime_error("v3 OP_ATTRS_INIT_DYN: attribute '" + s +
                                               "' already defined");
                 }
             }
-            Bindings * b = Alloc::allocBindings(static_cast<uint32_t>(entries.size()));
+            Bindings * b = Alloc::allocBindings(nEntries);
             V3_STATS_INC(attrsetsAllocated);
-            for (size_t i = 0; i < entries.size(); ++i) {
-                b->entries[i].name = std::get<0>(entries[i]);
-                b->entries[i].pos  = std::get<2>(entries[i]);  // #752 inline
-                bindingsSetValue(b, static_cast<uint32_t>(i),
-                                 std::get<1>(entries[i]));  // Phase D barrier
+            for (uint32_t i = 0; i < nEntries; ++i) {
+                b->entries[i].name = entries[i].name;
+                b->entries[i].pos  = entries[i].pos;  // #752 inline
+                bindingsSetValue(b, i, entries[i].value);  // Phase D barrier
             }
             // Phase A1: origin tracking.
             recordBindingsOrigin(b,
-                entries.empty() ? 0 : std::get<2>(entries[0]),
+                nEntries == 0 ? 0 : entries[0].pos,
                 "OP_ATTRS_INIT_DYN");
             Value v;
             v.mkAttrs(b);
