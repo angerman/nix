@@ -4351,8 +4351,8 @@ static std::string v3CoerceToString(
         "v3 BR-3 coerceToString: cannot coerce value of unsupported tag");
 }
 
-// BR-3.4: lexicographic attr iteration helper.  Returns a vector of
-// indices into `b->entries` sorted by name STRING, not SymbolId.
+// BR-3.4: lexicographic attr iteration helper.  Returns visible attrs sorted
+// by name STRING, not SymbolId.
 //
 // Why this matters: v3 Bindings store entries sorted by SymbolId
 // (interning order at parse time), but tree-walker's
@@ -4365,21 +4365,34 @@ static std::string v3CoerceToString(
 // This is the single biggest correctness landmine in the whole port:
 // if the order diverges by one swap, every dependent /nix/store path
 // changes silently.
-static std::vector<uint32_t> lexicographicAttrOrder(const Bindings * b)
+struct LexicographicAttrRef {
+    SymbolId name;
+    Value value;
+    Value * slot;
+};
+
+static std::vector<LexicographicAttrRef> lexicographicAttrEntries(Bindings * b)
 {
-    std::vector<uint32_t> order;
+    std::vector<LexicographicAttrRef> order;
     if (!b) return order;
-    order.reserve(b->size);
-    for (uint32_t i = 0; i < b->size; ++i) order.push_back(i);
+    order.reserve(b->countDistinct());
+    if (b->isChain()) {
+        b->forEach([&](const Bindings::Entry & e) {
+            order.push_back({e.name, e.value, nullptr});
+        });
+    } else {
+        for (uint32_t i = 0; i < b->size; ++i)
+            order.push_back({b->entries[i].name, b->entries[i].value,
+                             &b->entries[i].value});
+    }
     const auto & symTab = ir::globalSymbolTable();
-    auto nameOf = [&](uint32_t i) -> std::string_view {
-        SymbolId s = b->entries[i].name;
-        return s < symTab.size() ? std::string_view(symTab[s])
-                                  : std::string_view{};
+    auto nameOf = [&](const LexicographicAttrRef & ref) -> std::string_view {
+        return ref.name < symTab.size() ? std::string_view(symTab[ref.name])
+                                        : std::string_view{};
     };
     std::sort(order.begin(), order.end(),
-        [&](uint32_t a, uint32_t bIdx) {
-            return nameOf(a) < nameOf(bIdx);
+        [&](const LexicographicAttrRef & a, const LexicographicAttrRef & bRef) {
+            return nameOf(a) < nameOf(bRef);
         });
     return order;
 }
@@ -5307,17 +5320,10 @@ static void primDerivationFromPreprocessed(EvalState & state, Value * args, Valu
                     "v3 __derivationFromPreprocessed: `env` is not an attrset");
             if (f.asAttrs()) {
                 const auto & st = ir::globalSymbolTable();
-                auto * b = f.asAttrs();
-                // ChainBindings: the bytecode `derivation` wrapper builds this
-                // `env` attrset by merging the args (na≥16) → a Chain whose
-                // entries[] is the OVERLAY ONLY.  Iterating it directly here
-                // dropped env vars → wrong drv hash on `.drvPath` (while a full
-                // `derivation show` re-instantiation was correct).  Materialise
-                // to the full sorted view (no-op for Sorted).
-                if (b->isChain()) b = const_cast<Bindings *>(b->materialize());
-                for (uint32_t i = 0; i < b->size; ++i) {
-                    SymbolId nm = b->entries[i].name;
-                    Value elv = forceValue(*state.vm, b->entries[i].value);
+                const Bindings * b = f.asAttrs();
+                b->forEach([&](const Bindings::Entry & e) {
+                    SymbolId nm = e.name;
+                    Value elv = forceValue(*state.vm, e.value);
                     if (!elv.isString())
                         throw std::runtime_error(
                             "v3 __derivationFromPreprocessed: env value "
@@ -5326,7 +5332,7 @@ static void primDerivationFromPreprocessed(EvalState & state, Value * args, Valu
                     drv.env.emplace(keyStr,
                         elv.asString() ? elv.asString() : "");
                     absorbCtx(elv.asString(), context);
-                }
+                });
             }
         }
     }
@@ -5343,15 +5349,7 @@ static void primDerivationFromPreprocessed(EvalState & state, Value * args, Valu
 static void primDerivationStrictNative(
     EvalState & state, Value * args, Value & out)
 {
-    auto & ns = *state.nixEvalState;
     auto * src = args[0].asAttrs();
-    // ChainBindings: the whole derivation is computed by iterating src in lex
-    // order (lexicographicAttrOrder + src->entries[order[i]] reads below).  For
-    // a Chain that is the OVERLAY ONLY → the drv is built from a partial attr
-    // set → silently wrong store hash (the hello.drvPath fake-store divergence).
-    // Materialise to the full sorted view first (no-op for Sorted).  This is the
-    // most store-hash-critical chain-unsafe site.
-    if (src && src->isChain()) src = const_cast<Bindings *>(src->materialize());
     const auto & sym = drvStrictSymbols();
 
     // #741 Phase 3a SHADOW cache: deep-force input, hash, look up.
@@ -5468,7 +5466,7 @@ static void primDerivationStrictNative(
     nlohmann::json structuredJson = nlohmann::json::object();
 
     // ---- iterate attrs in lex order (BR-3.4) ----
-    auto order = lexicographicAttrOrder(src);
+    auto order = lexicographicAttrEntries(src);
     const auto & symTab = ir::globalSymbolTable();
 
     // Track which outputs were declared.  Default ["out"] if no
@@ -5482,8 +5480,8 @@ static void primDerivationStrictNative(
     std::optional<std::string> outputHashAlgoStr;
     std::optional<std::string> outputHashModeStr;
 
-    for (uint32_t idx : order) {
-        SymbolId sid = src->entries[idx].name;
+    for (auto & attr : order) {
+        SymbolId sid = attr.name;
         // 2026-05-20 #670/#671 ROOT CAUSE FIX: capture the attr key as a
         // std::string COPY, not a std::string_view into the global
         // symbol table.  The forceValue / valueToJsonWithContext calls
@@ -5511,7 +5509,13 @@ static void primDerivationStrictNative(
             ? std::string(symTab[sid])
             : std::string{};
         std::string_view key = keyStr;
-        Value & attrV = src->entries[idx].value;
+        Value attrCopy;
+        Value * attrSlot = attr.slot;
+        if (!attrSlot) {
+            attrCopy = attr.value;
+            attrSlot = &attrCopy;
+        }
+        Value & attrV = *attrSlot;
 
         // Skip flag attrs — they're meta, not env vars.  Mirrors
         // tree-walker's switch-case branches that don't fall through
@@ -6032,9 +6036,10 @@ void primDerivation(EvalState & state, Value * args, Value & out)
 
     // Result: drvAttrs // { outPath; drvPath; type = "derivation"; outputName; drvAttrs = drvAttrs; }
     std::vector<std::pair<SymbolId, Value>> entries;
-    entries.reserve(src->size + 5 + outputs.size());
-    for (uint32_t i = 0; i < src->size; ++i)
-        entries.emplace_back(src->entries[i].name, src->entries[i].value);
+    entries.reserve(src->countDistinct() + 5 + outputs.size());
+    src->forEach([&](const Bindings::Entry & e) {
+        entries.emplace_back(e.name, e.value);
+    });
     if (outPath)  entries.emplace_back(sOutPath, *outPath);
     if (drvPathV) entries.emplace_back(sDrvPath, *drvPathV);
     entries.emplace_back(sType,    mkStringValueOwned("derivation"));
