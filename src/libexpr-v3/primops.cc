@@ -787,6 +787,7 @@ void primAttrValues(EvalState &, Value * args, Value & out)
     };
     ListVec * lv = Alloc::allocList(n);
     V3_STATS_INC(listsAllocated);
+    constexpr uint32_t kSmallOrder = 32;
     if (!src->isChain()) {
         // Sorted/MapAttrs entries are already in SymbolId order, not
         // tree-walker's lexical string order.  Sort compact indices instead of
@@ -794,10 +795,15 @@ void primAttrValues(EvalState &, Value * args, Value & out)
         // not copy every Value into a temporary C++ vector before producing the
         // ListVec.  MapAttrs entries are still realized only because the value
         // list actually demands every mapped value.
-        std::vector<uint32_t> order;
-        order.reserve(n);
-        for (uint32_t i = 0; i < n; ++i) order.push_back(i);
-        std::sort(order.begin(), order.end(),
+        uint32_t smallOrder[kSmallOrder];
+        std::vector<uint32_t> bigOrder;
+        uint32_t * order = smallOrder;
+        if (n > kSmallOrder) {
+            bigOrder.resize(n);
+            order = bigOrder.data();
+        }
+        for (uint32_t i = 0; i < n; ++i) order[i] = i;
+        std::sort(order, order + n,
             [&](uint32_t x, uint32_t y) {
                 return nameView(src->entries[x].name) < nameView(src->entries[y].name);
             });
@@ -812,16 +818,24 @@ void primAttrValues(EvalState &, Value * args, Value & out)
         // Sort entry refs, not (name,value) pairs.  Chain attrValues can be a
         // large read-only consumer; copying every Value into a transient C++
         // vector adds work before we copy the same Values into the final ListVec.
-        std::vector<const Bindings::Entry *> order;
-        order.reserve(n);
+        const Bindings::Entry * smallOrder[kSmallOrder];
+        std::vector<const Bindings::Entry *> bigOrder;
+        const Bindings::Entry ** order = smallOrder;
+        if (n > kSmallOrder) {
+            bigOrder.resize(n);
+            order = bigOrder.data();
+        }
         Bindings::Cursor c(src);
+        uint32_t k = 0;
         while (const Bindings::Entry * e = c.next())
-            order.push_back(e);
-        std::sort(order.begin(), order.end(),
+            order[k++] = e;
+        if (__builtin_expect(k != n, 0))
+            throw std::runtime_error("v3 primAttrValues: chain cursor count mismatch");
+        std::sort(order, order + k,
             [&](const Bindings::Entry * x, const Bindings::Entry * y) {
                 return nameView(x->name) < nameView(y->name);
             });
-        for (uint32_t i = 0; i < n; ++i) lv->elems[i] = order[i]->value;
+        for (uint32_t i = 0; i < k; ++i) lv->elems[i] = order[i]->value;
     }
     listPostConstructBarrier(lv);  // Phase D coverage (primAttrValues; PhD-6)
     out.mkList(lv);
