@@ -53,6 +53,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -1099,10 +1100,20 @@ void Scavenger::run()
             }
             }
         }
-        // Clear retaining capacity — typical steady-state list size
-        // is ~thousands of entries between scavenges; keeping the
-        // backing storage avoids per-scavenge realloc churn.
+        auto releaseIfOversized = [](auto & v, size_t maxRetained) {
+            if (v.empty() && v.capacity() > maxRetained) {
+                using Vec = std::decay_t<decltype(v)>;
+                Vec trimmed;
+                trimmed.reserve(maxRetained);
+                v.swap(trimmed);
+            }
+        };
+        // Clear retaining modest capacity for the steady-state case, but do
+        // not keep multi-MB remembered-set spikes alive after the scavenge.
+        // python3.drvPath can transiently grow this past 1M entries and then
+        // carry an empty 8+ MB vector through the rest of evaluation.
         dirty.clear();
+        releaseIfOversized(dirty, 64 * 1024);
 
         // Standalone cells: the cell pointers themselves are
         // tenured (`Alloc::allocValue`), but their CONTENTS may
@@ -1123,14 +1134,14 @@ void Scavenger::run()
             // the inactive buffer).  Drop cells that now hold tenured
             // pointers (they no longer need tracking until the mutator
             // writes a new nursery pointer through them).
-            std::vector<Value *> keep;
-            keep.reserve(cells.size());
+            size_t kept = 0;
             for (Value * cell : cells) {
                 visitValue(*cell);
                 if (isNurseryPayload(*cell, n))
-                    keep.push_back(cell);
+                    cells[kept++] = cell;
             }
-            cells.swap(keep);
+            cells.resize(kept);
+            releaseIfOversized(cells, 16 * 1024);
         } else {
             // Legacy Phase D: every survivor went to tenured, so
             // post-walk cells hold tenured payloads.  Clear the
@@ -1139,6 +1150,7 @@ void Scavenger::run()
                 visitValue(*cell);
             }
             cells.clear();
+            releaseIfOversized(cells, 16 * 1024);
         }
     }
 
