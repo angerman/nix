@@ -382,7 +382,8 @@ struct Bindings
     public:
         static constexpr uint32_t kMaxLayers = 16;
 
-        explicit Cursor(const Bindings * b) noexcept
+        explicit Cursor(const Bindings * b, bool realizeMapAttrs = true) noexcept
+            : realizeMapAttrs_(realizeMapAttrs)
         {
             nLayers_ = 0;
             for (const Bindings * p = b; p; p = p->isChain() ? p->parent : nullptr) {
@@ -394,11 +395,13 @@ struct Bindings
                     const Bindings * m = b->materialize();
                     heads_[0] = m->entries;
                     ends_[0]  = m->entries + m->size;
+                    owners_[0] = m;
                     nLayers_  = m->size ? 1 : 0;
                     return;
                 }
                 heads_[nLayers_] = p->entries;
                 ends_[nLayers_]  = p->entries + p->size;
+                owners_[nLayers_] = p;
                 ++nLayers_;
             }
         }
@@ -419,16 +422,22 @@ struct Bindings
             }
             if (best == kInvalid) return nullptr;
             const Entry * winner = heads_[best];
+            const Bindings * owner = owners_[best];
             for (uint32_t l = 0; l < nLayers_; ++l)
                 if (heads_[l] != ends_[l] && heads_[l]->name == bestName)
                     ++heads_[l];
+            if (realizeMapAttrs_ && owner && owner->isMapAttrs())
+                const_cast<Bindings *>(owner)->realizeMapAttrsEntry(
+                    const_cast<Entry *>(winner));
             return winner;
         }
 
     private:
         const Entry * heads_[kMaxLayers];
         const Entry * ends_[kMaxLayers];
+        const Bindings * owners_[kMaxLayers];
         uint32_t      nLayers_;
+        bool          realizeMapAttrs_;
     };
 
     /// Count distinct names in the chain.  O(1) on Sorted, O(N·depth)
@@ -439,7 +448,7 @@ struct Bindings
         if (kind == uint8_t(Kind::Sorted)
             || kind == uint8_t(Kind::MapAttrs))
             return size;
-        Cursor c(this);
+        Cursor c(this, false);
         uint32_t n = 0;
         while (c.next()) ++n;
         return n;
@@ -476,7 +485,7 @@ struct Bindings
             for (uint32_t i = 0; i < size; ++i) func(entries[i].name);
             return;
         }
-        Cursor c(this);
+        Cursor c(this, false);
         while (const Entry * e = c.next()) func(e->name);
     }
 };

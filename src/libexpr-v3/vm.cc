@@ -1600,31 +1600,17 @@ inline Bindings * mergeBindings(const Bindings * a, const Bindings * b,
     if (b && !b->isChain() && b->size == 0) return const_cast<Bindings *>(a);
     if (a && !a->isChain() && a->size == 0) return const_cast<Bindings *>(b);
 
-    if (a && a->isMapAttrs())
-        a = a->materialize();
-    if (b && b->isMapAttrs())
-        b = b->materialize();
+    static const bool s_mapAttrsMergeLazy = []{
+        return std::getenv("NIX_V3_NO_MAPATTRS_MERGE_LAZY") == nullptr;
+    }();
 
-    // Chain knobs — hoisted so both the composition path (just below)
-    // and the construction path (further down) share them.  Function-
-    // local statics: each initialises once on first call.
+    // Chain knobs — hoisted so the MapAttrs no-realize merge can avoid
+    // defeating the existing large-parent/small-overlay chain path.
     //   NIX_V3_CHAIN_MIN_NA=1    — parent must be non-empty to chain-construct.
     //   NIX_V3_CHAIN_MAX_NB=8192 — overlay cap; high enough to catch the
     //                               real nixpkgs `//` volume, finite enough
     //                               to avoid unbounded-chain materialization
     //                               regressions.
-    // The audit can still override these at runtime (e.g. MAX_NB=0 to
-    // suppress fresh chains, or a huge value to stress every attrset op
-    // against the TW oracle without a rebuild).
-    //
-    // Lever A default-ON (2026-06-07, MEMORY_REPRESENTATION §10): chains are
-    // a measured pure-refactor of `//` (firefox.drvPath −268 MB; 0 real
-    // drv-hash divergences across core 19/19 chains-on + 53 packages incl.
-    // git/cargo/rustc/withPackages + the pure parity test).  Safety valve:
-    // NIX_V3_NO_CHAIN_BINDINGS=1 (or NIX_V3_CHAIN_BINDINGS=0) opts out with
-    // NO rebuild — a reversible rollout.  RETIREMENT: drop the valve once the
-    // full nixpkgs drvPath CI sweep (bench/chain-nixpkgs-fullsweep.sh) has run
-    // several cycles byte-clean.
     static const bool s_chain = []{
         if (std::getenv("NIX_V3_NO_CHAIN_BINDINGS")) return false;
         const char * e = std::getenv("NIX_V3_CHAIN_BINDINGS");
@@ -1639,6 +1625,109 @@ inline Bindings * mergeBindings(const Bindings * a, const Bindings * b,
         const char * e = std::getenv("NIX_V3_CHAIN_MAX_NB");
         return e ? (uint32_t) std::strtoul(e, nullptr, 10) : 8192u;
     }();
+
+    if (s_mapAttrsMergeLazy && s_chain
+        && a && b && a->isMapAttrs() && !b->isMapAttrs() && !b->isChain()
+        && b->size > 0 && b->size <= s_maxNb
+        && a->chainDepth() < Bindings::Cursor::kMaxLayers) {
+        Bindings * c = Alloc::allocChainBindings(a, b->size);
+        for (uint32_t j = 0; j < b->size; ++j) {
+            c->entries[j] = b->entries[j];
+            c->entries[j].pos &= Bindings::kPosMask;
+        }
+        bindingsPostConstructBarrier(c);
+        if (__builtin_expect(g_sharedWbDetect, 0)) ++chainChildCount()[a];
+        return c;
+    }
+
+    auto tryMergeMapAttrsNoRealize = [&]() -> Bindings * {
+        if (!a || !b)
+            return nullptr;
+        if (!s_mapAttrsMergeLazy)
+            return nullptr;
+        if (!a->isMapAttrs() && !b->isMapAttrs())
+            return nullptr;
+        if (a->isChain() || b->isChain())
+            return nullptr;
+
+        const Bindings * mapShape = a->isMapAttrs() ? a : b;
+        if (a->isMapAttrs() && b->isMapAttrs()
+            && (a->parent != b->parent || a->aux.w != b->aux.w))
+            return nullptr;
+
+        if (!a->isMapAttrs() && b->isMapAttrs()
+            && s_chain && b->size <= s_maxNb && a->size >= s_minNa
+            && uint64_t(a->size) > uint64_t(b->size) * 2)
+            return nullptr;
+        if (a->isMapAttrs() && !b->isMapAttrs()
+            && s_chain && b->size <= s_maxNb && a->size >= s_minNa
+            && uint64_t(a->size) > uint64_t(b->size) * 2)
+            return nullptr;
+
+        const uint32_t na = a->size, nb = b->size;
+        uint32_t kExact = 0;
+        {
+            uint32_t i = 0, j = 0;
+            while (i < na && j < nb) {
+                const SymbolId an = a->entries[i].name;
+                const SymbolId bn = b->entries[j].name;
+                if (an < bn)        { ++kExact; ++i; }
+                else if (an > bn)   { ++kExact; ++j; }
+                else                { ++kExact; ++i; ++j; }
+            }
+            kExact += (na - i) + (nb - j);
+        }
+        if (kExact == 0)
+            return Alloc::allocBindings(0);
+
+        Bindings * out = Alloc::allocBindings(kExact);
+        out->kind = uint8_t(Bindings::Kind::MapAttrs);
+        out->parent = mapShape->parent;
+        out->aux = mapShape->aux;
+
+        {
+            const uint8_t s = static_cast<uint8_t>(siteId);
+            if (s < AllocStats::kMergeBindingsSiteSlots)
+                allocStats().mergeBindingsBytesBySite[s]
+                    += uint64_t(kExact) * sizeof(Bindings::Entry);
+        }
+
+        uint32_t i = 0, j = 0, k = 0;
+        auto copyA = [&]() {
+            out->entries[k] = a->entries[i];
+            if (!a->isMapAttrs())
+                out->entries[k].pos &= Bindings::kPosMask;
+            ++k; ++i;
+        };
+        auto copyB = [&]() {
+            out->entries[k] = b->entries[j];
+            if (!b->isMapAttrs())
+                out->entries[k].pos &= Bindings::kPosMask;
+            ++k; ++j;
+        };
+        while (i < na && j < nb) {
+            if (a->entries[i].name < b->entries[j].name) {
+                copyA();
+            } else if (a->entries[i].name > b->entries[j].name) {
+                copyB();
+            } else {
+                copyB();
+                ++i;
+            }
+        }
+        while (i < na) copyA();
+        while (j < nb) copyB();
+        bindingsPostConstructBarrier(out);
+        return out;
+    };
+
+    if (Bindings * merged = tryMergeMapAttrsNoRealize())
+        return merged;
+
+    if (a && a->isMapAttrs())
+        a = a->materialize();
+    if (b && b->isMapAttrs())
+        b = b->materialize();
 
     // Lever A Step 4 (MEMORY_REPRESENTATION §6) — CHAIN COMPOSITION.
     // Before materialising chain inputs, try to EXTEND an existing
@@ -9596,16 +9685,30 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 if (g_chainLookupSelect) {
                     const Bindings * ownerLayer = nullptr;
                     Value * lslot = nullptr;
-                    for (const Bindings * L = b; L; L = L->parent) {
-                        if (const Value * v =
-                                L->lookupLocal(static_cast<SymbolId>(operand))) {
-                            lslot = const_cast<Value *>(v);
+                    uint32_t ownerSlot = UINT32_MAX;
+                    const SymbolId want = static_cast<SymbolId>(operand);
+                    for (const Bindings * L = b; L; L = L->isChain() ? L->parent : nullptr) {
+                        if (const Bindings::Entry * e = L->lookupLocalEntry(want)) {
+                            lslot = const_cast<Value *>(&e->value);
                             ownerLayer = L;
+                            ownerSlot = static_cast<uint32_t>(e - L->entries);
                             break;
                         }
                     }
                     if (lslot) {
                         const bool leafHit = (ownerLayer == b);
+                        if (ownerLayer && ownerLayer->isMapAttrs()) {
+                            MapAttrsSelectResult mapAttrsSelect =
+                                tryPushDirectMapAttrsEntry(
+                                    vm, const_cast<Bindings *>(ownerLayer),
+                                    ownerSlot, ip);
+                            if (mapAttrsSelect == MapAttrsSelectResult::Force)
+                                goto op_force_slow;
+                            if (mapAttrsSelect == MapAttrsSelectResult::Pushed)
+                                break;
+                            lslot = const_cast<Value *>(
+                                &ownerLayer->entries[ownerSlot].value);
+                        }
                         Value & s = *lslot;
                         if (leafHit && s.isAppLike()
                             && !isUnderappliedClosurePap(s)) {
@@ -9621,16 +9724,26 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                             f.ip = ip;
                             goto op_force_slow;
                         }
+                        if (!leafHit
+                            && __builtin_expect(
+                                shouldForceSelectedEntry(ownerLayer, s), 0)) {
+                            push(vm, s);
+                            CallFrame & f = vm.frames.back();
+                            armKeepBeltCheck(f);
+                            f.flags |= CFF_FORCE_RETRY;
+                            f.ip = ip;
+                            goto op_force_slow;
+                        }
                         // Parent hit, PAP, plain Thunk, or WHNF: push, no
                         // writeback (the consumer force-on-receives).
                         push(vm, s);
                         break;
                     }
                     const auto & symTab = ir::globalSymbolTable();
-                    SymbolId want = static_cast<SymbolId>(operand);
-                    std::string nm = want < symTab.size()
-                        ? symTab[want]
-                        : std::string("<sid=") + std::to_string(want) + ">";
+                    SymbolId missing = static_cast<SymbolId>(operand);
+                    std::string nm = missing < symTab.size()
+                        ? symTab[missing]
+                        : std::string("<sid=") + std::to_string(missing) + ">";
                     throw std::runtime_error("attribute '" + nm + "' missing");
                 }
                 // Explicit opt-out path: preserve the old flat search/IC
@@ -10293,10 +10406,15 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             uint32_t directMapAttrsSlot = UINT32_MAX;
             if (__builtin_expect(dynB->isChain(), 0)) {
                 if (g_chainLookupSelect) {
-                    for (const Bindings * L = dynB; L; L = L->parent) {
-                        if (const Value * v = L->lookupLocal(id)) {
-                            found = const_cast<Value *>(v);
+                    for (const Bindings * L = dynB; L; L = L->isChain() ? L->parent : nullptr) {
+                        if (const Bindings::Entry * e = L->lookupLocalEntry(id)) {
+                            found = const_cast<Value *>(&e->value);
                             dynLeafSafe = (L == dynB);
+                            if (L->isMapAttrs()) {
+                                directMapAttrsB = const_cast<Bindings *>(L);
+                                directMapAttrsSlot =
+                                    static_cast<uint32_t>(e - L->entries);
+                            }
                             break;
                         }
                     }
@@ -10354,6 +10472,16 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 f.flags |= CFF_FORCE_WB_PTR_KEEP | CFF_FORCE_RETRY;
                 if (__builtin_expect(g_sharedWbDetect, 0))
                     armedWritebackValue()[f.forceWriteTarget] = *f.forceWriteTarget;  // WS-A step 3 provenance
+                f.ip = ip;
+                goto op_force_slow;
+            }
+            if (__builtin_expect(
+                    shouldForceSelectedEntry(directMapAttrsB, *found), 0)
+                && !dynLeafSafe) {
+                push(vm, *found);
+                CallFrame & f = vm.frames.back();
+                armKeepBeltCheck(f);
+                f.flags |= CFF_FORCE_RETRY;
                 f.ip = ip;
                 goto op_force_slow;
             }

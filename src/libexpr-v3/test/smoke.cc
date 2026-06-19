@@ -1834,6 +1834,200 @@ static int testPrimMapAttrsEmptyUpdateNoApp3()
     return 0;
 }
 
+static int runPrimMapAttrsUpdateNoApp3(bool mapOnLeft)
+{
+    const PrimOp * mapAttrsPo = findPrimOp("mapAttrs");
+    if (!mapAttrsPo) {
+        std::fprintf(stderr,
+            "testPrimMapAttrsUpdateNoApp3: missing mapAttrs primop\n");
+        return 1;
+    }
+    static const PrimOp returnSecondPo{
+        "__smokeReturnSecondMapAttrsUpdate", 2, smokeReturnSecond
+    };
+
+    auto m = ir::makeModule();
+    auto entry = m.freshBlock();
+    funcOf(m, 0).entryBlock = entry;
+
+    auto fn = addBinding(m, entry, ir::LitPrimOp{&returnSecondPo});
+    auto aVal = addBinding(m, entry, ir::LitInt{10});
+    auto bVal = addBinding(m, entry, ir::LitInt{20});
+    auto cVal = addBinding(m, entry, ir::LitInt{30});
+    auto overlayAVal = addBinding(m, entry, ir::LitInt{1});
+    auto overlayBVal = addBinding(m, entry, ir::LitInt{99});
+    auto aSym = m.internSymbol("a");
+    auto bSym = m.internSymbol("b");
+    auto cSym = m.internSymbol("c");
+
+    ir::VarId mapped;
+    ir::VarId overlay;
+    if (mapOnLeft) {
+        auto src = addBinding(m, entry, ir::AttrSet{ { {aSym, aVal}, {bSym, bVal} } });
+        mapped = addBinding(m, entry, ir::PrimOpCall{mapAttrsPo, {fn, src}});
+        overlay = addBinding(m, entry, ir::AttrSet{ { {bSym, overlayBVal}, {cSym, cVal} } });
+    } else {
+        overlay = addBinding(m, entry, ir::AttrSet{ { {aSym, overlayAVal} } });
+        auto src = addBinding(m, entry, ir::AttrSet{ { {bSym, bVal}, {cSym, cVal} } });
+        mapped = addBinding(m, entry, ir::PrimOpCall{mapAttrsPo, {fn, src}});
+    }
+    auto updated = mapOnLeft
+        ? addBinding(m, entry, ir::Update{mapped, overlay})
+        : addBinding(m, entry, ir::Update{overlay, mapped});
+    setReturn(m, entry, updated);
+
+    ir::computeFreeVars(m);
+    auto cu = compile(m);
+    uint64_t pairsBefore = allocStats().pairsAllocated;
+    Value res = run(cu);
+    uint64_t pairsAfter = allocStats().pairsAllocated;
+    if (pairsAfter != pairsBefore) {
+        std::fprintf(stderr,
+            "testPrimMapAttrsUpdateNoApp3: %s update allocated %llu ValuePair(s)\n",
+            mapOnLeft ? "lhs-mapAttrs" : "rhs-mapAttrs",
+            (unsigned long long)(pairsAfter - pairsBefore));
+        return 1;
+    }
+    if (!res.isAttrs() || !res.asAttrs() || res.asAttrs()->countDistinct() != 3) {
+        std::fprintf(stderr,
+            "testPrimMapAttrsUpdateNoApp3: unexpected %s result shape\n",
+            mapOnLeft ? "lhs-mapAttrs" : "rhs-mapAttrs");
+        return 1;
+    }
+
+    const Bindings * out = res.asAttrs();
+    if (mapOnLeft) {
+        if (!out->isChain() || !out->parent || !out->parent->isMapAttrs()) {
+            std::fprintf(stderr,
+                "testPrimMapAttrsUpdateNoApp3: lhs-mapAttrs did not build MapAttrs-backed chain\n");
+            return 1;
+        }
+    } else if (!out->isMapAttrs()) {
+        std::fprintf(stderr,
+            "testPrimMapAttrsUpdateNoApp3: rhs-mapAttrs did not preserve MapAttrs result\n");
+        return 1;
+    }
+
+    const Bindings * mappedLayer = mapOnLeft ? out->parent : out;
+    const Bindings * overlayLayer = out;
+    const Bindings::Entry * a = mapOnLeft
+        ? mappedLayer->lookupLocalEntry(aSym)
+        : overlayLayer->lookupLocalEntry(aSym);
+    const Bindings::Entry * b = mapOnLeft
+        ? overlayLayer->lookupLocalEntry(bSym)
+        : mappedLayer->lookupLocalEntry(bSym);
+    const Bindings::Entry * c = mapOnLeft
+        ? overlayLayer->lookupLocalEntry(cSym)
+        : mappedLayer->lookupLocalEntry(cSym);
+    if (!a || !b || !c) {
+        std::fprintf(stderr,
+            "testPrimMapAttrsUpdateNoApp3: %s result missing entries\n",
+            mapOnLeft ? "lhs-mapAttrs" : "rhs-mapAttrs");
+        return 1;
+    }
+    const bool aMapped = (a->pos & Bindings::kMapAttrsUnrealizedPosBit) != 0;
+    const bool bMapped = (b->pos & Bindings::kMapAttrsUnrealizedPosBit) != 0;
+    const bool cMapped = (c->pos & Bindings::kMapAttrsUnrealizedPosBit) != 0;
+    if (mapOnLeft) {
+        if (!aMapped || bMapped || cMapped) {
+            std::fprintf(stderr,
+                "testPrimMapAttrsUpdateNoApp3: lhs-mapAttrs entry flags wrong\n");
+            return 1;
+        }
+    } else {
+        if (aMapped || !bMapped || !cMapped) {
+            std::fprintf(stderr,
+                "testPrimMapAttrsUpdateNoApp3: rhs-mapAttrs entry flags wrong\n");
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int runPrimMapAttrsUpdateSelectNoApp3(bool mapOnLeft)
+{
+    const PrimOp * mapAttrsPo = findPrimOp("mapAttrs");
+    if (!mapAttrsPo) {
+        std::fprintf(stderr,
+            "testPrimMapAttrsUpdateNoApp3: missing mapAttrs primop\n");
+        return 1;
+    }
+    static const PrimOp returnSecondPo{
+        "__smokeReturnSecondMapAttrsUpdateSelect", 2, smokeReturnSecond
+    };
+
+    auto m = ir::makeModule();
+    auto entry = m.freshBlock();
+    funcOf(m, 0).entryBlock = entry;
+
+    auto fn = addBinding(m, entry, ir::LitPrimOp{&returnSecondPo});
+    auto aVal = addBinding(m, entry, ir::LitInt{10});
+    auto bVal = addBinding(m, entry, ir::LitInt{20});
+    auto cVal = addBinding(m, entry, ir::LitInt{30});
+    auto overlayAVal = addBinding(m, entry, ir::LitInt{1});
+    auto overlayBVal = addBinding(m, entry, ir::LitInt{99});
+    auto aSym = m.internSymbol("a");
+    auto bSym = m.internSymbol("b");
+    auto cSym = m.internSymbol("c");
+
+    ir::VarId mapped;
+    ir::VarId overlay;
+    if (mapOnLeft) {
+        auto src = addBinding(m, entry, ir::AttrSet{ { {aSym, aVal}, {bSym, bVal} } });
+        mapped = addBinding(m, entry, ir::PrimOpCall{mapAttrsPo, {fn, src}});
+        overlay = addBinding(m, entry, ir::AttrSet{ { {bSym, overlayBVal}, {cSym, cVal} } });
+    } else {
+        overlay = addBinding(m, entry, ir::AttrSet{ { {aSym, overlayAVal} } });
+        auto src = addBinding(m, entry, ir::AttrSet{ { {bSym, bVal}, {cSym, cVal} } });
+        mapped = addBinding(m, entry, ir::PrimOpCall{mapAttrsPo, {fn, src}});
+    }
+    auto updated = mapOnLeft
+        ? addBinding(m, entry, ir::Update{mapped, overlay})
+        : addBinding(m, entry, ir::Update{overlay, mapped});
+    auto aSel = addBinding(m, entry, ir::AttrSelect{updated, aSym});
+    auto bSel = addBinding(m, entry, ir::AttrSelect{updated, bSym});
+    auto cSel = addBinding(m, entry, ir::AttrSelect{updated, cSym});
+    auto ab = addBinding(m, entry, ir::Add{aSel, bSel});
+    auto sum = addBinding(m, entry, ir::Add{ab, cSel});
+    setReturn(m, entry, sum);
+
+    ir::computeFreeVars(m);
+    auto cu = compile(m);
+    uint64_t pairsBefore = allocStats().pairsAllocated;
+    Value res = run(cu);
+    uint64_t pairsAfter = allocStats().pairsAllocated;
+    const int64_t expected = mapOnLeft ? 139 : 51;
+    if (!res.isInt() || res.asInt() != expected) {
+        std::fprintf(stderr,
+            "testPrimMapAttrsUpdateNoApp3: %s select expected %lld, got tag=%d val=%lld\n",
+            mapOnLeft ? "lhs-mapAttrs" : "rhs-mapAttrs",
+            (long long)expected, (int)res.tag(),
+            res.isInt() ? (long long)res.asInt() : 0LL);
+        return 1;
+    }
+    if (pairsAfter != pairsBefore) {
+        std::fprintf(stderr,
+            "testPrimMapAttrsUpdateNoApp3: %s select allocated %llu ValuePair(s)\n",
+            mapOnLeft ? "lhs-mapAttrs" : "rhs-mapAttrs",
+            (unsigned long long)(pairsAfter - pairsBefore));
+        return 1;
+    }
+    return 0;
+}
+
+static int testPrimMapAttrsUpdateNoApp3()
+{
+    int rc = 0;
+    rc |= runPrimMapAttrsUpdateNoApp3(true);
+    rc |= runPrimMapAttrsUpdateNoApp3(false);
+    rc |= runPrimMapAttrsUpdateSelectNoApp3(true);
+    rc |= runPrimMapAttrsUpdateSelectNoApp3(false);
+    if (rc == 0)
+        std::fprintf(stderr,
+            "testPrimMapAttrsUpdateNoApp3: OK (// preserves lazy MapAttrs entries)\n");
+    return rc;
+}
+
 static int testPrimMapAttrsNestedSelectUsesMappedValue()
 {
     const PrimOp * mapAttrsPo = findPrimOp("mapAttrs");
@@ -3803,6 +3997,7 @@ int main()
     rc |= testPrimAttrValuesMapAttrsSortsWithOneAppPerValue();
     rc |= testPrimMapAttrsSelectNoApp3();
     rc |= testPrimMapAttrsEmptyUpdateNoApp3();
+    rc |= testPrimMapAttrsUpdateNoApp3();
     rc |= testPrimMapAttrsNestedSelectUsesMappedValue();
     rc |= testPrimMapAttrsSetOpsNoApp3();
     rc |= testPrimMapAttrsValueIdentityNoApps();
