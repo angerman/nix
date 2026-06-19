@@ -1,0 +1,23 @@
+# darwin-4 canonical CPU baselines — the QUIET host (aarch64-darwin-4.lan, load ~1.1).
+# 2026-06-19. min-of-5, cache-off (NIX_V3_NO_DISK_CACHE=1), user CPU seconds.
+# THE MEASUREMENT OF RECORD for CPU. The laptop is UNUSABLE for CPU levers: its
+# ~5-10% noise floor exceeds the 3% keep-bar (proven 2026-06-19 — the attr-select
+# IC measured −8% on the laptop at min-of-3 and REVERSED to +6% at min-of-5; on
+# darwin-4 it is exactly 0.0%). All CPU grading MUST run here.
+#
+# Key finding: the true v3-vs-TW gap is ~4.4-5.5× (LARGER + more uniform than the
+# laptop's noisy 3.44×), byte-identical, and lives in the CORE EVAL LOOP
+# (forceValue #1 leaf + callClosure + dispatchLoop) — systemic interpreter cost,
+# not a hot-spot. See lode/V3_VS_TW_STRUCTURAL_ANALYSIS_2026-06-19.md.
+#
+# nixpkgs on darwin-4: 25.05pre-git (git→git-2.50.1.drv); absolute times are
+# darwin-4-specific — use for v3-vs-v3 A/Bs + the ratio, not cross-host compare.
+#
+# row	v3_cpu	tw_cpu	ratio	impure	cache
+hello	1.23	0.26	4.73	yes	off
+git	1.46	0.33	4.42	yes	off
+firefox	6.21	1.14	5.45	yes	off
+fib	2.29	NA	NA	no	off
+attrNames	0.57	NA	NA	yes	off
+# foldl: pending (ssh-quoting of the foldl' apostrophe; synthetic row, low priority)
+# M5: IFD-blocked even on darwin-4 (aarch64; cardano-node needs x86_64-linux IFD)
