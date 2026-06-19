@@ -1541,6 +1541,28 @@ inline Bindings * mergeBindings(const Bindings * a, const Bindings * b,
         return c;
     }
 
+    // Chained RHS rescue: `(large-or-chain a) // (small visible chain b)`.
+    // The sorted-merge fallback below would materialise BOTH inputs before
+    // merging.  If the RHS chain's visible surface is still a tiny overlay,
+    // copy just those visible entries into a fresh leaf above `a`.  This
+    // preserves `//` precedence, keeps writeback-safe private RHS slots, and
+    // avoids copying `a` solely because `b` happened to already be a Chain.
+    if (s_chain && b->isChain()
+        && (a->isChain() || a->size >= s_minNa)
+        && a->chainDepth() < Bindings::Cursor::kMaxLayers) {
+        const uint32_t nbVisible = b->countDistinct();
+        if (nbVisible == 0) return const_cast<Bindings *>(a);
+        if (nbVisible <= s_maxNb) {
+            Bindings * c = Alloc::allocChainBindings(a, nbVisible);
+            uint32_t j = 0;
+            b->forEach([&](const Bindings::Entry & e) {
+                bindingsSetEntry(c, j++, e);  // visible RHS entries sorted; Phase D
+            });
+            if (__builtin_expect(g_sharedWbDetect, 0)) ++chainChildCount()[a];  // WS-A detector
+            return c;
+        }
+    }
+
     // `a // {}` — return `a` UNCHANGED, preserving its chain form (do
     // not materialise just to drop an empty overlay).  Common in
     // nixpkgs via `a // lib.optionalAttrs cond {…}` when cond is false.
@@ -8973,17 +8995,28 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             const auto * src = ov.asAttrs();
             // First pass: overwrite existing entries; collect names to add.
             std::vector<std::pair<SymbolId, Value>> toAdd;
-            for (uint32_t i = 0; i < src->size; ++i) {
-                SymbolId k = src->entries[i].name;
-                const Value * existing = dst->lookup(k);
-                if (existing) {
-                    // Mutate in place via const_cast — `lookup` returns a
-                    // pointer to the actual storage and we own this Bindings.
-                    const_cast<Value &>(*existing) = src->entries[i].value;
-                } else {
-                    toAdd.emplace_back(k, src->entries[i].value);
+            auto findDstIndex = [&](SymbolId k) -> uint32_t {
+                uint32_t lo = 0, hi = dst->size;
+                while (lo < hi) {
+                    uint32_t mid = (lo + hi) >> 1;
+                    SymbolId midName = dst->entries[mid].name;
+                    if (midName == k) return mid;
+                    if (midName < k) lo = mid + 1;
+                    else             hi = mid;
                 }
-            }
+                return UINT32_MAX;
+            };
+            src->forEach([&](const Bindings::Entry & e) {
+                const uint32_t existing = findDstIndex(e.name);
+                if (existing != UINT32_MAX) {
+                    // Mutate in place through the normal barrier helper; dst
+                    // is Sorted/private here, so an indexed write cannot leak
+                    // into a shared chain parent.
+                    bindingsSetValue(dst, existing, e.value);
+                } else {
+                    toAdd.emplace_back(e.name, e.value);
+                }
+            });
             if (!toAdd.empty()) {
                 Bindings * grown = Alloc::allocBindings(dst->size + toAdd.size());
                 V3_STATS_INC(attrsetsAllocated);

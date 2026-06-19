@@ -61,6 +61,10 @@ check "static select parent"   "let c = $PAD // { extra = 99; }; in c.k7 + c.ext
 check "dynamic select"         "let c = $PAD // { extra = 99; }; k = \"k7\"; in c.\${k} + c.extra"
 check "formals @-pattern"      "let c = $PAD // { extra = 99; }; f = ({ k5, extra, ... }@a: k5 + extra); in f c"
 check "with-scope from chain"  "let c = $PAD // { extra = 99; }; in (with c; k3 + extra)"
+check "__overrides source chain" \
+  "let o = { x = 10; z = 99; } // { y = 20; };
+       r = rec { x = 1; y = 2; __overrides = o; };
+   in builtins.toString r.x + \":\" + builtins.toString r.y + \":\" + builtins.toString r.z"
 check "removeAttrs"            "let c = $PAD // { extra = 99; }; in builtins.length (builtins.attrNames (removeAttrs c [ \"k5\" \"extra\" ]))"
 check "intersectAttrs"         "let c = $PAD // { extra = 99; }; in builtins.length (builtins.attrNames (builtins.intersectAttrs c { k5 = 1; extra = 2; }))"
 check "mapAttrs then call"     "let c = $PAD // { f = x: x + 1; }; m = builtins.mapAttrs (n: v: v) c; in m.f 41"

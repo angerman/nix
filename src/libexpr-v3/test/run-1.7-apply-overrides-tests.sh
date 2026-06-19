@@ -58,6 +58,10 @@ chk "transitive: f.sum"     "($ROV).sum"          # 12 (sum sees overridden x)
 chk "grow: f.z"             "($ROV).z"            # 99 (new key added)
 chk "aggregate via with"    "with ($ROV); builtins.toString (x + y + sum + z)"  # "123"
 chk "overwrite-only.x"      "(rec { x = 1; __overrides = { x = 7; }; }).x"      # 7
+chk "source-chain all attrs" "let pad = builtins.listToAttrs (builtins.genList (i: { name = \"k\" + toString i; value = i; }) 20);
+                                  o = (pad // { x = 10; z = 99; }) // { y = 20; };
+                              in with (rec { x = 1; y = 2; __overrides = o; });
+                                 builtins.toString x + \":\" + builtins.toString y + \":\" + builtins.toString z"
 
 # nixpkgs override mechanisms (functional smoke; byte-identical).
 chk "makeOverridable"       "((import <nixpkgs> {}).lib.makeOverridable (a: { v = a.n or 5; }) { n = 7; }).v"
