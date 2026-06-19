@@ -546,11 +546,6 @@ inline bool valueEqual(VMState & vm, Value a0, Value b0)
         case Tag::Attrs: {
             auto * aa = a.asAttrs(); auto * bb = b.asAttrs();
             if (aa == bb) break;
-            // Lever A: index-wise comparison below assumes Sorted; a Chain's
-            // entries[] is the overlay only.  Materialise both first (no-op
-            // for Sorted; memoised) — same fix as vm.cc valuesEqual.
-            if (aa && aa->isChain()) aa = const_cast<Bindings *>(aa->materialize());
-            if (bb && bb->isChain()) bb = const_cast<Bindings *>(bb->materialize());
             // 2026-05-19 #666: TW's eqValues (libexpr/eval.cc:3365)
             // special-cases derivations: if both sides have `type =
             // "derivation"`, compare ONLY their `outPath` (the canonical
@@ -578,8 +573,25 @@ inline bool valueEqual(VMState & vm, Value a0, Value b0)
                     break;
                 }
             }
-            uint32_t na = aa ? aa->size : 0; uint32_t nb = bb ? bb->size : 0;
+            const bool anyChain = (aa && aa->isChain()) || (bb && bb->isChain());
+            uint32_t na = aa ? (anyChain ? aa->countDistinct() : aa->size) : 0;
+            uint32_t nb = bb ? (anyChain ? bb->countDistinct() : bb->size) : 0;
             if (na != nb) return false;
+            if (anyChain) {
+                Bindings::Cursor ca(aa);
+                Bindings::Cursor cb(bb);
+                std::vector<Task> pending;
+                pending.reserve(na);
+                while (const Bindings::Entry * ea = ca.next()) {
+                    const Bindings::Entry * eb = cb.next();
+                    if (!eb || ea->name != eb->name) return false;
+                    pending.push_back({ea->value, eb->value});
+                }
+                if (cb.next()) return false;
+                for (uint32_t i = static_cast<uint32_t>(pending.size()); i > 0; --i)
+                    stack.push_back(pending[i - 1]);
+                break;
+            }
             // A12b: name-check inline (cheap), then push value-pair
             // tasks in REVERSE for left-to-right processing.
             for (uint32_t i = 0; i < na; ++i)

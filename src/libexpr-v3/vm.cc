@@ -946,15 +946,6 @@ inline bool valueEqual(VMState & vm, Value a0, Value b0, bool insideContainer0 =
             auto * aa = a.asAttrs();
             auto * bb = b.asAttrs();
             if (aa == bb) break;
-            // Lever A: this case compares by index (`aa->entries[i]` vs
-            // `bb->entries[i]` over `aa->size`).  A Chain's entries[] is
-            // the overlay only, so an unmateralised chain compares as a
-            // partial attrset → `chain == its-own-materialisation` wrongly
-            // returns false, breaking lib.unique / elem / dedup / override
-            // equality across nixpkgs.  Materialise both to the full sorted
-            // view first (no-op for Sorted; memoised).
-            if (aa && aa->isChain()) aa = const_cast<Bindings *>(aa->materialize());
-            if (bb && bb->isChain()) bb = const_cast<Bindings *>(bb->materialize());
             // Special-case derivations: if both attrsets are derivations
             // (have `type = "derivation"`), compare their `outPath` fields
             // and ignore the rest.  Matches tree-walker semantics — required
@@ -976,9 +967,31 @@ inline bool valueEqual(VMState & vm, Value a0, Value b0, bool insideContainer0 =
                     break;
                 }
             }
-            uint32_t na = aa ? aa->size : 0;
-            uint32_t nb = bb ? bb->size : 0;
+            const bool anyChain = (aa && aa->isChain()) || (bb && bb->isChain());
+            uint32_t na = aa ? (anyChain ? aa->countDistinct() : aa->size) : 0;
+            uint32_t nb = bb ? (anyChain ? bb->countDistinct() : bb->size) : 0;
             if (na != nb) return false;
+            if (anyChain) {
+                Bindings::Cursor ca(aa);
+                Bindings::Cursor cb(bb);
+                std::vector<Task> pending;
+                pending.reserve(na);
+                while (const Bindings::Entry * ea = ca.next()) {
+                    const Bindings::Entry * eb = cb.next();
+                    if (!eb || ea->name != eb->name) return false;
+                    Value * aSlot = (aa && !aa->isChain())
+                        ? const_cast<Value *>(&ea->value) : nullptr;
+                    Value * bSlot = (bb && !bb->isChain())
+                        ? const_cast<Value *>(&eb->value) : nullptr;
+                    pending.push_back({ea->value, eb->value,
+                                       /*insideContainer=*/true,
+                                       aSlot, bSlot});
+                }
+                if (cb.next()) return false;
+                for (uint32_t i = static_cast<uint32_t>(pending.size()); i > 0; --i)
+                    stack.push_back(pending[i - 1]);
+                break;
+            }
             // A12 (2026-05-17) writeback-force on each entry value: see
             // List case above.  Attrs entries built by primMapAttrs or
             // lower.cc's lazy-binding lowering are Tag::App; without this,
