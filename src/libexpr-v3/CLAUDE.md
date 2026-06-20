@@ -100,6 +100,30 @@ is the gate now.
 For the `v3-eval` binary directly, there is no preeval at all —
 it's been v3-only from day one.
 
+## Pre-merge gate — RUN THE FULL `--brute` (not a subset)
+
+**Before committing/merging ANY v3 change, run the full 22-suite battery:**
+
+```bash
+nix develop -c bash src/libexpr-v3/test/all-v3-tests.sh --brute
+```
+
+This runs every suite under the aggressive moving-GC stress (1 MB nursery +
+`V3_DBG_NURSERY_AUDIT=1 V3_DBG_NURSERY_BRUTE=1`) — it catches BOTH missed-root /
+use-after-free regressions AND TW-divergence (drv-parity, chain-parity,
+brute-audit, 583 App-cache, lang 143, etc.). **Expect `22/22 ALL GREEN`.**
+
+Running only SUBSETS (lang / drv-parity / chain-parity / v3-smoke / darwin-smoke)
+is NOT sufficient and has shipped regressions: the 583 POS-3 valueEqual/mapAttrs
+forcing divergence (2026-06-20) passed lang+drv-parity+chain-parity but failed
+only under the full `--brute`'s `brute-audit` suite.  Subsets are fine for a fast
+inner loop; the full `--brute` is the gate.
+
+CPU/RSS perf is a SEPARATE gate and MUST be measured on the quiet host darwin-4
+(`aarch64-darwin-4.lan`) — the laptop's ~5-10% noise floor exceeds the keep-bar
+(see `bench/baselines/darwin4-rows.tsv`).  Correctness (`--brute` + byte-identity)
+can run anywhere; perf cannot.
+
 ## Critical constraints (hard rules; load-bearing)
 
 0. **Today's allocator is Boehm conservative GC**, inherited from cppnix. The Cheney nursery design (`CHENEY_NURSERY_DESIGN.md`) exists; Phase A (allocator) and Phase C (scavenge) have landed but are gated `NIX_V3_NURSERY=1` opt-in (default-OFF). Phase D (write barriers) is unresolved. **Do not assume nursery semantics in v3 code**. Empirical consequence: Boehm heap grows past 1 GB on `hello.drvPath` runs and stays there. See LESSONS §1.6 and `EXTEND_DERIVATION_INVESTIGATION_2026-05-18.md`.
