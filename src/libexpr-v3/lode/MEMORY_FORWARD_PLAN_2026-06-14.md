@@ -104,6 +104,56 @@ FP-4** (the nursery is the bigger Layer-C win and shares no surface).  No code t
 step — the reconcile + sizing is the deliverable (Rule 0: kills "FP-0 revives the
 split").
 
+#### FP-3 CLOSURE (2026-06-20 — M5 now measurable on darwin-4; lever CLOSED, not built)
+The 2026-06-14 sizing used the PRE-colleague-stack arena.  Re-measured on darwin-4
+(quiet host) at HEAD `81b58dc66` (env-sharing+interning+mapAttrs stack default-on),
+with the major GC forced near each workload's peak arena (`NIX_V3_MAJOR_GC_THRESHOLD_MB`
+just under peak) to read **peak-LIVE** pairs (not allocated churn — the FP-2 measure-
+first lesson):
+
+| workload | peak arena | peak-LIVE pairs | ×32 B (live) | allocated pairs (incl nursery) |
+|----------|-----------:|----------------:|-------------:|-------------------------------:|
+| firefox  | 436 MB     | 493 516         | 15.8 MB      | 33.5 MB (was 45.85 pre-stack)  |
+| M5       | 1543 MB    | 1 586 803       | 50.8 MB      | 125.4 MB (was 253.52 pre-stack)|
+
+Three measurement-driven findings retire BOTH paths:
+
+1. **The colleague's mapAttrs App3-deferral already captured ~half the pair tax.**
+   Allocated pairs M5 253.52 → **125.4 MB**, firefox 45.85 → **33.5 MB**.  The FP-3
+   projections (63 MB a / 127 MB M5 b) were against the larger pre-stack population;
+   the residual headroom is now ~half.
+
+2. **Option (a) 8 B-granular allocator (kAlign 16→8) is marginal-to-net-loss, not the
+   "lower-risk win" FP-3 assumed.**  Doubling the granule doubles `cellTypes` (1 byte/
+   granule) + `cellStarts` (1 bit/granule): the metadata INCREMENT is `arena/16`
+   (≈ **96 MB on M5**) + `arena/128` bits.  The rounding win is `8 B × (live cells whose
+   size mod 16 ∈ [1,8])` ≤ 8 B × (a fraction of M5's 15.1 M live cells) ≈ 40–60 MB.
+   Net = win − metadata ≈ break-even-to-negative; the sign hinges on M5's avg live-cell
+   size (~64–103 B, right at the cross-over `avg<64 ⇒ win`).  A heap-wide allocator +
+   GC-walker change (the campaign's highest *allocator* risk) for an uncertain ≤~0
+   net is not justified.
+
+3. **Option (b) ValuePair 32→16 B `{left,right}` is a real but small win at the highest
+   *semantic* risk.**  Peak-live win ≈ 50.8 MB ÷ 2 = **~25 MB M5** / ~8 MB firefox
+   (≤ ~2 % of M5 RSS; the allocated ceiling ~62 MB is mostly nursery churn that never
+   reaches peak tenured).  Surface is smaller than feared — `ValuePair.evaluated`
+   (the App self-memo) is only **6 real sites, 2 load-bearing short-circuits**
+   (vm.cc:8422 / 13791) — but dropping it without relocating the memo re-evaluates hot
+   Apps (**the #696 class**: re-eval every dispatch on hot mapAttrs entries → a CPU
+   regression that would fail the ≤3 % darwin-4 bar).  Relocating it (App cell-update,
+   like thunks) is drv-hash-critical.  App3's `third` (~80 real sites; App3 is now
+   *common* post-mapAttrs-deferral) must also go → nested App (2×16 B), which OFFSETS
+   the win for the App3 fraction.
+
+**DECISION: pair tax CLOSED (not built).** Both paths are at-best-small wins (≤ ~2 %
+RSS) at high risk, below the project's risk/reward bar (Rule 0 + the byte-id oracle +
+the ≤3 % CPU bar).  The colleague's mapAttrs stack already banked the cheap half.
+The thunk-header lever (FP-2, the bigger M5 win at −285 MB) remains the realized
+structural memory win; the next *strategic* RSS lever is the nursery/gen-major
+Layer-C reclaim (FP-4, shipped), not per-object shrink.  If a future workload makes
+the residual ~25 MB worth the App-cell-update risk, option (b) is the path (option (a)
+is retired as metadata-negative).
+
 ### FP-4 — generational nursery (the strategic Layer-C lever; multi-week; ⚠)
 The ONLY path to beating TW on derivations (reclaim the 224 MB dead mid-eval — the
 one capability TW's conservative GC structurally forbids). The barriers are already
