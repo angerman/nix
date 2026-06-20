@@ -1307,11 +1307,13 @@ private:
             // env-sharing: rewrite the shared Env's value pointers to their
             // forwarded locations.  The Env cell itself is non-moving (CellType::
             // Env is never relocated), so only its values[] need the rewrite.
-            // (Bring-up builds one fresh Env per closure → no shared-Env double-
-            // visit; interning, a follow-up, must add evac dedup before sharing.)
+            // Env interning makes one Env SHARED across many closures/thunks, so
+            // dedup via the evac walked_ set — rewrite each Env's values exactly
+            // once per pass (else a shared Env is content-walked once per referrer).
             if (c->upvalEnv) {
                 Env * e = c->upvalEnv;
-                for (uint16_t i = 0; i < e->nValues; ++i) visitValue(e->values[i]);
+                if (walked_.insert(e).second)
+                    for (uint16_t i = 0; i < e->nValues; ++i) visitValue(e->values[i]);
             } else {
                 for (uint16_t i = 0; i < c->nUpvalues; ++i) visitValue(c->upvalues[i]);
             }
@@ -1334,9 +1336,11 @@ private:
             case ThunkState::Blackhole:
                 clearCU(thunkCU(t));  // FP-2a: was t->suspended.cu; evac moves IC'd Bindings
                 if (ListVec * w = thunkCapturedWiths(t)) visitList(w);  // FP-2b: tail slot
-                // env-sharing: rewrite the shared (non-moving) Env's value ptrs.
+                // env-sharing: rewrite the shared (non-moving) Env's value ptrs,
+                // deduped via walked_ (interning shares one Env across referrers).
                 if (Env * te = thunkUpvalEnv(t)) {
-                    for (uint16_t i = 0; i < te->nValues; ++i) visitValue(te->values[i]);
+                    if (walked_.insert(te).second)
+                        for (uint16_t i = 0; i < te->nValues; ++i) visitValue(te->values[i]);
                 } else {
                     for (uint16_t i = 0; i < t->nUpvalues; ++i) visitValue(t->tail[i]);
                 }
