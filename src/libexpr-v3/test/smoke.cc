@@ -2216,7 +2216,7 @@ static int testPrimMapAttrsValueIdentityNoApps()
         return 1;
     }
     std::fprintf(stderr,
-        "testPrimMapAttrsValueIdentityNoApps: OK (value identity copies attrs without Apps)\n");
+        "testPrimMapAttrsValueIdentityNoApps: OK (value identity reuses attrs without Apps)\n");
     return 0;
 }
 

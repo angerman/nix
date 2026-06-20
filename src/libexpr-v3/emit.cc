@@ -2603,8 +2603,8 @@ struct Emitter
         // mapAttrs identity-value callback detection.  The common
         // `name: value: value` mapper is an arity-2 closure after eval/apply
         // collapse and compiles to a direct return of slot 1.  Mark it so
-        // primMapAttrs can copy the binding table without installing one lazy
-        // App3/MapAttrs cell per entry.
+        // primMapAttrs can return the source attrset directly without copying
+        // the binding table or installing one lazy App3/MapAttrs cell per entry.
         if (fid != 0
             && f.argName != ir::kInvalidSymbol
             && f.extraParams.size() == 1

@@ -2222,27 +2222,15 @@ void primMapAttrs(EvalState &, Value * args, Value & out)
     if (!args[1].isAttrs()) typeError("mapAttrs", "attrset");
     auto * src = args[1].asAttrs();
     if (!src) { out = args[1]; return; }
-    uint32_t n = src->countDistinct();
-    if (n == 0) { out.mkAttrs(Alloc::allocBindings(0)); return; }
-    if (!src->isChain()
-        && fn.tag() == Tag::Closure
+    if (fn.tag() == Tag::Closure
         && fn.asClosure()
         && fn.asClosure()->desc
         && fn.asClosure()->desc->secondArgIdentityLambda) {
-        Bindings * result = Alloc::allocBindings(src->size);
-        if (src->isMapAttrs()) {
-            result->kind = uint8_t(Bindings::Kind::MapAttrs);
-            result->parent = src->parent;
-            result->aux = src->aux;
-        }
-        for (uint32_t i = 0; i < src->size; ++i)
-            result->entries[i] = src->entries[i];
-        bindingsPostConstructBarrier(result);
-        V3_STATS_INC(attrsetsAllocated);
-        recordBindingsOrigin(result, 0, "primMapAttrs.identity");
-        out.mkAttrs(result);
+        out = args[1];
         return;
     }
+    uint32_t n = src->countDistinct();
+    if (n == 0) { out.mkAttrs(Alloc::allocBindings(0)); return; }
     Bindings * result = Alloc::allocBindings(n);
     result->kind = uint8_t(Bindings::Kind::MapAttrs);
     result->parent = src;
