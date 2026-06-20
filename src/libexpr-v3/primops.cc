@@ -32,6 +32,7 @@
 #include "lower_v3.hh"       // canLowerV3 + lowerV3Ast (native AST→IR)
 #include "v3/tw_baseenv.hh"  // twBaseEnvGlobals (free-name resolution)
 #include "v3/vm.hh"
+#include "v3/mapattrs_demand.hh"  // unrealized-MapAttrs immediate-demand helpers
 #include "v3/ffi.hh"  // FFI plan migration step 1: surface declarations.
 #include "v3/errors.hh"
 #include "v3/disasm.hh"  // #815 RCA: cached-vs-fresh disassembly
@@ -483,31 +484,10 @@ inline const Bindings::Entry * lookupEntryNoMapAttrsRealize(
     return nullptr;
 }
 
-inline bool isUnrealizedMapAttrsEntry(
-    const Bindings * owner, const Bindings::Entry & e) noexcept
-{
-    return owner && owner->isMapAttrs()
-        && (e.pos & Bindings::kMapAttrsUnrealizedPosBit) != 0;
-}
-
-inline Value entryValueForImmediateDemand(
-    VMState & vm, const Bindings * owner, const Bindings::Entry & e)
-{
-    if (!isUnrealizedMapAttrsEntry(owner, e))
-        return e.value;
-
-    auto * mutOwner = const_cast<Bindings *>(owner);
-    auto * mutEntry = const_cast<Bindings::Entry *>(&e);
-    Value nameStr = Bindings::makeMapAttrsNameValue(e.name);
-    Value src = mutOwner->mapAttrsEntrySource(mutEntry);
-    return callClosure2(vm, mutOwner->aux, nameStr, src);
-}
-
-inline Value forceEntryForImmediateDemand(
-    VMState & vm, const Bindings * owner, const Bindings::Entry & e)
-{
-    return forceValue(vm, entryValueForImmediateDemand(vm, owner, e));
-}
+// isUnrealizedMapAttrsEntry / entryValueForImmediateDemand /
+// forceEntryForImmediateDemand moved to v3/mapattrs_demand.hh (shared with
+// vm.cc's valueEqual — single source of truth for "force the mapped value, not
+// the stored source").  Included at the top of this file.
 
 template <typename Keep>
 inline Bindings * copyMapAttrsSubset(const Bindings * src, uint32_t n, Keep && keep)

@@ -20,6 +20,7 @@
 #include "v3/vm.hh"
 #include "v3/alloc.hh"
 #include "v3/primop.hh"
+#include "v3/mapattrs_demand.hh"  // unrealized-MapAttrs immediate-demand (valueEqual)
 #include "v3/ir.hh"
 #include "v3/disasm.hh"
 #include "v3/errors.hh"
@@ -1148,8 +1149,21 @@ inline bool valueEqual(VMState & vm, Value a0, Value b0, bool insideContainer0 =
                 if (aa->entries[i].name != bb->entries[i].name) return false;
             // C-16: push entry-value pairs UNFORCED with their source slots
             // (pop-time force + writeback + short-circuit; see the List case).
+            //
+            // 583 POS-3 fix: for an UNREALIZED MapAttrs entry the stored value is
+            // the SOURCE `v`, not `f n v` — comparing/forcing it would skip the
+            // mapper's side effects (e.g. builtins.trace) and diverge from TW
+            // (0 vs 8 traces).  Realize the entry first (builds the lazy App3
+            // mapper application + memoizes), IDENTICAL to the chain path above
+            // which realizes through Bindings::Cursor (default realizeMapAttrs=
+            // true); only this flat path missed it.  The pop-time forceValue then
+            // applies the mapper, and the slot writeback memoizes the result.
             for (uint32_t i = na; i > 0; --i) {
                 uint32_t idx = i - 1;
+                if (isUnrealizedMapAttrsEntry(aa, aa->entries[idx]))
+                    aa->realizeMapAttrsEntry(&aa->entries[idx]);
+                if (isUnrealizedMapAttrsEntry(bb, bb->entries[idx]))
+                    bb->realizeMapAttrsEntry(&bb->entries[idx]);
                 stack.push_back({aa->entries[idx].value, bb->entries[idx].value,
                                  /*insideContainer=*/true,
                                  &aa->entries[idx].value, &bb->entries[idx].value});
