@@ -483,6 +483,32 @@ inline const Bindings::Entry * lookupEntryNoMapAttrsRealize(
     return nullptr;
 }
 
+inline bool isUnrealizedMapAttrsEntry(
+    const Bindings * owner, const Bindings::Entry & e) noexcept
+{
+    return owner && owner->isMapAttrs()
+        && (e.pos & Bindings::kMapAttrsUnrealizedPosBit) != 0;
+}
+
+inline Value entryValueForImmediateDemand(
+    VMState & vm, const Bindings * owner, const Bindings::Entry & e)
+{
+    if (!isUnrealizedMapAttrsEntry(owner, e))
+        return e.value;
+
+    auto * mutOwner = const_cast<Bindings *>(owner);
+    auto * mutEntry = const_cast<Bindings::Entry *>(&e);
+    Value nameStr = Bindings::makeMapAttrsNameValue(e.name);
+    Value src = mutOwner->mapAttrsEntrySource(mutEntry);
+    return callClosure2(vm, mutOwner->aux, nameStr, src);
+}
+
+inline Value forceEntryForImmediateDemand(
+    VMState & vm, const Bindings * owner, const Bindings::Entry & e)
+{
+    return forceValue(vm, entryValueForImmediateDemand(vm, owner, e));
+}
+
 template <typename Keep>
 inline Bindings * copyMapAttrsSubset(const Bindings * src, uint32_t n, Keep && keep)
 {
@@ -2527,14 +2553,14 @@ static Value forceDeepRec(VMState & vm, Value v, std::unordered_set<const void *
     } else if (v.isAttrs() && v.asAttrs()) {
         // ChainBindings: deep-force every value in the WHOLE chain (overlay +
         // parent), else a `throw` in a parent value would escape deepSeq.
-        // Force-iterate the materialised view (forEach materialises a Chain);
-        // for Sorted this is the same in-place walk.  We can't write back into
-        // a materialised copy, so for a Chain we force via the merged view
-        // (forcing is idempotent + the chain shares the parent's cells).
+        // MapAttrs: force the mapped value, not the stored source value, but
+        // avoid realizing each mapped entry into an App3 first.
         const Bindings * b = v.asAttrs();
-        if (b->isChain()) {
-            b->forEach([&](const Bindings::Entry & e) {
-                forceDeepRec(vm, e.value, seen);
+        if (b->isChain() || b->isMapAttrs()) {
+            if (!seen.insert(b).second) return v;
+            forEachEntryRefNoMapAttrsRealize(b, [&](const Bindings * owner,
+                                                     const Bindings::Entry & e) {
+                forceDeepRec(vm, entryValueForImmediateDemand(vm, owner, e), seen);
             });
         } else {
             if (!seen.insert(v.asAttrs()).second) return v;
@@ -4566,6 +4592,8 @@ struct LexicographicAttrRef {
     SymbolId name;
     Value value;
     Value * slot;
+    const Bindings * owner;
+    const Bindings::Entry * entry;
 };
 
 static std::vector<LexicographicAttrRef> lexicographicAttrEntries(Bindings * b)
@@ -4574,13 +4602,14 @@ static std::vector<LexicographicAttrRef> lexicographicAttrEntries(Bindings * b)
     if (!b) return order;
     order.reserve(b->countDistinct());
     if (b->isChain()) {
-        b->forEach([&](const Bindings::Entry & e) {
-            order.push_back({e.name, e.value, nullptr});
+        forEachEntryRefNoMapAttrsRealize(b, [&](const Bindings * owner,
+                                                const Bindings::Entry & e) {
+            order.push_back({e.name, e.value, nullptr, owner, &e});
         });
     } else {
         for (uint32_t i = 0; i < b->size; ++i)
             order.push_back({b->entries[i].name, b->entries[i].value,
-                             &b->entries[i].value});
+                             &b->entries[i].value, b, &b->entries[i]});
     }
     const auto & symTab = ir::globalSymbolTable();
     auto nameOf = [&](const LexicographicAttrRef & ref) -> std::string_view {
@@ -5518,9 +5547,10 @@ static void primDerivationFromPreprocessed(EvalState & state, Value * args, Valu
             if (f.asAttrs()) {
                 const auto & st = ir::globalSymbolTable();
                 const Bindings * b = f.asAttrs();
-                b->forEach([&](const Bindings::Entry & e) {
+                forEachEntryRefNoMapAttrsRealize(b, [&](const Bindings * owner,
+                                                        const Bindings::Entry & e) {
                     SymbolId nm = e.name;
-                    Value elv = forceValue(*state.vm, e.value);
+                    Value elv = forceEntryForImmediateDemand(*state.vm, owner, e);
                     if (!elv.isString())
                         throw std::runtime_error(
                             "v3 __derivationFromPreprocessed: env value "
@@ -5708,7 +5738,11 @@ static void primDerivationStrictNative(
         std::string_view key = keyStr;
         Value attrCopy;
         Value * attrSlot = attr.slot;
-        if (!attrSlot) {
+        if (attr.entry && isUnrealizedMapAttrsEntry(attr.owner, *attr.entry)) {
+            attrCopy = entryValueForImmediateDemand(
+                *state.vm, attr.owner, *attr.entry);
+            attrSlot = &attrCopy;
+        } else if (!attrSlot) {
             attrCopy = attr.value;
             attrSlot = &attrCopy;
         }

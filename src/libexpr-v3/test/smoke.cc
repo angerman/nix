@@ -1722,6 +1722,72 @@ static int testPrimAttrValuesMapAttrsSortsWithOneAppPerValue()
     return 0;
 }
 
+static void smokeThrowMappedValue(EvalState &, Value *, Value &)
+{
+    throw std::runtime_error("__smokeThrowMappedValue");
+}
+
+static int testPrimDeepSeqMapAttrsForcesMappedValuesNoApp3()
+{
+    const PrimOp * mapAttrsPo = findPrimOp("mapAttrs");
+    const PrimOp * deepSeqPo = findPrimOp("deepSeq");
+    if (!mapAttrsPo || !deepSeqPo) {
+        std::fprintf(stderr,
+            "testPrimDeepSeqMapAttrsForcesMappedValuesNoApp3: missing primops\n");
+        return 1;
+    }
+    static const PrimOp throwPo{
+        "__smokeThrowMappedValue", 2, smokeThrowMappedValue
+    };
+
+    SymbolId aSym = ir::globalInternSymbol("__deepSeq_mapAttrs_a");
+    Bindings * src = Alloc::allocBindings(1);
+    src->entries[0].name = aSym;
+    src->entries[0].pos = 0;
+    src->entries[0].value.mkInt(10);
+
+    Value fn;
+    fn.mkPrimOp(&throwPo);
+    Value srcV;
+    srcV.mkAttrs(src);
+
+    VMState vm;
+    EvalState st;
+    st.vm = &vm;
+
+    Value mapped;
+    Value mapArgs[2] = {fn, srcV};
+    mapAttrsPo->fn(st, mapArgs, mapped);
+    uint64_t beforeDeepSeq = allocStats().pairsAllocated;
+
+    Value keep;
+    keep.mkInt(99);
+    Value deepArgs[2] = {mapped, keep};
+    Value out;
+    bool threw = false;
+    try {
+        deepSeqPo->fn(st, deepArgs, out);
+    } catch (const std::exception & e) {
+        threw = std::strstr(e.what(), "__smokeThrowMappedValue") != nullptr;
+    }
+    uint64_t afterDeepSeq = allocStats().pairsAllocated;
+    if (!threw) {
+        std::fprintf(stderr,
+            "testPrimDeepSeqMapAttrsForcesMappedValuesNoApp3: deepSeq did not force mapped value\n");
+        return 1;
+    }
+    if (afterDeepSeq != beforeDeepSeq) {
+        std::fprintf(stderr,
+            "testPrimDeepSeqMapAttrsForcesMappedValuesNoApp3: deepSeq allocated %llu ValuePair(s)\n",
+            (unsigned long long)(afterDeepSeq - beforeDeepSeq));
+        return 1;
+    }
+
+    std::fprintf(stderr,
+        "testPrimDeepSeqMapAttrsForcesMappedValuesNoApp3: OK (deepSeq forces MapAttrs without App3)\n");
+    return 0;
+}
+
 static int runPrimMapAttrsSelectNoApp3(bool dynamicName)
 {
     const PrimOp * mapAttrsPo = findPrimOp("mapAttrs");
@@ -4239,6 +4305,7 @@ int main()
     rc |= testPrimMapAttrsNamesDoNotRealize();
     rc |= testPrimMapAttrsNestedNamesDoNotRealize();
     rc |= testPrimAttrValuesMapAttrsSortsWithOneAppPerValue();
+    rc |= testPrimDeepSeqMapAttrsForcesMappedValuesNoApp3();
     rc |= testPrimMapAttrsSelectNoApp3();
     rc |= testPrimMapAttrsEmptyUpdateNoApp3();
     rc |= testPrimMapAttrsUpdateNoApp3();
