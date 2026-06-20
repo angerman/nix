@@ -1,23 +1,37 @@
 # darwin-4 canonical CPU baselines — the QUIET host (aarch64-darwin-4.lan, load ~1.1).
-# 2026-06-19. min-of-5, cache-off (NIX_V3_NO_DISK_CACHE=1), user CPU seconds.
+# min-of-5, cache-off (NIX_V3_NO_DISK_CACHE=1), user CPU seconds, byte-identical drvPaths.
 # THE MEASUREMENT OF RECORD for CPU. The laptop is UNUSABLE for CPU levers: its
 # ~5-10% noise floor exceeds the 3% keep-bar (proven 2026-06-19 — the attr-select
 # IC measured −8% on the laptop at min-of-3 and REVERSED to +6% at min-of-5; on
 # darwin-4 it is exactly 0.0%). All CPU grading MUST run here.
+#
+# CONVENTION (2026-06-20): every row is STAMPED with the commit it was measured
+# at (last column) + the date.  Re-measure + re-stamp after any change that could
+# move the eval hot path; a row whose `commit` is an ancestor of HEAD is STALE.
+# The same numbers are also attached to the tested commit as a `git notes`
+# (refs/notes/commits) entry — see `git notes show <commit>`.
 #
 # Key finding: the true v3-vs-TW gap is ~4.4-5.5× (LARGER + more uniform than the
 # laptop's noisy 3.44×), byte-identical, and lives in the CORE EVAL LOOP
 # (forceValue #1 leaf + callClosure + dispatchLoop) — systemic interpreter cost,
 # not a hot-spot. See lode/V3_VS_TW_STRUCTURAL_ANALYSIS_2026-06-19.md.
 #
-# nixpkgs on darwin-4: 25.05pre-git (git→git-2.50.1.drv); absolute times are
-# darwin-4-specific — use for v3-vs-v3 A/Bs + the ratio, not cross-host compare.
+# nixpkgs on darwin-4: hello-2.12.3, git-2.50.1, firefox-146.0.1; absolute times
+# are darwin-4-specific — use for v3-vs-v3 A/Bs + the ratio, not cross-host compare.
+# arena = NIX_V3_DIRECT_EVAL=1 NIX_VM_STATS=1 v3_arena MB (1 run; deterministic).
 #
-# row	v3_cpu	tw_cpu	ratio	impure	cache
-hello	1.23	0.26	4.73	yes	off
-git	1.46	0.33	4.42	yes	off
-firefox	6.21	1.14	5.45	yes	off
-fib	2.29	NA	NA	no	off
-attrNames	0.57	NA	NA	yes	off
+# 20758fad5 = colleague's env-sharing+interning+mapAttrs/force stack (default-on)
+#   + this session's #60-66 (POS-3 fix, evac dedup, docs).  vs the 3ff650587 base
+#   (pre-stack): CPU-NEUTRAL — hello 4.73 (=), git 4.42→4.45, firefox 5.45→5.50
+#   (both within darwin-4 noise) → the whole stack did NOT regress raw eval CPU.
+#
+# row	v3_cpu	tw_cpu	ratio	arena_MB	impure	cache	commit	date
+hello	1.23	0.26	4.73	67.1	yes	off	20758fad5	2026-06-20
+git	1.47	0.33	4.45	100.7	yes	off	20758fad5	2026-06-20
+firefox	6.27	1.14	5.50	436.2	yes	off	20758fad5	2026-06-20
+# synthetic v3-only rows below NOT re-measured at 20758fad5 — last at 3ff650587:
+fib	2.29	NA	NA	NA	no	off	3ff650587	2026-06-19
+attrNames	0.57	NA	NA	NA	yes	off	3ff650587	2026-06-19
 # foldl: pending (ssh-quoting of the foldl' apostrophe; synthetic row, low priority)
-# M5: IFD-blocked even on darwin-4 (aarch64; cardano-node needs x86_64-linux IFD)
+# M5/cardano/HNE: IFD-blocked on aarch64 (cardano-node needs x86_64-linux IFD);
+#   big-workload CPU+peak-RSS remain UNMEASURED until an x86_64-linux host builds.
