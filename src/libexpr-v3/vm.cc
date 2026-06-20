@@ -3328,7 +3328,8 @@ enum class MapAttrsSelectResult : uint8_t {
 }
 
 [[gnu::always_inline]] inline MapAttrsSelectResult tryPushDirectMapAttrsEntry(
-    VMState & vm, Bindings * b, uint32_t slotIdx, uint32_t resumeIp)
+    VMState & vm, Bindings * b, uint32_t slotIdx, uint32_t resumeIp,
+    bool memoize = true)
 {
     if (__builtin_expect(!b || !b->isMapAttrs() || slotIdx >= b->size, 1))
         return MapAttrsSelectResult::NotHandled;
@@ -3339,6 +3340,21 @@ enum class MapAttrsSelectResult : uint8_t {
     Value nameStr = Bindings::makeMapAttrsNameValue(e.name);
     Value src = b->mapAttrsEntrySource(&e);
     Value mapped = callClosure2(vm, b->aux, nameStr, src);
+    // Chain lookup may find a MapAttrs entry in a shared parent layer.  In
+    // that case compute the mapped value, but leave the parent entry untouched;
+    // only a leaf hit may memoize into the Bindings entry itself.
+    if (!memoize) {
+        if (shouldForceSelectedEntry(b, mapped)) {
+            push(vm, mapped);
+            CallFrame & f = vm.frames.back();
+            armKeepBeltCheck(f);
+            f.flags |= CFF_FORCE_RETRY;
+            f.ip = resumeIp;
+            return MapAttrsSelectResult::Force;
+        }
+        push(vm, mapped);
+        return MapAttrsSelectResult::Pushed;
+    }
     e.pos &= Bindings::kPosMask;
     bindingsSetValue(b, slotIdx, mapped);
 
@@ -9745,7 +9761,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                             MapAttrsSelectResult mapAttrsSelect =
                                 tryPushDirectMapAttrsEntry(
                                     vm, const_cast<Bindings *>(ownerLayer),
-                                    ownerSlot, ip);
+                                    ownerSlot, ip, leafHit);
                             if (mapAttrsSelect == MapAttrsSelectResult::Force)
                                 goto op_force_slow;
                             if (mapAttrsSelect == MapAttrsSelectResult::Pushed)
@@ -10500,7 +10516,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             if (directMapAttrsB) {
                 MapAttrsSelectResult mapAttrsSelect =
                     tryPushDirectMapAttrsEntry(
-                        vm, directMapAttrsB, directMapAttrsSlot, ip);
+                        vm, directMapAttrsB, directMapAttrsSlot, ip,
+                        dynLeafSafe);
                 if (mapAttrsSelect == MapAttrsSelectResult::Force)
                     goto op_force_slow;
                 if (mapAttrsSelect == MapAttrsSelectResult::Pushed)
