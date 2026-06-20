@@ -2146,16 +2146,29 @@ void primRemoveAttrs(EvalState & state, Value * args, Value & out)
     // size in the arena even when many entries were removed.
     // #746 attribution on hello.drvPath measured 17.4 % slack here.
     uint32_t kExact = 0;
-    src->forEach([&](const Bindings::Entry & e) {
+    forEachEntryNoMapAttrsRealize(src, [&](const Bindings::Entry & e) {
         if (toRemove.count(e.name) == 0)
             ++kExact;
     });
     Bindings * result = Alloc::allocBindings(kExact);
     V3_STATS_INC(attrsetsAllocated);
+    auto copySrcEntry = [&](const Bindings * owner,
+                            const Bindings::Entry & e) -> Bindings::Entry {
+        if (owner && owner->isMapAttrs()
+            && (e.pos & Bindings::kMapAttrsUnrealizedPosBit) != 0)
+        {
+            auto * mutOwner = const_cast<Bindings *>(owner);
+            auto * mutEntry = const_cast<Bindings::Entry *>(&e);
+            mutOwner->realizeMapAttrsEntry(mutEntry);
+            return *mutEntry;
+        }
+        return e;
+    };
     uint32_t k = 0;
-    src->forEach([&](const Bindings::Entry & e) {
+    forEachEntryRefNoMapAttrsRealize(src, [&](const Bindings * owner,
+                                              const Bindings::Entry & e) {
         if (toRemove.count(e.name) == 0) {
-            result->entries[k++] = e;
+            result->entries[k++] = copySrcEntry(owner, e);
         }
     });
     // k == kExact by construction; allocBindings already set the size.

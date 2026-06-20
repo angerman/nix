@@ -2273,6 +2273,125 @@ static int testPrimIntersectAttrsMapAttrsChainDiscardNoApp3()
     return 0;
 }
 
+static int testPrimRemoveAttrsMapAttrsChainCopy()
+{
+    const PrimOp * mapAttrsPo = findPrimOp("mapAttrs");
+    const PrimOp * removePo = findPrimOp("removeAttrs");
+    if (!mapAttrsPo || !removePo) {
+        std::fprintf(stderr,
+            "testPrimRemoveAttrsMapAttrsChainCopy: missing primops\n");
+        return 1;
+    }
+    static const PrimOp plusOnePo{
+        "__smokeSecondPlusOneRemove", 2, smokeSecondPlusOne
+    };
+
+    auto m = ir::makeModule();
+    auto entry = m.freshBlock();
+    funcOf(m, 0).entryBlock = entry;
+
+    auto fn = addBinding(m, entry, ir::LitPrimOp{&plusOnePo});
+    auto aVal = addBinding(m, entry, ir::LitInt{10});
+    auto cVal = addBinding(m, entry, ir::LitInt{30});
+    auto bVal = addBinding(m, entry, ir::LitInt{99});
+    auto aSym = m.internSymbol("a");
+    auto bSym = m.internSymbol("b");
+    auto cSym = m.internSymbol("c");
+
+    auto src = addBinding(m, entry,
+        ir::AttrSet{ { {aSym, aVal}, {cSym, cVal} } });
+    auto mapped = addBinding(m, entry, ir::PrimOpCall{mapAttrsPo, {fn, src}});
+    auto overlay = addBinding(m, entry, ir::AttrSet{ { {bSym, bVal} } });
+    auto updated = addBinding(m, entry, ir::Update{mapped, overlay});
+    auto removeName = addBinding(m, entry, ir::LitString{"b"});
+    auto removeList = addBinding(m, entry, ir::ListExpr{{removeName}});
+    auto removed = addBinding(m, entry, ir::PrimOpCall{removePo, {updated, removeList}});
+    auto selected = addBinding(m, entry, ir::AttrSelect{removed, aSym});
+    setReturn(m, entry, selected);
+
+    ir::computeFreeVars(m);
+    auto cu = compile(m);
+    uint64_t pairsBefore = allocStats().pairsAllocated;
+    Value res = run(cu);
+    uint64_t pairsAfter = allocStats().pairsAllocated;
+    if (!res.isInt() || res.asInt() != 11) {
+        std::fprintf(stderr,
+            "testPrimRemoveAttrsMapAttrsChainCopy: expected mapped a=11, got tag=%d val=%lld\n",
+            (int)res.tag(), res.isInt() ? (long long)res.asInt() : 0LL);
+        return 1;
+    }
+    if (pairsAfter != pairsBefore + 2) {
+        std::fprintf(stderr,
+            "testPrimRemoveAttrsMapAttrsChainCopy: expected two kept App3 pairs, got %llu\n",
+            (unsigned long long)(pairsAfter - pairsBefore));
+        return 1;
+    }
+    std::fprintf(stderr,
+        "testPrimRemoveAttrsMapAttrsChainCopy: OK (kept chain parent MapAttrs entries are mapped)\n");
+    return 0;
+}
+
+static int testPrimRemoveAttrsMapAttrsChainDiscardNoApp3()
+{
+    const PrimOp * mapAttrsPo = findPrimOp("mapAttrs");
+    const PrimOp * removePo = findPrimOp("removeAttrs");
+    if (!mapAttrsPo || !removePo) {
+        std::fprintf(stderr,
+            "testPrimRemoveAttrsMapAttrsChainDiscardNoApp3: missing primops\n");
+        return 1;
+    }
+    static const PrimOp plusOnePo{
+        "__smokeSecondPlusOneRemoveDiscard", 2, smokeSecondPlusOne
+    };
+
+    auto m = ir::makeModule();
+    auto entry = m.freshBlock();
+    funcOf(m, 0).entryBlock = entry;
+
+    auto fn = addBinding(m, entry, ir::LitPrimOp{&plusOnePo});
+    auto aVal = addBinding(m, entry, ir::LitInt{10});
+    auto cVal = addBinding(m, entry, ir::LitInt{30});
+    auto bVal = addBinding(m, entry, ir::LitInt{99});
+    auto aSym = m.internSymbol("a");
+    auto bSym = m.internSymbol("b");
+    auto cSym = m.internSymbol("c");
+
+    auto src = addBinding(m, entry,
+        ir::AttrSet{ { {aSym, aVal}, {cSym, cVal} } });
+    auto mapped = addBinding(m, entry, ir::PrimOpCall{mapAttrsPo, {fn, src}});
+    auto overlay = addBinding(m, entry, ir::AttrSet{ { {bSym, bVal} } });
+    auto updated = addBinding(m, entry, ir::Update{mapped, overlay});
+    auto removeA = addBinding(m, entry, ir::LitString{"a"});
+    auto removeC = addBinding(m, entry, ir::LitString{"c"});
+    auto removeList = addBinding(m, entry, ir::ListExpr{{removeA, removeC}});
+    auto removed = addBinding(m, entry, ir::PrimOpCall{removePo, {updated, removeList}});
+    setReturn(m, entry, removed);
+
+    ir::computeFreeVars(m);
+    auto cu = compile(m);
+    uint64_t pairsBefore = allocStats().pairsAllocated;
+    Value res = run(cu);
+    uint64_t pairsAfter = allocStats().pairsAllocated;
+    SymbolId bGlobal = ir::globalInternSymbol("b");
+    if (!res.isAttrs() || !res.asAttrs() || res.asAttrs()->size != 1
+        || res.asAttrs()->entries[0].name != bGlobal
+        || !res.asAttrs()->entries[0].value.isInt()
+        || res.asAttrs()->entries[0].value.asInt() != 99) {
+        std::fprintf(stderr,
+            "testPrimRemoveAttrsMapAttrsChainDiscardNoApp3: unexpected result\n");
+        return 1;
+    }
+    if (pairsAfter != pairsBefore) {
+        std::fprintf(stderr,
+            "testPrimRemoveAttrsMapAttrsChainDiscardNoApp3: discarded MapAttrs entries allocated %llu ValuePair(s)\n",
+            (unsigned long long)(pairsAfter - pairsBefore));
+        return 1;
+    }
+    std::fprintf(stderr,
+        "testPrimRemoveAttrsMapAttrsChainDiscardNoApp3: OK (removed chain parent MapAttrs entries stay unrealized)\n");
+    return 0;
+}
+
 static int testPrimMapAttrsValueIdentityNoApps()
 {
     const PrimOp * mapAttrsPo = findPrimOp("mapAttrs");
@@ -4127,6 +4246,8 @@ int main()
     rc |= testPrimMapAttrsSetOpsNoApp3();
     rc |= testPrimIntersectAttrsMapAttrsChainCopy();
     rc |= testPrimIntersectAttrsMapAttrsChainDiscardNoApp3();
+    rc |= testPrimRemoveAttrsMapAttrsChainCopy();
+    rc |= testPrimRemoveAttrsMapAttrsChainDiscardNoApp3();
     rc |= testPrimMapAttrsValueIdentityNoApps();
     rc |= testPrimOpHeadTail();
     rc |= testFibonacciSelfApp();
