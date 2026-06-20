@@ -3616,6 +3616,53 @@ static bool callClosureNExact(
 
 namespace { // re-open anon ns
 
+[[gnu::always_inline]] inline bool
+frameHasUpvalues(const Closure * closure, const CallFrame & frame) noexcept
+{
+    return closure != nullptr
+        || ((frame.flags & CFF_THUNK_RETURN) && frame.thunk != nullptr);
+}
+
+[[gnu::always_inline]] inline uint32_t
+frameNUpvalues(const Closure * closure, const CallFrame & frame) noexcept
+{
+    if (closure) return closure->nUpvalues;
+    if ((frame.flags & CFF_THUNK_RETURN) && frame.thunk)
+        return frame.thunk->nUpvalues;
+    return 0;
+}
+
+[[gnu::always_inline]] inline Value
+frameUpvalue(const Closure * closure, const CallFrame & frame, uint32_t i) noexcept
+{
+    if (closure) return closureUpvalue(closure, i);
+    Thunk * thunk = frame.thunk;
+    if (Env * env = thunkUpvalEnv(thunk))
+        return env->values[i];
+    return thunk->tail[i];
+}
+
+[[gnu::always_inline]] inline const Value *
+frameUpvaluePtr(const Closure * closure, const CallFrame & frame, uint32_t i) noexcept
+{
+    if (closure) return closureUpvaluePtr(closure, i);
+    Thunk * thunk = frame.thunk;
+    if (Env * env = thunkUpvalEnv(thunk))
+        return &env->values[i];
+    return &thunk->tail[i];
+}
+
+[[gnu::always_inline]] inline const LambdaDescriptor *
+frameDesc(const Closure * closure, const CallFrame & frame) noexcept
+{
+    if ((frame.flags & CFF_THUNK_RETURN)
+        && frame.thunk
+        && (frame.thunk->state == ThunkState::Suspended
+            || frame.thunk->state == ThunkState::Blackhole))
+        return frame.thunk->suspended.desc;
+    return closure ? closure->desc : nullptr;
+}
+
 Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
 {
     // Stage 2 (LIST_ITERATION_FIX_PLAN_2026-06-08): per-element callback
@@ -4427,23 +4474,25 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             break;
         }
         case OP_GET_UPVALUE: {
-            if (!closure)
+            const CallFrame & curFrame = vm.frames.back();
+            if (!frameHasUpvalues(closure, curFrame))
                 throw std::runtime_error("v3 OP_GET_UPVALUE: no closure context");
-            if (operand >= closure->nUpvalues) {
+            const uint32_t nUpvalues = frameNUpvalues(closure, curFrame);
+            if (operand >= nUpvalues) {
                 // #705 (2026-05-21) diagnostic: dump closure + frame
                 // state to localize which lambda body is reading an
                 // out-of-range upvalue.  Common signature when the
                 // frame.closure is the WRONG closure (a different
                 // lambda's body with fewer upvalues) post-scavenge.
-                const LambdaDescriptor * d = closure->desc;
+                const LambdaDescriptor * d = frameDesc(closure, curFrame);
                 const Nursery & nu = threadNursery();
                 std::fprintf(stderr,
                     "v3 OP_GET_UPVALUE OOR: operand=%u nUpvalues=%u "
                     "closure=%p (nursery=%s) desc=%p desc.name=%.*s codeOff=%u "
                     "ip=%u frames=%zu\n",
-                    (unsigned)operand, (unsigned)closure->nUpvalues,
+                    (unsigned)operand, (unsigned)nUpvalues,
                     (const void*)closure,
-                    nu.contains(closure) ? "YES (stale)" : "no",
+                    closure && nu.contains(closure) ? "YES (stale)" : "no",
                     (const void*)d,
                     d ? (int)d->name.size() : 0,
                     d ? d->name.data() : "",
@@ -4470,7 +4519,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                         fd ? fd->name.data() : "<?>");
                 }
                 // Search arena for refs to the stale closure pointer.
-                if (nu.contains(closure)) {
+                if (closure && nu.contains(closure)) {
                     Arena & arena = threadArena();
                     auto blocks = arena.blockRanges();
                     uintptr_t target = reinterpret_cast<uintptr_t>(closure);
@@ -4498,7 +4547,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 std::fflush(stderr);
                 throw std::runtime_error("v3 OP_GET_UPVALUE: index out of range");
             }
-            push(vm, closureUpvalue(closure, operand));   // env-sharing: FAM or shared Env
+            push(vm, frameUpvalue(closure, curFrame, operand));
             // Phase A5: frame-focused upvalue trace.  When
             // V3_DBG_SELECT_AT_CODEOFF=<codeoff> is set, log every
             // OP_GET_UPVALUE in matching frames.  Logs the tag of the
@@ -4568,12 +4617,16 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             break;
         }
         case OP_GET_UPVALUE_FORCE: {
-            if (!closure)
+            const CallFrame & curFrame = vm.frames.back();
+            if (!frameHasUpvalues(closure, curFrame))
                 throw std::runtime_error("v3 OP_GET_UPVALUE_FORCE: no closure context");
             // Hot path: tag != Thunk/App/Slot.  Diagnostics and the
             // NIX_V3_NO_GETFORCE_SUPER gate live below the bail-out so
             // they don't pay the load + branch on every iteration.
-            Value v = closureUpvalue(closure, operand);   // env-sharing: FAM or shared Env
+            const uint32_t nUpvalues = frameNUpvalues(closure, curFrame);
+            if (operand >= nUpvalues)
+                throw std::runtime_error("v3 OP_GET_UPVALUE_FORCE: index out of range");
+            Value v = frameUpvalue(closure, curFrame, operand);
             Tag t = v.tag();
             if (__builtin_expect(t != Tag::Thunk && t != Tag::App && t != Tag::App3
                                  && t != Tag::Slot, 1)) {
@@ -4582,7 +4635,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             }
             // V3_DBG_FORCE_SITE trace; see OP_GET_LOCAL_FORCE.
             dbgLogForceSite(cu, ip - 1,
-                operand < closure->nUpvalues ? closureUpvaluePtr(closure, operand) : nullptr);
+                operand < nUpvalues ? frameUpvaluePtr(closure, curFrame, operand) : nullptr);
             // See OP_GET_LOCAL_FORCE — same NIX_V3_NO_GETFORCE_SUPER gate.
             static const bool s_skipForceUv =
                 std::getenv("NIX_V3_NO_GETFORCE_SUPER") != nullptr;
@@ -7680,14 +7733,10 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             const uint32_t fWithBase     = frRef.withStackBase;
             const uint32_t fFlags        = frRef.flags;
             Thunk *        fThunk        = frRef.thunk;
-            // #558 Phase 4: capture the closure pointer too so we can
-            // recycle the fakeClo back to the pool below.  Only the
-            // CFF_THUNK_RETURN frames' closures are synthesized
-            // fakeClos eligible for pooling; OP_CALL frames' closures
-            // are owned by the caller's Value graph and must NOT be
-            // recycled.  Casting away const here is safe: the pool
-            // restores fakeClos to a clean state on recycle and the
-            // VM owns them once popped from the frame stack.
+            // Capture the optional closure pointer too.  Normal thunk-return
+            // frames now leave this null and read upvalues from fThunk; older
+            // auxiliary entrypoints or tail-call retargets may still leave a
+            // closure here.  recycleFakeClo rejects non-pool closures below.
             Closure *      fClosure      = const_cast<Closure *>(frRef.closure);
             vm.valueStack.resize(fStackBase);
             vm.withStack.resize(fWithBase);
@@ -7704,31 +7753,33 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             }
             // NIX_TRACE_EVAL: W event for OP_RETURN of any
             // CFF_THUNK_RETURN frame.  Pairs with the F emitted at
-            // OP_FORCE's or forceValue's frame push.  Uses the popped
-            // closure's desc (fClosure->desc) which is identical to
-            // the suspended.desc that produced the F.  Cheap when
-            // disabled (one FILE* null check).
+            // OP_FORCE's or forceValue's frame push.  Prefer the thunk
+            // descriptor: normal thunk frames no longer synthesize a fake
+            // closure, and the thunk descriptor is the one that produced F.
+            // Cheap when disabled (one FILE* null check).
+            const LambdaDescriptor * traceDesc = nullptr;
+            if (fFlags & CFF_THUNK_RETURN) {
+                if (fThunk
+                    && (fThunk->state == ThunkState::Suspended
+                        || fThunk->state == ThunkState::Blackhole))
+                    traceDesc = fThunk->suspended.desc;
+                else if (fClosure)
+                    traceDesc = fClosure->desc;
+            }
             if (__builtin_expect(nix::evalTrace::enabled(), 0)
-                && (fFlags & CFF_THUNK_RETURN) && fClosure && fClosure->desc) {
+                && traceDesc) {
                 const PosSnapshot * ps =
-                    resolvePosSnapshot(fClosure->desc->posHandle);
+                    resolvePosSnapshot(traceDesc->posHandle);
                 std::string posStr =
                     (ps && !ps->file.empty())
                         ? nix::evalTrace::formatPos(ps->file, ps->line, ps->column)
                         : std::string("<no-pos>");
                 nix::evalTrace::leaveWhnf(posStr, v3ValueTypeName(retVal));
             }
-            // EXIT_GC_SPIRAL Day 6-8 wire-back (2026-05-29): recycle
-            // the popped fakeClo back to the closure pool.  Only
-            // CFF_THUNK_RETURN frames synthesized fakeClos via
-            // `allocFakeClo` (with kFakeCloMagic in _pad);
-            // `recycleFakeClo` rejects non-magic closures, so a stray
-            // non-fakeClo closure here is a safe no-op.
-            //
-            // Must happen AFTER fClosure->desc is last read (above
-            // trace block); recycleFakeClo zeros upvalues + sets
-            // capturedWiths=nullptr, leaving desc/cu stale until next
-            // pop.  fClosure is unused beyond this point in OP_RETURN.
+            // If this frame still carries a pooled fakeClo, return it.
+            // Normal OP_FORCE / forceValue thunk frames leave fClosure null;
+            // tail-call retargets can leave real closures, and recycleFakeClo
+            // rejects those by magic word.
             if ((fFlags & CFF_THUNK_RETURN) && fClosure) {
                 Alloc::recycleFakeClo(fClosure);
             }
@@ -8016,16 +8067,6 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 // #558 Phase 3.3 (2026-05-12): partial-Bindings
                 // infrastructure retired.  No publishes fire so the
                 // registry stays empty; nothing to erase at OP_RETURN.
-
-                // Phase D Step 12 (2026-05-21): closure-pool retired.
-                // Previously the just-popped fakeClo would be
-                // returned to a thread-local pool here for
-                // reuse on the next OP_FORCE Thunk dispatch (and
-                // similar).  Replaced by nursery-based allocation
-                // (Alloc::allocClosure → nurseryOrArena) — fresh
-                // Closures land in the nursery and get reclaimed by
-                // scavenge when no longer referenced.  V3_DBG_RECYCLE_*
-                // diagnostics removed along with the pool.
 
                 // WC-38: the legacy "return-chain push" -- eagerly
                 // forcing the next thunk if the outer's body returned
@@ -8762,66 +8803,6 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     }
                 }
             }
-            // Synthesize a closure-like view for OP_GET_UPVALUE: we set
-            // `closure` to a fresh Closure crafted from the thunk
-            // tail.  Phase D Step 12 (2026-05-21): retired the
-            // fakeClo / closure-pool sentinel infrastructure.  Pool
-            // reuse saved a hand-rolled allocation, but the Cheney
-            // nursery (`NIX_V3_NURSERY=1`) provides real generational
-            // reclamation: fresh closures land in nursery, scavenge
-            // collects unreferenced ones at next cycle.  Pool was
-            // load-bearing only before nursery + Phase D landed.
-            // EXIT_GC_SPIRAL Day 6-8 wire-back (2026-05-29): use the
-            // fakeClo pool (`allocFakeClo`) instead of fresh
-            // `allocClosure`.  The pool is gated by
-            // `NIX_V3_NO_CLOSURE_POOL=1` (opt-OUT; pool default-on).
-            Closure * fakeClo = Alloc::allocFakeClo(t->nUpvalues);
-            // Phase A5 RCA: alarm when fakeClo's pre-overwrite desc is
-            // a "real" closure body (i.e., codeOff != 0 and name not
-            // empty).  A recycled-fakeClo pool would only set desc to a
-            // thunk-body — never to an OP_MAKE_CLOSURE-created closure.
-            // If we ever see a recycled fakeClo whose existing desc was
-            // for a real closure (e.g., codeOff=2863), the pool has
-            // returned a pointer that's STILL alive in the cell.
-            {
-                static const char * s_atFC =
-                    std::getenv("V3_DBG_FAKECLO_AT_PTR");
-                if (__builtin_expect(s_atFC != nullptr, 0)) {
-                    void * target = nullptr;
-                    sscanf(s_atFC, "%p", &target);
-                    if (fakeClo == target) {
-                        const LambdaDescriptor * preDesc = fakeClo->desc;
-                        std::fprintf(stderr,
-                            "v3 FAKECLO@%p: OVERWRITE desc pre=%p new=%p"
-                            " (pre-codeOff=%u new-codeOff=%u nUp=%u)\n",
-                            (void *)fakeClo,
-                            (const void *)preDesc,
-                            (const void *)desc,
-                            preDesc ? preDesc->codeOffset : 0,
-                            desc ? desc->codeOffset : 0,
-                            (unsigned)t->nUpvalues);
-                    }
-                }
-            }
-            fakeClo->desc = desc;
-            fakeClo->nUpvalues = t->nUpvalues;
-            fakeClo->capturedWiths = thunkCapturedWiths(t);  // FP-2b: was suspended.capturedWiths
-            fakeClo->cu = thunkCU(t);  // FP-2a: was t->suspended.cu
-            // env-sharing: share the thunk's Env directly (NO per-force upvalue
-            // copy — this is the forceValue lever).  allocFakeClo reset upvalEnv to
-            // null; poison the unused inline FAM so the brute-scanner sees no stale
-            // pointers there (walkClosure skips the FAM when upvalEnv is set).
-            if (Env * te = thunkUpvalEnv(t)) {
-                fakeClo->upvalEnv = te;
-                for (uint16_t i = 0; i < t->nUpvalues; ++i) fakeClo->upvalues[i].mkUninitialized();
-            } else {
-                for (uint16_t i = 0; i < t->nUpvalues; ++i) fakeClo->upvalues[i] = t->tail[i];
-            }
-            // Phase D coverage: fakeClo's upvalues now mirror t->tail[].
-            // If the fakeClo itself is tenured (pool may return tenured)
-            // and t->tail[] carries nursery payloads, dirty-list.
-            closurePostConstructBarrier(fakeClo);
-
             ListVec * thunkWiths = thunkCapturedWiths(t);  // FP-2b: was suspended.capturedWiths
             const CompilationUnit * thunkCu = thunkCU(t);  // FP-2a: was t->suspended.cu
             if (!thunkCu) thunkCu = cu;                     // ...?: cu fallback preserved
@@ -8987,7 +8968,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             }
             vm.frames.push_back(CallFrame{
                 .cu = thunkCu,
-                .closure = fakeClo,
+                .closure = nullptr,
                 .thunk = t,
                 .ip = desc->codeOffset,
                 .stackBaseOffset = static_cast<uint32_t>(newBase),
@@ -8998,7 +8979,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             cu = thunkCu;
 
             ip = desc->codeOffset;
-            closure = fakeClo;
+            closure = nullptr;
             stackBase = newBase;
             break;
         }
@@ -11216,16 +11197,17 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // Reads the captured rec-attrset upvalue directly — no
             // intermediate stack push/pop and one fewer dispatch — then runs
             // the identical recSlotCache IC lookup and pushes the Tag::Slot.
-            if (!closure)
+            const CallFrame & curFrame = vm.frames.back();
+            if (!frameHasUpvalues(closure, curFrame))
                 throw std::runtime_error(
                     "v3 OP_GET_UPVALUE_REC_BINDING: no closure context");
             SymbolId sym      = static_cast<SymbolId>(operand);
             uint32_t upvalIdx = cu->code[ip++];
             uint32_t icIdx    = cu->code[ip++];
-            if (upvalIdx >= closure->nUpvalues)
+            if (upvalIdx >= frameNUpvalues(closure, curFrame))
                 throw std::runtime_error(
                     "v3 OP_GET_UPVALUE_REC_BINDING: upvalue index out of range");
-            Value attrs = closureUpvalue(closure, upvalIdx);
+            Value attrs = frameUpvalue(closure, curFrame, upvalIdx);
             // Force to WHNF if the rec-attrset isn't materialised yet
             // (Slot/Thunk/App).  forceValue runs a nested eval, but `closure`
             // and `cu` are heap-stable across it and `attrs` is a C-stack
@@ -11285,17 +11267,18 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // into regs[dst] instead of pushing — dropping the SET that
             // materialised the recursive-self callee for R_CALL.  See
             // bytecode.hh.  operand=sym; follow-ups=[dst, upvalIdx, icIdx].
-            if (!closure)
+            const CallFrame & curFrame = vm.frames.back();
+            if (!frameHasUpvalues(closure, curFrame))
                 throw std::runtime_error(
                     "v3 OP_GET_UPVALUE_REC_BINDING_SLOT: no closure context");
             SymbolId sym      = static_cast<SymbolId>(operand);
             uint32_t dst      = cu->code[ip++];
             uint32_t upvalIdx = cu->code[ip++];
             uint32_t icIdx    = cu->code[ip++];
-            if (upvalIdx >= closure->nUpvalues)
+            if (upvalIdx >= frameNUpvalues(closure, curFrame))
                 throw std::runtime_error(
                     "v3 OP_GET_UPVALUE_REC_BINDING_SLOT: upvalue index out of range");
-            Value attrs = closureUpvalue(closure, upvalIdx);
+            Value attrs = frameUpvalue(closure, curFrame, upvalIdx);
             if (attrs.isAppLike()
                 || attrs.tag() == Tag::Thunk
                 || attrs.tag() == Tag::Slot)
@@ -14495,23 +14478,6 @@ Value forceValue(VMState & vm, Value v)
         if (__builtin_expect(nix::evalTrace::enabled(), 0))
             nix::evalTrace::enterForce(v3ThunkTracePos(t));
         hotForceCheck(t);
-        // Phase D Step 12 (2026-05-21): retired the closure-pool —
-        // see the OP_FORCE Thunk dispatch site above for rationale.
-        Closure * fakeClo = Alloc::allocFakeClo(t->nUpvalues);
-        fakeClo->desc = desc;
-        fakeClo->nUpvalues = t->nUpvalues;
-        fakeClo->capturedWiths = thunkCapturedWiths(t);  // FP-2b: was suspended.capturedWiths
-        fakeClo->cu = thunkCU(t);  // FP-2a: was t->suspended.cu
-        // env-sharing: share the thunk's Env directly (no per-force copy); see
-        // the OP_FORCE path above for the FAM-poison rationale.
-        if (Env * te = thunkUpvalEnv(t)) {
-            fakeClo->upvalEnv = te;
-            for (uint16_t i = 0; i < t->nUpvalues; ++i) fakeClo->upvalues[i].mkUninitialized();
-        } else {
-            for (uint16_t i = 0; i < t->nUpvalues; ++i) fakeClo->upvalues[i] = t->tail[i];
-        }
-        // Phase D coverage: same as the OP_FORCE fakeClo path above.
-        closurePostConstructBarrier(fakeClo);
         ListVec * thunkWiths = thunkCapturedWiths(t);  // FP-2b: was suspended.capturedWiths
         const CompilationUnit * thunkCu = thunkCU(t);  // FP-2a: was t->suspended.cu
         if (!thunkCu) thunkCu = vm.frames.back().cu;    // ...?: frame-cu fallback preserved
@@ -14537,7 +14503,7 @@ Value forceValue(VMState & vm, Value v)
 
         vm.frames.push_back(CallFrame{
             .cu = thunkCu,
-            .closure = fakeClo,
+            .closure = nullptr,
             .thunk = t,
             .ip = desc->codeOffset,
             .stackBaseOffset = static_cast<uint32_t>(newBase),
