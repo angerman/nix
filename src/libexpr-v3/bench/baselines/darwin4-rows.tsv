@@ -29,6 +29,11 @@
 hello	1.23	0.26	4.73	67.1	yes	off	20758fad5	2026-06-20
 git	1.47	0.33	4.45	100.7	yes	off	20758fad5	2026-06-20
 firefox	6.27	1.14	5.50	436.2	yes	off	20758fad5	2026-06-20
+# big-workload rows (IFD built locally on aarch64-darwin; min-of-3 for M5 cost,
+# min-of-5 for HNE). peak_rss: M5 3122MB (thunks 637MB dominant), HNE ~2055MB.
+# RATIO TIGHTENS WITH SCALE: small ~4.4-5.5x -> HNE 4.92x (453MB) -> M5 3.18x (1543MB).
+HNE	7.58	1.54	4.92	453.0	yes	off	20758fad5	2026-06-20
+M5	11.37	3.57	3.18	1543.5	yes	off	20758fad5	2026-06-20
 # synthetic v3-only rows below NOT re-measured at 20758fad5 — last at 3ff650587:
 fib	2.29	NA	NA	NA	no	off	3ff650587	2026-06-19
 attrNames	0.57	NA	NA	NA	yes	off	3ff650587	2026-06-19
