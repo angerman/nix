@@ -115,6 +115,13 @@ check_parity "POS-3 valueEqual Attrs cache" \
     "\"equal\"" \
     "[AB]-"
 
+# POS-5: chain sibling of POS-3 — valueEqual over mapAttrs-of-a-chain realizes
+# the mapped value (chain Cursor path), 6 traces (3 entries x 2 sides) == TW.
+check_parity "POS-5 valueEqual chain mapAttrs" \
+    "$TESTDIR/repro-583-tag-app-cache-positive-5.nix" \
+    "\"equal\"" \
+    "[PQ]-"
+
 # NEGATIVE: laziness preserved.
 check_parity "NEG-1 length on lazy mapAttrs" \
     "$TESTDIR/repro-583-tag-app-cache-negative-1.nix" \
