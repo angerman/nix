@@ -134,6 +134,32 @@ the source onto darwin-4 when the github push key fails: `rsync -az
 --exclude='*.o' --exclude='*.dylib' src/libexpr-v3/ aarch64-darwin-4.lan:Projects/iohk/nix/src/libexpr-v3/`
 then remote `nix develop -c ninja -C build src/libexpr-v3/v3-eval src/nix/nix`.
 
+### Checkpoint profiling — `make profile` (re-runnable; ALWAYS git-note it)
+"Where does the v3 VM spend CPU at scale" is NOT a one-off.  Re-run the SAME
+methodology at every checkpoint and diff:
+
+```
+ssh aarch64-darwin-4.lan 'cd ~/Projects/iohk/nix/src/libexpr-v3 && \
+  COMMIT=<canonical-HEAD> bench/profile-at-scale.sh'    # firefox M5 HNE
+# or, on the canonical checkout:  make profile / make profile-note
+```
+
+`bench/profile-at-scale.sh` (the committed form of the methodology in
+`lode/PROFILE_AT_SCALE_2026-06-21.md`) emits, per workload, the on-CPU phase
+breakdown (ALLOC / BINDINGS / PARSE / DISPATCH / LOWER / HASH / STRING / TLS /
+GC / FORCE / CALL — idle/wait excluded) via macOS `sample`, plus the
+DETERMINISTIC dynamics (opcode histogram, thunk churn = allocated-vs-forced,
+nursery hit-rate).  The deterministic counters are exact + host-independent; the
+CPU-category % carries single-sample variance, so trust the counters for fine
+deltas and the categories for direction.  **darwin-4 caveat:** its source
+checkout lags its rsync'd binary, so `git rev-parse` there is the WRONG commit —
+pass `COMMIT=<laptop HEAD>` and attach the git note from the canonical checkout.
+Like the CPU/RSS rows above, **every checkpoint profile MUST be git-noted to the
+commit measured** (`bench/profile-at-scale.sh --git-note`, or capture stdout and
+`git notes append <HEAD> -F -` on the laptop).  A ledger
+(`bench/samples/profile-ledger.tsv`) also accrues a commit-stamped one-liner per
+run as a quick drift index.
+
 ## Critical constraints (hard rules; load-bearing)
 
 0. **The generational nursery + Phase-D write barriers + gen-major collection are SHIPPED and DEFAULT-ON** (flip `e863f127d`; opt-out RETIRED `3c17abb08`). `barrier.cc` hardcodes `g_phaseDActive = true`, the nursery/scavenge/gen-major gates are hard constants, and `NIX_V3_NURSERY` / `_SCAVENGE` / `GEN_MAJOR` are now NO-OPS. **You MUST assume nursery + moving-GC semantics in all v3 code**: any tenured object holding a nursery payload needs a Phase-D barrier + a scavenger walker, or it's a missed-root UAF (the PhD-6 class). The legacy per-op major GC (`alloc.hh g_majorGcEnabled`) stays hard-`false` — re-enabling it alongside the always-on nursery is the M-3 UAF trap; `NIX_V3_EVAC` (which requires it) is therefore an unrevived experimental path. Boehm is still the underlying page allocator, but the generational layer above it is active. Environment-sharing (`Closure/Thunk` upvalues in a shared `Env`) + Env interning are ALSO default-on (opt-out `NIX_V3_NO_ENV_SHARING` / `NO_ENV_INTERN`). Stress every force-path / GC change with the full `--brute` (see the pre-merge gate above). Background: LESSONS §1.6, `NURSERY_PHASE_D_DESIGN_2026-05-18.md`, the project memory's Phase-D / FP-4 / flip entries.
