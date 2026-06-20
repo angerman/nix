@@ -1228,7 +1228,12 @@ public:
     /// compiler doesn't always CSE the two getInternalType() loads.
     inline bool isThunkOrApp() const noexcept
     {
-        return (static_cast<uint8_t>(getInternalType()) - tApp) <= 1u;
+        // Unsigned subtraction so the underflow trick (getInternalType() < tApp
+        // wraps to a large value > 1) is explicit — and GCC's -Werror=sign-compare
+        // doesn't fire on the `int <= 1u` it would otherwise see (clang/macOS is
+        // lenient; GCC/x86_64-linux is not).  Semantically identical.
+        return (static_cast<unsigned>(static_cast<uint8_t>(getInternalType()))
+                - static_cast<unsigned>(tApp)) <= 1u;
     }
 
     inline bool isBlackhole() const;
