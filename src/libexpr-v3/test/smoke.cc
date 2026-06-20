@@ -2148,6 +2148,131 @@ static int testPrimMapAttrsSetOpsNoApp3()
     return rc;
 }
 
+static int testPrimIntersectAttrsMapAttrsChainCopy()
+{
+    const PrimOp * mapAttrsPo = findPrimOp("mapAttrs");
+    const PrimOp * intersectPo = findPrimOp("intersectAttrs");
+    if (!mapAttrsPo || !intersectPo) {
+        std::fprintf(stderr,
+            "testPrimIntersectAttrsMapAttrsChainCopy: missing primops\n");
+        return 1;
+    }
+    static const PrimOp plusOnePo{
+        "__smokeSecondPlusOneIntersect", 2, smokeSecondPlusOne
+    };
+
+    auto m = ir::makeModule();
+    auto entry = m.freshBlock();
+    funcOf(m, 0).entryBlock = entry;
+
+    auto fn = addBinding(m, entry, ir::LitPrimOp{&plusOnePo});
+    auto aVal = addBinding(m, entry, ir::LitInt{10});
+    auto cVal = addBinding(m, entry, ir::LitInt{30});
+    auto bVal = addBinding(m, entry, ir::LitInt{99});
+    auto keepVal = addBinding(m, entry, ir::LitInt{0});
+    auto aSym = m.internSymbol("a");
+    auto bSym = m.internSymbol("b");
+    auto cSym = m.internSymbol("c");
+
+    auto src = addBinding(m, entry,
+        ir::AttrSet{ { {aSym, aVal}, {cSym, cVal} } });
+    auto mapped = addBinding(m, entry, ir::PrimOpCall{mapAttrsPo, {fn, src}});
+    auto overlay = addBinding(m, entry, ir::AttrSet{ { {bSym, bVal} } });
+    auto updated = addBinding(m, entry, ir::Update{mapped, overlay});
+    auto keep = addBinding(m, entry, ir::AttrSet{ { {aSym, keepVal} } });
+    auto inter = addBinding(m, entry, ir::PrimOpCall{intersectPo, {keep, updated}});
+    auto selected = addBinding(m, entry, ir::AttrSelect{inter, aSym});
+    setReturn(m, entry, selected);
+
+    ir::computeFreeVars(m);
+    auto cu = compile(m);
+    uint64_t pairsBefore = allocStats().pairsAllocated;
+    Value res = run(cu);
+    uint64_t pairsAfter = allocStats().pairsAllocated;
+    if (!res.isInt() || res.asInt() != 11) {
+        std::fprintf(stderr,
+            "testPrimIntersectAttrsMapAttrsChainCopy: expected mapped a=11, got tag=%d val=%lld\n",
+            (int)res.tag(), res.isInt() ? (long long)res.asInt() : 0LL);
+        return 1;
+    }
+    if (pairsAfter != pairsBefore + 1) {
+        std::fprintf(stderr,
+            "testPrimIntersectAttrsMapAttrsChainCopy: expected exactly one kept App3 pair, got %llu\n",
+            (unsigned long long)(pairsAfter - pairsBefore));
+        return 1;
+    }
+    std::fprintf(stderr,
+        "testPrimIntersectAttrsMapAttrsChainCopy: OK (kept chain parent MapAttrs entry is mapped)\n");
+    return 0;
+}
+
+static int testPrimIntersectAttrsMapAttrsChainDiscardNoApp3()
+{
+    const PrimOp * mapAttrsPo = findPrimOp("mapAttrs");
+    const PrimOp * intersectPo = findPrimOp("intersectAttrs");
+    if (!mapAttrsPo || !intersectPo) {
+        std::fprintf(stderr,
+            "testPrimIntersectAttrsMapAttrsChainDiscardNoApp3: missing primops\n");
+        return 1;
+    }
+    static const PrimOp plusOnePo{
+        "__smokeSecondPlusOneIntersectDiscard", 2, smokeSecondPlusOne
+    };
+
+    auto m = ir::makeModule();
+    auto entry = m.freshBlock();
+    funcOf(m, 0).entryBlock = entry;
+
+    auto fn = addBinding(m, entry, ir::LitPrimOp{&plusOnePo});
+    auto aVal = addBinding(m, entry, ir::LitInt{10});
+    auto cVal = addBinding(m, entry, ir::LitInt{30});
+    auto bVal = addBinding(m, entry, ir::LitInt{99});
+    auto keepVal = addBinding(m, entry, ir::LitInt{0});
+    auto aSym = m.internSymbol("a");
+    auto bSym = m.internSymbol("b");
+    auto cSym = m.internSymbol("c");
+    auto dSym = m.internSymbol("d");
+    auto eSym = m.internSymbol("e");
+    auto fSym = m.internSymbol("f");
+
+    auto src = addBinding(m, entry,
+        ir::AttrSet{ { {aSym, aVal}, {cSym, cVal} } });
+    auto mapped = addBinding(m, entry, ir::PrimOpCall{mapAttrsPo, {fn, src}});
+    auto overlay = addBinding(m, entry, ir::AttrSet{ { {bSym, bVal} } });
+    auto updated = addBinding(m, entry, ir::Update{mapped, overlay});
+    auto keep = addBinding(m, entry,
+        ir::AttrSet{ {
+            {bSym, keepVal}, {dSym, keepVal},
+            {eSym, keepVal}, {fSym, keepVal},
+        } });
+    auto inter = addBinding(m, entry, ir::PrimOpCall{intersectPo, {keep, updated}});
+    setReturn(m, entry, inter);
+
+    ir::computeFreeVars(m);
+    auto cu = compile(m);
+    uint64_t pairsBefore = allocStats().pairsAllocated;
+    Value res = run(cu);
+    uint64_t pairsAfter = allocStats().pairsAllocated;
+    SymbolId bGlobal = ir::globalInternSymbol("b");
+    if (!res.isAttrs() || !res.asAttrs() || res.asAttrs()->size != 1
+        || res.asAttrs()->entries[0].name != bGlobal
+        || !res.asAttrs()->entries[0].value.isInt()
+        || res.asAttrs()->entries[0].value.asInt() != 99) {
+        std::fprintf(stderr,
+            "testPrimIntersectAttrsMapAttrsChainDiscardNoApp3: unexpected result\n");
+        return 1;
+    }
+    if (pairsAfter != pairsBefore) {
+        std::fprintf(stderr,
+            "testPrimIntersectAttrsMapAttrsChainDiscardNoApp3: discarded MapAttrs entries allocated %llu ValuePair(s)\n",
+            (unsigned long long)(pairsAfter - pairsBefore));
+        return 1;
+    }
+    std::fprintf(stderr,
+        "testPrimIntersectAttrsMapAttrsChainDiscardNoApp3: OK (discarded chain parent MapAttrs entries stay unrealized)\n");
+    return 0;
+}
+
 static int testPrimMapAttrsValueIdentityNoApps()
 {
     const PrimOp * mapAttrsPo = findPrimOp("mapAttrs");
@@ -4000,6 +4125,8 @@ int main()
     rc |= testPrimMapAttrsUpdateNoApp3();
     rc |= testPrimMapAttrsNestedSelectUsesMappedValue();
     rc |= testPrimMapAttrsSetOpsNoApp3();
+    rc |= testPrimIntersectAttrsMapAttrsChainCopy();
+    rc |= testPrimIntersectAttrsMapAttrsChainDiscardNoApp3();
     rc |= testPrimMapAttrsValueIdentityNoApps();
     rc |= testPrimOpHeadTail();
     rc |= testFibonacciSelfApp();

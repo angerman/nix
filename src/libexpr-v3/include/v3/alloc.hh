@@ -423,6 +423,7 @@ struct Bindings
             if (best == kInvalid) return nullptr;
             const Entry * winner = heads_[best];
             const Bindings * owner = owners_[best];
+            lastOwner_ = owner;
             for (uint32_t l = 0; l < nLayers_; ++l)
                 if (heads_[l] != ends_[l] && heads_[l]->name == bestName)
                     ++heads_[l];
@@ -432,10 +433,13 @@ struct Bindings
             return winner;
         }
 
+        const Bindings * lastOwner() const noexcept { return lastOwner_; }
+
     private:
         const Entry * heads_[kMaxLayers];
         const Entry * ends_[kMaxLayers];
         const Bindings * owners_[kMaxLayers];
+        const Bindings * lastOwner_ = nullptr;
         uint32_t      nLayers_;
         bool          realizeMapAttrs_;
     };

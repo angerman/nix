@@ -448,21 +448,38 @@ inline void forEachEntryNoMapAttrsRealize(const Bindings * b, F && f)
 {
     if (!b) return;
     if (b->isChain()) {
-        Bindings::Cursor c(b);
+        Bindings::Cursor c(b, false);
         while (const Bindings::Entry * e = c.next()) f(*e);
         return;
     }
     for (uint32_t i = 0; i < b->size; ++i) f(b->entries[i]);
 }
 
+template <typename F>
+inline void forEachEntryRefNoMapAttrsRealize(const Bindings * b, F && f)
+{
+    if (!b) return;
+    if (b->isChain()) {
+        Bindings::Cursor c(b, false);
+        while (const Bindings::Entry * e = c.next())
+            f(c.lastOwner(), *e);
+        return;
+    }
+    for (uint32_t i = 0; i < b->size; ++i) f(b, b->entries[i]);
+}
+
 inline const Bindings::Entry * lookupEntryNoMapAttrsRealize(
-    const Bindings * b, SymbolId name) noexcept
+    const Bindings * b, SymbolId name,
+    const Bindings ** ownerOut = nullptr) noexcept
 {
     for (const Bindings * cur = b; cur;
          cur = cur->isChain() ? cur->parent : nullptr) {
-        if (const Bindings::Entry * e = cur->lookupLocalEntry(name))
+        if (const Bindings::Entry * e = cur->lookupLocalEntry(name)) {
+            if (ownerOut) *ownerOut = cur;
             return e;
+        }
     }
+    if (ownerOut) *ownerOut = nullptr;
     return nullptr;
 }
 
@@ -2195,20 +2212,36 @@ void primIntersectAttrs(EvalState &, Value * args, Value & out)
         result->aux = src->aux;
     }
     V3_STATS_INC(attrsetsAllocated);
+    const bool resultPreservesMapAttrs = result->isMapAttrs();
+    auto copySrcEntry = [&](const Bindings * owner,
+                            const Bindings::Entry & e) -> Bindings::Entry {
+        if (!resultPreservesMapAttrs
+            && owner && owner->isMapAttrs()
+            && (e.pos & Bindings::kMapAttrsUnrealizedPosBit) != 0)
+        {
+            auto * mutOwner = const_cast<Bindings *>(owner);
+            auto * mutEntry = const_cast<Bindings::Entry *>(&e);
+            mutOwner->realizeMapAttrsEntry(mutEntry);
+            return *mutEntry;
+        }
+        return e;
+    };
     // Pass 2: fill — always emit the `src` entry (e2's value wins).
     uint32_t k = 0;
     if (iterKeep) {
         // iter == keep: look the matched entry up in src (the value side).
         forEachEntryNoMapAttrsRealize(iter, [&](const Bindings::Entry & e) {
+            const Bindings * srcOwner = nullptr;
             if (const Bindings::Entry * se =
-                    lookupEntryNoMapAttrsRealize(src, e.name))
-                result->entries[k++] = *se;
+                    lookupEntryNoMapAttrsRealize(src, e.name, &srcOwner))
+                result->entries[k++] = copySrcEntry(srcOwner, *se);
         });
     } else {
         // iter == src: emit the src entry directly when its name is in keep.
-        forEachEntryNoMapAttrsRealize(iter, [&](const Bindings::Entry & e) {
+        forEachEntryRefNoMapAttrsRealize(iter, [&](const Bindings * owner,
+                                                   const Bindings::Entry & e) {
             if (keep->has(e.name))
-                result->entries[k++] = e;
+                result->entries[k++] = copySrcEntry(owner, e);
         });
     }
     // k == kExact by construction; allocBindings already set the size.
