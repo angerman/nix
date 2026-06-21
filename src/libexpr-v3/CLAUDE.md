@@ -172,6 +172,19 @@ via `NIX_PATH=nixpkgs=<rev archive>`.  Sourced by `run-brute-audit.sh` +
 and paste the versions).  The pinned rev currently yields hello-2.12.2 /
 git-2.51.2 / firefox-148.0.  (M5/HNE use their own flake.lock pins — unaffected.)
 
+### Nursery sizing tradeoff (L2, 2026-06-22 — `NIX_V3_NURSERY_SIZE`)
+The 32 MB default is M5-protective and stays.  Measured curve
+(lode/L2_NURSERY_SIZING_2026-06-22.md): a BIGGER nursery helps small/medium evals
+whose live set FITS it (firefox/hello at `NIX_V3_NURSERY_SIZE=256`: −9/−14% CPU,
+arena −20/−38%, lower RSS — rare-collect) but REGRESSES heavy workloads whose
+live set doesn't (M5 +14–41%: Cheney scavenge-copy of heavy survivors costs more
+than the small-nursery bypass-to-arena).  So there is NO universal default — a
+fixed bigger default is falsified.  Practical: a dev doing small `nix build`-style
+evals can opt into the win with `NIX_V3_NURSERY_SIZE=256`; leave the default for
+scale workloads.  (The nursery is lazy-resident, so a big size is cheap on small
+evals.)  A robust auto-adaptive nursery is deferred (needs multi-cycle hysteresis;
+no cheap M5-safe signal).
+
 ## Critical constraints (hard rules; load-bearing)
 
 0. **The generational nursery + Phase-D write barriers + gen-major collection are SHIPPED and DEFAULT-ON** (flip `e863f127d`; opt-out RETIRED `3c17abb08`). `barrier.cc` hardcodes `g_phaseDActive = true`, the nursery/scavenge/gen-major gates are hard constants, and `NIX_V3_NURSERY` / `_SCAVENGE` / `GEN_MAJOR` are now NO-OPS. **You MUST assume nursery + moving-GC semantics in all v3 code**: any tenured object holding a nursery payload needs a Phase-D barrier + a scavenger walker, or it's a missed-root UAF (the PhD-6 class). The legacy per-op major GC (`alloc.hh g_majorGcEnabled`) stays hard-`false` — re-enabling it alongside the always-on nursery is the M-3 UAF trap; `NIX_V3_EVAC` (which requires it) is therefore an unrevived experimental path. Boehm is still the underlying page allocator, but the generational layer above it is active. Environment-sharing (`Closure/Thunk` upvalues in a shared `Env`) + Env interning are ALSO default-on (opt-out `NIX_V3_NO_ENV_SHARING` / `NO_ENV_INTERN`). Stress every force-path / GC change with the full `--brute` (see the pre-merge gate above). Background: LESSONS §1.6, `NURSERY_PHASE_D_DESIGN_2026-05-18.md`, the project memory's Phase-D / FP-4 / flip entries.
