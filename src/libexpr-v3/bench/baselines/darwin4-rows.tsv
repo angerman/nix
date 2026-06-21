@@ -26,13 +26,15 @@
 #   (both within darwin-4 noise) → the whole stack did NOT regress raw eval CPU.
 #
 # row	v3_cpu	tw_cpu	ratio	arena_MB	impure	cache	commit	date
-# L1 countDistinct memoize (55ba50216): byte-id, zero-mem; v3_cpu drops on
-# chain-heavy workloads (memo-off == the prior 20758fad5 baseline):
-#   hello 1.23->1.07 (-14.4%), git 1.47->1.27 (-14.8%), firefox 6.27->5.70 (-9.2%),
-#   HNE 7.58->6.81 (-13.0%), M5 11.37->10.86 (-0.9%, few chains). arena unchanged.
-hello	1.07	0.26	4.12	67.1	yes	off	55ba50216	2026-06-21
-git	1.27	0.33	3.85	100.7	yes	off	55ba50216	2026-06-21
-firefox	5.70	1.14	5.00	436.2	yes	off	55ba50216	2026-06-21
+# PINNED nixpkgs (7e6cc3534, test/nixpkgs-pin.sh = flake.lock rev e764fc9a):
+# hello/git/firefox rows below are now the pinned workloads (hello-2.12.2 /
+# git-2.51.2 / firefox-148.0), memo-on (L1 55ba50216) — reproducible on ANY host
+# (no more channel drift; firefox was 5.50/5.00/3.62 by channel version).
+# These SUPERSEDE the channel-measured rows; absolute numbers differ because the
+# package versions differ (e.g. firefox-148.0 evals cheaper than channel 146.0.1).
+hello	1.21	0.27	4.48	83.9	yes	off	7e6cc3534	2026-06-22
+git	1.41	0.34	4.15	117.4	yes	off	7e6cc3534	2026-06-22
+firefox	2.64	0.73	3.62	352.3	yes	off	7e6cc3534	2026-06-22
 # big-workload rows (IFD built locally on aarch64-darwin; min-of-3 for M5 cost,
 # min-of-5 for HNE). peak_rss: M5 3122MB (thunks 637MB dominant), HNE ~2055MB.
 # RATIO TIGHTENS WITH SCALE: small ~4.4-5.5x -> HNE 4.92x (453MB) -> M5 3.18x (1543MB).
