@@ -452,9 +452,36 @@ struct Bindings
         if (kind == uint8_t(Kind::Sorted)
             || kind == uint8_t(Kind::MapAttrs))
             return size;
+        // L1 (PROFILE_AT_SCALE_2026-06-21): `countDistinct` on a Chain is an
+        // O(N·depth) Cursor walk and was the #1 named v3 self-time function
+        // (~17% firefox / ~16% HNE on-CPU) — OP_UPDATE sizes every `//` with it
+        // and shared base chains get re-counted by every consumer's override.
+        // MEMOIZE the result in the 3 spare header pad bytes (`_pad8`, a 24-bit
+        // little-endian count).  Safe because a chain's NAME SET is immutable
+        // after construction — only VALUES are written back (lookup()/OP_RETURN),
+        // never names/parent — so the distinct-count is a stable function of the
+        // structure.  The cache lives INLINE (not a side-table: that's the M-1
+        // stale-key UAF trap) so it moves with the object under the nursery and
+        // stays valid (a parent moving forwards the pointer but keeps the names).
+        // Sentinel 0 = uncomputed (a chain always has >=1 distinct name).
+        // Opt-out: NIX_V3_NO_COUNTDISTINCT_MEMO.
+        static const bool memo =
+            std::getenv("NIX_V3_NO_COUNTDISTINCT_MEMO") == nullptr;
+        if (memo) {
+            uint32_t cached = uint32_t(_pad8[0])
+                            | (uint32_t(_pad8[1]) << 8)
+                            | (uint32_t(_pad8[2]) << 16);
+            if (cached != 0) return cached;
+        }
         Cursor c(this, false);
         uint32_t n = 0;
         while (c.next()) ++n;
+        if (memo && n != 0 && n <= 0xFFFFFFu) {
+            Bindings * self = const_cast<Bindings *>(this);
+            self->_pad8[0] = uint8_t(n & 0xFF);
+            self->_pad8[1] = uint8_t((n >> 8) & 0xFF);
+            self->_pad8[2] = uint8_t((n >> 16) & 0xFF);
+        }
         return n;
     }
 
