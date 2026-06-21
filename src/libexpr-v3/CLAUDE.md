@@ -160,6 +160,18 @@ commit measured** (`bench/profile-at-scale.sh --git-note`, or capture stdout and
 (`bench/samples/profile-ledger.tsv`) also accrues a commit-stamped one-liner per
 run as a quick drift index.
 
+### Pinned nixpkgs — `test/nixpkgs-pin.sh` (no more golden drift)
+`<nixpkgs>`-based tests/measurements used each host's CHANNEL, so the brute-audit
+golden broke whenever a channel moved (laptop hello-2.12.3, darwin-4 2.12.1,
+flake 2.12.2).  `test/nixpkgs-pin.sh` pins `<nixpkgs>` to the repo's **flake.lock
+nixpkgs** (derives the rev from flake.lock → single source of truth, auto-tracks)
+via `NIX_PATH=nixpkgs=<rev archive>`.  Sourced by `run-brute-audit.sh` +
+`bench/profile-at-scale.sh`; `source` it in any ad-hoc `<nixpkgs>` eval too.
+**To bump nixpkgs: `nix flake update nixpkgs`, THEN re-derive the golden** in
+`run-brute-audit.sh` (eval the `hello/git/firefox/gcc` cases against the new rev
+and paste the versions).  The pinned rev currently yields hello-2.12.2 /
+git-2.51.2 / firefox-148.0.  (M5/HNE use their own flake.lock pins — unaffected.)
+
 ## Critical constraints (hard rules; load-bearing)
 
 0. **The generational nursery + Phase-D write barriers + gen-major collection are SHIPPED and DEFAULT-ON** (flip `e863f127d`; opt-out RETIRED `3c17abb08`). `barrier.cc` hardcodes `g_phaseDActive = true`, the nursery/scavenge/gen-major gates are hard constants, and `NIX_V3_NURSERY` / `_SCAVENGE` / `GEN_MAJOR` are now NO-OPS. **You MUST assume nursery + moving-GC semantics in all v3 code**: any tenured object holding a nursery payload needs a Phase-D barrier + a scavenger walker, or it's a missed-root UAF (the PhD-6 class). The legacy per-op major GC (`alloc.hh g_majorGcEnabled`) stays hard-`false` — re-enabling it alongside the always-on nursery is the M-3 UAF trap; `NIX_V3_EVAC` (which requires it) is therefore an unrevived experimental path. Boehm is still the underlying page allocator, but the generational layer above it is active. Environment-sharing (`Closure/Thunk` upvalues in a shared `Env`) + Env interning are ALSO default-on (opt-out `NIX_V3_NO_ENV_SHARING` / `NO_ENV_INTERN`). Stress every force-path / GC change with the full `--brute` (see the pre-merge gate above). Background: LESSONS §1.6, `NURSERY_PHASE_D_DESIGN_2026-05-18.md`, the project memory's Phase-D / FP-4 / flip entries.

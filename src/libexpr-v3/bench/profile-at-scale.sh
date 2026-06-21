@@ -34,6 +34,9 @@ set -u
 
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 NIX="${NIX:-$ROOT/build/src/nix/nix}"
+# Pin <nixpkgs> to flake.lock so the firefox workload (and any <nixpkgs> eval)
+# is the SAME tree on every host + checkpoint — reproducible profiles, no drift.
+source "$ROOT/src/libexpr-v3/test/nixpkgs-pin.sh"
 CN_PATH="${CN_PATH:-/Users/angerman/Projects/iohk/cardano-node}"
 HNE_PATH="${HNE_PATH:-/Users/angerman/Projects/iohk/haskell-nix-example}"
 LEDGER="${LEDGER:-$ROOT/src/libexpr-v3/bench/samples/profile-ledger.tsv}"

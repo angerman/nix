@@ -48,6 +48,11 @@ fi
 HAS_NIX=0
 if [[ -x "$NIX" ]]; then HAS_NIX=1; fi
 
+# Pin <nixpkgs> to the repo's flake.lock nixpkgs so the golden versions below
+# don't drift with each host's channel (see nixpkgs-pin.sh).  The expected
+# strings are derived from this pinned rev — re-derive them after a flake bump.
+source "$(dirname "${BASH_SOURCE[0]}")/nixpkgs-pin.sh"
+
 # Shared gates.  1 MB nursery so a 1000-iteration workload scavenges
 # many times — exposes any sticky tenured→nursery edge.
 export NIX_V3_NURSERY=1
@@ -246,18 +251,20 @@ run_case "deep-let-rec-fix" "28000" '
 #    firefox.name exercises a substantially larger transitive eval
 #    (qt5-packages + GTK + Rust toolchain) to surface anything that
 #    only triggers under nixpkgs-scale pressure.
-run_case_nix "hello-name"     "hello-2.12.3"               '(import <nixpkgs> { }).hello.name'
-run_case_nix "hello-drvPath"  "hello-2.12.3.drv"           '(import <nixpkgs> { }).hello.drvPath'
-run_case_nix "hello-outPath"  "hello-2.12.3"               '(import <nixpkgs> { }).hello.outPath'
+# Golden versions are pinned to flake.lock's nixpkgs (nixpkgs-pin.sh) — bump =
+# `nix flake update nixpkgs` THEN re-derive these by eval against the new rev.
+run_case_nix "hello-name"     "hello-2.12.2"               '(import <nixpkgs> { }).hello.name'
+run_case_nix "hello-drvPath"  "hello-2.12.2.drv"           '(import <nixpkgs> { }).hello.drvPath'
+run_case_nix "hello-outPath"  "hello-2.12.2"               '(import <nixpkgs> { }).hello.outPath'
 run_case_nix "gcc-name"       "gcc-wrapper"                '(import <nixpkgs> { }).gcc.name'
-run_case_nix "firefox-name"   "firefox-152.0.1"            '(import <nixpkgs> { }).firefox.name'
+run_case_nix "firefox-name"   "firefox-148.0"              '(import <nixpkgs> { }).firefox.name'
 
 # 8) PhD-6 regression — the nursery-flip blocker (2026-06-15).  git.drvPath is
 #    the workload that exposed the unbarriered primZipAttrsWith list
 #    construction (7 missed roots: "nursery Thunk reachable via ListVec.elems[]")
 #    that hello/firefox did NOT hit.  Keep it standing so the class-3
 #    list-construction barrier coverage cannot silently regress.
-run_case_nix "git-drvPath"    "git-2.54.0.drv"             '(import <nixpkgs> { }).git.drvPath'
+run_case_nix "git-drvPath"    "git-2.51.2.drv"             '(import <nixpkgs> { }).git.drvPath'
 
 # 9) PhD-6 synthetic — deterministically hammers EVERY swept list-construction
 #    primop (zipAttrsWith/attrValues/concatLists/filter/concatMap/partition/
