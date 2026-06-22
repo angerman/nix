@@ -991,7 +991,14 @@ static bool sweepOneBlock(
                 arena.freeListAdd(
                     const_cast<void *>(cellAddr), cellSize);
             }
-            arena.clearCellStartBitFor(cellAddr);
+            // MIDEVAL_GC reuse-SEGV fix (2026-06-23): under mid-eval the bins are
+            // rebuilt fresh each sweep (clearFreeListBins), so dead cells must KEEP
+            // their cell-start bit to be re-found + re-binned next sweep — and
+            // keeping it stable also stops the cross-sweep config change that let a
+            // big free entry span a now-live neighbour.  The legacy major-GC path
+            // keeps the original clear-on-bin (re-set on pop) behaviour.
+            if (!nix::v3::detail::g_midEvalGcEnabled)
+                arena.clearCellStartBitFor(cellAddr);
         }
     }
     // R2.1: bin this block's live-byte density (evacuation opportunity).
@@ -2070,6 +2077,13 @@ MajorGcResult runMajorMarkSweep(VMState & vm) noexcept
     }
 
     // -- Phase 2 step 2: sweep (measurement-only; no free yet) ------
+    // MIDEVAL_GC reuse-SEGV fix (2026-06-23): rebuild the free-list bins FRESH
+    // each sweep so no stale cross-sweep entry survives (the overlapping-entry
+    // corruption).  Live cells are never in the bins; dead cells keep their
+    // cell-start bits (sweep no longer clears them under mid-eval) so this sweep
+    // re-bins every current dead cell below.
+    if (nix::v3::detail::g_midEvalGcEnabled)
+        arena.clearFreeListBins();
     SweepStats sweep;
     const auto & cellStarts = arena.cellStartBitmaps();
     const auto & cellTypes  = arena.cellTypeArrays();  // R2.1′

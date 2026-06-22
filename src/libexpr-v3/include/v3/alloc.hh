@@ -1521,6 +1521,10 @@ public:
                 // internally; stamp the (new) type too so the reused
                 // granule doesn't keep the prior occupant's type (#13).
                 setCellTypeFor(p, type);
+                // RCA fix (2026-06-23): clear stale interior cell-start bits so the
+                // sweep doesn't split this reused multi-granule cell at a leftover
+                // bit from a prior occupant (the reuse-SEGV root cause).
+                clearInteriorCellStarts(p, bytes);
                 return p;
             }
         }
@@ -1544,6 +1548,13 @@ public:
             // packed write (preserves the neighbouring granule's nibble).
             if (type != CellType::None)
                 cellTypePack(active_.cellTypes.back(), bit, type);
+            // RCA fix (2026-06-23): clear any stale interior cell-start bits in
+            // this cell's span.  Bump regions are USUALLY fresh (bitmap 0), but a
+            // reused/recycled block region can carry a leftover bit from a prior
+            // finer-grained occupant; a spurious interior bit makes the sweep
+            // split this live multi-granule cell (the reuse-SEGV: a string with an
+            // interior stale Bindings cell-start, mis-binned + reused → corruption).
+            clearInteriorCellStarts(p, bytes);
         }
         return p;
     }
@@ -2160,10 +2171,37 @@ public:
     ///
     /// Lifetime: persistent across GC cycles.  Each sweep adds dead
     /// cells; each alloc that hits the free list removes them.
+    /// MIDEVAL_GC_DESIGN_2026-06-22 (reuse-SEGV fix, 2026-06-23): drop ALL
+    /// free-list entries.  Called at the start of each mid-eval sweep so the bins
+    /// are REBUILT fresh from the current cell-start bitmap — never carrying a
+    /// stale entry from a prior sweep whose cell-start configuration differed (the
+    /// overlapping-entry corruption: a region binned as one big cell in sweep N,
+    /// then sub-divided by sweep N+1, leaving sweep N's oversized entry spanning a
+    /// now-live neighbour).  Safe: live cells are never in the bins; dead cells
+    /// keep their start bits (the sweep no longer clears them) so the next sweep
+    /// re-bins them — nothing is lost.
+    void clearFreeListBins() noexcept
+    {
+        freeListBins_.clear();
+        freeListEntries_ = 0;
+        binnedDbg_.clear();
+    }
     void freeListAdd(void * p, size_t bytes) noexcept
     {
-        if (__builtin_expect(detail::g_midEvalPoison, 0))
+        if (__builtin_expect(detail::g_midEvalPoison, 0)) {
+            // RCA: detect DOUBLE-BIN (same address added to a bin twice without an
+            // intervening pop) + record the size to spot cross-size staleness.
+            auto dit = binnedDbg_.find(p);
+            if (dit != binnedDbg_.end()) {
+                std::fprintf(stderr,
+                    "[mideval-rca] DOUBLE-BIN: p=%p already in bin[%zu], re-added to "
+                    "bin[%zu] type=%d — stale free-list entry (bins never cleared)\n",
+                    p, dit->second, bytes, (int)cellTypeAt(p));
+                std::abort();
+            }
+            binnedDbg_[p] = bytes;
             *reinterpret_cast<uint64_t *>(p) = 0xDEADBEEFCAFEF00DULL;  // sentinel
+        }
         freeListBins_[bytes].push_back(p);
         ++freeListEntries_;
     }
@@ -2174,15 +2212,25 @@ public:
         void * p = it->second.back();
         it->second.pop_back();
         --freeListEntries_;
-        if (__builtin_expect(detail::g_midEvalPoison, 0)
-            && *reinterpret_cast<uint64_t *>(p) != 0xDEADBEEFCAFEF00DULL) {
+        if (__builtin_expect(detail::g_midEvalPoison, 0)) {
+            binnedDbg_.erase(p);
+            if (*reinterpret_cast<uint64_t *>(p) != 0xDEADBEEFCAFEF00DULL) {
+            // RCA: find the nearest SET cell-start at/below p-16.  If it's a
+            // nearby cell (esp. a string) that p falls inside, p is INTERIOR to a
+            // live cell (spurious-bit split); if it's p itself / far, p is a
+            // standalone MISSED live cell.
+            const char * below =
+                findContainingCellStart(static_cast<const char *>(p) - 16);
+            long dist = below ? (long)((const char *)p - below) : -1;
             std::fprintf(stderr,
-                "[mideval-poison] LIVE cell binned then mutated: p=%p type=%d "
-                "size=%zu word0=0x%016llx — sweep classified a still-live cell as "
-                "dead (missed root)\n",
+                "[mideval-poison] binned-then-mutated: p=%p type=%d size=%zu "
+                "word0=0x%016llx | nearest-start-below=%p dist=%ld belowType=%d\n",
                 p, (int)cellTypeAt(p), bytes,
-                (unsigned long long)*reinterpret_cast<uint64_t *>(p));
+                (unsigned long long)*reinterpret_cast<uint64_t *>(p),
+                (const void *)below, dist,
+                below ? (int)cellTypeAt(below) : -1);
             std::abort();
+            }
         }
         // Re-set the cell-start bit at this address (sweep cleared
         // it when adding to free list).  Slow path: linear-scan
@@ -2356,6 +2404,36 @@ public:
         }
     }
 
+    /// MIDEVAL_GC_DESIGN_2026-06-22: clear stale cell-start bits in the INTERIOR
+    /// granules of a freshly-allocated cell `[p+16, p+bytes)`.  THE reuse-SEGV fix
+    /// (RCA 2026-06-23): a multi-granule cell whose region previously held a
+    /// smaller cell can carry a stale interior cell-start bit (+ stale type) from
+    /// that prior occupant.  The non-moving sweep iterates cell-starts in address
+    /// order, so a spurious interior bit splits this live cell: it sees the real
+    /// start (marked → live, but its byte-0 mark doesn't cover the interior),
+    /// computes the cell as ending at the spurious bit, then treats `[interior,…)`
+    /// as a SEPARATE dead cell → bins + reuses it → corrupts THIS live cell (the
+    /// "type=Bindings, content=string" poison hit).  Clearing the interior on
+    /// alloc guarantees the sweep sees one cell.  Gated (cellMetaEnabled); only
+    /// touches this cell's own granules.
+    void clearInteriorCellStarts(void * p, size_t bytes) noexcept
+    {
+        if (!cellMetaEnabled() || !p || bytes <= 16) return;
+        bytes = (bytes + 15) & ~size_t{15};               // round to cell granularity
+        const char * cp = static_cast<const char *>(p);
+        const long bi = blockIndexContaining(cp);
+        if (bi < 0) return;                                // huge/external: single cell
+        const size_t i = static_cast<size_t>(bi);
+        if (i >= active_.cellStarts.size()) return;
+        const char * blk = active_.blocks[i];
+        const size_t base = static_cast<size_t>(cp - blk);
+        auto & bits = active_.cellStarts[i];
+        for (size_t off = base + 16; off < base + bytes; off += 16) {
+            const size_t bit = off >> 4, word = bit >> 6;
+            if (word < bits.size()) bits[word] &= ~(1ULL << (bit & 63));
+        }
+    }
+
     /// Total bytes pinned by all blocks the arena has ever
     /// allocated.  Cheap to read; useful for the alloc-stats dump.
     size_t bytesAllocated() const noexcept { return active_.totalBytes; }
@@ -2451,6 +2529,10 @@ private:
     /// Kept for one validation cycle so V3_DBG_IMMIX_ALLOC=0 falls
     /// back gracefully.
     std::unordered_map<size_t, std::vector<void *>> freeListBins_;
+    // RCA only (NIX_V3_MIDEVAL_POISON): address → bin-size of currently-binned
+    // cells, to detect double-bin / cross-size staleness.  Never touched when the
+    // poison gate is off.
+    std::unordered_map<void *, size_t> binnedDbg_;
     size_t freeListEntries_ = 0;
 
     /// Step 12′ (Immix, 2026-05-29) — line-region allocator state.
