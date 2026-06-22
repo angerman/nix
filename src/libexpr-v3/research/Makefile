@@ -7,7 +7,7 @@
 CXX      ?= clang++
 CXXFLAGS ?= -std=c++20 -O2 -Wall
 
-.PHONY: help jit-spike jit-encoder-test clean
+.PHONY: help jit-spike jit-encoder-test jit-intop-test clean
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) \
@@ -27,5 +27,12 @@ jit-encoder-test: jit_encoder_test ## J1: build + RUN the aarch64 encoder/JitAre
 jit_encoder_test: jit_encoder_test.cc ../include/v3/jit.hh ## Build the J1 encoder test
 	$(CXX) $(CXXFLAGS) -I../include -o $@ $<
 
+jit-intop-test: jit_intop_test ## J2: build + RUN the NaN-box-aware int-ADD codegen proof (byte-id vs v8nan + bail)
+	@echo "── running JIT int-op codegen proof (J2) ──"
+	@./jit_intop_test
+
+jit_intop_test: jit_intop_test.cc ../include/v3/jit.hh ## Build the J2 int-op codegen proof
+	$(CXX) $(CXXFLAGS) -I../include -o $@ $<
+
 clean: ## Remove built spike binaries
-	rm -f jit_feasibility_spike jit_encoder_test
+	rm -f jit_feasibility_spike jit_encoder_test jit_intop_test

@@ -116,6 +116,20 @@ public:
     size_t cmp(Reg n, Reg m) {
         return emit(0xEB00001Fu | (uint32_t(m) << 16) | (uint32_t(n) << 5));
     }
+    // AND Xd, Xn, Xm  (shifted-register, shift 0).
+    size_t andReg(Reg d, Reg n, Reg m) {
+        return emit(0x8A000000u | (uint32_t(m) << 16) | (uint32_t(n) << 5) | (d & 31));
+    }
+    // ORR Xd, Xn, Xm.
+    size_t orrReg(Reg d, Reg n, Reg m) {
+        return emit(0xAA000000u | (uint32_t(m) << 16) | (uint32_t(n) << 5) | (d & 31));
+    }
+    // SBFX Xd, Xn, #lsb, #width  (sign-extract; alias of SBFM, 64-bit).
+    // Used for the v8nan 48-bit inline-int sign-extend: sbfx(d, n, 0, 48).
+    size_t sbfx(Reg d, Reg n, unsigned lsb, unsigned width) {
+        uint32_t immr = lsb & 63, imms = (lsb + width - 1) & 63;
+        return emit(0x93400000u | (immr << 16) | (imms << 10) | (uint32_t(n) << 5) | (d & 31));
+    }
     // B <label>  — emit with a placeholder; patch via patchBranch(at, target).
     size_t b() { return emit(0x14000000u); }
     // B.<cond> <label> — placeholder; patch via patchCondBranch.
