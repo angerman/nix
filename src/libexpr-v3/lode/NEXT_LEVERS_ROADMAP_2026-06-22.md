@@ -96,6 +96,30 @@ ALLOC + the 637 MB M5 thunk RSS).
 - L2 fixed-bigger nursery — regresses M5 +14–41% (closed 2026-06-22).
 - toString(int) cache / genList fusion — real-world-neutral / falsified.
 
+## CAMPAIGN EXECUTION (2026-06-22) — T1a/T1b/T2a all closed; warm eval-loop is near its incremental floor
+Executed the roadmap with darwin-4 measurement between each:
+- **T1a TLS hoisting — FALSIFIED (reverted).** Cached the thread Arena* in the
+  Nursery (1 `_tlv_get_addr` not 2 in the hot `nurseryOrArena`). byte-id 5/5 +
+  --brute 22/22 but CPU NEUTRAL on all 5 incl M5 (whose 92% nursery-miss fired
+  the removed deref ~every alloc). The `_tlv` 6% sample was not an attackable
+  cost (skew / OOO-hidden). A sample-leaf % is a hypothesis, not a lever.
+- **T1b dispatch superinstructions — DOCUMENT-CLOSE.** Prior BYTECODE_NGRAM_ANALYSIS
+  (2026-06-04) already shipped the top peephole (`SET_LOCAL_KEEP`, +1.4%) +
+  concluded register-VM not wall-justified (dispatch ~5% of wall ceiling). Post-L1
+  mix unchanged; CG neutral; no new candidate clears the bar. (`NIX_VM_BIGRAMS`
+  instrument is broken on real workloads — separate bug.)
+- **T2a unforced-thunk churn — DOCUMENT-CLOSE; the prize is a mirage.** Falsifier:
+  turning ALL shipped strictness passes off removes only **0.85% of M5 thunks /
+  0.7% firefox**, CPU-neutral. The strictness suite is at its ceiling; the 62-67%
+  unforced churn is INHERENT conditional laziness (un-de-thunkable without breaking
+  byte-id; TW has it too). ALLOC ~20% is a structural floor, not a strictness gap.
+
+**Consequence:** after L1 (the one concentrated hot-spot), the warm eval-loop
+(~1.8-2.4×) has NO remaining bounded incremental lever — TLS/superinstr/strictness
+are exhausted. The only warm step-change left is **T2b JIT** (native bodies →
+fewer intermediate thunks + no dispatch). The remaining non-JIT work is **T3
+lowering** (cold/CI only) + **T4 GET_UPVALUE** (opportunistic bounded check).
+
 ## STRATEGIC READ
 L1 (countDistinct) was the one concentrated hot-spot; harvesting it took the warm
 gap toward ~1.8–2.4×. What remains is SYSTEMIC (allocation + dispatch + per-op), so
