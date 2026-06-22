@@ -872,6 +872,17 @@ inline const bool g_freeListReuseEnabled =
 inline const bool g_midEvalGcEnabled =
     std::getenv("NIX_V3_MIDEVAL_GC") != nullptr;
 
+/// MIDEVAL_GC_DESIGN_2026-06-22 — free-list REUSE opt-in, SPLIT from the gate
+/// above.  `NIX_V3_MIDEVAL_GC=1` alone runs the correct mark + sweep + bin-build
+/// (validated byte-id + --brute) but does NOT pop/reuse — so it does not reclaim
+/// RSS yet.  Reuse (the pop below) is GATED SEPARATELY behind NIX_V3_MIDEVAL_REUSE
+/// because it currently SEGVs: popping a swept cell that is still live (a residual
+/// mark-completeness gap) or wrong-sized.  Isolated here so the correct sweep+bin
+/// path stays committable while the reuse-safety is debugged (next: a differential
+/// mark audit / poison-on-bin + check-on-pop to identify the live-but-binned cell).
+inline const bool g_midEvalReuseEnabled =
+    std::getenv("NIX_V3_MIDEVAL_REUSE") != nullptr;
+
 } // namespace detail
 
 struct FreeListStats
@@ -1199,6 +1210,18 @@ public:
     /// the `static const bool` initialised at startup; the call
     /// inlines to a load + branch that the predictor optimises away.
     static bool majorGcEnabled() noexcept { return detail::g_majorGcEnabled; }
+    /// MIDEVAL_GC_DESIGN_2026-06-22: the cell-start/type bitmap is needed by BOTH
+    /// the legacy major GC AND the non-moving mid-eval sweep (to find + classify
+    /// cells for in-block free-list reuse).  Maintain it whenever EITHER is on
+    /// (both default-off → zero cost).  NOTE: this gates METADATA ONLY (cell-start
+    /// + cell-type bitmaps) — NOT the block alloc/free method.  Under mid-eval
+    /// blocks stay calloc'd (majorGcEnabled() still false), so whole-block-free
+    /// (munmap) MUST stay off (skipped in runMajorMarkSweep); the mid-eval win is
+    /// in-block free-list reuse, which needs no munmap.  Keeping the block method
+    /// unchanged avoids the munmap-on-calloc hazard.
+    static bool cellMetaEnabled() noexcept {
+        return detail::g_majorGcEnabled || detail::g_midEvalGcEnabled;
+    }
 
     /// 16 MB blocks: each block holds many thousands of typical
     /// allocations and a long-running eval doesn't accumulate too
@@ -1470,7 +1493,8 @@ public:
         // let the allocator CONSUME them under EITHER opt-in.  Default-OFF (both
         // gates) → byte-for-byte the old default path.  Correctness: bins hold
         // cells the precise+conservative non-moving mark proved dead.
-        if (__builtin_expect((detail::g_freeListReuseEnabled || detail::g_midEvalGcEnabled)
+        if (__builtin_expect((detail::g_freeListReuseEnabled
+                              || (detail::g_midEvalGcEnabled && detail::g_midEvalReuseEnabled))
                              && !detail::g_immixAllocEnabled, 0)) {
             if (void * p = freeListTryPop(bytes)) {
                 // Step 6: count the hit.  Bin is the requested size's
@@ -1499,7 +1523,7 @@ public:
         // majorGcEnabled() (cached at startup); zero cost when gate
         // OFF.  Hot path: branch is well-predicted (single fixed bool
         // per process).
-        if (__builtin_expect(majorGcEnabled(), 0)) {
+        if (__builtin_expect(cellMetaEnabled(), 0)) {
             const size_t offset = static_cast<size_t>(
                 static_cast<char *>(p) - active_.blocks.back());
             const size_t bit  = offset >> 4;           // /16
@@ -1528,7 +1552,7 @@ public:
     /// was allocated).
     bool isCellStart(const void * p) const noexcept
     {
-        if (!majorGcEnabled()) return false;
+        if (!cellMetaEnabled()) return false;
         if (!p) return false;
         const char * cp = static_cast<const char *>(p);
         {
@@ -1562,7 +1586,7 @@ public:
     /// by the evacuation mover at GC time, not on the alloc hot path.
     CellType cellTypeAt(const void * p) const noexcept
     {
-        if (!majorGcEnabled() || !p) return CellType::None;
+        if (!cellMetaEnabled() || !p) return CellType::None;
         const char * cp = static_cast<const char *>(p);
         const long bi = blockIndexContaining(cp);  // Lever 1: O(log blocks)
         if (bi >= 0) {
@@ -1916,7 +1940,7 @@ public:
     /// reinterpret_casts the wrong layout (heap corruption / SIGSEGV).
     void setCellTypeInBlock(const void * p, size_t blockIdx, CellType type) noexcept
     {
-        if (!majorGcEnabled() || !p) return;
+        if (!cellMetaEnabled() || !p) return;
         if (blockIdx >= active_.cellTypes.size()) return;
         const char * blk = active_.blocks[blockIdx];
         const size_t bit =
@@ -1992,7 +2016,7 @@ public:
 
     const char * findContainingCellStart(const void * p) const noexcept
     {
-        if (!majorGcEnabled() || !p) return nullptr;
+        if (!cellMetaEnabled() || !p) return nullptr;
         const char * cp = static_cast<const char *>(p);
         {
             const long bi = blockIndexContaining(cp);
@@ -2447,7 +2471,7 @@ private:
     /// occupant's stale type on the reused granule.
     void setCellTypeFor(const void * p, CellType type) noexcept
     {
-        if (!majorGcEnabled() || !p) return;
+        if (!cellMetaEnabled() || !p) return;
         const char * cp = static_cast<const char *>(p);
         for (size_t i = 0; i < active_.blocks.size(); ++i) {
             const char * blk = active_.blocks[i];
@@ -2541,7 +2565,7 @@ private:
         // line-mark bitmap by kLineU64sPerBlock words (2048 = 16 KB
         // per 16 MB block).  Cleared at start of each mark phase by
         // Arena::clearAllLineMarks().
-        if (majorGcEnabled()) {
+        if (cellMetaEnabled()) {
             active_.cellStarts.emplace_back(
                 kBlockSize / 16 / 64, 0ULL);
             active_.lineMarks.emplace_back(

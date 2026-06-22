@@ -2113,7 +2113,17 @@ MajorGcResult runMajorMarkSweep(VMState & vm) noexcept
     // context side-table for them too (review #2): the previous code only
     // swept the EVAC-freed ranges, leaking stale context for blocks freed
     // by this default whole-block-free path.
+    // MIDEVAL_GC_DESIGN_2026-06-22: whole-block-free munmaps the block
+    // (freeWholeBlock assumes refill() mmap'd it).  Under the mid-eval gate the
+    // legacy major GC is OFF, so blocks are CALLOC'd (cellMetaEnabled gates only
+    // the cell-start/type metadata, NOT the block alloc method) — munmap'ing a
+    // calloc'd block would crash.  So whole-block-free runs ONLY when the legacy
+    // major GC is on; under mid-eval the fully-dead blocks' CELLS are still binned
+    // by the sweep above for in-block free-list reuse (the firefox win — its dead
+    // is scattered → ~0 fully-dead blocks anyway).  Huge blocks (below) are safe:
+    // freeHugeBlock picks std::free vs munmap to match how they were allocated.
     std::vector<std::pair<uintptr_t, uintptr_t>> freedRanges;
+    if (Arena::majorGcEnabled())
     for (const char * blk : blocksToFree) {
         const size_t freed = arena.freeWholeBlock(blk);
         if (freed > 0) {
