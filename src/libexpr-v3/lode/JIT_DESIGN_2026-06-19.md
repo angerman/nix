@@ -131,5 +131,45 @@ multi-week build; this is the point to decide scope/scheduling with the user, si
 J1 alone (a real instruction encoder) is a meaningful sub-project. The env-sharing
 foundation (shared `Env`) is in place to make J2's upvalue access codegen-clean.
 
+## J3-2 INTEGRATION MAP (code-grounded hook points, 2026-06-22)
+
+The dedicated multi-week VM-integration project starts from these concrete hooks
+(read from the live tree, not invented).  **The central enabler: the v3 VM
+ALREADY uses the value stack as its GC-root working set.**  A `CallFrame`'s locals
+live at `valueStack[stackBaseOffset .. stackBaseOffset+nLocals)` (vm.cc:7,
+include/v3/vm.hh:75); the scavenger walks exactly `vm.valueStack` (gc.cc:846) and
+forwards each pointer Value in place (gc.cc:571).  So a JIT'd body that mirrors the
+interpreter's value-stack discipline — keep the working set on the value stack,
+spill/reload around any allocation — inherits the J3-proven GC-safety with NO new
+root registration (the frame region is already walked).  Hooks:
+
+1. **Compile trigger.** Add `mutable void * jittedBody = nullptr;` to
+   `LambdaDescriptor` (closure.hh:324) + a cheap hot counter.  NOTE: the existing
+   `callCount` (closure.hh:404, bumped vm.cc:6850) is gated behind `g_dbgAllocDump`
+   (diagnostic) → J3-2 needs either to un-gate a bare increment or add a dedicated
+   always-on counter.  Compile when it crosses a threshold (and the body is the
+   supported opcode subset).
+2. **Dispatch entry.** At the OP_CALL closure-invoke (vm.cc ~6842, after `desc` is
+   resolved + the frame's `stackBaseOffset` is set), `if (desc->jittedBody && shapeSupported)`
+   call the native body with the value-stack ABI instead of entering the dispatch
+   loop.
+3. **Value-stack ABI (the trampoline).** Pass `base = &valueStack[stackBaseOffset]`
+   (locals, base+offset loads — the codegen-clean shape), the `Closure *` (upvalues
+   via `closure->upvalEnv` per env-sharing), and the `withStack` floor
+   (`withStackBase`).  LR saved per the J2 trampoline ABI.  Return value pushed onto
+   `valueStack` exactly as OP_RETURN does (CallFrame.h: "return value is pushed onto
+   valueStack and consumed by the caller").
+4. **Safepoints.** Copy-patch alloc templates spill live Values to the value-stack
+   slots and reload after the alloc — the exact J3-proven discipline; no roots
+   beyond the already-walked frame region.
+5. **Bail.** Any unsupported opcode/shape/throw-path → bail sentinel; the caller
+   re-enters the interpreter for that body (the body stays interpretable always —
+   the JIT is a fast path, never the only path).
+6. **Validation gate.** AUDIT + full `--brute` + `V3_DBG_GC_STRESS` at every step
+   (a missed root = UAF, the PhD-6 class) + byte-identity sweep + darwin-4 CPU grade
+   JIT-on vs off.  Ship only if it clears the bar without gaming (no benchmark-only
+   fast paths; recall the J2 finding — pure-arith bodies have ~0 nixpkgs coverage,
+   so the supported subset MUST include allocating shapes, which is why J3 exists).
+
 *Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>, Input Output Group.
 SPDX-License-Identifier: Apache-2.0*
