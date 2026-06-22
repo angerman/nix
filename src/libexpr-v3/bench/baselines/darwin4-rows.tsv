@@ -40,6 +40,15 @@ firefox	2.64	0.73	3.62	352.3	yes	off	7e6cc3534	2026-06-22
 # RATIO TIGHTENS WITH SCALE: small ~4.4-5.5x -> HNE 4.92x (453MB) -> M5 3.18x (1543MB).
 HNE	6.81	1.54	4.42	453.0	yes	off	55ba50216	2026-06-21
 M5	10.86	3.57	3.04	1543.5	yes	off	55ba50216	2026-06-21
+# WARM (cache-on, production) rows — the disk cache amortizes parse+lower, so
+# these are the STEADY-STATE dev-loop CPU.  ~1/3-1/2 of the cache-off gap is the
+# amortizable lowering tax.  cache=warm.  THE PRODUCTION METRIC (track alongside
+# cache-off which stays the correctness/cold oracle).  Pinned nixpkgs, memo-on.
+hello	0.53	0.27	1.96	83.9	yes	warm	7e6cc3534	2026-06-22
+git	0.71	0.34	2.09	117.4	yes	warm	7e6cc3534	2026-06-22
+firefox	1.78	0.73	2.44	352.3	yes	warm	7e6cc3534	2026-06-22
+HNE	2.66	1.54	1.73	453.0	yes	warm	7e6cc3534	2026-06-22
+M5	6.45	3.60	1.79	1543.5	yes	warm	7e6cc3534	2026-06-22
 # synthetic v3-only rows below NOT re-measured at 20758fad5 — last at 3ff650587:
 fib	2.29	NA	NA	NA	no	off	3ff650587	2026-06-19
 attrNames	0.57	NA	NA	NA	yes	off	3ff650587	2026-06-19
