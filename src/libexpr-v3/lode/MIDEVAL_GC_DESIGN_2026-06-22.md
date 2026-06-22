@@ -122,5 +122,55 @@ toward TW's 375 MB). A differential-mark audit (compare mid-eval mark vs
 gen-major's post-forceScavenge mark; the delta = the missed cell's type) is the
 tool to confirm closure.
 
+## STATUS UPDATE 2 (2026-06-22) — MARK CORRECT; RECLAIM blocked on cell-metadata gate
+
+**The hard part is DONE + validated.** The non-moving mid-eval mark-sweep now
+marks correctly via PRECISE nursery traversal (commit 357d12859): hello.drvPath
+byte-identical at thresholds 8/16/24/32/48/64 MB; git.drvPath byte-identical;
+**full `--brute` 22/22 ALL GREEN with `NIX_V3_MIDEVAL_GC=1` forced active** (the
+1 MB-nursery + AUDIT + BRUTE missed-root stress). On darwin-4 firefox cache-off it
+**fires 5× at exitDepth>0, byte-identical** — the moving-GC-at-exitDepth>0 safety
+problem (the novel risk) is SOLVED.
+
+**But it reclaims NOTHING yet** (firefox: free-list hits=0, arena 352 MB unchanged,
+RSS 684→672 MB only). RCA: the sweep's `v3 sweep: blocksScanned=0` — the per-block
+sweep finds no cells because **the cell-start bitmap is not maintained**. That
+maintenance (alloc.hh:1502) — AND the mmap-vs-calloc block-allocation method
+(2515), the cell-start-bitmap-per-block allocation (2544), whole-block-free /
+munmap (2284), huge-block free policy (1352), and the queries isCellStart (1531) /
+cellTypeAt (1565) / setCellStartBitInBlock (1897) / clearCellStartBitFor (2450) /
+findContainingCellStart (1995) — are ALL gated on `majorGcEnabled()` (hard-false).
+The legacy major-GC reclaim machinery was disabled when the nursery shipped; GC_
+DECISION_2026-05-29 deferred its replacement to Immix (paused).
+
+**NEXT STEP (well-scoped, classified): enable the cell-metadata machinery under
+the mid-eval gate.** Add `Arena::cellMetaEnabled() = majorGcEnabled() ||
+detail::g_midEvalGcEnabled` and switch the cell-metadata sites from
+`majorGcEnabled()` to it. This is ~15 INTERLOCKING sites, not a one-liner — that
+is why it is its own focused pass (a missed site = silent miss or crash):
+ - block ALLOC method (regular 2515, huge 1352): mmap vs calloc;
+ - block FREE method (huge freeHugeBlock 2284 munmap-vs-free; regular freeWholeBlock
+   munmaps UNCONDITIONALLY but is only reached when metadata is on → consistent);
+ - per-block cell-start bitmap alloc (2544);
+ - cell-start MAINTENANCE: bump path (1502), setCellStartBitInBlock (1897),
+   setCellStartBitFor (~2147, the free-list-reuse re-set), clearCellStartBitFor;
+ - cell-TYPE stamping: setCellTypeInBlock (1919), setCellTypeFor (~2460, the
+   free-list-reuse re-stamp) — REQUIRED so a reused cell's type is correct, else
+   drainConservative byte-scans it instead of typed-walking;
+ - QUERIES: isCellStart (1531), cellTypeAt (1565), findContainingCellStart (1995).
+ CRITICAL CONSISTENCY: alloc/free method (mmap↔munmap vs calloc↔free) must flip
+ together for BOTH regular and huge blocks (mismatch = munmap-on-calloc crash);
+ every alloc path that stamps a cell-start bit must also stamp its TYPE.  Leave the
+ Immix line-mark sites (1616/1633/1663/1734) on `majorGcEnabled()` (the free-list-
+ bin path uses cell-start bits, not line-marks).
+ KEY FINDING from this pass: the DEFAULT gen-major sweep is ALSO a no-op today
+ (`blocksScanned=0` — cellStarts empty under majorGcEnabled=false); its reclaim is
+ the nursery scavenge's young-death only, NOT a tenured sweep.  So enabling
+ cell-metadata under mid-eval gives v3 its FIRST real mid-eval tenured reclamation.
+ Then: re-run `--brute` with mid-eval forced (validates metadata + reuse UAF-free
+ under the moving-nursery stress) → darwin-4 firefox/M5 peak-RSS (free-list reuse
+ fires at scale where ~78% of allocs bypass to the tenured Arena::alloc; target:
+ arena plateaus near ~157 MB live, RSS toward TW's 375 MB).
+
 *Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>, Input Output
 Group. SPDX-License-Identifier: Apache-2.0*
