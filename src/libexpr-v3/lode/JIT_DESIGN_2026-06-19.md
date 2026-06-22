@@ -87,6 +87,23 @@ integration, NO GC safepoints → NO CPU win yet; the measurable win is J2+J3.**
 Build lesson: a JIT'd body that cross-calls MUST save/restore X30 (LR) — the J2
 trampoline ABI (a test omitting it hung).
 
+**J2 CODEGEN PROOF DONE + VALIDATED (2026-06-22, commit 43c8d13cf).** The hard
+part of J2 — emitting a Value-level op that is BYTE-IDENTICAL to the interpreter's
+NaN-boxed bits, with the bail contract — is proven.  Extended the encoder
+(andReg/orrReg/sbfx) and JIT'd an integer ADD over v3 Values: mask+compare to
+INT_HEADER (bail if not inline-int), sbfx-unbox, add, 48-bit-overflow check (bail),
+orr-rebox.  `research/jit_intop_test.cc` EXECUTES it: 7/7 int-add cases byte-id vs
+the v8nan reference (incl edge-of-48-bit) + 4/4 bail cases correct (overflow ±,
+non-int ±).  **STRATEGIC FINDING — a shippable JIT REQUIRES J3.** Pure-int-arith
+bodies (the only ones safe without J3 GC-safepoints) have ~0 coverage on nixpkgs
+(the real hot `lib.*` helpers ALLOCATE — attrset/list/string ops); a pure-arith
+JIT would speed only synthetic microbenches (fib) = benchmark-gaming, which the
+no-gaming ship rule forbids.  So the measurable, shippable win needs J3 (spill
+live v3 pointers at allocation safepoints — the UAF-risk crux).  **CONCLUSION: J0
++ J1 + J2-codegen are proven foundations; the shippable JIT (value-stack ABI +
+full body emitter + VM integration + J3) is a dedicated multi-week project, not a
+campaign-tail slice.**
+
 J0 (feasibility) DONE — the platform mechanism is proven runnable. J1-J4 are the
 multi-week build; this is the point to decide scope/scheduling with the user, since
 J1 alone (a real instruction encoder) is a meaningful sub-project. The env-sharing
