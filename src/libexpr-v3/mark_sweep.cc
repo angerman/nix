@@ -242,7 +242,7 @@ public:
         if (marker_.tryMark(p)) {
             worklist_.push_back({p, KClosure});
             ++statsClosures_;
-        }
+        } else enqueueNurseryCell(p, KClosure);  // MIDEVAL_GC: traverse nursery cell
     }
     void visitThunk(Thunk * & p) override
     {
@@ -250,7 +250,7 @@ public:
         if (marker_.tryMark(p)) {
             worklist_.push_back({p, KThunk});
             ++statsThunks_;
-        }
+        } else enqueueNurseryCell(p, KThunk);
     }
     void visitBindings(Bindings * & p) override
     {
@@ -258,7 +258,7 @@ public:
         if (marker_.tryMark(p)) {
             worklist_.push_back({p, KBindings});
             ++statsBindings_;
-        }
+        } else enqueueNurseryCell(p, KBindings);
     }
     void visitList(ListVec * & p) override
     {
@@ -266,7 +266,7 @@ public:
         if (marker_.tryMark(p)) {
             worklist_.push_back({p, KList});
             ++statsLists_;
-        }
+        } else enqueueNurseryCell(p, KList);
     }
     void visitPair(ValuePair * & p) override
     {
@@ -274,7 +274,7 @@ public:
         if (marker_.tryMark(p)) {
             worklist_.push_back({p, KPair});
             ++statsPairs_;
-        }
+        } else enqueueNurseryCell(p, KPair);
     }
     void visitSlot(Value * & p) override
     {
@@ -293,6 +293,11 @@ public:
             // Walk through the cell's content to mark transitively
             // reached pointers.  No type info at the slot target, so
             // visitValue dispatches on the tag.
+            visitValue(*p);
+        } else if (nursery_ && nursery_->contains(p)
+                   && nurseryVisited_.insert(p).second) {
+            // MIDEVAL_GC: a nursery-resident Value cell — visitValue decodes its
+            // boxed payload so a tenured pointee is marked.  Deduped via the set.
             visitValue(*p);
         }
         // Phase 3.5: if the slot's target is INTERIOR of a larger
@@ -345,6 +350,8 @@ public:
     /// identify interior slot targets.  Must be called BEFORE the
     /// root walk.
     void setArena(Arena & a) noexcept { arenaSetForSlot_ = &a; }
+    // MIDEVAL_GC: enable precise traversal of the resident nursery (see member).
+    void setNursery(Nursery * n) noexcept { nursery_ = n; }
     // Lever 3 (R2.4d): enable typed interior-owner walk (mark only).
     void setTypedInteriorOwners(bool b) noexcept { typedInteriorOwners_ = b; }
     void visitString(const char * & s) noexcept override
@@ -542,6 +549,21 @@ private:
     std::vector<void *> conservativeRoots_;
     Arena * arenaSetForSlot_ = nullptr;
     bool typedInteriorOwners_ = false;  // Lever 3: mark-only typed walk
+    // MIDEVAL_GC_DESIGN_2026-06-22: when set (mid-eval non-moving sweep), the mark
+    // traverses RESIDENT nursery cells PRECISELY — the typed walkX → visitValue
+    // decode the v8nan box, so tenured cells reachable ONLY through the nursery
+    // are marked (a flat conservative byte-scan leaks nested boxed pointers).
+    // `tryMark` can't mark/dedup nursery cells (not in the arena bitmap), so the
+    // dedup is this side set.  arena helpers (markLinesForCell/findContaining…)
+    // all no-op on non-arena addresses, so the typed walkX are nursery-safe.
+    Nursery * nursery_ = nullptr;
+    std::unordered_set<const void *> nurseryVisited_;
+    bool enqueueNurseryCell(void * p, GrayKind kind) noexcept {
+        if (!nursery_ || !nursery_->contains(p)) return false;
+        if (!nurseryVisited_.insert(p).second) return false;
+        worklist_.push_back({p, kind});
+        return true;
+    }
 
     void walkClosure(Closure * c) noexcept
     {
@@ -558,7 +580,12 @@ private:
         // visit its values precisely; the inline FAM is unused when upvalEnv is set.
         if (c->upvalEnv) {
             Env * e = c->upvalEnv;
-            if (marker_.tryMark(e)) {
+            // MIDEVAL_GC: also traverse a nursery-resident Env (tryMark fails for
+            // non-arena cells); dedup via the nursery set.
+            const bool fresh = marker_.tryMark(e)
+                || (nursery_ && nursery_->contains(e)
+                    && nurseryVisited_.insert(e).second);
+            if (fresh) {
                 if (arenaSetForSlot_)
                     arenaSetForSlot_->markLinesForCell(
                         e, sizeof(Env) + sizeof(Value) * e->nValues);
@@ -606,7 +633,11 @@ private:
                 visitList(w);
             if (Env * te = thunkUpvalEnv(t)) {
                 // env-sharing: upvalues live in the shared, tenured Env (tail[0]).
-                if (marker_.tryMark(te)) {
+                // MIDEVAL_GC: also traverse a nursery-resident Env.
+                const bool fresh = marker_.tryMark(te)
+                    || (nursery_ && nursery_->contains(te)
+                        && nurseryVisited_.insert(te).second);
+                if (fresh) {
                     if (arenaSetForSlot_)
                         arenaSetForSlot_->markLinesForCell(
                             te, sizeof(Env) + sizeof(Value) * te->nValues);
@@ -1972,6 +2003,13 @@ MajorGcResult runMajorMarkSweep(VMState & vm) noexcept
     MarkVisitor visitor(marker);
     visitor.setArena(arena);  // for visitSlot interior-owner discovery
     visitor.setTypedInteriorOwners(true);  // Lever 3: fast mark (not verify)
+    // MIDEVAL_GC_DESIGN_2026-06-22: when the mid-eval non-moving sweep runs with a
+    // RESIDENT nursery, give the visitor the nursery so it traverses nursery cells
+    // PRECISELY (typed walkX → visitValue decode the box) — covering tenured cells
+    // reachable only through the nursery, which a flat byte-scan leaks.  Off on the
+    // gen-major path (post-forceScavenge nursery empty) and by default.
+    if (nix::v3::detail::g_midEvalGcEnabled)
+        visitor.setNursery(&threadNursery());
     const auto tm0 = clock::now();
     walkAllV3Roots(vm, visitor);
     visitor.drain();
