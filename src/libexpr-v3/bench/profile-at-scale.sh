@@ -88,10 +88,10 @@ f && /\(in / {
   else if (sym ~ /forceValue/) cat="FORCE"
   else if (sym ~ /callClosure/) cat="CALL"
   else if (sym ~ /mergeBindings|countDistinct|Bindings::|allocBindings|Cursor/) cat="BINDINGS"
-  else if (sym ~ /tryMark|visitValue|Nursery|RootVisitor|[Ss]cavenge|MarkSweep|Marker|markRoots|walkV3|walkAll/) cat="GC"
+  else if (sym ~ /tryMark|visitValue|Nursery|RootVisitor|[Ss]cavenge|MarkSweep|MarkVisitor|Marker|markRoots|walkV3|walkAll/) cat="GC"
   else if (sym ~ /strlen|printString|StringContext|stringContext|^memcmp$|basic_string|coerceToString/) cat="STRING"
   else if (sym ~ /sha256|blake|murmur|cityhash|hash_table|__emplace|__hash/) cat="HASH"
-  else if (sym ~ /malloc|free|xzm|_platform_mem|operator new|operator delete|nanov2|tiny_|__bzero|alloc[A-Z]|traceable_allocator|::__append/) cat="ALLOC"
+  else if (sym ~ /malloc|free|xzm|_platform_mem|operator new|operator delete|nanov2|tiny_|bzero|alloc[A-Z]|Arena::alloc|traceable_allocator|::__append/) cat="ALLOC"
   else if (sym ~ /PosTable|PosIdx|LinesIterator/) cat="POS"
   else if (sym ~ /_tlv_get_addr|tlv/) cat="TLS"
   sum[cat]+=n; if(cat!="WAIT") oncpu+=n
