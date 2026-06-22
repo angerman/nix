@@ -7,7 +7,7 @@
 CXX      ?= clang++
 CXXFLAGS ?= -std=c++20 -O2 -Wall
 
-.PHONY: help jit-spike clean
+.PHONY: help jit-spike jit-encoder-test clean
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) \
@@ -20,5 +20,12 @@ jit-spike: jit_feasibility_spike ## JIT-0: build + run the executable-codegen fe
 jit_feasibility_spike: jit_feasibility_spike.cc ## Build the JIT feasibility spike
 	$(CXX) $(CXXFLAGS) -o $@ $<
 
+jit-encoder-test: jit_encoder_test ## J1: build + RUN the aarch64 encoder/JitArena validation (emits + executes generated code)
+	@echo "── running JIT encoder test (J1) ──"
+	@./jit_encoder_test
+
+jit_encoder_test: jit_encoder_test.cc ../include/v3/jit.hh ## Build the J1 encoder test
+	$(CXX) $(CXXFLAGS) -I../include -o $@ $<
+
 clean: ## Remove built spike binaries
-	rm -f jit_feasibility_spike
+	rm -f jit_feasibility_spike jit_encoder_test
