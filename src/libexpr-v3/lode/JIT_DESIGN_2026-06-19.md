@@ -76,6 +76,17 @@ if it clears the bar without gaming (no benchmark-only fast paths).
 
 ## Status
 
+**J1 DONE + VALIDATED (2026-06-22, commit e010aa09e).** `include/v3/jit.hh`:
+JitArena (executable-memory manager) + a minimal correct aarch64 Aarch64Emitter
+(movz/movk/movImm64, mov, ldr/str, add/sub/mul, addImm/subImm, cmp, b/b.cond+patch,
+blr, ret).  Header-only/inline — no production-build impact until J2 includes it.
+Validated by `research/jit_encoder_test.cc` (EMITS + EXECUTES generated code on
+aarch64-darwin): **7/7 ALL PASS** (const materialise, load/store, ALU, compare,
+conditional + unconditional branch with patching).  **Foundation only: NO VM
+integration, NO GC safepoints → NO CPU win yet; the measurable win is J2+J3.**
+Build lesson: a JIT'd body that cross-calls MUST save/restore X30 (LR) — the J2
+trampoline ABI (a test omitting it hung).
+
 J0 (feasibility) DONE — the platform mechanism is proven runnable. J1-J4 are the
 multi-week build; this is the point to decide scope/scheduling with the user, since
 J1 alone (a real instruction encoder) is a meaningful sub-project. The env-sharing
