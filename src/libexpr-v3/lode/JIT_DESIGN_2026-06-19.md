@@ -104,6 +104,28 @@ live v3 pointers at allocation safepoints — the UAF-risk crux).  **CONCLUSION:
 full body emitter + VM integration + J3) is a dedicated multi-week project, not a
 campaign-tail slice.**
 
+**J3 CONTRACT PROOF DONE + VALIDATED (2026-06-22, commit pending).** The central
+J3 design question — can JIT'd allocating code keep its live v3 pointers correct
+across a MOVING collection? — is answered standalone (no VM integration), the same
+spike discipline as J1/J2.  `research/jit_safepoint_test.cc` JITs two bodies over a
+toy moving collector whose "safepoint" mirrors the real scavenger: it copies the
+value-stack root's object to to-space, REWRITES the root in place (mirrors
+gc.cc:571 `visitValue`: `v.mkClosure(fwdClosure(...))`), and poisons the vacated
+from-space cell.  Result: the **spilled-reload body reads the FORWARDED object**
+(spills the pointer to the value-stack slot before the BLR, reloads after — the
+slot now holds the forwarded address); the **register-kept control reads the
+POISON** (a textbook UAF), proving the contract is load-bearing.  So the J3
+calling-convention contract is confirmed correct: *spill every live v3-pointer
+Value to vm.valueStack before any allocation safepoint; keep no v3 pointer in a
+register across it; reload from the slot afterward.*  This de-risks the central
+hazard BEFORE the multi-week VM integration — but does NOT replace it: the real
+J3 risk is integrating with the ACTUAL nursery/gen-major scavenger (walking real
+JIT frames as roots, the cell-write barrier interaction, AUDIT+BRUTE+GC_STRESS at
+every step), which the toy collector cannot stand in for.  **Remaining shippable
+work (J3-2..J4) = a dedicated multi-week project:** value-stack ABI + safepoint
+emission in the body emitter, VM compile-trigger on hot callCount, dispatch + bail,
+real-scavenger integration, then darwin-4 grade JIT-on vs off + byte-id sweep.
+
 J0 (feasibility) DONE — the platform mechanism is proven runnable. J1-J4 are the
 multi-week build; this is the point to decide scope/scheduling with the user, since
 J1 alone (a real instruction encoder) is a meaningful sub-project. The env-sharing

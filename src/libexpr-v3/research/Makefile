@@ -7,7 +7,7 @@
 CXX      ?= clang++
 CXXFLAGS ?= -std=c++20 -O2 -Wall
 
-.PHONY: help jit-spike jit-encoder-test jit-intop-test clean
+.PHONY: help jit-spike jit-encoder-test jit-intop-test jit-safepoint-test clean
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) \
@@ -34,5 +34,12 @@ jit-intop-test: jit_intop_test ## J2: build + RUN the NaN-box-aware int-ADD code
 jit_intop_test: jit_intop_test.cc ../include/v3/jit.hh ## Build the J2 int-op codegen proof
 	$(CXX) $(CXXFLAGS) -I../include -o $@ $<
 
+jit-safepoint-test: jit_safepoint_test ## J3: build + RUN the safepoint spill/reload-across-move proof (the JIT GC contract)
+	@echo "── running JIT safepoint proof (J3) ──"
+	@./jit_safepoint_test
+
+jit_safepoint_test: jit_safepoint_test.cc ../include/v3/jit.hh ## Build the J3 safepoint proof
+	$(CXX) $(CXXFLAGS) -I../include -o $@ $<
+
 clean: ## Remove built spike binaries
-	rm -f jit_feasibility_spike jit_encoder_test jit_intop_test
+	rm -f jit_feasibility_spike jit_encoder_test jit_intop_test jit_safepoint_test
