@@ -41,6 +41,7 @@
 #include "v3/alloc.hh"
 #include "v3/precise_root.hh"
 #include "v3/fiber.hh"  // M-5: walkLiveFiberStacks (conservative yielded-fiber scan)
+#include "v3/nursery.hh"  // MIDEVAL_GC: threadNursery().forEachUsedRange conservative scan
 #include "v3/vm.hh"
 #include "v3/closure.hh"
 
@@ -486,8 +487,19 @@ public:
             for (size_t off = 0; off + sizeof(void *) <= cellSize;
                  off += sizeof(void *))
             {
-                const uintptr_t val = *reinterpret_cast<const uintptr_t *>(
+                const uintptr_t word = *reinterpret_cast<const uintptr_t *>(
                     cellStart + off);
+                // MIDEVAL_GC_DESIGN_2026-06-22: de-box the v8nan tag under the
+                // mid-eval gate.  This untyped byte-scan handles Value/Env/Chars
+                // cells; a Value cell holds a BOXED pointer (box(tag,ptr)), so the
+                // raw word is out of arena range → the pointee (a tenured Closure/
+                // Bindings reachable ONLY via this conservatively-marked Value
+                // cell) would be missed → swept → UAF.  gen-major marks such cells
+                // precisely so it never relied on this; the mid-eval nursery scan
+                // marks them conservatively, so the byte-scan MUST de-box.  Gated
+                // ⇒ default (raw `word`) is byte-and-behaviour-identical.
+                const uintptr_t val = nix::v3::detail::g_midEvalGcEnabled
+                    ? (word & 0x0000FFFFFFFFFFFFull) : word;
                 if (val < arenaMin || val >= arenaMax) continue;
                 // Range check passed; precise check + mark.
                 void * candidate = reinterpret_cast<void *>(val);
@@ -676,6 +688,30 @@ private:
 ///   * Conservative byte-walk of marked cells handles transitive
 ///     reachability via X.upvalues[0] → Y where Y's pointer might
 ///     not be on the stack.
+/// MIDEVAL_GC_DESIGN_2026-06-22: classify one scanned word as a conservative
+/// root, DE-BOXING the v8nan tag.  A pointer to a v3 cell living inside a Value
+/// (a C-local, a nursery cell, a fiber stack) is stored as box(tag,ptr) =
+/// (tag<<48)|ptr — the raw word is out of arena range, so a non-de-boxing scan
+/// MISSES it → swept live cell → UAF (the mid-eval-GC bug this fixes).  On
+/// aarch64 a raw 48-bit arena pointer has zero top bits, so masking the low 48
+/// covers BOTH raw pointers and boxed Values.  Over-approximate ⇒ safe (a
+/// non-pointer word whose low 48 bits land in arena range only over-retains).
+static inline void conservativeMarkWord(
+    MarkVisitor & v, Arena & arena, uintptr_t word,
+    uintptr_t arenaMin, uintptr_t arenaMax) noexcept
+{
+    constexpr uintptr_t kV8NanPay = 0x0000FFFFFFFFFFFFull;
+    // De-box ONLY under the mid-eval gate so the default gen-major path is
+    // byte-and-behaviour-identical (g_midEvalGcEnabled=false → val=word, the
+    // exact prior raw-pointer scan).  Under mid-eval, masking the low 48 bits
+    // catches boxed-Value pointers the raw scan would miss.
+    const uintptr_t val =
+        nix::v3::detail::g_midEvalGcEnabled ? (word & kV8NanPay) : word;
+    if (val < arenaMin || val >= arenaMax) return;
+    void * candidate = reinterpret_cast<void *>(val);
+    if (arena.inActive(candidate)) v.markConservative(candidate);
+}
+
 __attribute__((noinline))
 static void walkCStackConservative(
     MarkVisitor & v,
@@ -725,16 +761,10 @@ static void walkCStackConservative(
     arena.activeBounds(arenaMin, arenaMax);
     if (arenaMin >= arenaMax) return;  // no active blocks
 
-    // Walk stack.
+    // Walk stack.  De-box each word (covers boxed Value C-locals too).
     for (uintptr_t p = loU; p < hiU; p += sizeof(void *)) {
-        const uintptr_t val =
-            *reinterpret_cast<const uintptr_t *>(p);
-        if (val < arenaMin || val >= arenaMax) continue;
-        // Range hit; precise check.
-        void * candidate = reinterpret_cast<void *>(val);
-        if (arena.inActive(candidate)) {
-            v.markConservative(candidate);
-        }
+        conservativeMarkWord(v, arena,
+            *reinterpret_cast<const uintptr_t *>(p), arenaMin, arenaMax);
     }
 
     // Also walk the jmp_buf (callee-saved registers).
@@ -742,13 +772,8 @@ static void walkCStackConservative(
         reinterpret_cast<uintptr_t>(&regsBuf);
     const uintptr_t bufHi = bufLo + sizeof(regsBuf);
     for (uintptr_t p = bufLo; p < bufHi; p += sizeof(void *)) {
-        const uintptr_t val =
-            *reinterpret_cast<const uintptr_t *>(p);
-        if (val < arenaMin || val >= arenaMax) continue;
-        void * candidate = reinterpret_cast<void *>(val);
-        if (arena.inActive(candidate)) {
-            v.markConservative(candidate);
-        }
+        conservativeMarkWord(v, arena,
+            *reinterpret_cast<const uintptr_t *>(p), arenaMin, arenaMax);
     }
 
     // M-5 (CODEBASE_REVIEW_2026-06-11): conservatively scan every YIELDED
@@ -762,10 +787,30 @@ static void walkCStackConservative(
         uintptr_t b = reinterpret_cast<uintptr_t>(hi)
                       & ~(uintptr_t(sizeof(void *)) - 1);
         for (uintptr_t p = a; p < b; p += sizeof(void *)) {
-            const uintptr_t val = *reinterpret_cast<const uintptr_t *>(p);
-            if (val < arenaMin || val >= arenaMax) continue;
-            void * candidate = reinterpret_cast<void *>(val);
-            if (arena.inActive(candidate)) v.markConservative(candidate);
+            conservativeMarkWord(v, arena,
+                *reinterpret_cast<const uintptr_t *>(p), arenaMin, arenaMax);
+        }
+    });
+
+    // MIDEVAL_GC_DESIGN_2026-06-22: conservatively scan the RESIDENT nursery.
+    // The non-moving mid-eval mark-sweep runs with a non-empty nursery; the
+    // precise walk SKIPS nursery cells (tryMark rejects non-arena pointers,
+    // mark_sweep.cc:111), so a tenured cell reachable ONLY through a nursery
+    // cell would be missed → swept → UAF.  Scan every used nursery byte for
+    // tenured-arena pointers (same word-scan + arena-bounds filter as the
+    // C-stack scan above) and conservatively mark them.  No-op when the
+    // young region is empty (gen-major's post-forceScavenge path), so this is
+    // free on the default collector.  Over-approximate ⇒ safe.
+    // Nursery cells hold NaN-boxed Values; conservativeMarkWord de-boxes each
+    // word so boxed tenured pointers aren't missed (the swept-live-cell UAF).
+    threadNursery().forEachUsedRange([&](const char * lo, const char * hi) noexcept {
+        uintptr_t a = reinterpret_cast<uintptr_t>(lo)
+                      & ~(uintptr_t(sizeof(void *)) - 1);
+        uintptr_t b = reinterpret_cast<uintptr_t>(hi)
+                      & ~(uintptr_t(sizeof(void *)) - 1);
+        for (uintptr_t p = a; p < b; p += sizeof(void *)) {
+            conservativeMarkWord(v, arena,
+                *reinterpret_cast<const uintptr_t *>(p), arenaMin, arenaMax);
         }
     });
 
@@ -909,7 +954,8 @@ static bool sweepOneBlock(
             // gate (GC_DECISION_2026-05-29 §6).  clearCellStartBitFor stays
             // unconditional — it is bitmap-only (no growth) and keeps the
             // sweep-iteration semantics identical to before this change.
-            if (nix::v3::detail::g_freeListReuseEnabled
+            if ((nix::v3::detail::g_freeListReuseEnabled
+                 || nix::v3::detail::g_midEvalGcEnabled)
                 && !nix::v3::detail::g_immixAllocEnabled) {
                 arena.freeListAdd(
                     const_cast<void *>(cellAddr), cellSize);

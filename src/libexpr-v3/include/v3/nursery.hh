@@ -223,6 +223,25 @@ public:
         return false;
     }
 
+    /// Mid-eval non-moving GC (MIDEVAL_GC_DESIGN_2026-06-22): invoke `f(lo, hi)`
+    /// for each USED byte range that may hold pointers into the tenured arena —
+    /// the young region `[base, next)` and, under Phase E, both survivor buffers'
+    /// used spans.  A non-moving tenured mark-sweep running with a RESIDENT
+    /// nursery scans these CONSERVATIVELY (word-by-word, arena-bounds filter) to
+    /// mark tenured cells reachable THROUGH nursery cells — the precise mark skips
+    /// them (`tryMark` rejects non-arena pointers, mark_sweep.cc:111).  No-op when
+    /// the young region is empty (`next == base`), so it is also free on the
+    /// gen-major post-forceScavenge path.  Over-approximate ⇒ safe: scanning both
+    /// survivor buffers (incl. the inactive one) only over-retains tenured cells.
+    template <typename F>
+    void forEachUsedRange(F && f) const noexcept {
+        if (next > base) f(base, next);
+        if (phaseEEnabled) {
+            if (survNextA > survBaseA) f(survBaseA, survNextA);
+            if (survNextB > survBaseB) f(survBaseB, survNextB);
+        }
+    }
+
     /// #738 Phase E v0.2 — bump-allocate `bytes` from the INACTIVE
     /// survivor buffer (= destination for this scavenge's Y
     /// survivors).  Returns nullptr if survivor buffer overflows or

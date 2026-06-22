@@ -344,6 +344,24 @@ static const double g_majorGcGrowth = [] {
     if (v) { double d = std::strtod(v, nullptr); if (d >= 1.5 && d <= 8.0) return d; }
     return 2.0;
 }();
+// MIDEVAL_GC_DESIGN_2026-06-22: thresholds for the NON-MOVING mid-eval tenured
+// mark-sweep (gate NIX_V3_MIDEVAL_GC).  Fires at exitDepth>0 (where gen-major
+// can't — its forceScavenge moves) on arena-byte pressure, reclaiming scattered
+// dead tenured cells into the free-list bins.  Lower initial than gen-major
+// (96 MB) so the arena is bounded tighter; raise to `growth × live` after each
+// fire so a fire whose live-set already exceeds the initial doesn't re-fire every
+// opcode.
+static const size_t g_midEvalInitialThresholdBytes = [] {
+    const char * v = std::getenv("NIX_V3_MIDEVAL_GC_THRESHOLD_MB");
+    long mb = 96;
+    if (v) { long p = std::strtol(v, nullptr, 10); if (p >= 16 && p <= 32768) mb = p; }
+    return static_cast<size_t>(mb) << 20;
+}();
+static const double g_midEvalGrowth = [] {
+    const char * v = std::getenv("NIX_V3_MIDEVAL_GC_GROWTH");
+    if (v) { double d = std::strtod(v, nullptr); if (d >= 1.2 && d <= 8.0) return d; }
+    return 1.5;
+}();
 // FP-4 Shape A (GENERATIONAL_MAJOR_DESIGN_2026-06-14): opt-in
 // generational-major.  Under the nursery the per-op major GC is hard-disabled
 // (M-3: the major marker skips nursery cells → would sweep arena cells reachable
@@ -4155,6 +4173,59 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                         nextThreshold = g_majorGcInitialThresholdBytes;
                     s_majorGcThresholdBytes = nextThreshold;
                 }
+            }
+        }
+        // MIDEVAL_GC_DESIGN_2026-06-22: NON-MOVING tenured reclaim at exitDepth>0.
+        // The gen-major block above can only fire at exitDepth==0 (its
+        // forceScavenge MOVES — it can't forward nested dispatch-loop C-locals).
+        // But deep nixpkgs eval is ~always at exitDepth>0 (higher-order primop
+        // callbacks nest the dispatch loop), so without this the arena grows
+        // monotonically with zero mid-eval reclamation (the measured v3 RSS 1.9× TW
+        // root cause — project_v3_vs_tw_rss_rootcause_2026-06-22).  runMajorMarkSweep
+        // WITHOUT forceScavenge is NON-MOVING, hence SAFE under nested dispatch
+        // loops: nothing is forwarded, so the conservative C-stack scan (all nested
+        // C-locals) + the conservative nursery scan (tenured cells reachable through
+        // the RESIDENT nursery — walkCStackConservative now scans it) keep every
+        // live cell marked while every found pointer stays valid.  Dead tenured
+        // cells go to the free-list bins, which the allocator reuses (alloc.hh) →
+        // the arena plateaus near the live set.  Gated NIX_V3_MIDEVAL_GC (default-
+        // OFF); does NOT defer on nested-distinct VMState (walkAllV3Roots enumerates
+        // activeVMStack, so all VMs are marked; non-moving = none corrupted).
+        if (__builtin_expect(nix::v3::detail::g_midEvalGcEnabled && exitDepth > 0, 0)) {
+            static thread_local size_t s_midEvalThresholdBytes =
+                g_midEvalInitialThresholdBytes;
+            Arena & mArena = threadArena();
+            if (mArena.bytesAllocated() >= s_midEvalThresholdBytes) {
+                // Sync ip so the precise root walk sees a consistent frame.
+                if (!vm.frames.empty()) vm.frames.back().ip = ip;
+                // Clear the transient raw-Bindings*/Env side tables (IC /
+                // materialize-memo / env-intern / capWiths) before the sweep:
+                // walkAllV3Roots does NOT walk them, so a swept-then-REUSED cell
+                // they still alias would be a UAF on the next lookup.  Required
+                // for the free-list-reuse path; all repopulate on next use.
+                // (Bisect 2026-06-22 confirmed clearing is NOT the source of the
+                // ≥16 MB missed-root divergence — same hash with/without — so it
+                // is purely the reuse-safety measure here.)
+                for (const CompilationUnit * icu : cuRegistry()) {
+                    if (!icu) continue;
+                    for (auto & ic : icu->attrSelectCache)
+                        for (auto & e : ic.entries) e.bindings = nullptr;
+                    for (auto & rc : icu->recSlotCache) rc.bindings = nullptr;
+                }
+                Bindings::clearMaterializeMemo();
+                clearEnvInternTable();
+                clearCapWithsCache();
+                // NON-MOVING, nursery stays resident.  Frames are NOT forwarded,
+                // so the dispatch locals (cu/closure/ip/stackBase) stay valid —
+                // no post-GC re-read needed (unlike the moving gen-major path).
+                (void) runMajorMarkSweep(vm);
+                // Raise the threshold to ~`growth × live` so a fire whose live-set
+                // already exceeds the initial doesn't re-fire every opcode.
+                size_t liveSet = mArena.bytesAllocated();
+                size_t next = static_cast<size_t>(liveSet * g_midEvalGrowth);
+                if (next < g_midEvalInitialThresholdBytes)
+                    next = g_midEvalInitialThresholdBytes;
+                s_midEvalThresholdBytes = next;
             }
         }
         // Step 4 of post-Phase-3.8 plan (2026-05-29): periodic L(t)

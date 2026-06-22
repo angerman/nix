@@ -859,6 +859,19 @@ inline const bool g_immixAllocEnabled =
 inline const bool g_freeListReuseEnabled =
     std::getenv("V3_DBG_FREELIST_REUSE") != nullptr;
 
+/// MIDEVAL_GC_DESIGN_2026-06-22 — non-moving mid-eval tenured mark-sweep gate.
+/// When set, a non-moving runMajorMarkSweep fires at exitDepth>0 on arena
+/// pressure (vm.cc), reclaiming scattered dead tenured cells into the free-list
+/// bins, AND this allocator consumes them (the pop in alloc()).  Default-OFF.
+/// The measured fix for v3 peak RSS 1.9× TW: the arena grows monotonically
+/// because ALL prior GC is gated to exitDepth==0, which deep nixpkgs eval never
+/// reaches (project_v3_vs_tw_rss_rootcause_2026-06-22).
+/// Retirement (Rule 0): flip default-on once darwin-4 shows firefox/M5 RSS drops
+/// toward TW + --brute clean on a full nixpkgs sweep; or delete if Immix
+/// (GC_DECISION_2026-05-29) lands and subsumes it.
+inline const bool g_midEvalGcEnabled =
+    std::getenv("NIX_V3_MIDEVAL_GC") != nullptr;
+
 } // namespace detail
 
 struct FreeListStats
@@ -1448,7 +1461,16 @@ public:
         // bypassed (its hits/misses would be wrong against the Immix
         // line-region state).  See GC_DECISION §6 — this entire
         // section retires when Step 14′ SHIP gate clears.
-        if (__builtin_expect(majorGcEnabled() && detail::g_freeListReuseEnabled
+        //
+        // MIDEVAL_GC_DESIGN_2026-06-22: the pop was gated on majorGcEnabled()
+        // (the legacy non-moving major GC), hard-false since the nursery shipped
+        // (M-3) → reuse was dead code → the tenured arena never reused dead cells
+        // → it grew monotonically (v3 RSS 1.9× TW).  The bins are BUILT by the
+        // sweep (mark_sweep.cc, gated g_freeListReuseEnabled||g_midEvalGcEnabled);
+        // let the allocator CONSUME them under EITHER opt-in.  Default-OFF (both
+        // gates) → byte-for-byte the old default path.  Correctness: bins hold
+        // cells the precise+conservative non-moving mark proved dead.
+        if (__builtin_expect((detail::g_freeListReuseEnabled || detail::g_midEvalGcEnabled)
                              && !detail::g_immixAllocEnabled, 0)) {
             if (void * p = freeListTryPop(bytes)) {
                 // Step 6: count the hit.  Bin is the requested size's
