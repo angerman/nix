@@ -883,6 +883,14 @@ inline const bool g_midEvalGcEnabled =
 inline const bool g_midEvalReuseEnabled =
     std::getenv("NIX_V3_MIDEVAL_REUSE") != nullptr;
 
+/// MIDEVAL_GC_DESIGN_2026-06-22 — reuse-safety diagnostic.  When set, freeListAdd
+/// stamps a sentinel into each binned cell and freeListTryPop verifies it survived
+/// to pop time; if the mutator overwrote it (the cell was actually LIVE when the
+/// sweep classified it dead → a missed root), abort with the cell's type.  Pins
+/// the SEGV's cause.
+inline const bool g_midEvalPoison =
+    std::getenv("NIX_V3_MIDEVAL_POISON") != nullptr;
+
 } // namespace detail
 
 struct FreeListStats
@@ -2154,6 +2162,8 @@ public:
     /// cells; each alloc that hits the free list removes them.
     void freeListAdd(void * p, size_t bytes) noexcept
     {
+        if (__builtin_expect(detail::g_midEvalPoison, 0))
+            *reinterpret_cast<uint64_t *>(p) = 0xDEADBEEFCAFEF00DULL;  // sentinel
         freeListBins_[bytes].push_back(p);
         ++freeListEntries_;
     }
@@ -2164,6 +2174,16 @@ public:
         void * p = it->second.back();
         it->second.pop_back();
         --freeListEntries_;
+        if (__builtin_expect(detail::g_midEvalPoison, 0)
+            && *reinterpret_cast<uint64_t *>(p) != 0xDEADBEEFCAFEF00DULL) {
+            std::fprintf(stderr,
+                "[mideval-poison] LIVE cell binned then mutated: p=%p type=%d "
+                "size=%zu word0=0x%016llx — sweep classified a still-live cell as "
+                "dead (missed root)\n",
+                p, (int)cellTypeAt(p), bytes,
+                (unsigned long long)*reinterpret_cast<uint64_t *>(p));
+            std::abort();
+        }
         // Re-set the cell-start bit at this address (sweep cleared
         // it when adding to free list).  Slow path: linear-scan
         // blocks to find owner.  Only called on free-list pop,
