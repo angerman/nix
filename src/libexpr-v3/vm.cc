@@ -4129,6 +4129,12 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     // Minor GC forwards/rekeys it, but major GC should not keep
                     // cache-only ListVecs alive.
                     clearCapWithsCache();
+                    {   // RCA trace (2026-06-23): gen-major fire count, indep of NIX_VM_STATS
+                        static const bool s_gmTrace = std::getenv("NIX_V3_MIDEVAL_TRACE") != nullptr;
+                        if (__builtin_expect(s_gmTrace, 0))
+                            std::fprintf(stderr, "[genmajor-fire] arena=%zuMB\n",
+                                arena.bytesAllocated() >> 20);
+                    }
                     const MajorGcResult gcr = runMajorMarkSweep(vm);
                     // Frame pointers may have been forwarded.
                     // Re-read dispatch locals.
@@ -4196,6 +4202,13 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 g_midEvalInitialThresholdBytes;
             Arena & mArena = threadArena();
             if (mArena.bytesAllocated() >= s_midEvalThresholdBytes) {
+                // RCA trace (2026-06-23): does mid-eval fire in production (no
+                // NIX_VM_STATS)?  Cached gate, lint-clean, default-off.
+                static const bool s_midTrace =
+                    std::getenv("NIX_V3_MIDEVAL_TRACE") != nullptr;
+                if (__builtin_expect(s_midTrace, 0))
+                    std::fprintf(stderr, "[mideval-fire] arena=%zuMB thresh=%zuMB\n",
+                        mArena.bytesAllocated() >> 20, s_midEvalThresholdBytes >> 20);
                 // Sync ip so the precise root walk sees a consistent frame.
                 if (!vm.frames.empty()) vm.frames.back().ip = ip;
                 // Transient raw-Bindings*/Env side tables.  RCA 2026-06-23: the
