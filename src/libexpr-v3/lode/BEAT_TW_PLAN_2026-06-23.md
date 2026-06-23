@@ -6,10 +6,16 @@
 cross-session drift).  P0.1 A/B vs pre-mid-eval (d141896aa) confirmed NO default
 regression, so the TRUE stable gap (median, tight <1% within-run spread) is:
 
-| workload | TW | v3 default | gap | v3 mid-eval+reuse |
+| workload | mode | TW | v3 default | gap |
 |---|---|---|---|---|
-| firefox.drvPath | 0.73 s / 358 MB | **2.69 s / 676 MB** | **3.68× CPU, 1.89× RSS** | 3.73 s / 612 MB |
-| M5 cardano-node.name | 3.60 s / 982 MB | **11.10 s / 2984 MB** | **3.08× CPU, 3.04× RSS** | 16.82 s / 2577 MB |
+| firefox.drvPath | cold | 0.74 s / 358 MB | **2.69 s / 677 MB** | **3.64× CPU, 1.89× RSS** |
+| firefox.drvPath | **WARM** | 0.73 s / 358 MB | **1.82 s / 586 MB** | **2.49× CPU, 1.64× RSS** |
+| M5 cardano-node.name | cold | 3.60 s / 982 MB | **11.02 s / 2983 MB** | **3.06× CPU, 3.04× RSS** |
+| M5 cardano-node.name | **WARM** | 3.59 s / 982 MB | **6.57 s / 2218 MB** | **1.83× CPU, 2.26× RSS** |
+
+**WARM = the production steady-state (#132 P0.2, darwin-4):** parse+lower is 32%(ff)
+/40%(M5) of v3's cold CPU and is amortized in production → the REAL gap is CPU
+1.83–2.49×, RSS 1.64–2.26× (cache-off overstates it).
 
 So v3 is ~3× TW on CPU and ~1.9–3× on RSS — WORSE than the earlier (artifact)
 1.8–2.5× / 1.6–2.25×.  **Mid-eval reuse honest verdict (median): −9.5% RSS firefox /
