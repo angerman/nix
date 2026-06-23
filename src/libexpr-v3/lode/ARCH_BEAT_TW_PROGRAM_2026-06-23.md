@@ -63,6 +63,18 @@ must be provably-always-demanded or guarded by deopt.  (The "L3-hard" item.)
 **SHIP gate:** byte-id + --brute 22/22; warm CPU and/or RSS improvement above the
 darwin-4 noise floor on firefox AND M5; deopt guards proven correct under --brute.
 
+**P0.1 measured (#140, lode/C1_P01_STRICT_CEILING_2026-06-23.md) — REFRAME:** the
+static `strictArgs` analysis proves strictness for only ~0.1% of thunk-args, but
+58.6%(ff)/69.8%(M5) are forced at runtime ⇒ the bottleneck is ANALYSIS PRECISION,
+not dynamic-dispatch reach; the mechanism MUST be runtime speculation (observe +
+guard + deopt), not a better static proof.  Ceiling is MODEST: ~3.5% of firefox's
+2.88M thunks via the call-arg path (undercounts curried PAPs) — most thunks are
+lazy DATA (65.7% unforced) where eager eval is unsafe, so strictness is
+structurally bounded to the call-arg + known-strict-operand fraction.  Change 1 is
+a single-digit-% lever, NOT the dominant one; #142 (strict-by-default lowering, a
+different non-call subset) may be the larger/lower-risk half.  Bigger CPU/RSS
+levers remain Change 2 (HAMT) + Change 4 (JIT).
+
 ---
 
 ## Change 2 — Persistent HAMT attrsets  (nixpkgs CPU+RSS multiplier)
