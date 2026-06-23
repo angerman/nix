@@ -342,6 +342,19 @@ struct LambdaDescriptor
     /// the upvalue block.
     uint16_t nWithTargets = 0;
 
+    /// Change-1 (ARCH_BEAT_TW_PROGRAM) — runtime mirror of
+    /// `ir::Function::strictArgs`: bit i set ⇔ EVERY path through the body
+    /// forces formal i before branching, so a caller may pre-force that arg
+    /// and skip the MkThunk wrap.  The static unthunk pass (opt_strict_call_
+    /// unthunk) already applies this when the callee is statically known; the
+    /// runtime mask lets us (a) measure the residual ceiling at DYNAMIC call
+    /// sites (P0.1 / NIX_V3_STRICT_CEILING) and (b) later drive speculative
+    /// strictness.  Bit ≥64 formals → not represented (treated as non-strict;
+    /// negligible — functions with >64 forced formals do not occur).  NOT
+    /// serialised: disk-cache-loaded descriptors default to 0 (= "no strict
+    /// info", conservative), so the ceiling RCA must run cache-off.
+    uint64_t strictArgsMask = 0;
+
     /// Formal parameters (`{a, b ? def}: body`).  Each entry is
     /// (name SymbolId, hasDefault, posHandle).  posHandle is an index
     /// into the global posSnapshotPool; 0 means unknown.  Used by

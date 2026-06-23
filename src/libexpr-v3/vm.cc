@@ -789,6 +789,67 @@ inline Value pop(VMState & vm)
 [[gnu::always_inline]]
 inline Value & top(VMState & vm) { return vm.valueStack.back(); }
 
+// Change-1 P0.1 ceiling RCA (ARCH_BEAT_TW_PROGRAM, task #140): at a call site,
+// count function-arg thunks that the DYNAMIC runtime callee would force
+// (strictArgsMask bit set) — the residual the static unthunk pass cannot reach
+// (it only fires for statically-known callees, which leave non-thunk args).  So
+// "arg is still a Suspended thunk AND callee forces that formal" = exactly what
+// speculative strictness could eliminate.  Bounds Change-1's thunk-saving
+// ceiling.  Gated NIX_V3_STRICT_CEILING; atexit dump.  RETIRE when Change 1
+// ships or is re-scoped (P0.2 gate, task #141) — measurement scaffold, not a
+// permanent counter.  `formal` = the callee-formal index this arg fills.
+// Single gate for the P0.1 ceiling RCA (one getenv site; lint-safe).  RETIRE
+// when Change 1 ships or is re-scoped (P0.2 gate, task #141).
+static const bool g_strictCeiling = std::getenv("NIX_V3_STRICT_CEILING") != nullptr;
+static uint64_t g_scCalls = 0, g_scThunkArg = 0, g_scStaticStrict = 0,
+                g_scArgForced = 0;
+static std::unordered_set<const void *> g_scArgThunks;   // arg-thunks awaiting force
+[[gnu::cold]] static void strictCeilingRecord(const Value & fun, const Value & arg,
+                                              unsigned formal) noexcept
+{
+    static bool reg = [] {
+        std::atexit([] {
+            if (!g_scCalls) return;
+            std::fprintf(stderr,
+                "[strict-ceiling] closure-call-arg-slots=%llu  suspended-thunk-args="
+                "%llu(%.1f%%)  static-strict(strictArgsMask set)=%llu(%.1f%% of "
+                "thunk-args)  >> RUNTIME-FORCED arg-thunks=%llu(%.1f%% of thunk-args"
+                ") = the true speculative ceiling\n",
+                (unsigned long long)g_scCalls,
+                (unsigned long long)g_scThunkArg,
+                g_scCalls ? 100.0 * g_scThunkArg / g_scCalls : 0,
+                (unsigned long long)g_scStaticStrict,
+                g_scThunkArg ? 100.0 * g_scStaticStrict / g_scThunkArg : 0,
+                (unsigned long long)g_scArgForced,
+                g_scThunkArg ? 100.0 * g_scArgForced / g_scThunkArg : 0);
+        });
+        return true;
+    }();
+    (void)reg;
+    if (fun.tag() != Tag::Closure) return;          // PAP/primop/__functor: skip
+    const Closure * c = fun.asClosure();
+    if (!c || !c->desc) return;
+    ++g_scCalls;
+    if (arg.tag() != Tag::Thunk) return;
+    const Thunk * t = arg.asThunk();
+    if (!t || t->state != ThunkState::Suspended) return;
+    ++g_scThunkArg;
+    if (formal < 64 && (c->desc->strictArgsMask & (uint64_t(1) << formal)))
+        ++g_scStaticStrict;
+    // True runtime ceiling: does this arg-thunk EVER get forced?  (Upper bound on
+    // what speculative strictness could eliminate, independent of what the static
+    // analysis proves.)  Side-set; run with a big nursery to minimise moving-GC
+    // pointer aliasing (a moved+reused address would be a rare false match).
+    g_scArgThunks.insert(t);
+}
+// Companion: called at the Suspended->Blackhole force-entry.  If the forced
+// thunk was a recorded closure arg, it's a runtime speculative candidate.
+[[gnu::cold]] static void strictCeilingForce(const void * t) noexcept
+{
+    auto it = g_scArgThunks.find(t);
+    if (it != g_scArgThunks.end()) { ++g_scArgForced; g_scArgThunks.erase(it); }
+}
+
 /// V3_DBG_FORCE_SITE diagnostic: log "OP_FORCE@ip=N site=lower.cc:LINE"
 /// for each force-flavoured opcode dispatched.  Reads the side-table
 /// `cu->forceEmitSites` populated by emit.cc.  The env-var check is
@@ -5889,6 +5950,11 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // 5000-frame stack guard, not the tail-call counter.
             vm.tailCallCount = 0;
             Value arg = pop(vm), fun = pop(vm);
+            // Change-1 P0.1 ceiling RCA (#140): direct OP_CALL on a fresh
+            // closure fills formal 0 (PAP completions are Tag::App, skipped in
+            // the helper).
+            if (__builtin_expect(g_strictCeiling, 0))
+                strictCeilingRecord(fun, arg, 0);
             // V3_DBG_FINAL_CALL=1: log Apply of extends's `final:`
             // lambda OR allPackages's `self:` outer lambda — tracing
             // the broader-thunkify upvalue bug at #498.  Cache the
@@ -7587,6 +7653,12 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 && fun.asClosure()->desc->arity == n) {
                 const Closure * c = fun.asClosure();
                 const LambdaDescriptor * d = c->desc;
+                // Change-1 P0.1 ceiling RCA (#140): saturated call → args map
+                // 1:1 to formals 0..n-1, so the strictArgsMask bit per arg is
+                // exact here.
+                if (__builtin_expect(g_strictCeiling, 0))
+                    for (uint32_t i = 0; i < n; ++i)
+                        strictCeilingRecord(fun, argbuf[i], i);
                 if (__builtin_expect(vm.frames.size() >= kMaxCallDepth, 0))
                     throw std::runtime_error(
                         "v3 OP_CALL_N: stack overflow; call depth exceeded "
@@ -8929,6 +9001,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // the catch path can revert.  Single thunk per OP_FORCE so
             // the snapshot is one ThunkState.
             ThunkState priorState = t->state;
+            if (__builtin_expect(g_strictCeiling, 0)) strictCeilingForce(t);
             t->state = ThunkState::Blackhole;
 
             // ip on caller frame must be saved BEFORE the resize too,
@@ -14589,6 +14662,7 @@ Value forceValue(VMState & vm, Value v)
         ListVec * thunkWiths = thunkCapturedWiths(t);  // FP-2b: was suspended.capturedWiths
         const CompilationUnit * thunkCu = thunkCU(t);  // FP-2a: was t->suspended.cu
         if (!thunkCu) thunkCu = vm.frames.back().cu;    // ...?: frame-cu fallback preserved
+        if (__builtin_expect(g_strictCeiling, 0)) strictCeilingForce(t);
         t->state = ThunkState::Blackhole;
 
         size_t exitDepth = vm.frames.size();
