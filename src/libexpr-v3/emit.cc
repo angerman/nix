@@ -2401,12 +2401,6 @@ struct Emitter
 
         if (unit.lambdas.size() <= fid)         unit.lambdas.resize(fid + 1);
         if (unit.lambdaCodeOffsets.size() <= fid) unit.lambdaCodeOffsets.resize(fid + 1);
-        // Change-1: pack ir::Function::strictArgs into the runtime mask (≤64
-        // formals; the rest are conservatively non-strict).  Drives the P0.1
-        // ceiling RCA + later speculative strictness.
-        uint64_t saMask = 0;
-        for (std::size_t i = 0; i < f.strictArgs.size() && i < 64; ++i)
-            if (f.strictArgs[i]) saMask |= (uint64_t(1) << i);
         unit.lambdas[fid] = LambdaDescriptor{
             .codeOffset     = codeStart,
             .prologueOffset = codeStart,
@@ -2420,7 +2414,6 @@ struct Emitter
             // this to consume the with-target block before the
             // upvalue block at OP_MAKE_CLOSURE / OP_MAKE_THUNK.
             .nWithTargets   = f.nWithTargets,
-            .strictArgsMask = saMask,
             .formals        = {},
             .name           = f.name,
             .contextualName = f.contextualName,
