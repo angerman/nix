@@ -28,6 +28,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <unordered_set>
 #include <vector>
 
 namespace nix::v3::champ {
@@ -174,6 +175,24 @@ public:
     void forEach(const std::function<void(uint32_t, const V &)> & fn) const
     {
         forEachIn(root_.get(), fn);
+    }
+
+    /// Add every Node reachable from this version's root to `seen` (deduped by
+    /// pointer).  Used by tests to PROVE structural sharing: after a persistent
+    /// insert/merge, the new version's tree shares all untouched subtrees with
+    /// the old one, so walking both into one set adds only the copied path —
+    /// `seen` grows by ~the trie depth, not by a full second tree.
+    void collectNodes(std::unordered_set<const void *> & seen) const
+    {
+        collectIn(root_.get(), seen);
+    }
+
+private:
+    static void collectIn(const Node * n, std::unordered_set<const void *> & seen)
+    {
+        if (!seen.insert(n).second) return;        // already visited (shared)
+        for (const Slot & s : n->slots)
+            if (s.isBranch()) collectIn(s.child.get(), seen);
     }
 };
 

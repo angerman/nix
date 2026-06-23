@@ -34,6 +34,7 @@
 #include <cstring>
 #include <initializer_list>
 #include <limits>
+#include <map>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -4331,6 +4332,77 @@ static int testChampPersistentHamt()
     return 0;
 }
 
+// Change-2 #149/#150: PROVE the two properties the HAMT value proposition rests
+// on — (A) structural SHARING (the RSS-win mechanism: a persistent insert copies
+// only the path, not the whole tree) and (B) sorted-enumeration byte-id (design
+// audit item #2: enumerate → sort matches a reference sorted structure), plus a
+// deep nixpkgs-style override-chain merge.
+static int testChampSharingAndSorted()
+{
+    using H = nix::v3::champ::Hamt<uint64_t>;
+    const uint32_t MULT = 2654435761u;
+    auto K = [&](int i) { return (uint32_t)((uint32_t)i * MULT); };
+
+    // (A) Structural sharing: inserting one key into a 4096-key HAMT must add
+    // only ~the trie depth of new nodes (the copied path), NOT a second tree.
+    const int N = 4096;
+    H base;
+    for (int i = 0; i < N; ++i) base = base.insert(K(i), (uint64_t)i);
+    std::unordered_set<const void *> seen;
+    base.collectNodes(seen);
+    size_t baseNodes = seen.size();
+    H ins = base.insert(0x12345678u, 99);          // one new key
+    ins.collectNodes(seen);                         // adds ONLY the copied path
+    size_t added = seen.size() - baseNodes;
+    // 32-bit key / 5-bit chunks ⇒ ≤ 7 levels; copied path ≤ ~8 nodes.
+    if (added > 8) {
+        std::fprintf(stderr,
+            "champ: insert copied %zu nodes (no structural sharing; expected <=8)\n",
+            added);
+        return 1;
+    }
+    if (base.lookup(0x12345678u)) {                 // base must be unmutated
+        std::fprintf(stderr, "champ: sharing test mutated base\n"); return 1; }
+
+    // (B) Sorted-enumeration byte-id: enumerate the HAMT, sort by key, compare to
+    // a reference std::map (inherently sorted).  Proves "enumerate + sort =
+    // canonical sorted order" (the byte-id mechanism, since attrNames re-sorts).
+    std::map<uint32_t, uint64_t> ref;
+    for (int i = 0; i < N; ++i) ref[K(i)] = (uint64_t)i;
+    std::vector<std::pair<uint32_t, uint64_t>> hv;
+    base.forEach([&](uint32_t k, const uint64_t & v) { hv.push_back({k, v}); });
+    std::sort(hv.begin(), hv.end());
+    std::vector<std::pair<uint32_t, uint64_t>> rv(ref.begin(), ref.end());
+    if (hv != rv) {
+        std::fprintf(stderr, "champ: sorted enumeration != reference map\n"); return 1; }
+
+    // (C) Deep nixpkgs-style override chain: base // o1 // ... // o50, each
+    // overlay shadowing a few base keys + adding one.  Validate right-most-wins
+    // across 50 layers, base unmutated, and size = base + new-keys.
+    H acc = base;
+    for (int layer = 1; layer <= 50; ++layer) {
+        H o;
+        o = o.insert(K(layer), 900000u + layer);    // shadow base key `layer`
+        o = o.insert(0xF0000000u + layer, layer);    // brand-new key
+        acc = acc.update(o);                         // acc // o
+    }
+    for (int layer = 1; layer <= 50; ++layer) {
+        if (*acc.lookup(K(layer)) != 900000u + (uint64_t)layer) {
+            std::fprintf(stderr, "champ: deep-chain shadow %d wrong\n", layer); return 1; }
+        if (*acc.lookup(0xF0000000u + layer) != (uint64_t)layer) {
+            std::fprintf(stderr, "champ: deep-chain new key %d missing\n", layer); return 1; }
+    }
+    if (acc.size() != (uint32_t)(N + 50)) {
+        std::fprintf(stderr, "champ: deep-chain size %u != %d\n", acc.size(), N + 50); return 1; }
+    if (*base.lookup(K(5)) != 5) {                  // base still pristine
+        std::fprintf(stderr, "champ: deep chain mutated base\n"); return 1; }
+
+    std::fprintf(stderr,
+        "testChampSharingAndSorted: OK (insert copied %zu/%zu nodes [sharing]; "
+        "sorted byte-id; 50-layer override chain)\n", added, baseNodes);
+    return 0;
+}
+
 int main()
 {
     registerBuiltinPrimOps();
@@ -4434,6 +4506,8 @@ int main()
 
     // Change-2 #149 — persistent HAMT algorithm-validation (standalone).
     rc |= testChampPersistentHamt();
+    // Change-2 #149/#150 — structural sharing + sorted byte-id + deep merge.
+    rc |= testChampSharingAndSorted();
 
     auto & st = allocStats();
     std::fprintf(stderr,
