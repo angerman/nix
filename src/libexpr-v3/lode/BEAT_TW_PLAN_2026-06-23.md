@@ -109,12 +109,33 @@ any lever until measurement is trustworthy.
 1. P0.1 ✓, P0.2 (measurement) — FIRST, cheap, unblocks all.
 2. M1 ✓ (decompose RSS) — arena 53% #1, MALLOC_SMALL 24% #2.
 3. **M4/C1 (thunk avoidance) ✗ KILLED 2026-06-23** — measure-first falsified it
-   (0.7% avoidable; opt passes already cover it).  Freed the top slot.
-4. **M2 (#134 ImportCache eviction) — NOW THE #1 RSS LEVER** (the real arena lever:
-   un-pins 2851 imported nixpkgs Value subgraphs) + the MALLOC_SMALL sub-RCA.
-5. M3 (mmap + whole-block-free) — M1 showed the peak IS arena-inclusive, so the
-   reclaim CAN matter; pursue after #134 (mid-eval reuse already --brute 22/22).
-6. C2 (JIT) — last, multi-week, only after RCA confirms hot-body coverage; the
+   (0.7% avoidable; opt passes already cover it).
+4. **M2 (#134 ImportCache eviction) ✗ RE-FALSIFIED 2026-06-23** — was already
+   killed 2026-05-30; re-confirmed on the current binary (firefox 675→890 MB as
+   eviction tightens).  Root cause = **the arena never releases pages to the OS**
+   (the SAME pin that killed mid-eval reuse this session).  Reclaim-based RSS
+   levers are DEAD.  (lode/M2_IMPORTCACHE_FALSIFIED_2026-06-23.md.)
+
+### REFRAME (after two RSS-lever KILLs): the arena-no-release wall + honest ceiling
+
+Reclaim (eviction, reuse) cannot lower peak RSS — pages aren't munmap'd and reclaim
+triggers fresh allocation.  Only two RSS paths survive, and **neither beats TW
+alone**:
+- **Allocate fewer cells** — FP-2/FP-3 mostly closed; only thunk CHURN left
+  (L3-hard, byte-id risk).
+- **Arena page-release (#136/M3)** — HARD (needs whole-block-free; sweep frees
+  scattered cells), LOW ceiling: firefox→~480 MB (still 1.34× TW), M5 live arena
+  ~1023 MB ALONE ≈ TW's whole 982 MB.
+- **NEW lever surfaced — MALLOC_SMALL CU-shrink (#139)**: the 690 MB #2 bucket is
+  libc-malloc (per-CU bytecode/IR/ICs/PosTables), NOT arena-pinned — free IR after
+  lowering / shrink CU structures / fragmentation.  The only un-explored RSS lever.
+- **Boehm FFI 402 MB** — fewer TW-Value crossings (V3-NATIVE-ward).
+
+Honest: beating TW on RSS is a BROAD foundational program (M3 + #139 + Boehm +
+cell representation), not a single lever.  Next RSS step = #139 (un-explored) then
+M3 (with the low-ceiling caveat).
+
+5. C2 (JIT) — last, multi-week, only after RCA confirms hot-body coverage; the
    structural CPU lever now that thunk-count avoidance is dead.
 
 Each step: RCA/profile (no guess) → implement gated → validate (byte-id + --brute) →
