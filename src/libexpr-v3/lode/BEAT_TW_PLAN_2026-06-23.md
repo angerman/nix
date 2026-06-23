@@ -75,10 +75,14 @@ any lever until measurement is trustworthy.
   with reuse.  If the peak is transient-bound, DROP mid-eval as an RSS lever (honest
   kill) and focus on M1/M2.
 
-- **M4 — thunk over-allocation (shared with C1).** TW avoids 1.65 M thunks via
-  maybeThunk (vars/constants); v3 creates 2.88 M vs TW 2.15 M.  RCA the sites where
-  v3 emits OP_MAKE_THUNK for trivial var/const positions TW avoids; implement
-  avoidance.  Cuts arena thunk-bytes AND ALLOC-CPU.  GATE: byte-id + --brute.
+- **M4 — thunk over-allocation (shared with C1). ✗ KILLED 2026-06-23
+  (lode/M4_THUNK_AVOIDANCE_RCA).** Measured: only **0.7%** of v3's thunks are the
+  trivial var/const forms TW's maybeThunk avoids (99.3% real deferred work — the
+  opt passes already remove the trivial ones at compile time).  The v3-vs-TW count
+  excess (~730K) is ≤17MB arena, negligible.  No maybeThunk gap.  The real thunk
+  lever is CHURN (62-67% unforced) = a CPU lever needing strictness/eager-eval
+  (byte-id risk, L3-hard, deferred), NOT maybeThunk.  **The real arena RSS lever is
+  the LIVE SET → #134 ImportCache eviction (promoted to #1 RSS lever).**
 
 ## Phase 2 — CPU (1.8–2.5× → <1×)
 
@@ -102,12 +106,16 @@ any lever until measurement is trustworthy.
 
 ## Sequencing + kill criteria
 
-1. P0.1, P0.2 (measurement) — FIRST, cheap, unblocks all.
-2. M1 (decompose elsewhere) — cheap RCA, biggest RSS potential.
-3. M2 (ImportCache eviction) — if M1 confirms dominance.
-4. M4/C1 (thunk avoidance) — both fronts, RCA-grounded.
-5. M3 (mmap + whole-block-free) — only if M1 shows the arena reclaim can matter; else KILL.
-6. C2 (JIT) — last, multi-week, only after RCA confirms hot-body coverage.
+1. P0.1 ✓, P0.2 (measurement) — FIRST, cheap, unblocks all.
+2. M1 ✓ (decompose RSS) — arena 53% #1, MALLOC_SMALL 24% #2.
+3. **M4/C1 (thunk avoidance) ✗ KILLED 2026-06-23** — measure-first falsified it
+   (0.7% avoidable; opt passes already cover it).  Freed the top slot.
+4. **M2 (#134 ImportCache eviction) — NOW THE #1 RSS LEVER** (the real arena lever:
+   un-pins 2851 imported nixpkgs Value subgraphs) + the MALLOC_SMALL sub-RCA.
+5. M3 (mmap + whole-block-free) — M1 showed the peak IS arena-inclusive, so the
+   reclaim CAN matter; pursue after #134 (mid-eval reuse already --brute 22/22).
+6. C2 (JIT) — last, multi-week, only after RCA confirms hot-body coverage; the
+   structural CPU lever now that thunk-count avoidance is dead.
 
 Each step: RCA/profile (no guess) → implement gated → validate (byte-id + --brute) →
 measure on the P0 harness → git-note + lode note.  Beating TW likely requires M2
