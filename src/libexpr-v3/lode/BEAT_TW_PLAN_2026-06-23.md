@@ -1,11 +1,26 @@
 # Plan: beat the tree-walker (TW) on CPU AND memory — 2026-06-23
 
-## Where we stand (clean, darwin-4, cache-off, min-of-5)
+## Where we stand — CORRECTED baseline (darwin-4, cache-off, MEDIAN-of-5, beat-tw-compare.sh)
 
-| workload | TW | v3 | gap |
-|---|---|---|---|
-| firefox.drvPath | 0.73 s / 358 MB | 1.81 s / 586 MB | 2.5× CPU, 1.6× RSS |
-| M5 cardano-node.name | 3.58 s / 982 MB | 6.54 s / 2215 MB | 1.8× CPU, 2.25× RSS |
+⚠️ The min-of-5 numbers I first used were ARTIFACTS (min catches fast outliers +
+cross-session drift).  P0.1 A/B vs pre-mid-eval (d141896aa) confirmed NO default
+regression, so the TRUE stable gap (median, tight <1% within-run spread) is:
+
+| workload | TW | v3 default | gap | v3 mid-eval+reuse |
+|---|---|---|---|---|
+| firefox.drvPath | 0.73 s / 358 MB | **2.69 s / 676 MB** | **3.68× CPU, 1.89× RSS** | 3.73 s / 612 MB |
+| M5 cardano-node.name | 3.60 s / 982 MB | **11.10 s / 2984 MB** | **3.08× CPU, 3.04× RSS** | 16.82 s / 2577 MB |
+
+So v3 is ~3× TW on CPU and ~1.9–3× on RSS — WORSE than the earlier (artifact)
+1.8–2.5× / 1.6–2.25×.  **Mid-eval reuse honest verdict (median): −9.5% RSS firefox /
+−13.6% M5, at +39% / +52% CPU** — a real-but-modest RSS lever at a steep CPU cost
+(both the earlier "−40%" [NIX_VM_STATS teardown artifact] and "~0" [min-statistic
+artifact] were wrong).  CPU is the bigger gap, and mid-eval makes it worse, so
+mid-eval stays opt-in/off.
+
+LESSON (now baked into beat-tw-compare.sh): use MEDIAN not min; measure TW+v3
+back-to-back same-session; ratios vs the stable TW anchor; never NIX_VM_STATS for
+peak-RSS (its teardown GC perturbs).
 
 To BEAT TW we need v3 < TW on both axes — today we are ~2× behind on both. This is
 a multi-week program. The plan is prioritized cheap-RCA-first / highest-leverage,
