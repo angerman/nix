@@ -1,0 +1,103 @@
+# Plan: beat the tree-walker (TW) on CPU AND memory — 2026-06-23
+
+## Where we stand (clean, darwin-4, cache-off, min-of-5)
+
+| workload | TW | v3 | gap |
+|---|---|---|---|
+| firefox.drvPath | 0.73 s / 358 MB | 1.81 s / 586 MB | 2.5× CPU, 1.6× RSS |
+| M5 cardano-node.name | 3.58 s / 982 MB | 6.54 s / 2215 MB | 1.8× CPU, 2.25× RSS |
+
+To BEAT TW we need v3 < TW on both axes — today we are ~2× behind on both. This is
+a multi-week program. The plan is prioritized cheap-RCA-first / highest-leverage,
+and EVERY lever is measure-first per Rule 0 (the mid-eval "−40%" artifact this
+session is the cautionary tale: never trust a single noisy number).
+
+## What v3's RSS is made of (the target to shrink, M5)
+
+peak RSS 2215 MB ≈ arena ~1023–1543 MB + Boehm ~402 MB + "elsewhere" ~1200 MB
+(ImportCache + SQLite disk-cache + flake-fetch transients).  TW carries NONE of the
+v3 "elsewhere" disk-cache memory and runs a leaner heap → 982 MB.  **So the single
+biggest v3-vs-TW RSS chunk is "elsewhere", not the arena** — the prior campaign
+optimized the arena; the untouched lever is the caches.
+
+## Phase 0 — MEASUREMENT FOUNDATION (do first; everything depends on it)
+
+The whole mid-eval RSS confusion was a measurement failure (darwin-4 same-config
+RSS swung 1803–3032, CPU 6.5–12; NIX_VM_STATS perturbed peak RSS).  We cannot grade
+any lever until measurement is trustworthy.
+
+- **P0.1 — reliable TW-vs-v3 CPU+RSS harness.** Verify darwin-4 truly idle (or
+  quantify noise floor); median-of-N (not min, not single); correlate fire-count +
+  arena + peak-RSS + CPU in ONE run (a committed `bench/` script).  Re-establish the
+  stable baseline table above with error bars.  Output: a re-runnable
+  `bench/beat-tw-compare.sh` + a noise-characterization note.  GATE: same-config
+  RSS variance < 5%.
+
+- **P0.2 — WARM (cache-on) head-to-head.** Production uses the warm path (parse+lower
+  amortized).  Re-measure TW vs v3 warm CPU+RSS cleanly (the cache-off gap overstates
+  the steady-state).  This tells us the REAL production gap to close.
+
+## Phase 1 — MEMORY (the bigger gap: 1.6–2.25× → <1×)
+
+- **M1 — decompose "elsewhere" (~1200 MB M5).** RCA, not guess: instrument the
+  ImportCache footprint (entry count × Value-subgraph size), the SQLite/disk-cache
+  in-memory size, and the flake-fetch transient peak; A/B with NIX_V3_NO_DISK_CACHE.
+  Identify the dominant component.  (Prior HNE decomp: ImportCache ~700 MB + SQLite
+  ~270 MB — VERIFY on M5.)  This is the highest-potential RSS lever (>arena).
+
+- **M2 — attack the dominant "elsewhere" component** (per M1; likely ImportCache).
+  RCA the cache's retention (what keeps imported nixpkgs module subgraphs alive),
+  then an LRU/size-cap eviction or a lighter representation.  Measure RSS delta +
+  the warm-CPU cost of eviction (cache misses re-import).  GATE: byte-id + --brute.
+
+- **M3 — make the arena reclaim visible to the OS.** Mid-eval reuse already reclaims
+  the arena bump (1543→1023) but it does NOT lower peak RSS (calloc'd blocks, no
+  munmap; peak set by transients).  RCA: confirm the bump-vs-peak timing (is the peak
+  set by an early transient before the arena dominates?).  If the reclaim CAN matter:
+  enable mmap'd arena blocks + whole-block-free under mid-eval (the deferred
+  consistency change — alloc/free method must flip together for regular+huge blocks)
+  so freed pages return to the OS.  Measure the real RSS delta.  GATE: --brute 22/22
+  with reuse.  If the peak is transient-bound, DROP mid-eval as an RSS lever (honest
+  kill) and focus on M1/M2.
+
+- **M4 — thunk over-allocation (shared with C1).** TW avoids 1.65 M thunks via
+  maybeThunk (vars/constants); v3 creates 2.88 M vs TW 2.15 M.  RCA the sites where
+  v3 emits OP_MAKE_THUNK for trivial var/const positions TW avoids; implement
+  avoidance.  Cuts arena thunk-bytes AND ALLOC-CPU.  GATE: byte-id + --brute.
+
+## Phase 2 — CPU (1.8–2.5× → <1×)
+
+- **C1 — thunk avoidance (= M4).** The ALLOC category is ~20% of on-CPU; fewer
+  thunks cuts it directly.  Highest-leverage non-JIT CPU lever.
+
+- **C2 — JIT (the structural lever; multi-week dedicated project).** The uniform
+  per-op interpreter gap only closes with native codegen.  Foundations proven
+  (J0 platform / J1 encoder / J2 byte-id codegen / J3 GC-safepoint contract — all
+  validated standalone, lode/JIT_DESIGN_2026-06-19.md).  Remaining = J3 real-
+  scavenger integration (spill live v3 ptrs at allocation safepoints; the UAF crux)
+  + value-stack ABI trampoline + VM compile-trigger on hot callCount + bail +
+  darwin-4 grade.  Ship only without gaming (must cover allocating bodies).
+  RCA-first: confirm the hot-body coverage on M5/firefox (what fraction of CPU is in
+  JIT-able bodies) BEFORE committing the multi-week build.
+
+- **C3 — GC mark cost (conditional on M3).** If a non-moving sweep becomes a default
+  RSS lever, the mark dominates its CPU (markMs up to 1 s/sweep on M5).  RCA + reduce
+  (incremental mark / fewer sweeps / drop redundant conservative scans now that
+  precise nursery traversal exists).
+
+## Sequencing + kill criteria
+
+1. P0.1, P0.2 (measurement) — FIRST, cheap, unblocks all.
+2. M1 (decompose elsewhere) — cheap RCA, biggest RSS potential.
+3. M2 (ImportCache eviction) — if M1 confirms dominance.
+4. M4/C1 (thunk avoidance) — both fronts, RCA-grounded.
+5. M3 (mmap + whole-block-free) — only if M1 shows the arena reclaim can matter; else KILL.
+6. C2 (JIT) — last, multi-week, only after RCA confirms hot-body coverage.
+
+Each step: RCA/profile (no guess) → implement gated → validate (byte-id + --brute) →
+measure on the P0 harness → git-note + lode note.  Beating TW likely requires M2
+(caches) + C1 (thunks) + C2 (JIT) to all land; M3 may be a kill.  Honest bar: if a
+lever's clean measured delta is below the noise floor, kill it (don't ship noise).
+
+*Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>, Input Output
+Group. SPDX-License-Identifier: Apache-2.0*
