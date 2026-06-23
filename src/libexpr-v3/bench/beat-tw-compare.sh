@@ -43,6 +43,11 @@ spread() { sort -n | awk '{a[NR]=$0} END{ if(NR){printf "%s-%s", a[1], a[NR]} }'
 # run config N times → echo "medCPU medRSS cpuSpread rssSpread"
 measure() { local env="$1" expr="$2" opts="$3"
   local us=() ms=()
+  # WARM mode (P0.2): one discarded warmup run so the v3 disk cache (bytecode)
+  # is populated + FS/store warm — measures the PRODUCTION steady state where
+  # parse+lower is amortized.  Cold mode skips this (NIX_V3_NO_DISK_CACHE makes
+  # it a no-op anyway) to preserve the committed cache-off baseline methodology.
+  [ "${WARM:-0}" = 1 ] && env $env "$NIX" eval --impure $opts --raw --expr "$expr" >/dev/null 2>&1
   for i in $(seq "$N"); do
     /usr/bin/time -l env $env "$NIX" eval --impure $opts --raw --expr "$expr" >/dev/null 2>/tmp/btc.$$
     us+=( "$(grep -E ' real ' /tmp/btc.$$ | awk '{print $3}')" )
@@ -55,11 +60,13 @@ measure() { local env="$1" expr="$2" opts="$3"
   echo "$mc $mm $sc $sm"
 }
 
+MODE="cache-off"; [ "${WARM:-0}" = 1 ] && MODE="WARM cache-on (production steady-state)"
 echo "================================================================"
 echo "beat-tw-compare — $(hostname -s) — $(date '+%Y-%m-%d %H:%M') — N=$N — $(uptime | sed 's/.*load/load/')"
-echo "  (cache-off; median-of-$N; back-to-back; ratios vs stable TW anchor)"
+echo "  ($MODE; median-of-$N; back-to-back; ratios vs stable TW anchor)"
 echo "================================================================"
-V3="NIX_V3_DIRECT_EVAL=1 NIX_V3_NO_DISK_CACHE=1"
+# WARM (P0.2): disk cache ON (parse+lower amortized).  Cold: cache OFF.
+if [ "${WARM:-0}" = 1 ]; then V3="NIX_V3_DIRECT_EVAL=1"; else V3="NIX_V3_DIRECT_EVAL=1 NIX_V3_NO_DISK_CACHE=1"; fi
 for w in "${WL[@]}"; do
   expr="$(wl_expr "$w")"; opts="$(wl_opts "$w")"
   [ -z "$expr" ] && { echo "unknown workload $w"; continue; }
