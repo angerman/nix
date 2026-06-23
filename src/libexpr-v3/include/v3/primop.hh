@@ -113,6 +113,11 @@ size_t importCacheBytecodeBytes() noexcept;
 size_t importCacheCuCount() noexcept;
 size_t importCacheResultCount() noexcept;
 size_t importCacheStringConstRefs() noexcept;  // M-10: total interned-string refs
+/// #139 CU-shrink RCA: per-field decomposition of the libc-malloc'd CU footprint
+/// across all cached CUs, printed to stderr.  Separates runtime-irreducible fields
+/// (code/symbols/ICs) from droppable DIAGNOSTIC side-tables (forceEmitSites,
+/// LambdaDescriptor::name).  Gated by the caller (NIX_V3_MEM_BUCKETS).
+void importCachePrintFieldBreakdown() noexcept;
 
 /// 2026-05-29 evening (DIAG analysis spike): clear in-memory import
 /// cache result set so a subsequent LiveTracer / GC walk sees the

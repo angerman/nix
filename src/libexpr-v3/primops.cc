@@ -6459,6 +6459,65 @@ size_t importCacheResultCount() noexcept
     return importCache().results.size();
 }
 
+/// #139 CU-shrink RCA: decompose the per-CU libc footprint into fields so we can
+/// tell what is runtime-irreducible (code/symbols/ICs) vs droppable diagnostic
+/// side-tables (forceEmitSites, LambdaDescriptor::name).  Print, don't return —
+/// it's a one-shot measurement gated by the caller.
+void importCachePrintFieldBreakdown() noexcept
+{
+    size_t code = 0, ints = 0, floats = 0, strRefs = 0, symTbl = 0, symBody = 0;
+    size_t lambdas = 0, lamNames = 0, lamFormals = 0, lamOffs = 0, prim = 0;
+    size_t attrIC = 0, recIC = 0, forceSites = 0, fixed = 0;
+    size_t nLambdas = 0, nForceSites = 0;
+    for (const CompilationUnit & cu : importCache().cus) {
+        fixed   += sizeof(CompilationUnit);
+        code    += cu.code.capacity() * sizeof(Instruction);
+        ints    += cu.intConstants.capacity() * sizeof(int64_t);
+        floats  += cu.floatConstants.capacity() * sizeof(double);
+        strRefs += cu.stringConstants.capacity() * sizeof(const std::string *);
+        symTbl  += cu.symbolTable.capacity() * sizeof(std::string);
+        for (const auto & s : cu.symbolTable) symBody += s.capacity();
+        lambdas += cu.lambdas.capacity() * sizeof(LambdaDescriptor);
+        for (const auto & ld : cu.lambdas) {
+            lamNames   += ld.name.capacity();
+            lamFormals += ld.formals.capacity() * sizeof(LambdaDescriptor::Formal);
+            ++nLambdas;
+        }
+        lamOffs += cu.lambdaCodeOffsets.capacity() * sizeof(uint32_t);
+        prim    += cu.primops.capacity() * sizeof(const PrimOp *);
+        attrIC  += cu.attrSelectCache.capacity() * sizeof(CompilationUnit::AttrSelectIC);
+        recIC   += cu.recSlotCache.capacity() * sizeof(CompilationUnit::RecSlotIC);
+        forceSites += cu.forceEmitSites.capacity()
+                      * sizeof(std::pair<uint32_t, const char *>);
+        nForceSites += cu.forceEmitSites.size();
+    }
+    const size_t diag = forceSites + lamNames;   // droppable in default builds
+    const size_t irreducible = code + ints + floats + strRefs + symTbl + symBody
+        + lambdas + lamFormals + lamOffs + prim + attrIC + recIC + fixed;
+    auto mb = [](size_t b) { return b / (1024.0 * 1024.0); };
+    std::fprintf(stderr,
+        "\n[#139 CU-field breakdown] %zu CUs, %zu lambdas, %zu force-sites\n"
+        "  IRREDUCIBLE (runtime-needed):\n"
+        "    code(bytecode)   %8.2f MB\n"
+        "    symbolTable      %8.2f MB  (refs %.2f + bodies %.2f)\n"
+        "    attrSelectIC     %8.2f MB\n"
+        "    recSlotIC        %8.2f MB\n"
+        "    lambdas+formals  %8.2f MB\n"
+        "    consts(int/flt/strRef) %8.2f MB\n"
+        "    primops+offsets+fixed  %8.2f MB\n"
+        "  DROPPABLE (diagnostic, default-off readers):\n"
+        "    forceEmitSites   %8.2f MB  <-- 16B/force-site, read only by V3_DBG_FORCE_SITE\n"
+        "    lambda names     %8.2f MB  <-- read only by disassembler/opcycle\n"
+        "  >> irreducible=%.2f MB  droppable=%.2f MB (%.1f%% of CU footprint)\n",
+        importCache().cus.size(), nLambdas, nForceSites,
+        mb(code), mb(symTbl + symBody), mb(strRefs), mb(symBody),
+        mb(attrIC), mb(recIC), mb(lambdas + lamFormals),
+        mb(ints + floats + strRefs), mb(prim + lamOffs + fixed),
+        mb(forceSites), mb(lamNames),
+        mb(irreducible), mb(diag),
+        100.0 * diag / (irreducible + diag ? irreducible + diag : 1));
+}
+
 // 2026-05-29 evening (DIAG analysis spike): clear in-memory import
 // cache result set.  Used by run.cc's end-of-eval hook to test
 // whether the LiveTracer's "concentrated retention" finding

@@ -949,6 +949,9 @@ void dumpV3MemoryBuckets() noexcept
             bf, tr.objsBy[static_cast<int>(RootSource::Ffi)]);
     }
 
+    // #139 CU-shrink RCA: per-field breakdown of the CU-cache bytecode bucket.
+    importCachePrintFieldBreakdown();
+
     std::fprintf(stderr,
         "  accounted live                %12s\n"
         "  resident RSS (now)            %12s\n"
