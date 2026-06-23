@@ -5572,6 +5572,13 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // referenced function (treated as 0-arg for thunks).
             // Reuse the LambdaDescriptor pointer through suspended.desc.
             t->suspended.desc = &cu->lambdas[funcIdx];
+            // #135 (M4/C1) thunk-body categorization RCA lived here:
+            // NIX_V3_THUNK_BODY_STATS measured that only 0.7% of v3's thunks are the
+            // trivial alias/const forms TW's maybeThunk avoids (99.3% are real
+            // deferred work — the opt passes already remove the trivial ones at
+            // compile time).  The maybeThunk-count-avoidance hypothesis is
+            // FALSIFIED; instrument retired per Rule 0.  See
+            // lode/M4_THUNK_AVOIDANCE_RCA_2026-06-23.md.
             // #733: thunksAllocated + per-descriptor allocCount serve
             // V3_DBG_ALLOC_DUMP / V3_DBG_FORCES / NIX_VM_STATS only —
             // gate the writes (cross-cache-line; unconditional cost
