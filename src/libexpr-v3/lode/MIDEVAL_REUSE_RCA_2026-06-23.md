@@ -77,4 +77,30 @@ clearing attrSelectCache in the mid-eval block (the mark now keeps its cells ali
 capWiths stay cleared: their cells are reachable via OTHER marked roots (rec
 Value / caller / closure upvalEnv / closure capturedWiths), so clearing only
 invalidates stale entries after reclaim — safe.  RESULT: apply-overrides 9/0 under
-brute+reuse.  (full --brute result below)
+brute+reuse.
+
+## VALIDATION + MEASUREMENT (darwin-4, commit 8559219b0)
+
+CORRECTNESS — all gated `NIX_V3_MIDEVAL_GC` / `NIX_V3_MIDEVAL_REUSE`:
+- **full `--brute` 22/22 ALL GREEN with MIDEVAL_GC + REUSE** (1 MB-nursery moving
+  stress + AUDIT + BRUTE) — the reuse path is missed-root-free.
+- **full `--brute` 22/22 with NO mid-eval env** — production/default path UNCHANGED.
+- hello/git byte-identical at all thresholds; poison + audit clean.
+
+RSS (cache-off, byte-identical drv, mid-eval+reuse vs default vs TW):
+| workload | TW | v3 default | v3 mid-eval+reuse | reuse hit | CPU (user) |
+|---|---|---|---|---|---|
+| firefox | 375 | 685 (1.83×) | **622 (1.66×) −9%**; arena 352→285 | 26% | 3.90→3.83 (neutral) |
+| M5      | —   | 3032        | **1822 −40%**; arena 1543→1023      | 36% | 6.53→12.06 (+84%) |
+
+VERDICT: a powerful RSS lever (M5 −40%/−1.2 GB; win scales with tenured churn) but
+a workload-dependent CPU cost (M5 +84% from 7 non-moving sweeps × dirty-list[242 K]
++ conservative + IC walks; firefox neutral).  ⇒ SHIPS OPT-IN (`NIX_V3_MIDEVAL_GC=1
+NIX_V3_MIDEVAL_REUSE=1`), like `NIX_V3_NURSERY_SIZE` — NOT default-on (the +84% CPU
+on the flagship is above the default-flip bar).  Default-flip deferred pending CPU
+reduction (cheaper dirty-list handling / fewer sweeps / drop the now-maybe-redundant
+conservative nursery byte-scan now that precise nursery traversal exists).
+
+THREE missed-root classes closed (all RCA-confirmed by instrument, not guessed):
+stale-bin overlap (ccec2bd01), remembered set (8559219b0), attrSelect IC
+(8559219b0).  The reuse SEGV/divergence is RESOLVED.
