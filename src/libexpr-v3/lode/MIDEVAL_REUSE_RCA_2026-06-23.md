@@ -87,19 +87,35 @@ CORRECTNESS — all gated `NIX_V3_MIDEVAL_GC` / `NIX_V3_MIDEVAL_REUSE`:
 - **full `--brute` 22/22 with NO mid-eval env** — production/default path UNCHANGED.
 - hello/git byte-identical at all thresholds; poison + audit clean.
 
-RSS (cache-off, byte-identical drv, mid-eval+reuse vs default vs TW):
-| workload | TW | v3 default | v3 mid-eval+reuse | reuse hit | CPU (user) |
-|---|---|---|---|---|---|
-| firefox | 375 | 685 (1.83×) | **622 (1.66×) −9%**; arena 352→285 | 26% | 3.90→3.83 (neutral) |
-| M5      | —   | 3032        | **1822 −40%**; arena 1543→1023      | 36% | 6.53→12.06 (+84%) |
+RSS — ⚠️ CORRECTED (the first table below was a NIX_VM_STATS ARTIFACT):
 
-VERDICT: a powerful RSS lever (M5 −40%/−1.2 GB; win scales with tenured churn) but
-a workload-dependent CPU cost (M5 +84% from 7 non-moving sweeps × dirty-list[242 K]
-+ conservative + IC walks; firefox neutral).  ⇒ SHIPS OPT-IN (`NIX_V3_MIDEVAL_GC=1
-NIX_V3_MIDEVAL_REUSE=1`), like `NIX_V3_NURSERY_SIZE` — NOT default-on (the +84% CPU
-on the flagship is above the default-flip bar).  Default-flip deferred pending CPU
-reduction (cheaper dirty-list handling / fewer sweeps / drop the now-maybe-redundant
-conservative nursery byte-scan now that precise nursery traversal exists).
+FIRST (WITH NIX_VM_STATS=1 — forces a teardown forceScavenge+major-GC → ARTIFACT):
+| workload | v3 default | v3 mid-eval+reuse | reuse hit |
+|---|---|---|---|
+| firefox | 685 | 622 (−9%); arena 352→285 | 26% |
+| M5      | 3032 | 1822 (−40%); arena 1543→1023 | 36% |
+
+CLEAN (production: min-of-5, NO NIX_VM_STATS, --no-eval-cache) vs TW:
+| workload | TW | v3 default | v3 mid-eval+reuse |
+|---|---|---|---|
+| firefox | 0.73s / 358 MB | 1.81s / 586 MB | 1.81s / **586 MB (NO change)** |
+| M5      | 3.58s / 982 MB | 6.54s / 2215 MB | 6.54s / **2217 MB (NO change)** |
+
+VERDICT (CORRECTED): the −40%/−9% were NIX_VM_STATS artifacts.  In CLEAN production
+measurement, mid-eval reuse shows **NO peak-RSS reduction and NO CPU change**, even
+though NIX_V3_MIDEVAL_TRACE confirms it FIRES (M5 5-6×, no stats) and reclaims the
+arena BUMP (1543→1023 under stats, 36% free-list reuse).  The arena reclaim does NOT
+translate to OS peak RSS — the peak is dominated by non-arena (Boehm 402 MB +
+ImportCache + SQLite + flake-fetch ~1200 MB) that mid-eval does not touch, and the
+freed arena pages (calloc'd blocks, whole-block-free gated off under mid-eval) are
+not returned to the OS.  Why with-stats vs no-stats diverge is UNRESOLVED (darwin-4
+contention-noisy: same-config RSS swung 1803-3032, CPU 6.5-12).  ⇒ **the reuse SEGV
+is FIXED + reuse is correct (--brute 22/22) but its PRODUCTION RSS benefit is
+UNCONFIRMED (likely ~0).  NOT a shippable RSS win as-is.**  Stays opt-in/off.
+NEXT (separate effort): clean idle-host correlated measurement; and to realize the
+arena reclaim as RSS, whole-block-free (munmap) must be enabled under mid-eval
+(requires mmap'd blocks — the consistency change deferred earlier) so freed pages
+return to the OS.
 
 THREE missed-root classes closed (all RCA-confirmed by instrument, not guessed):
 stale-bin overlap (ccec2bd01), remembered set (8559219b0), attrSelect IC
