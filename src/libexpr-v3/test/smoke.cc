@@ -25,6 +25,7 @@
 #include "v3/primop.hh"
 #include "v3/serialize.hh"
 #include "v3/disk_cache.hh"
+#include "v3/champ.hh"        // Change-2 #149: persistent HAMT (algorithm-validation)
 
 #include <algorithm>
 #include <cassert>
@@ -4264,6 +4265,72 @@ static int testBindingsForEachMaterialise()
     return 0;
 }
 
+// Change-2 #149: persistent HAMT algorithm-validation.  Validates persistent
+// insert (path-copy), right-biased update (Nix // merge), lookup, size,
+// structural sharing (originals unmutated), and canonical order-independence.
+static int testChampPersistentHamt()
+{
+    using H = nix::v3::champ::Hamt<uint64_t>;
+    const int N = 1000;
+    const uint32_t MULT = 2654435761u;            // Knuth hash: bijective mod 2^32
+    auto K = [&](int i) { return (uint32_t)((uint32_t)i * MULT); };
+
+    H a;
+    for (int i = 0; i < N; ++i) a = a.insert(K(i), (uint64_t)i + 100);
+    if (a.size() != (uint32_t)N) {
+        std::fprintf(stderr, "champ: size %u != %d\n", a.size(), N); return 1; }
+    for (int i = 0; i < N; ++i) {
+        const uint64_t * v = a.lookup(K(i));
+        if (!v || *v != (uint64_t)i + 100) {
+            std::fprintf(stderr, "champ: lookup %d failed\n", i); return 1; }
+    }
+    if (a.lookup(0xDEADBEEFu)) {
+        std::fprintf(stderr, "champ: absent lookup not null\n"); return 1; }
+
+    // Overwrite an existing key: size unchanged, value updated, ORIGINAL unmutated.
+    const uint32_t kk = K(5);                      // value 105 in `a`
+    H a3 = a.insert(kk, 7777);
+    if (a3.size() != a.size()) {
+        std::fprintf(stderr, "champ: overwrite changed size\n"); return 1; }
+    if (!a3.lookup(kk) || *a3.lookup(kk) != 7777) {
+        std::fprintf(stderr, "champ: overwrite value wrong\n"); return 1; }
+    if (!a.lookup(kk) || *a.lookup(kk) != 105) {
+        std::fprintf(stderr, "champ: original mutated by insert (not persistent)\n"); return 1; }
+
+    // update = a // b : b wins on conflict, new keys added, `a` unmutated.
+    H b;
+    b = b.insert(kk, 5555);
+    b = b.insert(0xABCDEF01u, 42);
+    H m = a.update(b);
+    if (!m.lookup(kk) || *m.lookup(kk) != 5555) {
+        std::fprintf(stderr, "champ: merge right-bias failed\n"); return 1; }
+    if (!m.lookup(0xABCDEF01u) || *m.lookup(0xABCDEF01u) != 42) {
+        std::fprintf(stderr, "champ: merge new key missing\n"); return 1; }
+    if (m.size() != a.size() + 1) {
+        std::fprintf(stderr, "champ: merge size %u != %u\n", m.size(), a.size() + 1); return 1; }
+    if (*a.lookup(kk) != 105) {
+        std::fprintf(stderr, "champ: `a` mutated by update (not persistent)\n"); return 1; }
+
+    uint32_t cnt = 0;
+    a.forEach([&](uint32_t, const uint64_t &) { ++cnt; });
+    if (cnt != a.size()) {
+        std::fprintf(stderr, "champ: forEach count %u != size %u\n", cnt, a.size()); return 1; }
+
+    // Canonical: same key SET inserted in REVERSE order must enumerate identically.
+    H c;
+    for (int i = N - 1; i >= 0; --i) c = c.insert(K(i), (uint64_t)i + 100);
+    std::vector<std::pair<uint32_t, uint64_t>> ea, ec;
+    a.forEach([&](uint32_t k, const uint64_t & v) { ea.push_back({k, v}); });
+    c.forEach([&](uint32_t k, const uint64_t & v) { ec.push_back({k, v}); });
+    if (ea != ec) {
+        std::fprintf(stderr, "champ: enumeration not canonical (order-dependent)\n"); return 1; }
+
+    std::fprintf(stderr,
+        "testChampPersistentHamt: OK (N=%d; persistent insert/overwrite/merge, "
+        "right-bias, structural sharing, canonical order)\n", N);
+    return 0;
+}
+
 int main()
 {
     registerBuiltinPrimOps();
@@ -4364,6 +4431,9 @@ int main()
 
     // #825 / A1a Phase B — forEach + materialize iteration helpers.
     rc |= testBindingsForEachMaterialise();
+
+    // Change-2 #149 — persistent HAMT algorithm-validation (standalone).
+    rc |= testChampPersistentHamt();
 
     auto & st = allocStats();
     std::fprintf(stderr,
