@@ -42,6 +42,8 @@
 #include "v3/precise_root.hh"
 #include "v3/fiber.hh"  // M-5: walkLiveFiberStacks (conservative yielded-fiber scan)
 #include "v3/nursery.hh"  // MIDEVAL_GC: threadNursery().forEachUsedRange conservative scan
+#include "v3/barrier.hh"  // MIDEVAL_GC: dirtyContainers() remembered-set root walk
+#include "v3/bytecode.hh"  // MIDEVAL_GC: CompilationUnit::attrSelectCache IC walk
 #include "v3/vm.hh"
 #include "v3/closure.hh"
 
@@ -565,6 +567,23 @@ private:
         return true;
     }
 
+    // MIDEVAL_GC (RCA fix, 2026-06-23): mirror the scavenger (gc.cc:641) — a live
+    // closure/thunk's CompilationUnit attrSelect IC pins `Bindings*` that are
+    // reachable ONLY via the IC (transient attrsets cached by an attr-select).
+    // The moving scavenger FORWARDS those entries; the non-moving mid-eval mark
+    // must MARK them, else they're swept + reused = UAF (the apply-overrides
+    // divergence: an override Bindings zeroed → empty attrset).  Mid-eval only
+    // (nursery_ is set solely under g_midEvalGcEnabled); gen-major clears the IC
+    // before its mark, so it never relied on this.  Dedup CUs via walkedCUs_.
+    std::unordered_set<const CompilationUnit *> walkedCUs_;
+    void walkCuIC(const CompilationUnit * cu) noexcept {
+        if (!nursery_ || !cu || !walkedCUs_.insert(cu).second) return;
+        for (const auto & ic : cu->attrSelectCache)
+            for (int w = 0; w < CompilationUnit::AttrSelectIC::kWays; ++w)
+                if (Bindings * b = const_cast<Bindings *>(ic.entries[w].bindings))
+                    visitBindings(b);
+    }
+
     void walkClosure(Closure * c) noexcept
     {
         // Step 11′ (Immix, 2026-05-29): mark the allocated Closure range.
@@ -575,6 +594,7 @@ private:
         }
         if (c->capturedWiths)
             visitList(c->capturedWiths);
+        walkCuIC(c->cu);  // MIDEVAL_GC: IC-pinned Bindings (mirror scavenger)
         // env-sharing (NIX_V3_ENV_SHARING): upvalues live in a shared, tenured
         // (non-moving) Env rather than the inline FAM.  Mark the Env's lines and
         // visit its values precisely; the inline FAM is unused when upvalEnv is set.
@@ -629,6 +649,7 @@ private:
         switch (t->state) {
         case ThunkState::Suspended:
         case ThunkState::Blackhole:
+            walkCuIC(thunkCU(t));  // MIDEVAL_GC: IC-pinned Bindings (mirror scavenger)
             if (ListVec * w = thunkCapturedWiths(t))  // FP-2b: tail slot
                 visitList(w);
             if (Env * te = thunkUpvalEnv(t)) {
@@ -2053,6 +2074,50 @@ MajorGcResult runMajorMarkSweep(VMState & vm) noexcept
         char anchor;
         const void * sp = &anchor;
         walkCStackConservative(visitor, arena, sp);
+    }
+
+    // MIDEVAL_GC (RCA + fix, 2026-06-23): walk the inter-gen DIRTY LIST
+    // (remembered set) as roots.  walkAllV3Roots does NOT walk it — but the
+    // scavenger does, because it is a genuine root source: a tenured cell written
+    // to point into the nursery is recorded here, and may be reachable ONLY via
+    // the remembered set, not the direct value-stack roots.  The non-moving
+    // mid-eval mark would otherwise miss it → swept → reused → UAF (the wild
+    // Value* deref).  Walking it marks those cells + (transitively) their nursery
+    // and tenured pointees.  Safe: over-marking a dead-but-dirty cell only
+    // over-retains.  Under NIX_V3_MIDEVAL_AUDIT, COUNT the cells this newly marks
+    // (mark MISSED them) to CONFIRM the gap rather than assume it.
+    if (nix::v3::detail::g_midEvalGcEnabled) {
+        const size_t before = marker.markedCells();
+        for (const DirtyEntry & e : dirtyContainers()) {
+            void * ptr = e.ptr();
+            if (!ptr) continue;
+            switch (e.kind()) {
+            case DirtyKind::Bindings: { Bindings * b = static_cast<Bindings *>(ptr); visitor.visitBindings(b); break; }
+            case DirtyKind::Pair:     { ValuePair * p = static_cast<ValuePair *>(ptr); visitor.visitPair(p); break; }
+            case DirtyKind::Thunk:    { Thunk * t = static_cast<Thunk *>(ptr); visitor.visitThunk(t); break; }
+            case DirtyKind::Closure:  { Closure * c = static_cast<Closure *>(ptr); visitor.visitClosure(c); break; }
+            case DirtyKind::List:     { ListVec * l = static_cast<ListVec *>(ptr); visitor.visitList(l); break; }
+            case DirtyKind::Env: {
+                Env * en = static_cast<Env *>(ptr);
+                if (marker.tryMark(en))
+                    for (uint16_t i = 0; i < en->nValues; ++i) visitor.visitValue(en->values[i]);
+                break;
+            }
+            }
+        }
+        visitor.drain();
+        {
+            uintptr_t aMin, aMax; arena.activeBounds(aMin, aMax);
+            visitor.drainConservative(arena, aMin, aMax);
+        }
+        static const bool s_midEvalAudit = std::getenv("NIX_V3_MIDEVAL_AUDIT") != nullptr;
+        if (__builtin_expect(s_midEvalAudit, 0)) {
+            const size_t newly = marker.markedCells() - before;
+            std::fprintf(stderr,
+                "[mideval-audit] dirty-list walk: %zu entries, marked %zu NEW cells "
+                "(mark MISSED them → remembered set %s a needed root)\n",
+                dirtyContainers().size(), newly, newly ? "IS" : "is NOT");
+        }
     }
 
     const size_t conservativeOnlyCells =

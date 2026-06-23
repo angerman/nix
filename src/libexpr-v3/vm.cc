@@ -4198,18 +4198,21 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             if (mArena.bytesAllocated() >= s_midEvalThresholdBytes) {
                 // Sync ip so the precise root walk sees a consistent frame.
                 if (!vm.frames.empty()) vm.frames.back().ip = ip;
-                // Clear the transient raw-Bindings*/Env side tables (IC /
-                // materialize-memo / env-intern / capWiths) before the sweep:
-                // walkAllV3Roots does NOT walk them, so a swept-then-REUSED cell
-                // they still alias would be a UAF on the next lookup.  Required
-                // for the free-list-reuse path; all repopulate on next use.
-                // (Bisect 2026-06-22 confirmed clearing is NOT the source of the
-                // ≥16 MB missed-root divergence — same hash with/without — so it
-                // is purely the reuse-safety measure here.)
+                // Transient raw-Bindings*/Env side tables.  RCA 2026-06-23: the
+                // attrSelect IC can SOLE-reference a transient attrset (built,
+                // selected, otherwise unreferenced) — clearing it dropped that root
+                // under the non-moving mid-eval mark → the Bindings was swept +
+                // reused (zeroed → empty attrset = the apply-overrides divergence).
+                // FIX: the mid-eval mark now WALKS the attrSelect IC (MarkVisitor::
+                // walkCuIC, mirroring the scavenger gc.cc:641), so DON'T clear it —
+                // its cells are marked + kept alive (pointers stay valid, non-
+                // moving).  The others (recSlotCache / materialize-memo / env-
+                // intern / capWiths) are NOT walked, but their cells are reachable
+                // via OTHER marked roots (rec Value / caller / closure upvalEnv /
+                // closure capturedWiths), so clearing only invalidates a stale
+                // entry after reclaim — safe + repopulates.
                 for (const CompilationUnit * icu : cuRegistry()) {
                     if (!icu) continue;
-                    for (auto & ic : icu->attrSelectCache)
-                        for (auto & e : ic.entries) e.bindings = nullptr;
                     for (auto & rc : icu->recSlotCache) rc.bindings = nullptr;
                 }
                 Bindings::clearMaterializeMemo();
