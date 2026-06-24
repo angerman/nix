@@ -215,22 +215,6 @@ const Bindings * Bindings::materialize() const
         return out;
     }
 
-    if (kind == uint8_t(Kind::Hamt)) {   // Change-2 #149: flatten to Sorted
-        std::vector<const HamtNode::Slot *> ss;
-        ss.reserve(size);
-        hamtCollectSlots(hamtRoot(), ss);
-        std::sort(ss.begin(), ss.end(),
-                  [](const HamtNode::Slot * a, const HamtNode::Slot * b) {
-                      return a->key < b->key;
-                  });
-        Bindings * out = Alloc::allocBindings((uint32_t)ss.size());
-        for (size_t i = 0; i < ss.size(); ++i)
-            out->entries[i] = *reinterpret_cast<const Entry *>(ss[i]);
-        bindingsPostConstructBarrier(out);
-        s_matMemo.emplace(this, out);
-        return out;
-    }
-
     if (chainDepth() <= Cursor::kMaxLayers) {
         const uint32_t kExact = countDistinct();
         Bindings * out = Alloc::allocBindings(kExact);

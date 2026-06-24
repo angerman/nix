@@ -453,14 +453,6 @@ inline void forEachEntryNoMapAttrsRealize(const Bindings * b, F && f)
         while (const Bindings::Entry * e = c.next()) f(*e);
         return;
     }
-    if (b->isHamt()) {   // Change-2 #149: sorted (SymbolId) Entry-view iteration
-        std::vector<const HamtNode::Slot *> ss; ss.reserve(b->size);
-        hamtCollectSlots(b->hamtRoot(), ss);
-        std::sort(ss.begin(), ss.end(),
-                  [](const HamtNode::Slot * x, const HamtNode::Slot * y) { return x->key < y->key; });
-        for (const HamtNode::Slot * s : ss) f(*reinterpret_cast<const Bindings::Entry *>(s));
-        return;
-    }
     for (uint32_t i = 0; i < b->size; ++i) f(b->entries[i]);
 }
 
@@ -474,14 +466,6 @@ inline void forEachEntryRefNoMapAttrsRealize(const Bindings * b, F && f)
             f(c.lastOwner(), *e);
         return;
     }
-    if (b->isHamt()) {   // Change-2 #149: sorted (SymbolId) Entry-view iteration
-        std::vector<const HamtNode::Slot *> ss; ss.reserve(b->size);
-        hamtCollectSlots(b->hamtRoot(), ss);
-        std::sort(ss.begin(), ss.end(),
-                  [](const HamtNode::Slot * x, const HamtNode::Slot * y) { return x->key < y->key; });
-        for (const HamtNode::Slot * s : ss) f(b, *reinterpret_cast<const Bindings::Entry *>(s));
-        return;
-    }
     for (uint32_t i = 0; i < b->size; ++i) f(b, b->entries[i]);
 }
 
@@ -489,14 +473,6 @@ inline const Bindings::Entry * lookupEntryNoMapAttrsRealize(
     const Bindings * b, SymbolId name,
     const Bindings ** ownerOut = nullptr) noexcept
 {
-    if (b && b->isHamt()) {   // Change-2 #149: leaf slot's prefix aliases Entry
-        if (const HamtNode::Slot * s = hamtLookupSlot(b->hamtRoot(), name)) {
-            if (ownerOut) *ownerOut = b;
-            return reinterpret_cast<const Bindings::Entry *>(s);
-        }
-        if (ownerOut) *ownerOut = nullptr;
-        return nullptr;
-    }
     for (const Bindings * cur = b; cur;
          cur = cur->isChain() ? cur->parent : nullptr) {
         if (const Bindings::Entry * e = cur->lookupLocalEntry(name)) {
@@ -664,11 +640,6 @@ inline bool valueEqual(VMState & vm, Value a0, Value b0)
                     break;
                 }
             }
-            // Change-2 #149: materialise Kind::Hamt operands to Sorted so the
-            // entries[] lockstep / Cursor compare below works (Hamt has no
-            // entries[]).  Memoized, so repeated compares don't re-flatten.
-            if (aa && aa->isHamt()) aa = const_cast<Bindings *>(aa->materialize());
-            if (bb && bb->isHamt()) bb = const_cast<Bindings *>(bb->materialize());
             const bool anyChain = (aa && aa->isChain()) || (bb && bb->isChain());
             uint32_t na = aa ? (anyChain ? aa->countDistinct() : aa->size) : 0;
             uint32_t nb = bb ? (anyChain ? bb->countDistinct() : bb->size) : 0;
@@ -833,7 +804,6 @@ void primAttrValues(EvalState &, Value * args, Value & out)
         throw std::runtime_error(expectedTypeButFound("a set", a));
     // Lever A: stream the chain via Cursor (see primAttrNames above).
     const Bindings * src = a.asAttrs();
-    if (src && src->isHamt()) src = src->materialize();   // Change-2 #149
     uint32_t n = src->totalSize();
     auto & symTab = ir::globalSymbolTable();
     auto nameView = [&](SymbolId sid) -> std::string_view {
@@ -4611,7 +4581,7 @@ static std::vector<LexicographicAttrRef> lexicographicAttrEntries(Bindings * b)
     std::vector<LexicographicAttrRef> order;
     if (!b) return order;
     order.reserve(b->countDistinct());
-    if (b->isChain() || b->isHamt()) {   // #149: Hamt has no entries[] — use forEach
+    if (b->isChain()) {
         forEachEntryRefNoMapAttrsRealize(b, [&](const Bindings * owner,
                                                 const Bindings::Entry & e) {
             order.push_back({e.name, e.value, nullptr, owner, &e});

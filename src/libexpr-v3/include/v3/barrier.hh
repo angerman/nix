@@ -65,7 +65,6 @@ enum class DirtyKind : uint8_t {
     Closure  = 3,  ///< Closure (upvalues[] or capturedWiths mutation)
     List     = 4,  ///< ListVec (elems[] mutation; mostly write-once at build)
     Env      = 5,  ///< Env (env-sharing: shared upvalue Env's values[] holds nursery payloads)
-    HamtNode = 6,  ///< Change-2 (#149): persistent-HAMT node's slot vals hold nursery payloads
 };
 
 /// One dirty-list entry: which kind + raw container pointer.  Container
@@ -367,28 +366,6 @@ envPostConstructBarrier(Env * e) noexcept
         for (uint16_t i = 0; i < e->nValues; ++i) {
             if (isNurseryPayload(e->values[i], n)) {
                 dirtyContainers().push_back({DirtyKind::Env, e});
-                return;
-            }
-        }
-    }
-}
-
-/// Change-2 (#149): a HAMT node is tenured (allocHamtNode) but its leaf slots'
-/// `val` may hold nursery payloads written at insert/merge.  Mirror
-/// envPostConstructBarrier: if any leaf val is a nursery payload, remember the
-/// node (DirtyKind::HamtNode) so a minor scavenge walks it (walkHamtNode) even
-/// when it isn't reached from a root that pass.  Branch slots point to tenured
-/// child nodes (never nursery), so only leaf vals matter.  Call AFTER filling
-/// the node's slots.
-[[gnu::always_inline]] inline void
-hamtNodePostConstructBarrier(HamtNode * h) noexcept
-{
-    if (__builtin_expect(phaseDActive(), 0)) [[unlikely]] {
-        const Nursery & n = threadNursery();
-        if (n.contains(h)) return;  // (HAMT nodes are tenured, but mirror the guard)
-        for (uint16_t i = 0; i < h->nSlots; ++i) {
-            if (!h->slots[i].isBranch() && isNurseryPayload(h->slots[i].val, n)) {
-                dirtyContainers().push_back({DirtyKind::HamtNode, h});
                 return;
             }
         }

@@ -70,7 +70,6 @@ enum GrayKind : uint8_t {
     GK_BINDINGS = 3,
     GK_PAIR     = 4,
     GK_ENV      = 5,  ///< env-sharing: a shared upvalue Env (tenured, non-moving)
-    GK_HAMT     = 6,  ///< Change-2 (#149): a persistent-HAMT node (tenured, non-moving)
 };
 
 struct Gray { void * ptr; uint8_t kind; };
@@ -236,7 +235,6 @@ struct Scavenger
     void walkBindings(Bindings * b);
     void walkPair    (ValuePair * p);
     void walkEnv     (Env      * e);  ///< env-sharing: walk a shared upvalue Env
-    void walkHamtNode(HamtNode * h);  ///< Change-2 (#149): walk a persistent-HAMT node
 
     // -- top-level driver ---------------------------------------
 
@@ -677,27 +675,6 @@ void Scavenger::walkEnv(Env * e)
     if (n.isPhaseEActive()) envPostConstructBarrier(e);
 }
 
-// Change-2 (#149): walk a persistent-HAMT node.  Mirrors walkEnv — the node is
-// tenured (never moves); forward each LEAF slot's Value payload in place + gray
-// each BRANCH slot's child node (also tenured).  `walked` dedups shared children
-// (the persistent DAG) so each node is walked once.  Re-apply the barrier so any
-// nursery edge surviving the walk stays remembered.
-void Scavenger::walkHamtNode(HamtNode * h)
-{
-    recordLiveTenured(h, sizeof(HamtNode) + sizeof(HamtNode::Slot) * h->nSlots,
-                      CellType::HamtNode);
-    for (uint16_t i = 0; i < h->nSlots; ++i) {
-        HamtNode::Slot & s = h->slots[i];
-        if (s.isBranch()) {
-            if (walked.insert(s.child).second)
-                graylist.push_back({s.child, GK_HAMT});
-        } else {
-            visitValue(s.val);
-        }
-    }
-    if (n.isPhaseEActive()) hamtNodePostConstructBarrier(h);
-}
-
 void Scavenger::walkThunk(Thunk * t)
 {
     // BRUTE-refinement: Thunk size depends on state (matches fwdThunk's
@@ -811,12 +788,6 @@ void Scavenger::walkList(ListVec * l)
 
 void Scavenger::walkBindings(Bindings * b)
 {
-    if (b->isHamt()) {   // Change-2 #149: data lives in the HAMT; gray its root
-        recordLiveTenured(b, sizeof(Bindings), CellType::Bindings);
-        if (HamtNode * r = b->hamtRoot())
-            if (walked.insert(r).second) graylist.push_back({r, GK_HAMT});
-        return;
-    }
     recordLiveTenured(b, sizeof(Bindings) + sizeof(Bindings::Entry) * b->size, CellType::Bindings);
     if (b->isMapAttrs())
         visitValue(b->aux);
@@ -860,7 +831,6 @@ void Scavenger::drain()
         case GK_BINDINGS: walkBindings(static_cast<Bindings *>(g.ptr)); break;
         case GK_PAIR:     walkPair    (static_cast<ValuePair *>(g.ptr)); break;
         case GK_ENV:      walkEnv     (static_cast<Env      *>(g.ptr)); break;
-        case GK_HAMT:     walkHamtNode(static_cast<HamtNode *>(g.ptr)); break;
         }
     }
 }
@@ -1128,13 +1098,6 @@ void Scavenger::run()
                 }
                 break;
             }
-            case DirtyKind::HamtNode: {
-                auto * h = static_cast<HamtNode *>(ptr);
-                if (walked.insert(h).second) {
-                    graylist.push_back({h, GK_HAMT});
-                }
-                break;
-            }
             }
         }
         auto releaseIfOversized = [](auto & v, size_t maxRetained) {
@@ -1295,20 +1258,6 @@ struct Auditor {
             visitValue(e->values[i], "Env.values[]");
     }
 
-    // Change-2 (#149): mirror visitEnv — recurse leaf vals + child nodes.
-    void visitHamtNode(const HamtNode * h, const char * site)
-    {
-        if (!h) return;
-        check(h, "HamtNode", site);
-        if (!visited.insert(h).second) return;
-        for (uint16_t i = 0; i < h->nSlots; ++i) {
-            if (h->slots[i].isBranch())
-                visitHamtNode(h->slots[i].child, "HamtNode.child");
-            else
-                visitValue(h->slots[i].val, "HamtNode.slot.val");
-        }
-    }
-
     void visitThunk(const Thunk * t, const char * site)
     {
         if (!t) return;
@@ -1367,10 +1316,6 @@ struct Auditor {
         if (!b) return;
         check(b, "Bindings", site);
         if (!visited.insert(b).second) return;
-        if (b->isHamt()) {   // Change-2 #149: recurse the HAMT root, not entries[]
-            visitHamtNode(b->hamtRoot(), "Bindings.hamtRoot");
-            return;
-        }
         // Phase D diagnostic: include the Bindings pointer + entry
         // index when a child value is nursery-resident — helps trace
         // back to the construction site.  Also pulls in the
@@ -1581,10 +1526,6 @@ void postScavengeAudit(const Nursery & n, const VMState & vm)
                 if (a.visited.insert(ptr).second)
                     a.visitEnv(static_cast<Env *>(ptr), "dirty.Env");
                 break;
-            case DirtyKind::HamtNode:
-                if (a.visited.insert(ptr).second)
-                    a.visitHamtNode(static_cast<HamtNode *>(ptr), "dirty.HamtNode");
-                break;
             }
         }
         for (Value * cell : standaloneCellRoots()) {
@@ -1674,7 +1615,6 @@ void postScavengeBruteScan(
         case CellType::Pair:     return "ValuePair";
         case CellType::Env:      return "Env";
         case CellType::Chars:    return "Chars";
-        case CellType::HamtNode: return "HamtNode";
         case CellType::None:     return "None";
         }
         return "None";

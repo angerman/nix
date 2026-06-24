@@ -27,7 +27,6 @@
 #include "v3/bytecode_primops.hh"
 #include "v3/limits.hh"
 #include "v3/barrier.hh"  // Phase D write-barrier helpers
-#include "v3/arena_hamt.hh"  // Change-2 #150: HAMT merge for `//`
 #include "v3/mark_sweep.hh"      // Stage 6 runMajorMarkSweep dispatch trigger
 #include "v3/live_trace.hh"      // Step 4 periodic L(t) trace dispatch hook
 
@@ -1132,10 +1131,6 @@ inline bool valueEqual(VMState & vm, Value a0, Value b0, bool insideContainer0 =
                     break;
                 }
             }
-            // Change-2 #149: materialise Kind::Hamt operands to Sorted (no
-            // entries[]); memoized so repeat compares don't re-flatten.
-            if (aa && aa->isHamt()) aa = const_cast<Bindings *>(aa->materialize());
-            if (bb && bb->isHamt()) bb = const_cast<Bindings *>(bb->materialize());
             const bool anyChain = (aa && aa->isChain()) || (bb && bb->isChain());
             uint32_t na = aa ? (anyChain ? aa->countDistinct() : aa->size) : 0;
             uint32_t nb = bb ? (anyChain ? bb->countDistinct() : bb->size) : 0;
@@ -1674,39 +1669,6 @@ inline Bindings * mergeBindings(const Bindings * a, const Bindings * b,
     // is just the original operand.
     if (b && !b->isChain() && b->size == 0) return const_cast<Bindings *>(a);
     if (a && !a->isChain() && a->size == 0) return const_cast<Bindings *>(b);
-
-    // Change-2 #150: `a // b` as a persistent HAMT.  Gated NIX_V3_HAMT_BINDINGS=1
-    // (default OFF; retire after the #151 nixpkgs byte-id soak + default flip).
-    // If `a` is ALREADY Kind::Hamt, share its root → O(|b|) merge + structural
-    // sharing (the win); else build the base HAMT once (a chain of `//` then
-    // shares it).  `b` shadows `a` (insert b's entries last; insert overwrites).
-    static const bool s_hamtBindings = []{
-        const char * e = std::getenv("NIX_V3_HAMT_BINDINGS");
-        return e && e[0] != '0';
-    }();
-    if (s_hamtBindings && a && b) {
-        using namespace nix::v3::ahamt;
-        V3_STATS_INC(hamtMerges);   // C2 HAMT RCA
-        HamtNode * root;
-        uint32_t cnt;
-        if (a->isHamt()) { root = a->hamtRoot(); cnt = a->size; }
-        else {
-            root = nullptr; cnt = 0;
-            a->forEach([&](const Bindings::Entry & e) {
-                bool grew = false;
-                root = insert(root, (uint32_t) e.name, e.pos & Bindings::kPosMask,
-                              e.value, grew);
-                if (grew) ++cnt;
-            });
-        }
-        b->forEach([&](const Bindings::Entry & e) {
-            bool grew = false;
-            root = insert(root, (uint32_t) e.name, e.pos & Bindings::kPosMask,
-                          e.value, grew);
-            if (grew) ++cnt;
-        });
-        return Alloc::allocHamtBindings(root, cnt);
-    }
 
     static const bool s_mapAttrsMergeLazy = []{
         return std::getenv("NIX_V3_NO_MAPATTRS_MERGE_LAZY") == nullptr;
@@ -9816,42 +9778,6 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // App(App(fn,name),val) entries that, without memoization,
             // re-apply the function on every access.
             auto * b = attrs.asAttrs();
-            // Change-2 #149/#150: HAMT-native SELECT — direct hamtLookupSlot,
-            // NO materialise() flat copy.  The earlier materialise shortcut
-            // allocated a full Sorted COPY on EVERY select (memoized per-epoch,
-            // but the memo retains every distinct attrset accessed) → firefox
-            // RSS 9.3× / git 4.8× regression measured on darwin-4 2026-06-24.
-            // HAMT nodes are TENURED + structurally SHARED across `//` versions,
-            // so a slot is never a private "leaf overlay": treat every hit like
-            // the chain PARENT-hit case (push + force-retry, NO memoizing
-            // writeback into the shared node — writing a forced value there
-            // contaminates every sibling version that shares the subtree, the
-            // 2026-06-07 chain corruption mechanism).  Memoization is NOT lost:
-            // the App/Thunk self-memoises in its OWN cell (the slot val is a
-            // pointer to it), only the slot-flattening indirection is dropped.
-            // This is exactly shouldForceSelectedEntry()'s non-MapAttrs rule.
-            if (__builtin_expect(b && b->isHamt(), 0)) {
-                const SymbolId want = static_cast<SymbolId>(operand);
-                const HamtNode::Slot * hs = hamtLookupSlot(b->hamtRoot(), want);
-                if (hs) {
-                    Value s = hs->val;  // copy out — never write the shared node
-                    if (s.isAppLike() && !isUnderappliedClosurePap(s)) {
-                        push(vm, s);
-                        CallFrame & f = vm.frames.back();
-                        armKeepBeltCheck(f);
-                        f.flags |= CFF_FORCE_RETRY;  // no WB_PTR_KEEP: shared
-                        f.ip = ip;
-                        goto op_force_slow;
-                    }
-                    push(vm, s);  // plain Thunk / WHNF / PAP: consumer forces
-                    break;
-                }
-                const auto & symTab = ir::globalSymbolTable();
-                std::string nm = want < symTab.size()
-                    ? symTab[want]
-                    : std::string("<sid=") + std::to_string(want) + ">";
-                throw std::runtime_error("attribute '" + nm + "' missing");
-            }
 
             // Lever A (MEMORY_REPRESENTATION §6) — chain-aware SELECT,
             // NO materialise().  The IC fast path and the slow-path

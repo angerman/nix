@@ -574,25 +574,6 @@ int main(int argc, char ** argv)
                 (unsigned long long)a.attrsetsAllocated,
                 (unsigned long long)a.envsAllocated,
                 (unsigned long long)(nix::v3::threadArena().bytesAllocated() >> 20));
-            // C2 HAMT RCA (2026-06-24): direct attribution of the HAMT regression.
-            if (a.hamtNodesAllocated || a.hamtMerges) {
-                const double nodesPerInsert = a.hamtInserts
-                    ? (double)a.hamtNodesAllocated / (double)a.hamtInserts : 0.0;
-                const double arenaMB = (double)(nix::v3::threadArena().bytesAllocated()) / 1e6;
-                const double nodeMB = a.hamtNodeBytes / 1e6;
-                std::fprintf(stderr,
-                    "v3 HAMT stats: merges=%llu inserts=%llu nodes=%llu "
-                    "(%.2f nodes/insert) slots=%llu nodeBytes=%.1fMB (%.1f%% of arena) "
-                    "hamtBindings=%llu\n",
-                    (unsigned long long)a.hamtMerges,
-                    (unsigned long long)a.hamtInserts,
-                    (unsigned long long)a.hamtNodesAllocated,
-                    nodesPerInsert,
-                    (unsigned long long)a.hamtSlotsAllocated,
-                    nodeMB,
-                    arenaMB > 0 ? 100.0 * nodeMB / arenaMB : 0.0,
-                    (unsigned long long)a.hamtBindingsAllocated);
-            }
             // IR Phase E (2026-05-18): selector-lambda fast-path
             // counter.  Confirms the emit-time peephole + runtime
             // dispatch are actually firing on the workload.  Zero

@@ -129,14 +129,29 @@ shallow).
 - write-path `//` merge + ~12 consumer migrations; gate `NIX_V3_HAMT_BINDINGS`
   (default OFF).
 
-## Disposition
+## Disposition — REMOVED (2026-06-24)
 
-Per Rule 0 the falsified path's gate should not persist as "both coexist." The code
-is correct + validated and the GC integration is a reusable reference; the data
-structure itself is a measured regression with no path to a win (Chain dominates by
-construction). Recommend RETIRE: either delete the HAMT backend + gate, or keep it
-as an explicitly-marked falsified reference. (User decision — large correct
-subsystem.)
+The entire HAMT experiment was deleted as a failed experiment (user decision: "remove
+it as a failed experiment, no point carrying more cruft than needed"). Removed:
+`champ.hh`, `arena_hamt.hh`, `CellType::HamtNode` + `Bindings::Kind::Hamt` + all
+backend/lookup/iterate code, the `GK_HAMT` moving-GC integration, all consumer
+Hamt-branches, the `// → Hamt` write-path, the `NIX_V3_HAMT_BINDINGS` gate, the
+`AllocStats::hamt*` instrumentation, and the smoke tests — by restoring every
+HAMT-touched source file to `c5932d6c1` (the pre-HAMT state) and deleting the new
+files. Validated post-removal: hello/git/firefox.drvPath byte-id, full `--brute`
+22/22 ALL GREEN.
+
+**The reusable GC reference is NOT lost:** the shared-tenured-cell moving-GC pattern
+that `GK_HAMT` mirrored is the **`GK_ENV` env-sharing walker**, which remains LIVE and
+default-on in the tree (`gc.cc` `walkEnv` / `DirtyKind::Env` / `envPostConstructBarrier`).
+`GK_HAMT` was a dead duplicate of it once the backend was gone, so keeping it would
+itself have been cruft. This doc + the git history (commits `317f69e33`..`b02325331`,
+with the measurement git-noted on `b02325331`) + the project memory are the record.
+
+This was a clean measure-first kill: built, proven byte-correct on 20 packages +
+21/22 of the battery, measured a structural 4.7–9.2× regression, root-caused to the
+node bytes by direct instrumentation, then removed. The knowledge is kept; the code
+is not.
 
 ## Lesson
 
