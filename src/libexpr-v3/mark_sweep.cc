@@ -1739,6 +1739,25 @@ static void runEvacuation(VMState & vm, Arena & arena,
     for (auto & [owner, ty] : pins) ev.pin(const_cast<char *>(owner), ty);
     walkAllV3Roots(vm, ev);
     ev.drain();
+
+    // S2.1 (#170): forward the REMEMBERED SET through the relocation map.
+    // A DirtyEntry points at a tenured cell holding a nursery reference; the
+    // next minor scavenge walks dirtyContainers() (gc.cc) to forward those
+    // nursery pointees.  If evac RELOCATED that tenured cell (B → B'), the
+    // entry still names the freed old B, so the scavenge walks garbage and the
+    // relocated copy's nursery pointers go unforwarded → dangling.  This was the
+    // brute-audit miss under mid-eval evac ("nursery Thunk reachable via
+    // Bindings.entries[].value ... raw/bulk-path"; isolated 2026-06-25: clean
+    // without evac, fails with it).  walkAllV3Roots(ev) rewrote the live graph
+    // but NOT this side table, so remap it explicitly.  Pinned (unmoved) cells
+    // are absent from `forward` → their entries are left untouched.
+    if (!ev.forward.empty()) {
+        for (auto & e : dirtyContainers()) {
+            auto it = ev.forward.find(e.ptr());
+            if (it != ev.forward.end())
+                e = DirtyEntry(e.kind(), it->second);
+        }
+    }
     auto tc1 = eclock::now();
 
     // VERIFY (PRECISE only): re-mark from precise roots (pointers now
