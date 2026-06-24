@@ -4611,7 +4611,7 @@ static std::vector<LexicographicAttrRef> lexicographicAttrEntries(Bindings * b)
     std::vector<LexicographicAttrRef> order;
     if (!b) return order;
     order.reserve(b->countDistinct());
-    if (b->isChain()) {
+    if (b->isChain() || b->isHamt()) {   // #149: Hamt has no entries[] — use forEach
         forEachEntryRefNoMapAttrsRealize(b, [&](const Bindings * owner,
                                                 const Bindings::Entry & e) {
             order.push_back({e.name, e.value, nullptr, owner, &e});
