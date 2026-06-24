@@ -683,6 +683,21 @@ private:
     }
     void walkBindings(Bindings * b) noexcept
     {
+        if (b->isHamt()) {   // Change-2 #149: mark the HAMT root + recurse, not entries[]
+            if (arenaSetForSlot_) arenaSetForSlot_->markLinesForCell(b, sizeof(Bindings));
+            std::function<void(HamtNode *)> walk = [&](HamtNode * h) {
+                if (!h || !marker_.tryMark(h)) return;
+                if (arenaSetForSlot_)
+                    arenaSetForSlot_->markLinesForCell(
+                        h, sizeof(HamtNode) + sizeof(HamtNode::Slot) * h->nSlots);
+                for (uint16_t i = 0; i < h->nSlots; ++i) {
+                    if (h->slots[i].isBranch()) walk(h->slots[i].child);
+                    else visitValue(h->slots[i].val);
+                }
+            };
+            walk(b->hamtRoot());
+            return;
+        }
         // Step 11′: line-mark the Bindings cell (header + FAM entries).
         if (arenaSetForSlot_) {
             arenaSetForSlot_->markLinesForCell(
@@ -1462,6 +1477,17 @@ private:
         }
         case CellType::Bindings: {
             auto * b = static_cast<Bindings *>(cell);
+            if (b->isHamt()) {   // Change-2 #149: recurse the HAMT root, not entries[]
+                std::function<void(HamtNode *)> walk = [&](HamtNode * h) {
+                    if (!h) return;
+                    for (uint16_t i = 0; i < h->nSlots; ++i) {
+                        if (h->slots[i].isBranch()) walk(h->slots[i].child);
+                        else visitValue(h->slots[i].val);
+                    }
+                };
+                walk(b->hamtRoot());
+                break;
+            }
             if (b->isMapAttrs()) visitValue(b->aux);
             for (uint32_t i = 0; i < b->size; ++i) visitValue(b->entries[i].value);
             if (b->parent) visitBindings(const_cast<Bindings * &>(b->parent));

@@ -122,6 +122,48 @@ struct ListVec
 using PosIdx32 = uint32_t;
 constexpr PosIdx32 kNoPos = 0;
 
+// ---------------------------------------------------------------------------
+// HamtNode — Change 2 (#149): persistent-HAMT attrset node.  Defined BEFORE
+// Bindings so Bindings::lookupEntry can walk it inline.  A tenured, NON-MOVING
+// arena cell (like the shared Env), keyed by SymbolId.  5 bits/level / 32-way;
+// `bitmap` marks occupied positions; `slots` is the popcount-packed array.  A
+// slot is a LEAF (`child == nullptr`: key/pos/val) or BRANCH (`child != nullptr`:
+// subnode).  The leaf's {key,pos,val} prefix is LAYOUT-IDENTICAL to
+// Bindings::Entry {name,pos,value} (all u32+u32+Value), so a leaf reinterprets to
+// an Entry* — see the static_assert after Bindings.  GC: tenured nodes never
+// move; walkHamtNode forwards each leaf's nursery Value + grays children.
+// ---------------------------------------------------------------------------
+struct HamtNode
+{
+    struct Slot {
+        uint32_t   key = 0;          // SymbolId (leaf only) — aliases Entry::name
+        uint32_t   pos = 0;          // PosIdx32 (leaf only)  — aliases Entry::pos
+        Value      val;              // leaf value            — aliases Entry::value
+        HamtNode * child = nullptr;  // non-null => branch (subnode)
+        bool isBranch() const noexcept { return child != nullptr; }
+    };
+    uint32_t bitmap = 0;
+    uint16_t nSlots = 0;
+    Slot     slots[];                // FAM, popcount-packed
+};
+
+/// Inline HAMT lookup (used by Bindings::lookupEntry).  Returns the leaf slot for
+/// `key`, or nullptr.  The full persistent insert/merge live in arena_hamt.hh.
+inline const HamtNode::Slot * hamtLookupSlot(const HamtNode * n, uint32_t key) noexcept
+{
+    unsigned shift = 0;
+    while (n) {
+        unsigned pos = (key >> shift) & 31u;
+        if (!(n->bitmap & (1u << pos))) return nullptr;
+        const HamtNode::Slot & s =
+            n->slots[(unsigned)__builtin_popcount(n->bitmap & ((1u << pos) - 1))];
+        if (!s.isBranch()) return s.key == key ? &s : nullptr;
+        n = s.child;
+        shift += 5;
+    }
+    return nullptr;
+}
+
 struct Bindings
 {
     /// 2026-05-21 #752: PosIdx32 fits in what used to be Entry's
@@ -172,7 +214,8 @@ struct Bindings
     /// sites.  Phase C enables Chain creation in mergeBindings under
     /// `NIX_V3_CHAIN_BINDINGS=1`.  Phase D promotes to default after
     /// the falsifier (≥ 200 MB recovered on HNE) is met.
-    enum class Kind : uint8_t { Sorted = 0, Chain = 1, MapAttrs = 2 };
+    enum class Kind : uint8_t { Sorted = 0, Chain = 1, MapAttrs = 2,
+                                Hamt = 3 /* Change-2 #149: persistent HAMT backend */ };
 
     uint8_t  kind = uint8_t(Kind::Sorted);   // offset 0
     uint8_t  _pad8[3] = {};                  // offset 1..3
@@ -185,6 +228,13 @@ struct Bindings
 
     bool isChain() const noexcept { return kind == uint8_t(Kind::Chain); }
     bool isMapAttrs() const noexcept { return kind == uint8_t(Kind::MapAttrs); }
+    /// Change-2 (#149): a HAMT-backed Bindings.  `entries[]` is empty; the
+    /// persistent-HAMT root lives in the `aux` slot (reinterpreted — aux is an
+    /// 8 B Value, unused for non-MapAttrs).  GC walks it via walkBindings's Hamt
+    /// branch (grays the root → walkHamtNode); never visitValue(aux).
+    bool isHamt() const noexcept { return kind == uint8_t(Kind::Hamt); }
+    HamtNode * hamtRoot() const noexcept { return *reinterpret_cast<HamtNode * const *>(&aux); }
+    void setHamtRoot(HamtNode * r) noexcept { *reinterpret_cast<HamtNode **>(&aux) = r; }
 
     /// Binary search the entries array of `this` (does NOT walk parent).
     /// Internal helper used by `lookupEntry` to factor the chain walk.
@@ -233,6 +283,10 @@ struct Bindings
     /// name/pos/value without materialising the entire chain.
     const Entry * lookupEntry(SymbolId name) const noexcept
     {
+        if (isHamt()) {   // Change-2 #149: leaf slot's prefix aliases Entry
+            const HamtNode::Slot * s = hamtLookupSlot(hamtRoot(), name);
+            return s ? reinterpret_cast<const Entry *>(s) : nullptr;
+        }
         for (const Bindings * b = this; b; b = b->isChain() ? b->parent : nullptr) {
             const Entry * e = b->lookupLocalEntry(name);
             if (e) {
@@ -247,6 +301,10 @@ struct Bindings
 
     Entry * lookupEntry(SymbolId name) noexcept
     {
+        if (isHamt()) {   // Change-2 #149: leaf slot's prefix aliases Entry
+            const HamtNode::Slot * s = hamtLookupSlot(hamtRoot(), name);
+            return s ? const_cast<Entry *>(reinterpret_cast<const Entry *>(s)) : nullptr;
+        }
         for (Bindings * b = this; b; b = b->isChain() ? const_cast<Bindings *>(b->parent) : nullptr) {
             Entry * e = b->lookupLocalEntry(name);
             if (e) {
@@ -521,30 +579,17 @@ struct Bindings
     }
 };
 
-// ---------------------------------------------------------------------------
-// HamtNode — Change 2 (#149): persistent-HAMT attrset node.
-//
-// A tenured, NON-MOVING arena cell (like the shared Env), keyed by SymbolId.
-// 5 bits/level / 32-way; `bitmap` marks occupied positions; `slots` is the
-// popcount-packed array.  A slot is a LEAF (`child == nullptr`: holds key/pos/val)
-// or a BRANCH (`child != nullptr`: points to a subnode).  Persistent: insert/merge
-// path-copy, sharing untouched subtrees (proven in champ.hh).  GC: tenured nodes
-// never move; the scavenger (walkHamtNode / GK_HAMT) only forwards each leaf
-// slot's nursery Value payload + grays child nodes — exactly mirroring walkEnv.
-// ---------------------------------------------------------------------------
-struct HamtNode
-{
-    struct Slot {
-        uint32_t   key = 0;       // SymbolId (leaf only)
-        uint32_t   pos = 0;       // PosIdx32 (leaf only; unsafeGetAttrPos)
-        Value      val;           // leaf value
-        HamtNode * child = nullptr; // non-null => branch (subnode)
-        bool isBranch() const noexcept { return child != nullptr; }
-    };
-    uint32_t bitmap = 0;
-    uint16_t nSlots = 0;
-    Slot     slots[];             // FAM, popcount-packed
-};
+// Change-2 (#149): the HAMT leaf slot's {key,pos,val} prefix must alias
+// Bindings::Entry {name,pos,value} so a leaf reinterprets to an Entry* in
+// lookupEntry.  Verify the layout here (both structs now complete).
+static_assert(sizeof(HamtNode::Slot) >= sizeof(Bindings::Entry),
+              "HAMT slot must contain an Entry-compatible prefix");
+static_assert(offsetof(HamtNode::Slot, key) == offsetof(Bindings::Entry, name),
+              "HAMT slot key must alias Entry::name");
+static_assert(offsetof(HamtNode::Slot, pos) == offsetof(Bindings::Entry, pos),
+              "HAMT slot pos must alias Entry::pos");
+static_assert(offsetof(HamtNode::Slot, val) == offsetof(Bindings::Entry, value),
+              "HAMT slot val must alias Entry::value");
 
 // ---------------------------------------------------------------------------
 // Allocation counters (defined before Alloc so allocBindings can record
@@ -2969,6 +3014,20 @@ struct Alloc
         n->nSlots = nSlots;
         for (uint16_t i = 0; i < nSlots; ++i) n->slots[i] = HamtNode::Slot{};
         return n;
+    }
+
+    /// Change-2 (#149): allocate a Kind::Hamt Bindings header (no entries[]; the
+    /// data lives in the HAMT rooted at `root`).  `size` is the logical entry
+    /// count.  Tenured; the GC walks it via walkBindings's Hamt branch.
+    static Bindings * allocHamtBindings(HamtNode * root, uint32_t size) noexcept
+    {
+        auto * b = static_cast<Bindings *>(
+            threadArena().alloc(sizeof(Bindings), CellType::Bindings));
+        b->kind = uint8_t(Bindings::Kind::Hamt);
+        b->size = size;
+        b->parent = nullptr;
+        b->setHamtRoot(root);   // writes the root pointer into the aux slot
+        return b;
     }
 
     /// T1.3 (2026-05-27): file/line attribution via `__builtin_FILE` /

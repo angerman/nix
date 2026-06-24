@@ -4447,6 +4447,51 @@ static int testChampArenaGcStress()
     return 0;
 }
 
+// Change-2 #149 increment 4: a Kind::Hamt Bindings.  Build a HAMT, wrap it in a
+// Bindings header (allocHamtBindings), and verify lookupEntry returns correct
+// Entry views — validating the leaf-slot→Entry reinterpret + the central lookup
+// dispatch (the hook ~30 consumers route through).
+static int testHamtBindingsLookup()
+{
+    using namespace nix::v3::ahamt;
+    const int N = 300;
+    HamtNode * root = nullptr;
+    for (int i = 0; i < N; ++i) {
+        Value v;
+        v.mkInt(7000 + i);
+        bool grew = false;
+        // SymbolId keys 1..N (0 == kInvalidSymbol); pos = i*2.
+        root = insert(root, (uint32_t)(i + 1), /*pos=*/(uint32_t)(i * 2), v, grew);
+    }
+    Bindings * b = Alloc::allocHamtBindings(root, (uint32_t)N);
+    if (b->size != (uint32_t)N) {
+        std::fprintf(stderr, "hamt-bindings: size %u != %d\n", b->size, N);
+        return 1;
+    }
+    for (int i = 0; i < N; ++i) {
+        const Bindings::Entry * e = b->lookupEntry((SymbolId)(i + 1));
+        if (!e) {
+            std::fprintf(stderr, "hamt-bindings: lost key %d\n", i + 1);
+            return 1;
+        }
+        if (e->name != (SymbolId)(i + 1) || e->pos != (uint32_t)(i * 2)
+            || !e->value.isInt() || e->value.asInt() != 7000 + i) {
+            std::fprintf(stderr,
+                "hamt-bindings: entry %d mismatch (name=%u pos=%u)\n",
+                i + 1, e->name, e->pos);
+            return 1;
+        }
+    }
+    if (b->lookupEntry((SymbolId)99999)) {
+        std::fprintf(stderr, "hamt-bindings: absent key found\n");
+        return 1;
+    }
+    std::fprintf(stderr,
+        "testHamtBindingsLookup: OK (N=%d; Kind::Hamt Bindings lookupEntry via "
+        "leaf→Entry reinterpret)\n", N);
+    return 0;
+}
+
 int main()
 {
     registerBuiltinPrimOps();
@@ -4554,6 +4599,8 @@ int main()
     rc |= testChampSharingAndSorted();
     // Change-2 #149 increment 3 — arena HAMT + moving-GC integration.
     rc |= testChampArenaGcStress();
+    // Change-2 #149 increment 4 — Kind::Hamt Bindings lookup dispatch.
+    rc |= testHamtBindingsLookup();
 
     auto & st = allocStats();
     std::fprintf(stderr,

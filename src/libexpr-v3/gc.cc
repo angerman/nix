@@ -811,6 +811,12 @@ void Scavenger::walkList(ListVec * l)
 
 void Scavenger::walkBindings(Bindings * b)
 {
+    if (b->isHamt()) {   // Change-2 #149: data lives in the HAMT; gray its root
+        recordLiveTenured(b, sizeof(Bindings), CellType::Bindings);
+        if (HamtNode * r = b->hamtRoot())
+            if (walked.insert(r).second) graylist.push_back({r, GK_HAMT});
+        return;
+    }
     recordLiveTenured(b, sizeof(Bindings) + sizeof(Bindings::Entry) * b->size, CellType::Bindings);
     if (b->isMapAttrs())
         visitValue(b->aux);
@@ -1361,6 +1367,10 @@ struct Auditor {
         if (!b) return;
         check(b, "Bindings", site);
         if (!visited.insert(b).second) return;
+        if (b->isHamt()) {   // Change-2 #149: recurse the HAMT root, not entries[]
+            visitHamtNode(b->hamtRoot(), "Bindings.hamtRoot");
+            return;
+        }
         // Phase D diagnostic: include the Bindings pointer + entry
         // index when a child value is nursery-resident — helps trace
         // back to the construction site.  Also pulls in the
