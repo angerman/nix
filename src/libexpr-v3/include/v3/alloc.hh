@@ -643,6 +643,23 @@ struct AllocStats
     uint64_t attrsetsAllocated = 0;
     uint64_t pairsAllocated    = 0;
 
+    /// C2 HAMT RCA (2026-06-24): direct instrumentation of the HAMT-Bindings
+    /// regression.  hamtNodesAllocated/hamtNodeBytes = total tenured interior
+    /// nodes path-copied across all `//` merges + builds (never freed → this IS
+    /// the RSS bloat).  hamtSlotsAllocated = sum of nSlots (node-fanout proxy).
+    /// hamtBindingsAllocated = # Kind::Hamt headers; hamtMerges = mergeBindings
+    /// calls that took the HAMT path; hamtInserts = single-key inserts (each
+    /// path-copies ~log32(n) nodes).  Ratio hamtNodesAllocated/hamtInserts = the
+    /// per-insert node-copy amplification; hamtNodeBytes/(entries) = the
+    /// structural overhead vs a flat Sorted Bindings.  Only bumped when the
+    /// HAMT path runs (gate on); zero cost otherwise.
+    uint64_t hamtNodesAllocated    = 0;
+    uint64_t hamtNodeBytes         = 0;
+    uint64_t hamtSlotsAllocated    = 0;
+    uint64_t hamtBindingsAllocated = 0;
+    uint64_t hamtMerges            = 0;
+    uint64_t hamtInserts           = 0;
+
     /// #538 dispatch profiling: total bytecode instructions executed
     /// across all VMState instances in the process.  Bumped by
     /// `dispatchLoop` per opcode iteration when NIX_VM_STATS=1 enables
@@ -3050,6 +3067,9 @@ struct Alloc
         n->bitmap = 0;
         n->nSlots = nSlots;
         for (uint16_t i = 0; i < nSlots; ++i) n->slots[i] = HamtNode::Slot{};
+        V3_STATS_INC(hamtNodesAllocated);              // C2 HAMT RCA
+        V3_STATS_BUMP(hamtNodeBytes, bytes);
+        V3_STATS_BUMP(hamtSlotsAllocated, nSlots);
         return n;
     }
 
@@ -3064,6 +3084,7 @@ struct Alloc
         b->size = size;
         b->parent = nullptr;
         b->setHamtRoot(root);   // writes the root pointer into the aux slot
+        V3_STATS_INC(hamtBindingsAllocated);           // C2 HAMT RCA
         return b;
     }
 

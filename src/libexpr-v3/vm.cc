@@ -1686,6 +1686,7 @@ inline Bindings * mergeBindings(const Bindings * a, const Bindings * b,
     }();
     if (s_hamtBindings && a && b) {
         using namespace nix::v3::ahamt;
+        V3_STATS_INC(hamtMerges);   // C2 HAMT RCA
         HamtNode * root;
         uint32_t cnt;
         if (a->isHamt()) { root = a->hamtRoot(); cnt = a->size; }

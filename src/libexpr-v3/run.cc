@@ -462,6 +462,24 @@ RootResult runRootExprModule(nix::EvalState & state, ir::Module module)
             (unsigned long long)a.thunksForced,
             (unsigned long long)a.bridgeThunksForced,
             (unsigned long long)a.bytecodeInstructions);
+        // C2 HAMT RCA (2026-06-24): only meaningful with NIX_V3_HAMT_BINDINGS=1.
+        // nodes/insert = per-insert path-copy amplification; nodeBytes is the
+        // never-freed tenured arena bloat; nodes/binding-entry = structural
+        // overhead vs a flat Sorted Bindings.
+        if (a.hamtNodesAllocated || a.hamtMerges) {
+            const double nodesPerInsert = a.hamtInserts
+                ? (double)a.hamtNodesAllocated / (double)a.hamtInserts : 0.0;
+            std::fprintf(stderr,
+                "v3-direct HAMT: merges=%llu inserts=%llu nodes=%llu "
+                "(%.2f nodes/insert) slots=%llu nodeBytes=%.1fMB hamtBindings=%llu\n",
+                (unsigned long long)a.hamtMerges,
+                (unsigned long long)a.hamtInserts,
+                (unsigned long long)a.hamtNodesAllocated,
+                nodesPerInsert,
+                (unsigned long long)a.hamtSlotsAllocated,
+                a.hamtNodeBytes / 1e6,
+                (unsigned long long)a.hamtBindingsAllocated);
+        }
         // #702: BYTES per allocation category.  The count counters
         // above are partly bumped at primop call sites and miss
         // Alloc::* invocations from vm.cc dispatch; the byte

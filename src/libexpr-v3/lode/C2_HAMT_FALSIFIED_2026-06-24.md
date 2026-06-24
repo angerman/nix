@@ -30,7 +30,52 @@ Byte-identical throughout (hello/git/firefox.drvPath; 20-pkg gate-on-vs-default
 sweep 20/20; gate-on `--brute` 21/22 — lone fail a benign smoke optimization-count
 assertion). Correctness was never the problem.
 
-## Root cause (controlled experiment, not speculation)
+## Root cause — DIRECTLY MEASURED (instrumented 2026-06-24, commit TBD)
+
+Per-allocation HAMT counters (`AllocStats::hamt*`, reported by `NIX_VM_STATS`)
+on firefox.drvPath via `v3-eval --strict` (cache-free), darwin-4:
+
+| metric | DEFAULT | HAMT |
+|---|---|---|
+| arena | **336 MB** | **5776 MB** (17.2×) |
+| HamtNode bytes | — | **5708.8 MB = 94.3 % of the arena** |
+| HamtNodes allocated | — | **10,311,027** |
+| slots copied (Σ nSlots) | — | **234,427,919** |
+| `//` merges | — | 94,803 |
+| single-key inserts | — | 4,115,697 |
+| nodes / insert | — | 2.51 |
+| inserts / merge | — | ≈ 43 |
+| slots / insert | — | ≈ 57 |
+
+**The HamtNode forest is 94.3 % of the bloated arena — the regression is the node
+allocation, measured directly, not inferred.** Eval shape is otherwise identical
+(thunks 2.88M both; closures/lists within 0.1 %) — only the Bindings rep differs.
+
+The precise mechanism — **the merge inserts b's keys one at a time.**
+`mergeBindings`'s HAMT path does `b->forEach(k => root = insert(root, k))`: a 43-key
+`//` performs **43 sequential persistent inserts**, each path-copying the growing
+root + spine (~57 slots, ~2.5 nodes). The 42 intermediate root versions are dead the
+instant the next insert supersedes them — but every node is TENURED and the arena
+never frees. One 43-key merge thus allocates ~108 nodes / ~2451 slots ≈ 59 KB of
+which only the final spine (~a few nodes) is live. ×94,803 merges = 5.7 GB.
+
+Versus ChainBindings: the same 43-key `//` is ONE overlay `Bindings` (43 entries +
+parent ptr) ≈ 1 KB. **HAMT allocates ≈ 59× more per merge**, all of it tenured-dead.
+
+**CPU (1.3×) has the same source, by the same counts:** 10.3M `allocHamtNode` calls +
+`copyOf` memcpy of 234M slots (~5.7 GB memmoved) is the extra ~0.85 s. Allocation +
+memcpy bound — exact by counter, not sampled.
+
+### Could a bulk merge save it? No.
+A one-pass merge (build the result HAMT once instead of |b| sequential persistent
+inserts) would cut the *transient* intermediate versions — but a persistent `//`
+still must **path-copy every interior node on b's key paths** to share a's subtrees
+immutably (that is what "persistent" costs). It would still allocate O(|b|·log n)
+tenured nodes per merge versus Chain's O(1) parent pointer + O(|b|) flat overlay.
+Under a never-freeing arena, path-copy sharing loses to pointer sharing by
+construction. The bulk merge narrows the constant, not the asymptotics or the verdict.
+
+## Root cause (controlled experiment — corroborates the above)
 
 The first suspicion was the `materialize()` shortcut: every consumer (`OP_ATTRS_
 SELECT`, `valueEqual`, `attrValues`, …) on a `Kind::Hamt` allocated + memoized a

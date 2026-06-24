@@ -127,6 +127,7 @@ inline HamtNode * insert(const HamtNode * root, uint32_t key, uint32_t pos,
                          const Value & val, bool & grew) noexcept
 {
     grew = false;
+    V3_STATS_INC(hamtInserts);   // C2 HAMT RCA — each insert path-copies ~log32(n) nodes
     if (!root) root = emptyNode();
     return insertAt(root, key, pos, val, 0, grew);
 }
