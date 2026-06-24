@@ -522,6 +522,31 @@ struct Bindings
 };
 
 // ---------------------------------------------------------------------------
+// HamtNode — Change 2 (#149): persistent-HAMT attrset node.
+//
+// A tenured, NON-MOVING arena cell (like the shared Env), keyed by SymbolId.
+// 5 bits/level / 32-way; `bitmap` marks occupied positions; `slots` is the
+// popcount-packed array.  A slot is a LEAF (`child == nullptr`: holds key/pos/val)
+// or a BRANCH (`child != nullptr`: points to a subnode).  Persistent: insert/merge
+// path-copy, sharing untouched subtrees (proven in champ.hh).  GC: tenured nodes
+// never move; the scavenger (walkHamtNode / GK_HAMT) only forwards each leaf
+// slot's nursery Value payload + grays child nodes — exactly mirroring walkEnv.
+// ---------------------------------------------------------------------------
+struct HamtNode
+{
+    struct Slot {
+        uint32_t   key = 0;       // SymbolId (leaf only)
+        uint32_t   pos = 0;       // PosIdx32 (leaf only; unsafeGetAttrPos)
+        Value      val;           // leaf value
+        HamtNode * child = nullptr; // non-null => branch (subnode)
+        bool isBranch() const noexcept { return child != nullptr; }
+    };
+    uint32_t bitmap = 0;
+    uint16_t nSlots = 0;
+    Slot     slots[];             // FAM, popcount-packed
+};
+
+// ---------------------------------------------------------------------------
 // Allocation counters (defined before Alloc so allocBindings can record
 // the size histogram inline).
 // ---------------------------------------------------------------------------
@@ -1171,6 +1196,7 @@ enum class CellType : uint8_t {
     Pair     = 6,  ///< ValuePair (App / App3 / PrimOpApp)
     Env      = 7,
     Chars    = 8,  ///< allocChars string/path buffer
+    HamtNode = 9,  ///< Change-2 (#149): persistent-HAMT attrset node (tenured)
 };
 
 // M-9 (CODEBASE_REVIEW_2026-06-11): the per-block cellTypes array is
@@ -2929,6 +2955,20 @@ struct Alloc
         e->isWithEnv = false;
         e->nValues = nValues;
         return e;
+    }
+
+    /// Change-2 (#149): allocate a HAMT node with `nSlots` slots.  TENURED
+    /// (threadArena, like allocEnv) so the node never moves — the scavenger only
+    /// forwards its slot Value payloads + grays child nodes (walkHamtNode).
+    /// Slots are zero-initialised (child=nullptr => leaf by default).
+    static HamtNode * allocHamtNode(uint16_t nSlots) noexcept
+    {
+        const size_t bytes = sizeof(HamtNode) + sizeof(HamtNode::Slot) * nSlots;
+        auto * n = static_cast<HamtNode *>(threadArena().alloc(bytes, CellType::HamtNode));
+        n->bitmap = 0;
+        n->nSlots = nSlots;
+        for (uint16_t i = 0; i < nSlots; ++i) n->slots[i] = HamtNode::Slot{};
+        return n;
     }
 
     /// T1.3 (2026-05-27): file/line attribution via `__builtin_FILE` /

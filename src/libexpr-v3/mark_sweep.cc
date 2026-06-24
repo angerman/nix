@@ -339,6 +339,7 @@ public:
                 case CellType::List:     { ListVec  * l = reinterpret_cast<ListVec  *>(o); visitList(l);     break; }
                 case CellType::Pair:     { ValuePair * pr = reinterpret_cast<ValuePair *>(o); visitPair(pr); break; }
                 case CellType::Value:
+                case CellType::HamtNode:  // #149: tenured non-moving, mirror Env (conservative)
                 case CellType::Env:
                 case CellType::Chars:
                 case CellType::None:
@@ -481,6 +482,7 @@ public:
             case CellType::List:     walkList(reinterpret_cast<ListVec *>(cs));      continue;
             case CellType::Pair:     walkPair(reinterpret_cast<ValuePair *>(cs));    continue;
             case CellType::Value:
+            case CellType::HamtNode:  // #149: tenured non-moving, mirror Env (conservative)
             case CellType::Env:
             case CellType::Chars:
             case CellType::None:
@@ -1146,6 +1148,7 @@ static size_t evacCellSize(const void * p, CellType t) noexcept
         return sizeof(ListVec)
              + sizeof(Value) * static_cast<const ListVec *>(p)->size;
     case CellType::Pair:     return sizeof(ValuePair);
+    case CellType::HamtNode:  // #149: tenured non-moving (mirror Env)
     case CellType::None:
     case CellType::Env:
     case CellType::Chars:    return 0;  // not moved this cut
@@ -1476,6 +1479,7 @@ private:
             break;
         }
         case CellType::Value: visitValue(*static_cast<Value *>(cell)); break;
+        case CellType::HamtNode:  // #149: tenured non-moving (mirror Env)
         case CellType::None:
         case CellType::Env:
         case CellType::Chars:
@@ -1680,6 +1684,7 @@ static void runEvacuation(VMState & vm, Arena & arena,
             case CellType::List:     { ListVec   * l = reinterpret_cast<ListVec   *>(o); consWalk.visitList(l);     break; }
             case CellType::Pair:     { ValuePair * p = reinterpret_cast<ValuePair *>(o); consWalk.visitPair(p);     break; }
             case CellType::Value:    { Value     * v = reinterpret_cast<Value     *>(o); consWalk.visitSlot(v);     break; }
+            case CellType::HamtNode:  // #149: tenured non-moving (mirror Env)
             case CellType::None:
             case CellType::Env:
             case CellType::Chars:
@@ -1783,7 +1788,7 @@ static void runEvacuation(VMState & vm, Arena & arena,
             case CellType::List:     { ListVec   * l = reinterpret_cast<ListVec   *>(o); vverify.visitList(l);     break; }
             case CellType::Pair:     { ValuePair * p = reinterpret_cast<ValuePair *>(o); vverify.visitPair(p);     break; }
             case CellType::Value:    { Value     * v = reinterpret_cast<Value     *>(o); vverify.visitSlot(v);     break; }
-            case CellType::None: case CellType::Env: case CellType::Chars: break;
+            case CellType::None: case CellType::Env: case CellType::Chars: case CellType::HamtNode: break;
             }
         }
     }
@@ -1951,6 +1956,7 @@ static void runEvacuation(VMState & vm, Arena & arena,
                     case CellType::Value:
                         if (refCand(*reinterpret_cast<const Value *>(cs))) note("Value", cs);
                         break;
+                    case CellType::HamtNode:  // #149: tenured non-moving (mirror Env)
                     case CellType::None:
                     case CellType::Env:
                     case CellType::Chars:
@@ -2101,6 +2107,18 @@ MajorGcResult runMajorMarkSweep(VMState & vm) noexcept
                 Env * en = static_cast<Env *>(ptr);
                 if (marker.tryMark(en))
                     for (uint16_t i = 0; i < en->nValues; ++i) visitor.visitValue(en->values[i]);
+                break;
+            }
+            case DirtyKind::HamtNode: {
+                // #149: mark the (tenured) node + its leaf vals; recurse children.
+                std::function<void(HamtNode *)> walk = [&](HamtNode * h) {
+                    if (!h || !marker.tryMark(h)) return;
+                    for (uint16_t i = 0; i < h->nSlots; ++i) {
+                        if (h->slots[i].isBranch()) walk(h->slots[i].child);
+                        else visitor.visitValue(h->slots[i].val);
+                    }
+                };
+                walk(static_cast<HamtNode *>(ptr));
                 break;
             }
             }

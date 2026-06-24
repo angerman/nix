@@ -26,6 +26,7 @@
 #include "v3/serialize.hh"
 #include "v3/disk_cache.hh"
 #include "v3/champ.hh"        // Change-2 #149: persistent HAMT (algorithm-validation)
+#include "v3/arena_hamt.hh"   // Change-2 #149: arena-backed HAMT (GC-integrated)
 
 #include <algorithm>
 #include <cassert>
@@ -4403,6 +4404,49 @@ static int testChampSharingAndSorted()
     return 0;
 }
 
+// Change-2 #149 increment 3: GC integration.  Build an arena HAMT whose values
+// are NURSERY cells (1-elem lists), force a moving scavenge, and verify the
+// values survive — i.e. walkHamtNode forwarded each leaf slot's nursery payload
+// (the HAMT nodes reach the scavenger via hamtNodePostConstructBarrier → dirty
+// list).  Under --brute the auditor's visitHamtNode independently verifies no
+// slot val is a missed root, catching walker bugs regardless of C-stack masking.
+static int testChampArenaGcStress()
+{
+    using namespace nix::v3::ahamt;
+    VMState vm;
+    const int N = 256;
+    const uint32_t MULT = 2654435761u;
+    HamtNode * root = nullptr;
+    for (int i = 0; i < N; ++i) {
+        ListVec * lv = Alloc::allocList(1);        // nursery cell
+        lv->elems[0].mkInt(1000 + i);
+        Value v;
+        v.mkList(lv);
+        bool grew = false;
+        root = insert(root, (uint32_t)((uint32_t)i * MULT), /*pos=*/0, v, grew);
+    }
+    threadNursery().forceScavenge(vm);             // move nursery → tenured
+    for (int i = 0; i < N; ++i) {
+        const HamtNode::Slot * s = lookup(root, (uint32_t)((uint32_t)i * MULT));
+        if (!s) {
+            std::fprintf(stderr, "arena-hamt-gc: lost key %d after scavenge\n", i);
+            return 1;
+        }
+        if (!s->val.isList() || s->val.asList()->size != 1
+            || !s->val.asList()->elems[0].isInt()
+            || s->val.asList()->elems[0].asInt() != 1000 + i) {
+            std::fprintf(stderr,
+                "arena-hamt-gc: key %d value corrupted after scavenge "
+                "(walkHamtNode missed forwarding?)\n", i);
+            return 1;
+        }
+    }
+    std::fprintf(stderr,
+        "testChampArenaGcStress: OK (N=%d nursery values forwarded via "
+        "walkHamtNode; audit-clean under --brute)\n", N);
+    return 0;
+}
+
 int main()
 {
     registerBuiltinPrimOps();
@@ -4508,6 +4552,8 @@ int main()
     rc |= testChampPersistentHamt();
     // Change-2 #149/#150 — structural sharing + sorted byte-id + deep merge.
     rc |= testChampSharingAndSorted();
+    // Change-2 #149 increment 3 — arena HAMT + moving-GC integration.
+    rc |= testChampArenaGcStress();
 
     auto & st = allocStats();
     std::fprintf(stderr,
