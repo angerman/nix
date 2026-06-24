@@ -489,6 +489,14 @@ inline const Bindings::Entry * lookupEntryNoMapAttrsRealize(
     const Bindings * b, SymbolId name,
     const Bindings ** ownerOut = nullptr) noexcept
 {
+    if (b && b->isHamt()) {   // Change-2 #149: leaf slot's prefix aliases Entry
+        if (const HamtNode::Slot * s = hamtLookupSlot(b->hamtRoot(), name)) {
+            if (ownerOut) *ownerOut = b;
+            return reinterpret_cast<const Bindings::Entry *>(s);
+        }
+        if (ownerOut) *ownerOut = nullptr;
+        return nullptr;
+    }
     for (const Bindings * cur = b; cur;
          cur = cur->isChain() ? cur->parent : nullptr) {
         if (const Bindings::Entry * e = cur->lookupLocalEntry(name)) {
