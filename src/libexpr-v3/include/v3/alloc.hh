@@ -164,6 +164,18 @@ inline const HamtNode::Slot * hamtLookupSlot(const HamtNode * n, uint32_t key) n
     return nullptr;
 }
 
+/// Collect all leaf slots of a HAMT (trie order) into `out`.  Callers that need
+/// sorted (SymbolId) order — forEach, materialize — sort `out` after.
+inline void hamtCollectSlots(const HamtNode * n,
+                             std::vector<const HamtNode::Slot *> & out)
+{
+    if (!n) return;
+    for (uint16_t i = 0; i < n->nSlots; ++i) {
+        if (n->slots[i].isBranch()) hamtCollectSlots(n->slots[i].child, out);
+        else out.push_back(&n->slots[i]);
+    }
+}
+
 struct Bindings
 {
     /// 2026-05-21 #752: PosIdx32 fits in what used to be Entry's
@@ -508,7 +520,8 @@ struct Bindings
     uint32_t countDistinct() const noexcept
     {
         if (kind == uint8_t(Kind::Sorted)
-            || kind == uint8_t(Kind::MapAttrs))
+            || kind == uint8_t(Kind::MapAttrs)
+            || kind == uint8_t(Kind::Hamt))   // Change-2 #149: size is the count
             return size;
         // L1 (PROFILE_AT_SCALE_2026-06-21): `countDistinct` on a Chain is an
         // O(N·depth) Cursor walk and was the #1 named v3 self-time function
@@ -552,6 +565,18 @@ struct Bindings
             for (uint32_t i = 0; i < size; ++i) func(entries[i]);
             return;
         }
+        if (kind == uint8_t(Kind::Hamt)) {   // Change-2 #149: sorted (SymbolId) view
+            std::vector<const HamtNode::Slot *> ss;
+            ss.reserve(size);
+            hamtCollectSlots(hamtRoot(), ss);
+            std::sort(ss.begin(), ss.end(),
+                      [](const HamtNode::Slot * a, const HamtNode::Slot * b) {
+                          return a->key < b->key;
+                      });
+            for (const HamtNode::Slot * s : ss)
+                func(*reinterpret_cast<const Entry *>(s));
+            return;
+        }
         if (kind == uint8_t(Kind::MapAttrs)) {
             auto * self = const_cast<Bindings *>(this);
             for (uint32_t i = 0; i < size; ++i) {
@@ -572,6 +597,17 @@ struct Bindings
         if (kind == uint8_t(Kind::Sorted)
             || kind == uint8_t(Kind::MapAttrs)) {
             for (uint32_t i = 0; i < size; ++i) func(entries[i].name);
+            return;
+        }
+        if (kind == uint8_t(Kind::Hamt)) {   // Change-2 #149: sorted names
+            std::vector<const HamtNode::Slot *> ss;
+            ss.reserve(size);
+            hamtCollectSlots(hamtRoot(), ss);
+            std::sort(ss.begin(), ss.end(),
+                      [](const HamtNode::Slot * a, const HamtNode::Slot * b) {
+                          return a->key < b->key;
+                      });
+            for (const HamtNode::Slot * s : ss) func((SymbolId)s->key);
             return;
         }
         Cursor c(this, false);

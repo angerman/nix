@@ -4486,9 +4486,36 @@ static int testHamtBindingsLookup()
         std::fprintf(stderr, "hamt-bindings: absent key found\n");
         return 1;
     }
+    // forEach must yield entries in SymbolId order (matching Sorted, for byte-id).
+    std::vector<std::pair<uint32_t, int64_t>> seen;
+    b->forEach([&](const Bindings::Entry & e) {
+        seen.push_back({(uint32_t)e.name, e.value.asInt()});
+    });
+    if (seen.size() != (size_t)N) {
+        std::fprintf(stderr, "hamt-bindings: forEach yielded %zu != %d\n", seen.size(), N);
+        return 1;
+    }
+    for (int i = 0; i < N; ++i)
+        if (seen[i].first != (uint32_t)(i + 1) || seen[i].second != 7000 + i) {
+            std::fprintf(stderr, "hamt-bindings: forEach[%d] out of order/wrong\n", i);
+            return 1;
+        }
+    // materialize → a Sorted Bindings with identical entries.
+    const Bindings * m = b->materialize();
+    if (m->isHamt() || m->size != (uint32_t)N) {
+        std::fprintf(stderr, "hamt-bindings: materialize wrong kind/size\n");
+        return 1;
+    }
+    for (int i = 0; i < N; ++i) {
+        const Bindings::Entry * e = m->lookupEntry((SymbolId)(i + 1));
+        if (!e || e->value.asInt() != 7000 + i) {
+            std::fprintf(stderr, "hamt-bindings: materialized entry %d wrong\n", i + 1);
+            return 1;
+        }
+    }
     std::fprintf(stderr,
-        "testHamtBindingsLookup: OK (N=%d; Kind::Hamt Bindings lookupEntry via "
-        "leaf→Entry reinterpret)\n", N);
+        "testHamtBindingsLookup: OK (N=%d; Kind::Hamt lookupEntry + sorted forEach "
+        "+ materialize→Sorted)\n", N);
     return 0;
 }
 
