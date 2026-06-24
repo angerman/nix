@@ -9815,12 +9815,42 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // App(App(fn,name),val) entries that, without memoization,
             // re-apply the function on every access.
             auto * b = attrs.asAttrs();
-            // Change-2 #149/#150: the IC + binary-search SELECT paths assume
-            // entries[]; a Kind::Hamt operand has none.  Materialise it to a
-            // Sorted view (memoized per-epoch) so all existing SELECT logic
-            // works unchanged.  (Direct HAMT-select is a later perf step.)
-            if (__builtin_expect(b && b->isHamt(), 0))
-                b = const_cast<Bindings *>(b->materialize());
+            // Change-2 #149/#150: HAMT-native SELECT — direct hamtLookupSlot,
+            // NO materialise() flat copy.  The earlier materialise shortcut
+            // allocated a full Sorted COPY on EVERY select (memoized per-epoch,
+            // but the memo retains every distinct attrset accessed) → firefox
+            // RSS 9.3× / git 4.8× regression measured on darwin-4 2026-06-24.
+            // HAMT nodes are TENURED + structurally SHARED across `//` versions,
+            // so a slot is never a private "leaf overlay": treat every hit like
+            // the chain PARENT-hit case (push + force-retry, NO memoizing
+            // writeback into the shared node — writing a forced value there
+            // contaminates every sibling version that shares the subtree, the
+            // 2026-06-07 chain corruption mechanism).  Memoization is NOT lost:
+            // the App/Thunk self-memoises in its OWN cell (the slot val is a
+            // pointer to it), only the slot-flattening indirection is dropped.
+            // This is exactly shouldForceSelectedEntry()'s non-MapAttrs rule.
+            if (__builtin_expect(b && b->isHamt(), 0)) {
+                const SymbolId want = static_cast<SymbolId>(operand);
+                const HamtNode::Slot * hs = hamtLookupSlot(b->hamtRoot(), want);
+                if (hs) {
+                    Value s = hs->val;  // copy out — never write the shared node
+                    if (s.isAppLike() && !isUnderappliedClosurePap(s)) {
+                        push(vm, s);
+                        CallFrame & f = vm.frames.back();
+                        armKeepBeltCheck(f);
+                        f.flags |= CFF_FORCE_RETRY;  // no WB_PTR_KEEP: shared
+                        f.ip = ip;
+                        goto op_force_slow;
+                    }
+                    push(vm, s);  // plain Thunk / WHNF / PAP: consumer forces
+                    break;
+                }
+                const auto & symTab = ir::globalSymbolTable();
+                std::string nm = want < symTab.size()
+                    ? symTab[want]
+                    : std::string("<sid=") + std::to_string(want) + ">";
+                throw std::runtime_error("attribute '" + nm + "' missing");
+            }
 
             // Lever A (MEMORY_REPRESENTATION §6) — chain-aware SELECT,
             // NO materialise().  The IC fast path and the slow-path
