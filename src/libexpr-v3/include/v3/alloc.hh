@@ -360,6 +360,7 @@ struct Bindings
     }
 
     bool has(SymbolId name) const noexcept {
+        if (isHamt()) return hamtLookupSlot(hamtRoot(), name) != nullptr;  // #149
         for (const Bindings * b = this; b; b = b->isChain() ? b->parent : nullptr) {
             if (b->lookupLocalEntry(name)) return true;
         }
