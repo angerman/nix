@@ -1280,6 +1280,17 @@ public:
     /// rewrites the reference.  Deduped via charForward_.
     void evacChars(const char * & s)
     {
+        // S2.1a: string-buffer relocation is CORRUPTING under evac (bisected
+        // 2026-06-25: evacChars is the git "Python version mismatch" source — a
+        // semantic corruption, evac-brute-clean; exact line TBD by S2.1b). v3
+        // strings are ~1.2% of the arena (STRINGS_ATTR_SPIKE), so SKIPPING their
+        // relocation — pinning their candidate blocks via the verify's
+        // visitString tryMark instead — costs negligible RSS and removes the
+        // corruption.  DEFAULT-SKIP under evac; the clean compactor (S2.1b) will
+        // relocate Chars correctly.  Opt back in (for that work) with
+        // NIX_V3_EVAC_RELOC_CHARS=1.
+        static const bool s_relocChars = std::getenv("NIX_V3_EVAC_RELOC_CHARS") != nullptr;
+        if (!s_relocChars) { if (s && inCandidate(s)) ++pinnedCells; return; }
         if (!s || !inCandidate(s)) return;
         // Review #12: only relocate a char buffer when `s` is its START
         // (an allocChars cell-start).  An interior char pointer (a
