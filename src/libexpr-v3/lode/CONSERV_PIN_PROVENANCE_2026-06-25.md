@@ -123,6 +123,50 @@ conservative scan (S2.1b clean compactor) + auditor-validate. The frame instrume
 (`NIX_V3_PIN_FRAMES`) confirms the on-stack primop chain at each safepoint BEFORE
 migrating, so we stop guessing.
 
+## ★ DECISIVE REDIRECT (2026-06-26) — the pins are STALE, not live; the SCAN is removable
+
+Rooting `toStringCoerceCtx`'s live Value locals (GcRoot v/el/tsFn/res/forced + Rule-2
+re-read of `v.asList()`; byte-id vs TW ✓) left conserv-provenance UNCHANGED
+(Chars 84977→84977, Bindings 38560, Pair 41125). That is the **4th** measure-first
+redirect (args[] → list primops → toStringCoerceCtx all leave the count flat), and
+the counts are STABLE to the cell across every mid-eval sweep — a pattern that
+contradicts "transient live re-entrant locals."
+
+**Decisive test (NIX_V3_NO_CONSERV_SCAN): DISABLE the conservative C-stack scan under
+the mid-eval mark-sweep and check byte-identity.** If the pins were LIVE-but-precise-
+missed, dropping the scan sweeps a live cell → UAF/divergence. If STALE/DEAD, byte-id
+survives. **RESULT: byte-identical on hello + git + gcc + firefox, AND brute-audit
+17/17 with MIDEVAL_GC=1 + NO_CONSERV_SCAN=1 under 1 MB-nursery stress (heavy synthetic
+folds fold-genlist-100k / tail-1000 / deep-let-rec-fix with tight reuse + the nixpkgs
+derivations) — ZERO corruption.**
+
+→ The ~85k Chars + 41k Pair + 38.5k Bindings conservativeOnly pins are **STALE stack
+slots pinning DEAD cells** (dead locals in long-lived frames — the dispatch loop, FFI
+frames — never overwritten, within [sp, stackHi]). The PRECISE roots (value stack +
+frames + globals + handles + remembered set) ALREADY cover the live set for the
+non-moving mid-eval sweep. **The conservative scan is REDUNDANT for liveness — it only
+over-pins dead cells, and those pins are exactly what blocked whole-block-free (the
+S2.3 negative).**
+
+**This OVERTURNS the S1.2 premise** that handle migration is the path to remove the
+conservative scan: there is nothing live to migrate (4 redirects prove it). The
+scan can be dropped directly for the non-moving mid-eval sweep. **It re-opens S2.1b on
+a concrete basis:** a mid-eval MOVING compactor on PRECISE roots only (no conservative
+pins) → everything movable → compact + free emptied blocks + munmap → the RSS win.
+CAVEAT for the moving case: the non-moving no-scan test proves "no live cell was swept";
+a moving compactor is stricter (a live-only-via-C-stack cell would DANGLE on relocation,
+not just on reuse) — but if no such cell exists (4 derivations + 17 brute cases agree),
+moving is also safe. SHIP-grade proof still requires the moving compactor built +
+auditor-zero-missed under relocation. Strong GO, not yet a ship.
+
+NEW critical path (supersedes the handle-migration plan above): **S2.1b = mid-eval
+moving compactor on precise roots, conservative scan OFF** (validated by
+NIX_V3_NO_CONSERV_SCAN as the oracle) → S2.2 whole-block-free + munmap → S2.3 re-measure
+RSS (must beat default-v3). The GcRoot handle toolkit + the 6 list-primop + the
+toStringCoerceCtx migrations stand as correct Rule-2 hardening for the moving path
+(a cached cell-ptr across a callback dangles under relocation) but are NOT the RSS
+lever — removing the scan is.
+
 **Honest scope:** the derivation leaf path is FFI-heavy (nix::Derivation /
 NixStringContext / store ops), hundreds of lines across `primDerivationFromPreprocessed`
 + `primDerivCoerce` + `primDerivationStrict{,Native}`. This is the genuine firefox
