@@ -1205,13 +1205,14 @@ struct Auditor {
     // audit also walks AttrSelectIC entries transitively.
     std::unordered_set<const CompilationUnit *> walkedCUs;
     bool ok = true;
+    const char * root = "?";   // S2.1 RCA: top-level root of the current walk
 
     void check(const void * p, const char * what, const char * site)
     {
         if (n.contains(p)) {
             std::fprintf(stderr,
-                "v3 SCAVENGE AUDIT: nursery %s %p reachable via %s\n",
-                what, p, site);
+                "v3 SCAVENGE AUDIT: nursery %s %p reachable via %s [root=%s]\n",
+                what, p, site, root);
             ok = false;
         }
     }
@@ -1436,6 +1437,7 @@ void postScavengeAudit(const Nursery & n, const VMState & vm)
     //    thread — same set the scavenger walks via activeVMStack).
     auto walkVm = [&](const char * label, const VMState * vmp) {
         if (!vmp) return;
+        a.root = label;   // S2.1 RCA
         for (size_t i = 0; i < vmp->valueStack.size(); ++i)
             a.visitValue(vmp->valueStack[i], label);
         for (size_t i = 0; i < vmp->withStack.size(); ++i)
@@ -1462,35 +1464,35 @@ void postScavengeAudit(const Nursery & n, const VMState & vm)
     // 3. Bytecode-primop replacement map (bytecode_primops.cc).
     {
         std::function<void(Value &)> visit =
-            [&](Value & v) { a.visitValue(v, "primopReplacementMap"); };
+            [&](Value & v) { a.root = "primopReplacementMap"; a.visitValue(v, "primopReplacementMap"); };
         walkBytecodePrimopRoots(visit);
     }
 
     // 4. vBuiltins singleton.
     {
         std::function<void(Value &)> visit =
-            [&](Value & v) { a.visitValue(v, "vBuiltins"); };
+            [&](Value & v) { a.root = "vBuiltins"; a.visitValue(v, "vBuiltins"); };
         walkBuiltinsRoot(visit);
     }
 
     // 5. import-cache results.
     {
         std::function<void(Value &)> visit =
-            [&](Value & v) { a.visitValue(v, "importCache"); };
+            [&](Value & v) { a.root = "importCache"; a.visitValue(v, "importCache"); };
         walkImportCacheRoots(visit);
     }
 
     // 6. call-flake closure.
     {
         std::function<void(Value &)> visit =
-            [&](Value & v) { a.visitValue(v, "callFlakeRoot"); };
+            [&](Value & v) { a.root = "callFlakeRoot"; a.visitValue(v, "callFlakeRoot"); };
         walkCallFlakeRoot(visit);
     }
 
     // 6b. deep-force roots (Round 1 #7).  See gc.cc:run() comment.
     {
         std::function<void(Value &)> visit =
-            [&](Value & v) { a.visitValue(v, "deepForceRoots"); };
+            [&](Value & v) { a.root = "deepForceRoots"; a.visitValue(v, "deepForceRoots"); };
         walkDeepForceRoots(visit);
     }
 
@@ -1499,6 +1501,7 @@ void postScavengeAudit(const Nursery & n, const VMState & vm)
     // diagnostic-parity walk that catches missed-drain regressions.
     // The list will normally be empty by the time auditor runs.
     {
+        a.root = "dirtyList";   // S2.1 RCA
         for (const DirtyEntry & e : dirtyContainers()) {
             void * ptr = e.ptr();
             switch (e.kind()) {
@@ -1528,6 +1531,7 @@ void postScavengeAudit(const Nursery & n, const VMState & vm)
                 break;
             }
         }
+        a.root = "standaloneCell";   // S2.1 RCA
         for (Value * cell : standaloneCellRoots()) {
             a.visitValue(*cell, "dirty.cell");
         }
@@ -1535,6 +1539,7 @@ void postScavengeAudit(const Nursery & n, const VMState & vm)
 
     // 6d. Captured-withs singleton cache slots.  Mirrors the scavenger's
     // explicit slot forwarding above.
+    a.root = "capWithsCache";   // S2.1 RCA
     for (ListVec ** slot : singletonCapturedWithsRegistry()) {
         if (slot && *slot)
             a.visitList(*slot, "capWithsCache");
