@@ -1586,16 +1586,25 @@ void primMap(EvalState & state, Value * args, Value & out)
 void primFilter(EvalState & state, Value * args, Value & out)
 {
     if (!args[1].isList()) typeError("filter", "list");
-    auto * src = args[1].asList();
-    if (!src || src->size == 0) {
+    auto * src0 = args[1].asList();
+    if (!src0 || src0->size == 0) {
         out = args[1];
         return;
     }
     Value pred = args[0];
-    std::vector<Value> kept;
-    kept.reserve(src->size);
-    for (uint32_t i = 0; i < src->size; ++i) {
-        Value r = callClosure(*state.vm, pred, src->elems[i]);
+    // S1.2 (template Rule 1 + Rule 4-clean): pred + the source list are live
+    // across the re-entrant callClosure → GcRoot them.  CRUCIALLY, accumulate
+    // INDICES, not Value copies: a std::vector<Value> of kept elements would hold
+    // raw copies that a relocation leaves stale (the vector isn't GC-walked), and
+    // re-rooting a growing vector is the Rule-4 hard case.  Indices are plain
+    // ints (no relocation hazard); we rebuild from the rooted source by re-read
+    // (Rule 2).  Same elements, same order → byte-identical.
+    GcRoot rPred(pred), rList(args[1]);
+    const uint32_t sz = src0->size;  // stable across relocations
+    std::vector<uint32_t> keptIdx;
+    keptIdx.reserve(sz);
+    for (uint32_t i = 0; i < sz; ++i) {
+        Value r = callClosure(*state.vm, pred, args[1].asList()->elems[i]);
         // Predicate result may be a thunk / app — force to WHNF.
         {
             Tag rt = r.tag();
@@ -1605,19 +1614,20 @@ void primFilter(EvalState & state, Value * args, Value & out)
                 r = forceValue(*state.vm, r);
         }
         if (!r.isBool()) typeError("filter", "predicate returning bool");
-        if (r.asInt() == 1) kept.push_back(src->elems[i]);
+        if (r.asInt() == 1) keptIdx.push_back(i);
     }
-    if (kept.empty()) {
+    if (keptIdx.empty()) {
         out = Value::vEmptyList;
         return;
     }
-    if (kept.size() == src->size) {
+    if (keptIdx.size() == sz) {
         out = args[1];
         return;
     }
-    ListVec * result = Alloc::allocList(static_cast<uint32_t>(kept.size()));
+    ListVec * result = Alloc::allocList(static_cast<uint32_t>(keptIdx.size()));
     V3_STATS_INC(listsAllocated);
-    for (size_t i = 0; i < kept.size(); ++i) result->elems[i] = kept[i];
+    auto * src = args[1].asList();  // re-read once after the loop (no callbacks below)
+    for (size_t i = 0; i < keptIdx.size(); ++i) result->elems[i] = src->elems[keptIdx[i]];
     listPostConstructBarrier(result);  // Phase D coverage (primFilter; PhD-6)
     out.mkList(result);
 }
@@ -1683,22 +1693,28 @@ void primFoldlMap(EvalState & state, Value * args, Value & out)
     Value op   = args[0];
     Value acc  = args[1];
     Value f    = args[2];
-    auto * src = args[3].asList();
-    if (src) {
-        for (uint32_t i = 0; i < src->size; ++i) {
-            // Compute f(elem); force the result before passing to op.
-            Value fx = callClosure(*state.vm, f, src->elems[i]);
-            if (__builtin_expect(fx.tag() == Tag::Thunk
-                                 || fx.isAppLike()
-                                 || fx.tag() == Tag::Slot, 0))
-                fx = forceValue(*state.vm, fx);
-            // Apply op acc fx — T1 saturated 2-arg call (see primFoldl).
-            acc = callClosure2(*state.vm, op, acc, fx);
-            if (__builtin_expect(acc.tag() == Tag::Thunk
-                                 || acc.isAppLike()
-                                 || acc.tag() == Tag::Slot, 0))
-                acc = forceValue(*state.vm, acc);
-        }
+    // S1.2 (template Rules 1-3): op/acc/f and the list Value are live across the
+    // re-entrant callClosure/callClosure2; GcRoot makes them precise + rewritten
+    // in place.  Re-read the list each iteration (Rule 2 — the cached raw `src`
+    // would dangle after a relocation); size is stable so cache once.  `fx` is
+    // forced+consumed within the iteration (forceValue roots its own arg; passed
+    // by value into callClosure2 — Rule 3) so it needs no separate root.
+    GcRoot rOp(op), rAcc(acc), rF(f), rList(args[3]);
+    auto * src0 = args[3].asList();
+    const uint32_t sz = src0 ? src0->size : 0;
+    for (uint32_t i = 0; i < sz; ++i) {
+        // Compute f(elem); force the result before passing to op.
+        Value fx = callClosure(*state.vm, f, args[3].asList()->elems[i]);
+        if (__builtin_expect(fx.tag() == Tag::Thunk
+                             || fx.isAppLike()
+                             || fx.tag() == Tag::Slot, 0))
+            fx = forceValue(*state.vm, fx);
+        // Apply op acc fx — T1 saturated 2-arg call (see primFoldl).
+        acc = callClosure2(*state.vm, op, acc, fx);
+        if (__builtin_expect(acc.tag() == Tag::Thunk
+                             || acc.isAppLike()
+                             || acc.tag() == Tag::Slot, 0))
+            acc = forceValue(*state.vm, acc);
     }
     out = acc;
 }
