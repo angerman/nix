@@ -70,3 +70,30 @@ Note: this latent barrier gap likely affects the existing gen-major evac path to
 
 Gate `NIX_V3_EVAC` default-OFF; dead by default (verified). Mover proven; ship gate
 pending the upstream barrier fix.
+
+## Update (later 2026-06-25): bug class 1 FIXED; bug class 2 found (deep)
+
+Bug class 1 (barrier-gap missed-root) FIXED (commit 6d6805a4a): disable phaseDStep7's
+"trust the dirty list" under NIX_V3_EVAC → the scavenge fully walks root-reached tenured
+cells → forwards every tenured→nursery edge. brute-audit 14/3 → 16/1 (hello-drvPath/
+outPath AUDIT hits gone). Cost: O(live-tenured)/minor-scavenge → quadratic under the
+1MB-nursery stress (gated; bounded at the 32MB production nursery).
+
+Bug class 2 (git-drvPath [exit=1]): a SEMANTIC relocation corruption in the experimental
+evac. git.drvPath under 1MB-stress + evac throws nixpkgs `error: Python version mismatch
+in 'asciidoc-10.2.1'` (a nixpkgs assertion — a version STRING / python reference got
+corrupted), exit=1 (NOT a timeout; standalone byte-correct). EVAC-BRUTE TYPED audit is
+CLEAN (MARKED-dangle=0, UNMARKED=0) → NOT a dangling pointer; the cell's CONTENTS are
+wrong after relocation while the pointer is valid. Prime suspects: `evacChars` (char-
+buffer relocation + string-context re-key) or the cell-pin field-rewrite. Hard to
+localize (evac-brute can't see it; manifests as a downstream nixpkgs assertion).
+
+VERDICT: the experimental evac (NIX_V3_EVAC, "unrevived path") has ≥2 deep correctness
+bug classes under the never-validated cell-pin + EVAC_PCT=1.0 + mid-eval + 1MB-stress
+combination. Hardening it to pass the full brute-audit is a sustained multi-bug
+campaign. The mover MECHANISM is proven (hello/firefox/synthetic byte-correct + frees
+RSS); shipping S2.1 needs either (a) a dedicated evac-hardening campaign (RCA evacChars/
+cell-pin corruption; de-quadratic the scavenge), or (b) a cleaner mid-eval compactor
+written against the validated S1 roots rather than reviving the experimental evac.
+Next bisect for class 2 (documented, not yet run): EVAC_PCT sweep; cell-pin off;
+evacChars off — to isolate which relocation path corrupts.
