@@ -962,6 +962,15 @@ static std::string toStringCoerceCtx(EvalState & state, Value v,
             ctx.insert(ctx.end(), raw->begin(), raw->end());
         }
     };
+    // S1.2 PRECISE ROOT (CONSERV_PIN_PROVENANCE): firefox.drvPath's conservative
+    // C-stack pins are 51.5% Chars + 23.4% Bindings, sourced by this recursive
+    // coercion bridge (primDerivCoerce → here; the dominant frame in the
+    // NIX_V3_PIN_FRAMES dump).  Root every Value held across a re-entrant force/
+    // callClosure/recursion so a mid-eval moving GC can relocate it instead of
+    // the conservative scan pinning it.  `v` is a by-value param, reassigned just
+    // below — GcRoot holds &v, so the slot tracks the reassignment + relocation.
+    // Recursion is correct for GcRoot: each frame roots its own `v` (LIFO).
+    GcRoot rootV(v);
     v = forceValue(*state.vm, v);
     switch (v.tag()) {
     case Tag::String: absorbCtx(v.asString());
@@ -1027,12 +1036,19 @@ static std::string toStringCoerceCtx(EvalState & state, Value v,
     case Tag::Null:   return "";
     case Tag::List: {
         std::string out;
-        auto * lv = v.asList();
-        if (!lv) return out;
-        for (uint32_t i = 0; i < lv->size; ++i) {
-            Value el = forceValue(*state.vm, lv->elems[i]);
+        if (!v.asList()) return out;
+        // Rule 2: do NOT cache the `ListVec*` across the re-entrant forceValue +
+        // recursion below — re-read `v.asList()` each iteration so it follows a
+        // mid-eval relocation (`v` is rooted by rootV).  `size` is stable (lists
+        // are immutable), so snapshot it once.  `el` is held across the recursive
+        // call AND inspected after it (isList/asList at the separator check) →
+        // root it so it can't dangle if the recursion moves the cell.
+        const uint32_t n = v.asList()->size;
+        for (uint32_t i = 0; i < n; ++i) {
+            Value el = forceValue(*state.vm, v.asList()->elems[i]);
+            GcRoot rootEl(el);
             out += toStringCoerceCtx(state, el, ctx, copyPathsToStore);
-            if (i + 1 < lv->size) {
+            if (i + 1 < n) {
                 bool elIsEmptyList = el.isList()
                     && (!el.asList() || el.asList()->size == 0);
                 if (!elIsEmptyList) out += ' ';
@@ -1052,17 +1068,24 @@ static std::string toStringCoerceCtx(EvalState & state, Value v,
             // recursively coerce the result.  Only fires for callable
             // shapes; non-callable falls through to outPath.
             if (auto * tsRaw = v.asAttrs()->lookup(sToString)) {
+                // Rule 1: root each Value held across callClosure / forceValue /
+                // recursion (tsFn across callClosure; res across forceValue;
+                // forced across the recursive coerce).  `v` is rootV-rooted.
                 Value tsFn = forceValue(*state.vm, *tsRaw);
+                GcRoot rootTsFn(tsFn);
                 if (tsFn.isClosure() || tsFn.isPrimOp()
                     || tsFn.tag() == Tag::PrimOpApp) {
                     Value res = callClosure(*state.vm, tsFn, v);
+                    GcRoot rootRes(res);
                     Value forced = forceValue(*state.vm, res);
+                    GcRoot rootForced(forced);
                     return toStringCoerceCtx(state, forced, ctx, copyPathsToStore);
                 }
                 // non-callable: fall through to outPath
             }
             if (auto * outV = v.asAttrs()->lookup(sOutPath)) {
                 Value forced = forceValue(*state.vm, *outV);
+                GcRoot rootForced(forced);
                 return toStringCoerceCtx(state, forced, ctx, copyPathsToStore);
             }
             // #760 (2026-05-22): match TW's `EvalState::coerceToString`
