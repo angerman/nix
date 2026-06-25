@@ -45,6 +45,23 @@ struct TagCountVisitor : RootVisitor
     void visitSlot     (Value     * &) override { ++slots; }
 };
 
+// S1.1: a RELOCATING visitor — models a moving GC that relocates each pointee,
+// rewriting the field to the cell's new address.  Used to prove GcRoot is
+// relocation-AWARE: walkCppStackRoots → RootVisitor::visitValue (read p →
+// visitX(&p) → writeback via mkX) rewrites the rooted C++ local's Value IN
+// PLACE, so a primop local that survives a mid-eval safepoint follows the moved
+// cell instead of dangling.  Sentinels are distinct per type to catch dispatch
+// mix-ups.
+struct RelocatingVisitor : RootVisitor
+{
+    void visitClosure  (Closure   * & p) override { p = reinterpret_cast<Closure   *>(0xC0FFEE00); }
+    void visitThunk    (Thunk     * & p) override { p = reinterpret_cast<Thunk     *>(0xC0FFEE10); }
+    void visitBindings (Bindings  * & p) override { p = reinterpret_cast<Bindings  *>(0xC0FFEE20); }
+    void visitList     (ListVec   * & p) override { p = reinterpret_cast<ListVec   *>(0xC0FFEE30); }
+    void visitPair     (ValuePair * & p) override { p = reinterpret_cast<ValuePair *>(0xC0FFEE40); }
+    void visitSlot     (Value     * & p) override { (void)p; }
+};
+
 int failures = 0;
 
 #define ASSERT_EQ(actual, expected, label) do { \
@@ -144,6 +161,31 @@ void testNullSlot()
     ASSERT_EQ(total, 0, "walkCppStackRoots null entry not dispatched");
 }
 
+void testRelocationRewrite()
+{
+    // S1.1 relocation-awareness: a GcRoot'd Value whose pointee is "relocated"
+    // by a moving visitor must have its pointer REWRITTEN in place.  This is the
+    // property the safepoint foundation relies on — a primop's GcRoot'd local
+    // following a mid-eval compaction instead of dangling.
+    Value vB; vB.mkAttrs  (reinterpret_cast<Bindings *>(0x5678));
+    Value vC; vC.mkClosure(reinterpret_cast<Closure  *>(0x1234));
+    Value vL; vL.mkList   (reinterpret_cast<ListVec  *>(0x9abc));
+    Value vI; vI.mkInt(99);  // scalar — must be UNTOUCHED by relocation
+    Value vU; vU.mkAttrs(reinterpret_cast<Bindings *>(0xDEAD));  // NOT rooted (- contrast)
+    {
+        GcRoot rB(vB), rC(vC), rL(vL), rI(vI);  // vU deliberately NOT GcRoot'd
+        RelocatingVisitor rv;
+        walkCppStackRoots(rv);
+    }
+    // + : rooted pointers followed the relocation.
+    ASSERT_EQ((long long)(uintptr_t)vB.asAttrs(),   (long long)0xC0FFEE20, "GcRoot Bindings rewritten on relocation");
+    ASSERT_EQ((long long)(uintptr_t)vC.asClosure(), (long long)0xC0FFEE00, "GcRoot Closure rewritten on relocation");
+    ASSERT_EQ((long long)(uintptr_t)vL.asList(),    (long long)0xC0FFEE30, "GcRoot List rewritten on relocation");
+    ASSERT_EQ((long long)vI.asInt(),                (long long)99,         "GcRoot scalar untouched by relocation");
+    // - : an un-rooted Value is NOT in gcRootStack → never visited → unchanged.
+    ASSERT_EQ((long long)(uintptr_t)vU.asAttrs(),   (long long)0xDEAD,     "un-rooted Value NOT rewritten (contrast)");
+}
+
 } // anon ns
 
 int main()
@@ -153,6 +195,7 @@ int main()
     testLifo();
     testWalkDispatch();
     testNullSlot();
+    testRelocationRewrite();
 
     if (failures > 0) {
         std::fprintf(stderr, "gc-root-handles: %d FAILURE%s\n",
