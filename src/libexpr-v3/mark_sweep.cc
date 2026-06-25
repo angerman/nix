@@ -53,6 +53,7 @@
 #include <cstdint>
 #include <cstring>
 #include <csetjmp>
+#include <execinfo.h>  // S1.2 PIN-FRAMES: backtrace at the mid-eval safepoint
 #include <pthread.h>
 #include <unordered_map>
 #include <unordered_set>
@@ -424,6 +425,18 @@ public:
             if (arenaSetForSlot_) {
                 const char * cellStart =
                     arenaSetForSlot_->findContainingCellStart(p);
+                // S1.2 PROVENANCE: attribute this conservative-only pin to its
+                // cell type (one nibble read; reuses the cellStart the line-mark
+                // already resolves).  Precise marking finishes BEFORE the
+                // conservative C-stack scan, so every tryMark success here is a
+                // cell the precise root graph did NOT reach = a genuine direct
+                // C-stack ROOT pin.  Gated on NIX_VM_STATS (read once) so
+                // production pays nothing; only accrues when it will be reported.
+                static const bool s_prov = std::getenv("NIX_VM_STATS") != nullptr;
+                if (__builtin_expect(s_prov, 0) && cellStart) {
+                    auto ct = static_cast<uint8_t>(arenaSetForSlot_->cellTypeAt(cellStart));
+                    if (ct < 9) ++statsConservByType_[ct];
+                }
                 if (cellStart) {
                     const char * cellEnd =
                         arenaSetForSlot_->findNextCellStartOrBlockEnd(cellStart);
@@ -530,6 +543,8 @@ public:
     size_t statsChars()    const noexcept { return statsChars_; }
     size_t statsConservative()      const noexcept { return statsConservative_; }
     size_t statsConservativeWalks() const noexcept { return statsConservativeWalks_; }
+    /// S1.2 PROVENANCE: per-CellType count of conservative-only pins (0-8).
+    const size_t * statsConservByType() const noexcept { return statsConservByType_; }
 
 private:
     BitmapMarker & marker_;
@@ -548,6 +563,18 @@ private:
     size_t statsChars_    = 0;
     size_t statsConservative_      = 0;
     size_t statsConservativeWalks_ = 0;
+    // S1.2 PROVENANCE (NON_JIT_LEVER / safepoint-foundation): per-CellType
+    // breakdown of the cells the conservative scan marks as NEW (tryMark
+    // success).  Since precise marking finishes BEFORE the conservative C-stack
+    // scan runs (runMajorMarkSweep captures preciseMarkedCells first), every
+    // tryMark success here is a cell the precise root graph did NOT reach — i.e.
+    // a genuine conservative-ONLY pin.  Indexed by CellType (0-8).  Read-only
+    // diagnostic (reported under NIX_VM_STATS); zero hot-path cost beyond the
+    // increment.  Tells us WHICH cell type dominates firefox's 12.5% pinned set
+    // → which construction/eval/FFI paths to migrate to precise handles next
+    // (guessing the targets from a static census kept missing — args[], list
+    // primops both measured-unchanged).
+    size_t statsConservByType_[9] = {0,0,0,0,0,0,0,0,0};
     std::vector<void *> conservativeRoots_;
     Arena * arenaSetForSlot_ = nullptr;
     bool typedInteriorOwners_ = false;  // Lever 3: mark-only typed walk
@@ -2103,6 +2130,31 @@ MajorGcResult runMajorMarkSweep(VMState & vm) noexcept
     {
         char anchor;
         const void * sp = &anchor;
+        // S1.2 PIN-FRAME ATTRIBUTION (NIX_V3_PIN_FRAMES): at a mid-eval safepoint
+        // the C-stack literally CONTAINS the suspended re-entrant primop frames
+        // whose C-locals are about to be conservatively pinned.  Symbolize the
+        // call chain here (once per sweep, capped) so the conserv-provenance
+        // TYPE breakdown gains FRAME provenance — names the exact primops whose
+        // Value/string/Bindings locals must migrate to GcRoot.  Confirms the
+        // migration target BEFORE the work (args[]+list-primops were both
+        // measured-unchanged from a static census → frames remove the guessing).
+        // Gated; one-shot read; capped at 8 dumps to bound stderr.
+        static const bool s_pinFrames = std::getenv("NIX_V3_PIN_FRAMES") != nullptr;
+        if (__builtin_expect(s_pinFrames, 0)) {
+            static int s_dumps = 0;
+            if (s_dumps++ < 8) {
+                void * fr[64];
+                int n = ::backtrace(fr, 64);
+                char ** syms = ::backtrace_symbols(fr, n);
+                std::fprintf(stderr, "[pin-frames] sweep#%d C-stack at safepoint (%d frames):\n",
+                             s_dumps, n);
+                // Skip the top GC frames (this fn + caller); print the chain so
+                // primNNN / *Strict / merge* / mapAttrs frames are visible.
+                for (int i = 0; i < n; ++i)
+                    if (syms && syms[i]) std::fprintf(stderr, "[pin-frames]   #%02d %s\n", i, syms[i]);
+                if (syms) ::free(syms);
+            }
+        }
         walkCStackConservative(visitor, arena, sp);
     }
 
@@ -2380,6 +2432,20 @@ MajorGcResult runMajorMarkSweep(VMState & vm) noexcept
                 ? 100.0 * double(conservativeOnlyCells)
                           / double(preciseMarkedCells + conservativeOnlyCells)
                 : 0.0);
+        // S1.2 PROVENANCE: per-CellType breakdown of the conservative-ONLY pins
+        // (cells the C-stack scan marked NEW, after the precise mark).  This is
+        // the actionable signal: the dominant type names the construction/eval/
+        // FFI path whose C++-local Values must be migrated to precise handles
+        // (GcRoot/…) next.  args[] + the 6 list-fold primops both measured
+        // firefox-unchanged at 12.5% → this localizes the ACTUAL sources instead
+        // of guessing from a static census.
+        {
+            const size_t * c = visitor.statsConservByType();
+            std::fprintf(stderr,
+                "v3 conserv-provenance: None=%zu Value=%zu Closure=%zu Thunk=%zu "
+                "Bindings=%zu List=%zu Pair=%zu Env=%zu Chars=%zu\n",
+                c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7], c[8]);
+        }
         // R2.1′: live-cell tally by stamped CellType — validates the
         // per-cell type metadata + shows the typed (movable) fraction.
         {
