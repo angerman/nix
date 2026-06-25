@@ -25,6 +25,7 @@
 #include "v3/import_timing.hh"  // #769 per-import phase timing
 #include "v3/dedup_survey.hh"   // #772 Stage 9 L0 spike
 #include "v3/barrier.hh"  // Phase D write-barrier helpers
+#include "v3/gc_root.hh"  // S1.2 GcRoot/GcRootRange — precise re-entrant roots
 // PARSER_PROJECT_PLAN §5.3: native parse + lower for the import path,
 // behind NIX_V3_NATIVE_PARSER=1 (+ NIX_V3_NATIVE_LOWER=1), with a
 // per-file canLowerV3 fallback to the proven bridge / TW path.
@@ -1627,25 +1628,33 @@ void primFoldl(EvalState & state, Value * args, Value & out)
     if (!args[2].isList()) typeError("foldl'", "list");
     Value op = args[0];
     Value acc = args[1];
-    auto * src = args[2].asList();
-    if (src) {
-        for (uint32_t i = 0; i < src->size; ++i) {
-            // Apply `op acc elem`.  T1: callClosure2 enters the arity-2
-            // `op` body once with both args in slots, eliminating the
-            // throwaway curry-PAP ValuePair (per-element) that the curried
-            // callClosure(callClosure(op,acc),elem) allocated.  Falls back
-            // to the curried form byte-identically for any other op shape.
-            // The final `acc` IS forced each iteration since foldl' is
-            // strict in the accumulator -- callers expect the seq behaviour
-            // and a Tag::Thunk acc would defer subsequent op-calls' force
-            // into the next iteration's first action.  Match TW's
-            // `forceValue(*vAcc)` in primops.cc primFoldl'.
-            acc = callClosure2(*state.vm, op, acc, src->elems[i]);
-            if (__builtin_expect(acc.tag() == Tag::Thunk
-                                 || acc.isAppLike()
-                                 || acc.tag() == Tag::Slot, 0))
-                acc = forceValue(*state.vm, acc);
-        }
+    // S1.2 precise re-entrant roots: op / acc / the list Value are all live
+    // ACROSS callClosure2 (which re-enters the VM and may trigger a mid-eval
+    // relocation).  GcRoot makes them precise + rewritable in place, so once the
+    // conservative C-stack scan is removed they follow the move instead of
+    // dangling.  The list (args[2]) is rooted too and RE-READ each iteration —
+    // the old cached raw `src = asList()` would dangle after a relocation; with
+    // args[2] rooted, asList() re-yields the current pointer (size is stable
+    // across a relocation, so cache it once).
+    GcRoot rOp(op), rAcc(acc), rList(args[2]);
+    auto * src0 = args[2].asList();
+    const uint32_t sz = src0 ? src0->size : 0;
+    for (uint32_t i = 0; i < sz; ++i) {
+        // Apply `op acc elem`.  T1: callClosure2 enters the arity-2
+        // `op` body once with both args in slots, eliminating the
+        // throwaway curry-PAP ValuePair (per-element) that the curried
+        // callClosure(callClosure(op,acc),elem) allocated.  Falls back
+        // to the curried form byte-identically for any other op shape.
+        // The final `acc` IS forced each iteration since foldl' is
+        // strict in the accumulator -- callers expect the seq behaviour
+        // and a Tag::Thunk acc would defer subsequent op-calls' force
+        // into the next iteration's first action.  Match TW's
+        // `forceValue(*vAcc)` in primops.cc primFoldl'.
+        acc = callClosure2(*state.vm, op, acc, args[2].asList()->elems[i]);
+        if (__builtin_expect(acc.tag() == Tag::Thunk
+                             || acc.isAppLike()
+                             || acc.tag() == Tag::Slot, 0))
+            acc = forceValue(*state.vm, acc);
     }
     out = acc;
 }
