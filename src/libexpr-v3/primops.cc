@@ -4119,29 +4119,35 @@ void primParseDrvName(EvalState & state, Value * args, Value & out)
 void primGroupBy(EvalState & state, Value * args, Value & out)
 {
     if (!args[1].isList()) typeError("groupBy", "list");
-    auto * src = args[1].asList();
+    auto * src0 = args[1].asList();
     Value keyFn = args[0];
-    std::unordered_map<std::string, std::vector<Value>> groups;
-    if (src) {
-        for (uint32_t i = 0; i < src->size; ++i) {
-            Value k = callClosure(*state.vm, keyFn, src->elems[i]);
-            // Bytecode-closure key fn can return Tag::Thunk wrapping a
-            // string (see genericClosure rationale at #624) — force to
-            // WHNF before the shape check.
-            if (__builtin_expect(k.tag() == Tag::Thunk
-                                 || k.isAppLike()
-                                 || k.tag() == Tag::Slot, 0))
-                k = forceValue(*state.vm, k);
-            if (!k.isString()) typeError("groupBy", "key fn returning string");
-            groups[std::string(k.asString())].push_back(src->elems[i]);
-        }
+    // S1.2 (template Rule 1 + Rule 4 SELECT-style): keyFn + the source list are
+    // live across the re-entrant callClosure → GcRoot.  Buckets hold SOURCE
+    // elements, so accumulate INDICES (no relocation hazard) not Value copies; the
+    // key is converted to std::string immediately (consumed in-iteration → Rule 3,
+    // no held root).  Rebuild each bucket from the rooted source by re-read.
+    GcRoot rKey(keyFn), rList(args[1]);
+    std::unordered_map<std::string, std::vector<uint32_t>> groups;
+    const uint32_t sz = src0 ? src0->size : 0;
+    for (uint32_t i = 0; i < sz; ++i) {
+        Value k = callClosure(*state.vm, keyFn, args[1].asList()->elems[i]);
+        // Bytecode-closure key fn can return Tag::Thunk wrapping a
+        // string (see genericClosure rationale at #624) — force to
+        // WHNF before the shape check.
+        if (__builtin_expect(k.tag() == Tag::Thunk
+                             || k.isAppLike()
+                             || k.tag() == Tag::Slot, 0))
+            k = forceValue(*state.vm, k);
+        if (!k.isString()) typeError("groupBy", "key fn returning string");
+        groups[std::string(k.asString())].push_back(i);
     }
     std::vector<std::pair<SymbolId, Value>> entries;
     entries.reserve(groups.size());
-    for (auto & [name, items] : groups) {
-        ListVec * lv = Alloc::allocList(static_cast<uint32_t>(items.size()));
+    auto * src = args[1].asList();  // re-read once (allocList/vmIntern below don't re-enter eval)
+    for (auto & [name, idxs] : groups) {
+        ListVec * lv = Alloc::allocList(static_cast<uint32_t>(idxs.size()));
         V3_STATS_INC(listsAllocated);
-        for (size_t i = 0; i < items.size(); ++i) lv->elems[i] = items[i];
+        for (size_t i = 0; i < idxs.size(); ++i) lv->elems[i] = src->elems[idxs[i]];
         listPostConstructBarrier(lv);  // Phase D coverage (primGroupBy; PhD-6) — lazy src elems
         Value lstV;
         lstV.mkList(lv);
