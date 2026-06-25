@@ -114,6 +114,27 @@ public:
     GcRoot & operator=(GcRoot &&) = delete;
 };
 
+/// S1.2: root a CONTIGUOUS range of Values [data, data+n).  The canonical use is
+/// a primop's C++-local `Value args[]` array — popped off the value-stack into a
+/// stack copy (vm.cc OP_CALL_PRIMOP), so NOT otherwise a precise root — held
+/// across a re-entrant callClosure/forceValue.  Each slot is walked AND rewritten
+/// in place by walkCppStackRoots exactly like GcRoot, so the args follow a
+/// mid-eval relocation instead of dangling once the conservative C-stack scan is
+/// removed.  RAII: pushes n entries on construct, pops n on destruct (LIFO).
+/// Non-copyable/movable.
+class GcRootRange
+{
+    size_t n_;
+public:
+    GcRootRange(Value * data, size_t n) noexcept;
+    ~GcRootRange() noexcept;
+
+    GcRootRange(const GcRootRange &) = delete;
+    GcRootRange & operator=(const GcRootRange &) = delete;
+    GcRootRange(GcRootRange &&) = delete;
+    GcRootRange & operator=(GcRootRange &&) = delete;
+};
+
 /// Convenience: register the given Value-typed local for GC root
 /// scanning until the enclosing scope exits.  Uses `__COUNTER__` to
 /// allow multiple V3_GC_ROOT(...) calls in the same scope without

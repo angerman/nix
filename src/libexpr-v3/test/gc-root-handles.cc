@@ -186,6 +186,29 @@ void testRelocationRewrite()
     ASSERT_EQ((long long)(uintptr_t)vU.asAttrs(),   (long long)0xDEAD,     "un-rooted Value NOT rewritten (contrast)");
 }
 
+void testRangeRelocation()
+{
+    // S1.2: GcRootRange roots a contiguous Value[] (the primop args[] case).
+    // Registers n entries; a relocating visitor rewrites EVERY element in place;
+    // pops n on dtor.
+    Value args[4];
+    args[0].mkAttrs  (reinterpret_cast<Bindings *>(0x1000));
+    args[1].mkClosure(reinterpret_cast<Closure  *>(0x2000));
+    args[2].mkInt(7);  // scalar — untouched
+    args[3].mkList   (reinterpret_cast<ListVec  *>(0x3000));
+    {
+        GcRootRange rr(args, 4);
+        ASSERT_EQ(gcRootStack().size(), 4u, "GcRootRange registers n entries");
+        RelocatingVisitor rv;
+        walkCppStackRoots(rv);
+    }
+    ASSERT_EQ(gcRootStack().size(), 0u, "GcRootRange pops n on dtor");
+    ASSERT_EQ((long long)(uintptr_t)args[0].asAttrs(),   (long long)0xC0FFEE20, "range[0] Bindings rewritten");
+    ASSERT_EQ((long long)(uintptr_t)args[1].asClosure(), (long long)0xC0FFEE00, "range[1] Closure rewritten");
+    ASSERT_EQ((long long)args[2].asInt(),                (long long)7,          "range[2] scalar untouched");
+    ASSERT_EQ((long long)(uintptr_t)args[3].asList(),    (long long)0xC0FFEE30, "range[3] List rewritten");
+}
+
 } // anon ns
 
 int main()
@@ -196,6 +219,7 @@ int main()
     testWalkDispatch();
     testNullSlot();
     testRelocationRewrite();
+    testRangeRelocation();
 
     if (failures > 0) {
         std::fprintf(stderr, "gc-root-handles: %d FAILURE%s\n",

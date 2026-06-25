@@ -40,6 +40,22 @@ GcRoot::GcRoot(Value * p) noexcept
     gcRootStack().push_back(p);
 }
 
+GcRootRange::GcRootRange(Value * data, size_t n) noexcept
+    : n_(data ? n : 0)
+{
+    auto & s = gcRootStack();
+    s.reserve(s.size() + n_);
+    for (size_t i = 0; i < n_; ++i) s.push_back(&data[i]);
+}
+
+GcRootRange::~GcRootRange() noexcept
+{
+    // LIFO: pop exactly the n_ entries we pushed (defensive against an empty
+    // stack, mirroring GcRoot::~GcRoot).
+    auto & s = gcRootStack();
+    for (size_t i = 0; i < n_ && !s.empty(); ++i) s.pop_back();
+}
+
 GcRoot::~GcRoot() noexcept
 {
     // LIFO discipline: we always pop the top.  Mismatched ordering
