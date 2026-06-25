@@ -135,6 +135,25 @@ public:
     GcRootRange & operator=(GcRootRange &&) = delete;
 };
 
+/// S1.2 Rule-4 (compute-style): root a GROWING `std::vector<Value>` accumulator whose
+/// elements are COMPUTED (not source indices — so the cheap index trick used by
+/// filter/partition doesn't apply, e.g. concatMap/groupBy) and held across re-entrant
+/// callbacks.  Unlike GcRootRange (fixed data+n at construct), this registers the VECTOR
+/// OBJECT; walkCppStackRoots reads its CURRENT data()/size() each GC, so it is
+/// REALLOC-SAFE (push_back may move the buffer) and covers elements added after
+/// construction.  Each element is walked + rewritten in place.  RAII register/unregister.
+class GcRootVec
+{
+public:
+    explicit GcRootVec(std::vector<Value> & v) noexcept;
+    ~GcRootVec() noexcept;
+
+    GcRootVec(const GcRootVec &) = delete;
+    GcRootVec & operator=(const GcRootVec &) = delete;
+    GcRootVec(GcRootVec &&) = delete;
+    GcRootVec & operator=(GcRootVec &&) = delete;
+};
+
 /// Convenience: register the given Value-typed local for GC root
 /// scanning until the enclosing scope exits.  Uses `__COUNTER__` to
 /// allow multiple V3_GC_ROOT(...) calls in the same scope without

@@ -24,6 +24,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
 namespace {
 
@@ -209,6 +210,29 @@ void testRangeRelocation()
     ASSERT_EQ((long long)(uintptr_t)args[3].asList(),    (long long)0xC0FFEE30, "range[3] List rewritten");
 }
 
+void testRootVecRelocation()
+{
+    // S1.2 GcRootVec (compute-style Rule 4): a GROWING Value vector's CURRENT
+    // elements are walked + rewritten in place, REALLOC-SAFE.  Grow well past the
+    // initial capacity (forcing reallocation), then a relocating visitor must
+    // rewrite EVERY current element (proving data()/size() are re-read each walk).
+    std::vector<Value> acc;
+    {
+        GcRootVec rv(acc);
+        for (int i = 0; i < 64; ++i) {  // forces several reallocations
+            Value v; v.mkAttrs(reinterpret_cast<Bindings *>(0x1000 + i * 16));
+            acc.push_back(v);
+        }
+        RelocatingVisitor rrv;
+        walkCppStackRoots(rrv);
+    }
+    ASSERT_EQ((long long)acc.size(), (long long)64, "GcRootVec size preserved");
+    int rewritten = 0;
+    for (auto & e : acc)
+        if ((uintptr_t)e.asAttrs() == 0xC0FFEE20) ++rewritten;
+    ASSERT_EQ((long long)rewritten, (long long)64, "GcRootVec rewrote ALL current elements (realloc-safe)");
+}
+
 } // anon ns
 
 int main()
@@ -220,6 +244,7 @@ int main()
     testNullSlot();
     testRelocationRewrite();
     testRangeRelocation();
+    testRootVecRelocation();
 
     if (failures > 0) {
         std::fprintf(stderr, "gc-root-handles: %d FAILURE%s\n",

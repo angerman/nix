@@ -1897,12 +1897,22 @@ void primConcatMap(EvalState & state, Value * args, Value & out)
     if (lst.isAppLike() || lst.tag() == Tag::Thunk || lst.tag() == Tag::Slot)
         lst = forceValue(*state.vm, lst);
     if (!lst.isList()) typeError("concatMap", "list");
-    auto * src = lst.asList();
+    auto * src0 = lst.asList();
     Value fn = args[0];
+    // S1.2 (template Rule 1 + Rule 4 COMPUTE-style): fn + the list are live across
+    // the re-entrant callClosure → GcRoot.  `all` accumulates elements of the
+    // COMPUTED sub-lists (not source indices, so the filter/partition index trick
+    // doesn't apply) and is held across subsequent callbacks → GcRootVec roots its
+    // CURRENT contents each GC (realloc-safe).  Re-read the source list each
+    // iteration (Rule 2).  The inner copy of `r`'s elements has no callback, so `r`
+    // is stable within it and dead after (its elements live on in the rooted `all`).
+    GcRoot rFn(fn), rLst(lst);
     std::vector<Value> all;
-    if (src) {
-        for (uint32_t i = 0; i < src->size; ++i) {
-            Value r = callClosure(*state.vm, fn, src->elems[i]);
+    GcRootVec rAll(all);
+    const uint32_t sz = src0 ? src0->size : 0;
+    {
+        for (uint32_t i = 0; i < sz; ++i) {
+            Value r = callClosure(*state.vm, fn, lst.asList()->elems[i]);
             // Force the callback's return value — it may be a Tag::App
             // (e.g., when fn = (x: map g xs) and v3's lazy map returns
             // a list with App entries, then concatMap of that gets the
@@ -1933,37 +1943,45 @@ void primConcatMap(EvalState & state, Value * args, Value & out)
 void primPartition(EvalState & state, Value * args, Value & out)
 {
     if (!args[1].isList()) typeError("partition", "list");
-    auto * src = args[1].asList();
+    auto * src0 = args[1].asList();
     Value pred = args[0];
-    std::vector<Value> right_, wrong_;
-    if (src) {
-        for (uint32_t i = 0; i < src->size; ++i) {
-            Value r = callClosure(*state.vm, pred, src->elems[i]);
-            // The predicate may return a thunk / app / closure-eval-
-            // pending value — force it to WHNF before the bool check.
-            {
-                Tag rt = r.tag();
-                if (__builtin_expect(rt == Tag::Thunk
-                                     || rt == Tag::App || rt == Tag::App3
-                                     || rt == Tag::Slot, 0))
-                    r = forceValue(*state.vm, r);
-            }
-            if (!r.isBool()) typeError("partition", "predicate returning bool");
-            if (r.asInt() == 1) right_.push_back(src->elems[i]);
-            else                  wrong_.push_back(src->elems[i]);
+    // S1.2 (template Rule 1 + Rule 4-clean select-style, like filter): GcRoot pred
+    // + the source list; accumulate INDICES (no relocation hazard), not Value
+    // copies; rebuild from the rooted source by re-read.  Same elements/order →
+    // byte-identical.
+    GcRoot rPred(pred), rList(args[1]);
+    std::vector<uint32_t> rightIdx, wrongIdx;
+    const uint32_t sz = src0 ? src0->size : 0;
+    for (uint32_t i = 0; i < sz; ++i) {
+        Value r = callClosure(*state.vm, pred, args[1].asList()->elems[i]);
+        // The predicate may return a thunk / app / closure-eval-
+        // pending value — force it to WHNF before the bool check.
+        {
+            Tag rt = r.tag();
+            if (__builtin_expect(rt == Tag::Thunk
+                                 || rt == Tag::App || rt == Tag::App3
+                                 || rt == Tag::Slot, 0))
+                r = forceValue(*state.vm, r);
         }
+        if (!r.isBool()) typeError("partition", "predicate returning bool");
+        if (r.asInt() == 1) rightIdx.push_back(i);
+        else                wrongIdx.push_back(i);
     }
-    auto mkList = [](std::vector<Value> & v) {
-        ListVec * l = Alloc::allocList(static_cast<uint32_t>(v.size()));
+    // Build each result list by re-reading the (rooted) source.  allocList does
+    // not re-enter eval, so no relocation fires between these — the re-read is a
+    // safety re-extract (Rule 2), valid after the loop's last callback.
+    auto mkList = [&](std::vector<uint32_t> & idx) {
+        ListVec * l = Alloc::allocList(static_cast<uint32_t>(idx.size()));
         V3_STATS_INC(listsAllocated);
-        for (size_t i = 0; i < v.size(); ++i) l->elems[i] = v[i];
+        auto * src = args[1].asList();
+        for (size_t i = 0; i < idx.size(); ++i) l->elems[i] = src->elems[idx[i]];
         listPostConstructBarrier(l);  // Phase D coverage (primPartition; PhD-6)
         Value out;
         out.mkList(l);
         return out;
     };
-    Value rightV = mkList(right_);
-    Value wrongV = mkList(wrong_);
+    Value rightV = mkList(rightIdx);
+    Value wrongV = mkList(wrongIdx);
 
     // Intern via the global table so the resulting attrset's SymbolIds
     // match what other CUs and the JSON printer use.

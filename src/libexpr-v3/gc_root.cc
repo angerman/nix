@@ -19,6 +19,14 @@ std::vector<Value *> & gcRootStack() noexcept
     return s;
 }
 
+// S1.2: registry of growing Value-vector accumulators (GcRootVec).  Walked with
+// CURRENT data()/size() each GC → realloc-safe + covers post-construct growth.
+std::vector<std::vector<Value> *> & gcRootVecStack() noexcept
+{
+    thread_local std::vector<std::vector<Value> *> s;
+    return s;
+}
+
 void walkCppStackRoots(RootVisitor & visitor) noexcept
 {
     // Vector iteration is bottom-to-top of the LIFO push history;
@@ -27,6 +35,12 @@ void walkCppStackRoots(RootVisitor & visitor) noexcept
     // each visitor.visitValue() call rewrites in place.
     for (Value * p : gcRootStack()) {
         if (p) visitor.visitValue(*p);
+    }
+    // GcRootVec: re-read each registered vector's CURRENT elements (data()/size()
+    // at THIS instant — realloc-safe) and rewrite them in place.
+    for (std::vector<Value> * v : gcRootVecStack()) {
+        if (!v) continue;
+        for (Value & e : *v) visitor.visitValue(e);
     }
 }
 
@@ -54,6 +68,17 @@ GcRootRange::~GcRootRange() noexcept
     // stack, mirroring GcRoot::~GcRoot).
     auto & s = gcRootStack();
     for (size_t i = 0; i < n_ && !s.empty(); ++i) s.pop_back();
+}
+
+GcRootVec::GcRootVec(std::vector<Value> & v) noexcept
+{
+    gcRootVecStack().push_back(&v);
+}
+
+GcRootVec::~GcRootVec() noexcept
+{
+    auto & s = gcRootVecStack();
+    if (!s.empty()) s.pop_back();
 }
 
 GcRoot::~GcRoot() noexcept
