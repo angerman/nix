@@ -1188,6 +1188,7 @@ public:
 
     std::unordered_map<void *, void *> forward;
     size_t movedCells = 0, movedBytes = 0, pinnedCells = 0;
+    size_t blackholeThunksSeen_ = 0;  // S2.1b: in-force thunks met as evac candidates
 
     /// O(log candidates) — sorted [start,end) ranges.
     bool inCandidate(const void * p) const noexcept
@@ -1453,12 +1454,18 @@ private:
         // (bounded by live C-stack force depth) so pinning them costs negligible
         // compaction.  Pin like an unmovable type (verify marks the block).
         // Opt-out NIX_V3_EVAC_MOVE_BLACKHOLE=1 to A/B-confirm this is the fix.
-        if (ty == CellType::Thunk) {
+        if (ty == CellType::Thunk
+            && static_cast<Thunk *>(owner)->state == ThunkState::Blackhole) {
+            // S2.1b RELEVANCE COUNTER: count in-force (blackholed) thunks the evac
+            // encounters as candidates — the population this fix acts on.  >0 ⇒ the
+            // moving evac DOES meet mid-force thunks (the fix addresses a REAL event
+            // even when the downstream corruption is nondeterministic/non-reproducing);
+            // ==0 ⇒ the fix is a no-op and the Blackhole leak is elsewhere.  Reported
+            // under NIX_VM_STATS (v3 evac: ... bhThunks=N).
+            ++blackholeThunksSeen_;
             static const bool s_moveBlackhole =
                 std::getenv("NIX_V3_EVAC_MOVE_BLACKHOLE") != nullptr;
-            if (!s_moveBlackhole
-                && static_cast<Thunk *>(owner)->state == ThunkState::Blackhole)
-                return nullptr;
+            if (!s_moveBlackhole) return nullptr;  // pin: never relocate mid-force
         }
         const size_t sz = evacCellSize(owner, ty);
         if (sz == 0) return nullptr;
@@ -2094,12 +2101,13 @@ static void runEvacuation(VMState & vm, Arena & arena,
 
     std::fprintf(stderr,
         "v3 evac: candidates=%zu pins=%zu pinnedBlocks=%zu consClosureBlocks=%zu "
-        "movedCells=%zu movedBytes=%.1fMB blocksFreed=%zu freedRSS=%.1fMB "
+        "movedCells=%zu movedBytes=%.1fMB blocksFreed=%zu freedRSS=%.1fMB bhThunks=%zu "
         "[move=%.0fms verify=%.0fms munmap=%.0fms]\n",
         cands.size(), pins.size(), pinnedByCStack, pinnedByConsClosure,
         ev.movedCells,
         double(ev.movedBytes) / 1e6, freedBlocks,
         double(freedBlocks) * double(Arena::kBlockSize) / 1e6,
+        ev.blackholeThunksSeen_,
         ms(tc0, tc1), ms(tc1, tc2), ms(tc2, tc3));
 }
 

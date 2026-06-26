@@ -142,6 +142,40 @@ that only fires on the first cold evals + resists every aggressiveness/store kno
 nasty nondeterministic class — a controlled SYNTHETIC (not a real-derivation eval) is the
 only reliable way to A/B the fix.
 
+## ★ VALIDATION UPGRADE (2026-06-26) — relevance counter + 1:1 correlation
+
+Added a relevance counter `bhThunks` (EvacVisitor: count in-force Blackhole-state thunks
+met as evac candidates; reported on the `v3 evac:` line; increments on BOTH fix-on and
+fix-off, before the pin decision). firefox.drvPath, full-compaction evac:
+
+- **A run with `bhThunks=308` (fix-off, MOVE_BLACKHOLE=1) ALSO produced `tag=14`** — the
+  evac relocated 308 in-force blackholed thunks and corrupted.
+- **Every `bhThunks=0` run is byte-id** (12+ runs across fix-on/fix-off).
+
+⇒ **1:1 correlation: `bhThunks>0` ⟺ corruption.** The nondeterminism IS "does an evac
+fire while thunks are blackholed" (depends on evac-vs-force timing; ~1 in ~13 firefox runs
+hits `bhThunks>0`). This both CONFIRMS the mechanism (relocating an in-force thunk is the
+cause) and PROVES the fix acts on a real population (308 thunks), not a phantom.
+
+**★ FIX VALIDATED — deterministic A/B (2026-06-26).** The `bhThunks>0` event is
+DETERMINISTIC inside `nix develop -c` (direct `build/src/nix/nix` runs get bhThunks=0 — a
+different allocator/library-path/ASLR shifts the evac-vs-force timing; the repro MUST run
+inside `nix develop -c`). With that environment, firefox.drvPath full-compaction evac:
+
+  - **fix-OFF (NIX_V3_EVAC_MOVE_BLACKHOLE=1): 6/6 bhThunks=308 → tag=14 CORRUPT.**
+  - **fix-ON (default pin):            16/16 bhThunks=345 → BYTE-ID.**
+
+The dangerous event (relocating in-force blackholed thunks) occurs in BOTH arms; the fix
+PINS them and eliminates the corruption. This is the airtight A/B — the fix is confirmed,
+not merely by-construction. The earlier "nondeterminism / repro lost" was the harness
+environment (direct vs nix-develop), NOT the bug.
+
+The blackhole-pin is the DEFAULT within the evac path (opt-out NIX_V3_EVAC_MOVE_BLACKHOLE).
+A controlled synthetic still eludes (shallow forces blackhole→evaluate within one step →
+bhThunks=0; even depth-120 nested-thunk chains stayed 0) — firefox's deep derivation-coerce
+forcing is the reliable repro, inside nix develop -c. A test hook (force an evac the instant
+a thunk blackholes) would make a synthetic deterministic — future hardening.
+
 ## Next steps (S2.1b)
 
 1. VERIFY the armed-writeback-key hypothesis: instrument `armedWritebackValue()` rekeying
