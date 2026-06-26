@@ -126,13 +126,21 @@ binary (no fix, no instruments) is now 5/5 byte-id, AND 3/3 even at evac-every-1
 — the A/B cannot distinguish them. The fix targets the VERIFIED mechanism and is sound,
 but "fix makes firefox byte-id" is UNCONFIRMED because the window closed.
 
-**To validate (next):** a DETERMINISTIC repro — either (a) evict firefox's source paths
-from /nix/store to force the cold copyPathToStore path again, or (b) a synthetic that
-forces a thunk whose body does a re-entrant store/IO op (mimicking copyPathToStore) while
-an evac fires mid-force. Then A/B the blackhole-pin. Until then the fix ships gated
-(NIX_V3_EVAC default-off, experimental) as a sound RCA-motivated measure, NOT a validated
-one. LESSON: evac correctness repros that touch copyPathToStore are store-state-sensitive
-— pin the store state (or use a synthetic) before A/B-ing a fix.
+**To validate (next):** a DETERMINISTIC repro — a synthetic that forces a thunk whose
+body re-enters store/IO or allocates heavily (mimicking copyPathToStore) while an evac
+fires mid-force, then A/B the blackhole-pin. Until then the fix ships gated (NIX_V3_EVAC
+default-off, experimental) as a sound RCA-motivated measure, NOT a validated one.
+
+**CORRECTION (store-state hypothesis FALSIFIED, git-note on 17e6f11cb):** the "cold-store
+copyPathToStore" trigger theory did NOT hold — a FRESH relocated store (--store
+/private/tmp/...) with fix-OFF did NOT reproduce (exit=0, byte-id), nor did
+evac-every-1MB, nor 5/5 plain re-runs of the committed no-fix binary. The corruption
+reproduced ~7/7 only on the session's FIRST firefox evals and has not recurred since on
+ANY binary/setting. The trigger is UNIDENTIFIED. The MECHANISM stays verified
+(NO_BLACKHOLE_AS_VALUE flip); only the e2e repro is lost. LESSON: an evac-correctness bug
+that only fires on the first cold evals + resists every aggressiveness/store knob is a
+nasty nondeterministic class — a controlled SYNTHETIC (not a real-derivation eval) is the
+only reliable way to A/B the fix.
 
 ## Next steps (S2.1b)
 
