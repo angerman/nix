@@ -41,23 +41,37 @@ low-live trough** (opportunistic trigger). Both clear 80 MB.
    BiBOP strongly positive at small/medium scale too** — but that's a larger allocator
    change (the 16 MB block size + side-table sizing is baked in).
 
-## M5 — NOT measured (IFD wall locally)
+## M5 (cardano-node.name) — measured on darwin-4 (the decisive big-arena workload)
 
-M5 (cardano-node.name) aborts on a missing IFD path locally (cardano-node-plan-to-nix-pkgs)
-— it needs darwin-4 where the IFDs are built. The partial pre-abort projection (arena
-≤151 MB) is unrepresentative. **M5's full ~3 GB arena would make the 16 MB-block rounding
-negligible → almost certainly a strong GO**, but this MUST be confirmed on darwin-4 to
-complete B0.3.
+```
+arena=537MB  live=299MB | mixed-perfect 302MB(+235) | LANES 352MB(+185) | seg-overhead +50
+arena=805MB  live=420MB | mixed-perfect 436MB(+369) | LANES 453MB(+352) | seg-overhead +17
+arena=1208MB live=580MB | mixed-perfect 587MB(+621) | LANES 621MB(+587) | seg-overhead +34  ← peak sweep
+```
 
-## Decision
+**M5 is a STRONG GO: LANES reclaim = 587 MB at the peak sweep, with seg-overhead only
++34 MB (negligible).** Exactly as predicted — at M5's large arena the fixed per-lane
+16 MB-block rounding is a rounding error vs the 587 MB reclaim. (The captured arena tops
+out at 1208 MB here; the full M5 RSS is ~3 GB, so the absolute reclaim is likely larger
+still — but ~587 MB of arena is already a major RSS cut on the workload where RSS matters
+most. Note the reclaim is ARENA-only; M5's ~1.2 GB non-arena RSS — Boehm/ImportCache/
+SQLite — is untouched.)
 
-firefox clears the pre-committed bar (84-168 MB ≥ 80 MB) under perfect-recycling, and M5
-is expected stronger — so the projection is a **GO, but a MARGINAL/caveated one**: the
-realizable win shrinks under imperfect recycling, and the 16 MB-block rounding caps the
-small-workload benefit at ~half theoretical. Recommended before the multi-week B1+ build:
-(a) confirm M5 on darwin-4 (expected strong), and (b) decide the lane block size (keep
-16 MB = simpler but small-workload-marginal; or 1-2 MB lane blocks = bigger change but
-strongly positive everywhere). This is a genuine cost/scope call for the user.
+## DECISION — GO (complete)
+
+- **M5: strong GO** (587 MB reclaim, overhead negligible) — the big-arena workloads where
+  RSS matters are exactly where BiBOP-with-16MB-blocks shines.
+- **firefox: marginal pass** (84-168 MB; +84 MB rounding overhead halves the win at small
+  arena scale).
+
+⇒ **Build B1+ with the existing 16 MB blocks.** The M5 win justifies the multi-week
+allocator build; firefox's marginality is a small-workload artifact of the 16 MB block
+granularity and does NOT gate the decision (the priority RSS workloads are large). The
+1-2 MB lane-block refinement (B1.3-adjacent) stays OPTIONAL — pursue only if small-workload
+RSS later becomes a priority. Caveat carried into B2.4: the projection assumes perfect
+within-lane recycling; the real net-block-free measurement (B2.4) is the true test.
+
+VERDICT: **GO.** Proceed B0.2 (mmap) → B1 (lanes) → B2 (recycling evac) → B3 (darwin-4 ship).
 
 Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>, Input Output Group.
 SPDX-License-Identifier: Apache-2.0
