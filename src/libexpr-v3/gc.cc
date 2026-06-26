@@ -268,7 +268,7 @@ Closure * Scavenger::fwdClosure(Closure * c)
             const size_t bytes = closureAllocatedSize(c);
             void * dst = n.targetSurvivorAlloc(bytes);
             const bool toSurv = (dst != nullptr);
-            if (!dst) dst = threadArena().alloc(bytes);  // S overflow → T
+            if (!dst) dst = threadArena().alloc(bytes, CellType::Closure);  // S overflow → T (B0.1: stamp type)
             std::memcpy(dst, c, bytes);
             forward.emplace(c, dst);
             graylist.push_back({dst, GK_CLOSURE});
@@ -281,7 +281,7 @@ Closure * Scavenger::fwdClosure(Closure * c)
             auto it = forward.find(c);
             if (it != forward.end()) return static_cast<Closure *>(it->second);
             const size_t bytes = closureAllocatedSize(c);
-            void * dst = threadArena().alloc(bytes);
+            void * dst = threadArena().alloc(bytes, CellType::Closure);  // B0.1: stamp type
             std::memcpy(dst, c, bytes);
             forward.emplace(c, dst);
             graylist.push_back({dst, GK_CLOSURE});
@@ -295,7 +295,7 @@ Closure * Scavenger::fwdClosure(Closure * c)
         auto it = forward.find(c);
         if (it != forward.end()) return static_cast<Closure *>(it->second);
         const size_t bytes = closureAllocatedSize(c);
-        void * dst = threadArena().alloc(bytes);
+        void * dst = threadArena().alloc(bytes, CellType::Closure);  // B0.1: stamp type
         std::memcpy(dst, c, bytes);
         forward.emplace(c, dst);
         graylist.push_back({dst, GK_CLOSURE});
@@ -369,7 +369,7 @@ Thunk * Scavenger::fwdThunk(Thunk * t)
             const size_t bytes = computeThunkBytes(t);
             void * dst = n.targetSurvivorAlloc(bytes);
             const bool toSurv = (dst != nullptr);
-            if (!dst) dst = threadArena().alloc(bytes);
+            if (!dst) dst = threadArena().alloc(bytes, CellType::Thunk);  // B0.1: stamp type
             std::memcpy(dst, t, bytes);
             forward.emplace(t, dst);
             graylist.push_back({dst, GK_THUNK});
@@ -382,7 +382,7 @@ Thunk * Scavenger::fwdThunk(Thunk * t)
             auto it = forward.find(t);
             if (it != forward.end()) return static_cast<Thunk *>(it->second);
             const size_t bytes = computeThunkBytes(t);
-            void * dst = threadArena().alloc(bytes);
+            void * dst = threadArena().alloc(bytes, CellType::Thunk);  // B0.1: stamp type
             std::memcpy(dst, t, bytes);
             forward.emplace(t, dst);
             graylist.push_back({dst, GK_THUNK});
@@ -403,7 +403,7 @@ Thunk * Scavenger::fwdThunk(Thunk * t)
         // re-reads `tail[i]` and `suspended.capturedWiths` to
         // rebuild the fakeClo.
         const size_t bytes = computeThunkBytes(t);
-        void * dst = threadArena().alloc(bytes);
+        void * dst = threadArena().alloc(bytes, CellType::Thunk);  // B0.1: stamp type
         std::memcpy(dst, t, bytes);
         forward.emplace(t, dst);
         graylist.push_back({dst, GK_THUNK});
@@ -481,7 +481,7 @@ ListVec * Scavenger::fwdList(ListVec * l)
             const size_t bytes = sizeof(ListVec) + sizeof(Value) * l->size;
             void * dst = n.targetSurvivorAlloc(bytes);
             const bool toSurv = (dst != nullptr);
-            if (!dst) dst = threadArena().alloc(bytes);
+            if (!dst) dst = threadArena().alloc(bytes, CellType::List);  // B0.1: stamp type
             std::memcpy(dst, l, bytes);
             forward.emplace(l, dst);
             graylist.push_back({dst, GK_LIST});
@@ -494,7 +494,7 @@ ListVec * Scavenger::fwdList(ListVec * l)
             auto it = forward.find(l);
             if (it != forward.end()) return static_cast<ListVec *>(it->second);
             const size_t bytes = sizeof(ListVec) + sizeof(Value) * l->size;
-            void * dst = threadArena().alloc(bytes);
+            void * dst = threadArena().alloc(bytes, CellType::List);  // B0.1: stamp type
             std::memcpy(dst, l, bytes);
             forward.emplace(l, dst);
             graylist.push_back({dst, GK_LIST});
@@ -506,7 +506,7 @@ ListVec * Scavenger::fwdList(ListVec * l)
         auto it = forward.find(l);
         if (it != forward.end()) return static_cast<ListVec *>(it->second);
         const size_t bytes = sizeof(ListVec) + sizeof(Value) * l->size;
-        void * dst = threadArena().alloc(bytes);
+        void * dst = threadArena().alloc(bytes, CellType::List);  // B0.1: stamp type
         std::memcpy(dst, l, bytes);
         forward.emplace(l, dst);
         graylist.push_back({dst, GK_LIST});
