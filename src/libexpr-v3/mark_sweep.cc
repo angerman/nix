@@ -935,6 +935,10 @@ struct SweepStats {
     // cluster those deaths into whole sparse blocks → freeable.  If uniform across
     // types, segregation-by-type can't create the density variance compaction needs.
     size_t deadCellTypeHist[9] = {0,0,0,0,0,0,0,0,0};
+    // B0.3 GO/NO-GO: per-CellType LIVE bytes → project the per-type-segregated +
+    // compacted footprint (sum_T ceil(liveBytes_T / kBlockSize) blocks) vs the
+    // current mapped arena.  The reclaim is the realizable BiBOP RSS ceiling.
+    size_t liveBytesByType[9] = {0,0,0,0,0,0,0,0,0};
 
     // R2.4b: per regular-block (start, live-byte fraction).  The
     // evacuator filters this to the sparse candidate set.  Populated
@@ -1020,6 +1024,7 @@ static bool sweepOneBlock(
             const uint8_t ty =
                 static_cast<uint8_t>(nix::v3::cellTypeUnpack(cellTypeBytes, gran));
             stats.cellTypeHist[ty < 9 ? ty : 0]++;
+            stats.liveBytesByType[ty < 9 ? ty : 0] += cellSize;  // B0.3 projection
         } else {
             ++stats.deadCells;
             stats.deadBytes += cellSize;
@@ -2555,6 +2560,37 @@ MajorGcResult runMajorMarkSweep(VMState & vm) noexcept
                 "List=%.0f Pair=%.0f Env=%.0f Chars=%.0f (dead: Thunk=%zu Pair=%zu Bindings=%zu Chars=%zu)\n",
                 mort(1), mort(2), mort(3), mort(4), mort(5), mort(6), mort(7), mort(8),
                 d[3], d[6], d[4], d[8]);
+        }
+        // B0.3 GO/NO-GO: project the realizable per-type-segregated + compacted arena
+        // footprint vs the current mapped arena.  Each lane needs ceil(liveBytes_T /
+        // kBlockSize) blocks (perfect within-type recycling).  Three projections:
+        //   mixed-perfect  = single lane, all types (no segregation rounding) — the floor.
+        //   lanes(hot+cold)= the actual BiBOP plan: Closure/Thunk/Bindings/List/Pair own
+        //                    lanes + a shared cold lane (Value+Env+Chars). THIS is the GO
+        //                    number to compare against the pre-committed ship threshold.
+        //   per-type-own   = every type its own lane (max segregation, max rounding waste).
+        // reclaim = current arena − projected footprint.  munmap-realizable iff the evac
+        // packing achieves the per-lane floor (B2 measures the real achievement).
+        {
+            const size_t * lb = sweep.liveBytesByType;
+            const size_t blk = Arena::kBlockSize;
+            auto cb = [&](size_t b){ return b ? (b + blk - 1) / blk : size_t(0); };
+            size_t ownBlk = 0; for (int i = 1; i <= 8; ++i) ownBlk += cb(lb[i]);
+            size_t hotBlk = cb(lb[2]) + cb(lb[3]) + cb(lb[4]) + cb(lb[5]) + cb(lb[6]);
+            size_t laneBlk = hotBlk + cb(lb[1] + lb[7] + lb[8]);
+            size_t totLive = 0; for (int i = 1; i <= 8; ++i) totLive += lb[i];
+            size_t mixBlk = cb(totLive);
+            const size_t cur = arenaBytesBefore;
+            auto MB = [](double b){ return b / 1e6; };
+            std::fprintf(stderr,
+                "v3 BiBOP-projection: arena=%.0fMB live=%.0fMB || mixed-perfect=%.0fMB(reclaim %.0fMB) "
+                "| LANES(hot+cold)=%.0fMB(reclaim %.0fMB) | per-type-own=%.0fMB(reclaim %.0fMB) "
+                "|| seg-overhead(lanes vs mixed)=+%.0fMB\n",
+                MB(cur), MB(totLive),
+                MB(double(mixBlk)*blk), MB(double(cur) - double(mixBlk)*blk),
+                MB(double(laneBlk)*blk), MB(double(cur) - double(laneBlk)*blk),
+                MB(double(ownBlk)*blk), MB(double(cur) - double(ownBlk)*blk),
+                MB(double(laneBlk - mixBlk)*blk));
         }
         // Step 11′ (Immix, 2026-05-29): line-mark bitmap summary.
         // Each block has 131,072 lines of 128 B; a line is "live"
