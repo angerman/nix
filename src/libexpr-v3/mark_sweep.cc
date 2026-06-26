@@ -921,6 +921,8 @@ struct SweepStats {
     //   bins by live-byte fraction: [0-10) [10-25) [25-50) [50-75) [75-100]%
     size_t densityHist[5]  = {0, 0, 0, 0, 0};
     size_t sparseBlocks    = 0;  // < 25% live = good evacuation candidates
+    size_t singleTypeBlocks = 0; // B1.4: blocks whose live cells are all one CellType
+    size_t mixedTypeBlocks  = 0; // B1.4: blocks with >1 live CellType (BiBOP should ~0 these)
     size_t sparseLiveBytes = 0;  // live bytes in sparse blocks = copy cost
 
     // R2.1′ (2026-06-03): live-cell tally by CellType (index = CellType
@@ -999,6 +1001,7 @@ static bool sweepOneBlock(
     ++stats.blocksScanned;
     size_t blockLiveCells = 0;
     size_t blockLiveBytes = 0;
+    uint32_t blockTypeMask = 0;  // B1.4: bitmask of live CellTypes in this block
     for (size_t i = 0; i < starts.size(); ++i) {
         const size_t offset    = starts[i];
         const size_t endOffset = (i + 1 < starts.size())
@@ -1025,6 +1028,7 @@ static bool sweepOneBlock(
                 static_cast<uint8_t>(nix::v3::cellTypeUnpack(cellTypeBytes, gran));
             stats.cellTypeHist[ty < 9 ? ty : 0]++;
             stats.liveBytesByType[ty < 9 ? ty : 0] += cellSize;  // B0.3 projection
+            blockTypeMask |= (1u << (ty < 9 ? ty : 0));           // B1.4 homogeneity
         } else {
             ++stats.deadCells;
             stats.deadBytes += cellSize;
@@ -1067,6 +1071,13 @@ static bool sweepOneBlock(
             if (!nix::v3::detail::g_midEvalGcEnabled)
                 arena.clearCellStartBitFor(cellAddr);
         }
+    }
+    // B1.4: classify the block's type-homogeneity (the BiBOP linchpin — lanes should
+    // make every block single-type).  popcount(mask)==1 → single-type; >1 → mixed.
+    if (blockLiveCells > 0) {
+        const uint32_t m = blockTypeMask & ~1u;  // ignore None (bit 0): unstamped/cold filler
+        if ((m & (m - 1)) == 0) ++stats.singleTypeBlocks;  // 0 or 1 typed bit = homogeneous
+        else                    ++stats.mixedTypeBlocks;
     }
     // R2.1: bin this block's live-byte density (evacuation opportunity).
     if (blockUsedBytes > 0) {
@@ -2548,7 +2559,14 @@ MajorGcResult runMajorMarkSweep(VMState & vm) noexcept
                 h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], h[8],
                 (typed + h[0]) > 0 ? 100.0 * double(typed)
                                      / double(typed + h[0]) : 0.0);
-            // S2.2 DENSIFY: per-type MORTALITY = dead/(dead+live).  A type that is
+            // B1.4: BiBOP block-homogeneity — single-type vs mixed blocks.  Without
+        // BiBOP, blocks are mixed-type (lanes off) → high mixed count.  With BiBOP,
+        // lanes make every block single-type → mixed≈0, which is what lets the
+        // high-mortality types' blocks go sparse (the density variance the evac needs).
+        std::fprintf(stderr, "v3 block-homogeneity: singleType=%zu mixedType=%zu laneAllocs=%zu\n",
+            sweep.singleTypeBlocks, sweep.mixedTypeBlocks,
+            nix::v3::detail::g_bibopLaneAllocs);
+        // S2.2 DENSIFY: per-type MORTALITY = dead/(dead+live).  A type that is
             // mostly dead (high mortality) is a BiBOP-segregation candidate: cluster
             // its allocations into dedicated blocks → those blocks go mostly-dead →
             // sparse → freeable by compaction.  Uniform mortality across types ⇒

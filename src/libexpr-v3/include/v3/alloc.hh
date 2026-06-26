@@ -894,6 +894,10 @@ inline const bool g_midEvalReuseEnabled =
 inline const bool g_bibopEnabled =
     std::getenv("NIX_V3_BIBOP") != nullptr;
 
+/// B1.1 diagnostic: count alloc()s routed through the per-type lane path (vs total),
+/// to confirm the bulk of arena cells are lane-segregated.  Single-threaded VM.
+inline size_t g_bibopLaneAllocs = 0;
+
 /// MIDEVAL_GC_DESIGN_2026-06-22 — reuse-safety diagnostic.  When set, freeListAdd
 /// stamps a sentinel into each binned cell and freeListTryPop verifies it survived
 /// to pop time; if the mutator overwrote it (the cell was actually LIVE when the
@@ -1239,7 +1243,10 @@ public:
     /// in-block free-list reuse, which needs no munmap.  Keeping the block method
     /// unchanged avoids the munmap-on-calloc hazard.
     static bool cellMetaEnabled() noexcept {
-        return detail::g_majorGcEnabled || detail::g_midEvalGcEnabled;
+        // B1.1: BiBOP also needs the per-block cell-start + cell-type metadata
+        // (the lane bump stamps it; the recycling evac + per-lane density read it).
+        return detail::g_majorGcEnabled || detail::g_midEvalGcEnabled
+            || detail::g_bibopEnabled;
     }
 
     /// B0.2 (BiBOP): are arena blocks mmap'd (vs calloc'd)?  mmap'd blocks can be
@@ -1428,6 +1435,14 @@ public:
             active_.totalBytes += bytes;
             return blk;
         }
+        // B1.1 (BiBOP, lode/BIBOP_DESIGN_2026-06-26.md): per-CellType lane bump.
+        // Routes each non-huge alloc into a per-type lane so every block holds ONE
+        // CellType → high-mortality types (Closure/Bindings/List, 73-81% dead at
+        // firefox peak) cluster into SPARSE blocks the per-type recycling evac (B2)
+        // can empty + munmap.  Gated NIX_V3_BIBOP (default-off → branch skipped →
+        // the immix/free-list/bump paths below stay byte-identical for production).
+        if (__builtin_expect(detail::g_bibopEnabled, 0))
+            return bumpInLane(bytes, type);
         // Stage 6 Phase 3: free-list reuse.  Opt-in via
         // V3_DBG_FREELIST_REUSE=1.
         //
@@ -2658,6 +2673,68 @@ public:
     }
 
 private:
+    // B1.1 (BiBOP): per-CellType allocation lanes.  Each lane bump-allocates into
+    // its own block(s) so every block holds ONE CellType.  laneFor() maps the hot,
+    // high-mortality, movable types (Closure/Thunk/Bindings/List/Pair) to their own
+    // lanes; the cold types (Value/Env/Chars/None — low mortality + low volume) share
+    // lane 0, matching the B0.3 LANES(hot+cold) projection that cleared the firefox
+    // bar.  Only used when g_bibopEnabled (default-off); the array is tiny + idle
+    // otherwise.  NOTE: lanes_[].blockIdx is a raw index into active_.blocks; it is
+    // stable under BiBOP-only + BiBOP+mid-eval (neither frees blocks), but the B2
+    // recycling evac (which calls freeWholeBlock → erases + shifts block indices)
+    // MUST re-point the lanes after a free (handled in B2.2).
+    static constexpr int kNumLanes = 6;
+    struct Lane { char * cur = nullptr; char * end = nullptr; size_t blockIdx = 0; };
+    Lane lanes_[kNumLanes];
+
+    static int laneFor(CellType t) noexcept {
+        switch (t) {
+        case CellType::Closure:  return 1;
+        case CellType::Thunk:    return 2;
+        case CellType::Bindings: return 3;
+        case CellType::List:     return 4;
+        case CellType::Pair:     return 5;
+        // cold lane (low mortality + low volume): Value/Env/Chars/None
+        case CellType::None:
+        case CellType::Value:
+        case CellType::Env:
+        case CellType::Chars:    return 0;
+        }
+        return 0;  // unreachable; satisfies -Wreturn-type
+    }
+
+    // Refill a lane with a fresh block.  Reuses refill() (alloc block + push all
+    // per-block metadata + Boehm-register + set active_), then hands the just-
+    // allocated active block to the lane.  Under BiBOP every alloc goes through a
+    // lane, so active_ is otherwise unused — no contention.
+    void refillLane(int li) noexcept {
+        refill();
+        lanes_[li].cur      = active_.cur;
+        lanes_[li].end      = active_.end;
+        lanes_[li].blockIdx = active_.blocks.size() - 1;
+    }
+
+    // B1.1 per-lane bump.  Mirrors the default bump path's metadata stamp but indexes
+    // the LANE's current block (not active_.blocks.back(), which another lane may own).
+    void * bumpInLane(size_t bytes, CellType type) noexcept {
+        ++detail::g_bibopLaneAllocs;
+        const int li = laneFor(type);
+        Lane & L = lanes_[li];
+        if (!L.cur || L.cur + bytes > L.end) refillLane(li);
+        void * p = L.cur;
+        L.cur += bytes;
+        // cellMetaEnabled() is always true under BiBOP, so the metadata vectors exist
+        // for L.blockIdx.  Stamp cell-start + type at this granule (nibble-packed).
+        const size_t offset = static_cast<size_t>(
+            static_cast<char *>(p) - active_.blocks[L.blockIdx]);
+        const size_t bit = offset >> 4;
+        active_.cellStarts[L.blockIdx][bit >> 6] |= 1ULL << (bit & 63);
+        if (type != CellType::None)
+            cellTypePack(active_.cellTypes[L.blockIdx], bit, type);
+        clearInteriorCellStarts(p, bytes);
+        return p;
+    }
+
     void refill() noexcept
     {
         // Phase-13 review HIGH-6 fix: zero-fill the block before
