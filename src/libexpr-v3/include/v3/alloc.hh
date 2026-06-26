@@ -883,6 +883,17 @@ inline const bool g_midEvalGcEnabled =
 inline const bool g_midEvalReuseEnabled =
     std::getenv("NIX_V3_MIDEVAL_REUSE") != nullptr;
 
+/// BiBOP (lode/BIBOP_DESIGN_2026-06-26.md) — per-CellType block-pool allocator +
+/// per-type Immix recycling evac, the S2.2 RSS foundation.  Default-OFF.  B0.2: when
+/// set, arena blocks are mmap'd (not calloc'd) so the recycling evac's freeWholeBlock
+/// can actually munmap them and return RSS — without this, mid-eval munmap on a calloc'd
+/// block fails silently on macOS (the phantom-freedRSS the S2.1 evac reported).  B1+ add
+/// the per-type lanes that consume this.  Retirement (Rule 0): flip default-on once the
+/// B3 darwin-4 ship gate shows net peak-RSS beats default-v3 (M5 projects ~587MB reclaim,
+/// B0.3) + --brute clean; or delete if the go/no-go is later overturned.
+inline const bool g_bibopEnabled =
+    std::getenv("NIX_V3_BIBOP") != nullptr;
+
 /// MIDEVAL_GC_DESIGN_2026-06-22 — reuse-safety diagnostic.  When set, freeListAdd
 /// stamps a sentinel into each binned cell and freeListTryPop verifies it survived
 /// to pop time; if the mutator overwrote it (the cell was actually LIVE when the
@@ -1231,6 +1242,18 @@ public:
         return detail::g_majorGcEnabled || detail::g_midEvalGcEnabled;
     }
 
+    /// B0.2 (BiBOP): are arena blocks mmap'd (vs calloc'd)?  mmap'd blocks can be
+    /// munmap'd by freeWholeBlock → real RSS return on macOS; calloc'd cannot (munmap
+    /// fails silently → the phantom-freedRSS the S2.1 evac reported).  True under the
+    /// legacy major GC (always mmap'd) OR BiBOP (so the per-type recycling evac can
+    /// actually free blocks).  Plain mid-eval (no BiBOP) keeps calloc — its win is
+    /// in-block reuse, no munmap — preserving the validated calloc path.  This gate
+    /// keys alloc (refill/huge) AND free (freeWholeBlock/freeHugeBlock) to the SAME
+    /// primitive, so the inverse always matches (process-wide constant, set at startup).
+    static bool blocksAreMmapped() noexcept {
+        return detail::g_majorGcEnabled || detail::g_bibopEnabled;
+    }
+
     /// 16 MB blocks: each block holds many thousands of typical
     /// allocations and a long-running eval doesn't accumulate too
     /// many block tails.  The 16 MB choice (audit §2.7 correction
@@ -1380,7 +1403,7 @@ public:
             // alloc-vs-free primitive is keyed on the same process-wide
             // majorGcEnabled() gate, so freeHugeBlock picks the matching
             // inverse — no per-block flag needed.
-            const bool gc = majorGcEnabled();
+            const bool gc = blocksAreMmapped();  // B0.2: BiBOP mmaps huge cells too (freeHugeBlock munmaps)
             void * blk = gc ? static_cast<void *>(mapArenaBlock(bytes))
                             : std::calloc(1, bytes);
             // Review #3: OOM backstop — never push a null huge block.
@@ -2292,17 +2315,23 @@ public:
             freeListEntries_ -= removed;
         }
 
-        // 3. GC_remove_roots + munmap the block bytes.  R2.0: munmap
+        // 3. GC_remove_roots + release the block bytes.  R2.0: munmap
         //    (NOT std::free) is the only primitive that returns the
-        //    bytes to RSS on macOS (R1 spike).  freeWholeBlock only
-        //    runs under the major-GC gate, where refill() mmap'd the
-        //    block, so munmap is always the correct inverse here.
+        //    bytes to RSS on macOS (R1 spike).  B0.2: keyed on
+        //    blocksAreMmapped() (major GC OR BiBOP → mmap'd → munmap;
+        //    plain calloc'd → std::free) so the inverse matches how
+        //    refill() allocated the block.  Without this, a calloc'd
+        //    block hit by the evac's freeWholeBlock would munmap-fail
+        //    silently → phantom freedRSS (the S2.1 16.8MB illusion).
 #if NIX_USE_BOEHMGC
         if (!arenaNorootEnabled())
             GC_remove_roots(const_cast<char *>(blockStart),
                             const_cast<char *>(blockStart) + kBlockSize);
 #endif
-        unmapArenaBlock(const_cast<char *>(blockStart), kBlockSize);
+        if (blocksAreMmapped())
+            unmapArenaBlock(const_cast<char *>(blockStart), kBlockSize);
+        else
+            std::free(const_cast<char *>(blockStart));
 
         // 4. Remove from active_.blocks + parallel cellStarts +
         //    parallel lineMarks (Step 11′ Immix, 2026-05-29).
@@ -2373,7 +2402,7 @@ public:
                 GC_remove_roots(const_cast<char *>(begin),
                                 const_cast<char *>(begin) + sz);
 #endif
-            if (majorGcEnabled())
+            if (blocksAreMmapped())  // B0.2: inverse must match the alloc primitive (BiBOP-aware)
                 unmapArenaBlock(const_cast<char *>(begin), sz);
             else
                 std::free(const_cast<char *>(begin));
@@ -2638,7 +2667,7 @@ private:
         // exit (phantom retention scaling with arena lifetime).
         // mmap(MAP_ANON) (GC path) and calloc (default path) both hand
         // back zero pages directly from the kernel.
-        char * blk = majorGcEnabled()
+        char * blk = blocksAreMmapped()       // B0.2: BiBOP mmaps so freeWholeBlock can munmap
             ? mapArenaBlock(kBlockSize)
             : static_cast<char *>(std::calloc(1, kBlockSize));
         // Review #3: mapArenaBlock (mmap) / calloc return nullptr on OOM /
