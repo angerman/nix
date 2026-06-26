@@ -1189,6 +1189,7 @@ public:
     std::unordered_map<void *, void *> forward;
     size_t movedCells = 0, movedBytes = 0, pinnedCells = 0;
     size_t blackholeThunksSeen_ = 0;  // S2.1b: in-force thunks met as evac candidates
+    size_t declinedByType_[9] = {0,0,0,0,0,0,0,0,0};  // S2.2: unmovable cells by type (block-pinners)
 
     /// O(log candidates) — sorted [start,end) ranges.
     bool inCandidate(const void * p) const noexcept
@@ -1468,7 +1469,14 @@ private:
             if (!s_moveBlackhole) return nullptr;  // pin: never relocate mid-force
         }
         const size_t sz = evacCellSize(owner, ty);
-        if (sz == 0) return nullptr;
+        if (sz == 0) {
+            // S2.2 BLOCK-PIN PROVENANCE: an unmovable cell (evacCellSize==0) left in
+            // its candidate block prevents whole-block-free (verify marks the block).
+            // Count by type to find what pins the un-freed blocks (the RSS blocker:
+            // freedRSS stuck at 16.8MB / blocksFreed=1 of 43 despite moving 342MB).
+            if ((unsigned)ty < 9) ++declinedByType_[(unsigned)ty];
+            return nullptr;
+        }
         auto it = forward.find(owner);
         if (it != forward.end()) return it->second;
         void * dest = threadArena().alloc(sz, ty);
@@ -2109,6 +2117,13 @@ static void runEvacuation(VMState & vm, Arena & arena,
         double(freedBlocks) * double(Arena::kBlockSize) / 1e6,
         ev.blackholeThunksSeen_,
         ms(tc0, tc1), ms(tc1, tc2), ms(tc2, tc3));
+    {
+        const size_t * d = ev.declinedByType_;
+        std::fprintf(stderr,
+            "v3 evac-declined (unmovable→block-pin): None=%zu Value=%zu Closure=%zu "
+            "Thunk=%zu Bindings=%zu List=%zu Pair=%zu Env=%zu Chars=%zu\n",
+            d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8]);
+    }
 }
 
 } // anonymous
