@@ -2375,6 +2375,20 @@ public:
         immixEnd_ = nullptr;
         sortedBlocksDirty_ = true;  // Lever 1: block set changed (indices shifted)
 
+        // B2.2: re-point per-type lanes after the block-index shift (same hazard the
+        // immix cursor + active_.cur have above).  A lane whose current block was just
+        // freed must reset (cur=null → next bumpInLane refills); a lane indexing a
+        // block ABOVE idx shifts down by one.  Only matters under BiBOP.
+        if (detail::g_bibopEnabled) {
+            for (Lane & L : lanes_) {
+                if (L.blockIdx == idx) {        // lane's current block was freed
+                    L.cur = nullptr; L.end = nullptr; L.blockIdx = 0;
+                } else if (L.blockIdx > idx) {  // index shifted down by the erase
+                    --L.blockIdx;
+                }
+            }
+        }
+
         // 5. Update totalBytes + cur/end if we freed the current
         //    block.  After freeing, the next alloc will refill (since
         //    cur points to a now-invalid address).
