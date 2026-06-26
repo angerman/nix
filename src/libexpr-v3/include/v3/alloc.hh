@@ -1321,6 +1321,12 @@ public:
         /// Future Stage 6 Day 2-3 will free the backup region's
         /// blocks after a major scavenge.
         std::vector<char *> blocks;
+        /// B2.1 (BiBOP): per-block owning lane (parallel to `blocks`; 0xFF = non-lane
+        /// default/cold).  Lets the per-lane recycling evac (B2.2) find a lane's blocks +
+        /// their free spans without re-deriving from cell types (an emptied block has no
+        /// cells to derive from).  Maintained wherever `blocks` changes (refill/refillLane
+        /// push, freeWholeBlock erase).  Idle when BiBOP off.
+        std::vector<uint8_t> blockLane;
         /// Oversized allocations (> kHugeCutoff), tracked separately.
         std::vector<HugeBlock> hugeBlocks;
         size_t  totalBytes = 0;
@@ -2351,6 +2357,8 @@ public:
         // 4. Remove from active_.blocks + parallel cellStarts +
         //    parallel lineMarks (Step 11′ Immix, 2026-05-29).
         active_.blocks.erase(active_.blocks.begin() + idx);
+        if (idx < active_.blockLane.size())          // B2.1: keep parallel to blocks
+            active_.blockLane.erase(active_.blockLane.begin() + idx);
         active_.cellStarts.erase(active_.cellStarts.begin() + idx);
         if (idx < active_.lineMarks.size()) {
             active_.lineMarks.erase(active_.lineMarks.begin() + idx);
@@ -2726,6 +2734,7 @@ private:
         lanes_[li].cur      = active_.cur;
         lanes_[li].end      = active_.end;
         lanes_[li].blockIdx = active_.blocks.size() - 1;
+        active_.blockLane[lanes_[li].blockIdx] = static_cast<uint8_t>(li);  // B2.1: tag block's lane
     }
 
     // B1.1 per-lane bump.  Mirrors the default bump path's metadata stamp but indexes
@@ -2776,6 +2785,7 @@ private:
             std::abort();
         }
         active_.blocks.push_back(blk);
+        active_.blockLane.push_back(0xFF);  // B2.1: default non-lane; refillLane overrides
         sortedBlocksDirty_ = true;  // Lever 1: block set changed
         active_.cur = blk;
         active_.end = blk + kBlockSize;
