@@ -929,6 +929,12 @@ struct SweepStats {
     // mover) vs None (unstamped → pinned).  None (index 0) counts
     // interior/huge/non-bump cells the mover can't directly type.
     size_t cellTypeHist[9] = {0,0,0,0,0,0,0,0,0};
+    // S2.2 DENSIFY: per-CellType DEAD-cell tally (mirrors cellTypeHist for the
+    // swept/unmarked cells).  mortality_by_type = dead/(dead+live).  If mortality
+    // is type-dependent (some type mostly dead), BiBOP type-segregation would
+    // cluster those deaths into whole sparse blocks → freeable.  If uniform across
+    // types, segregation-by-type can't create the density variance compaction needs.
+    size_t deadCellTypeHist[9] = {0,0,0,0,0,0,0,0,0};
 
     // R2.4b: per regular-block (start, live-byte fraction).  The
     // evacuator filters this to the sparse candidate set.  Populated
@@ -1017,6 +1023,14 @@ static bool sweepOneBlock(
         } else {
             ++stats.deadCells;
             stats.deadBytes += cellSize;
+            // S2.2 DENSIFY: tally the dead cell by its stamped type (same nibble
+            // unpack as the live branch) → per-type mortality.
+            {
+                const size_t gran = offset >> 4;
+                const uint8_t ty =
+                    static_cast<uint8_t>(nix::v3::cellTypeUnpack(cellTypeBytes, gran));
+                stats.deadCellTypeHist[ty < 9 ? ty : 0]++;
+            }
             // Phase 3: route dead cell to the per-exact-size free
             // list and clear its cell-start bit.  Subsequent allocs
             // of this size will reuse the freed slot.
@@ -2529,6 +2543,18 @@ MajorGcResult runMajorMarkSweep(VMState & vm) noexcept
                 h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], h[8],
                 (typed + h[0]) > 0 ? 100.0 * double(typed)
                                      / double(typed + h[0]) : 0.0);
+            // S2.2 DENSIFY: per-type MORTALITY = dead/(dead+live).  A type that is
+            // mostly dead (high mortality) is a BiBOP-segregation candidate: cluster
+            // its allocations into dedicated blocks → those blocks go mostly-dead →
+            // sparse → freeable by compaction.  Uniform mortality across types ⇒
+            // segregation-by-type can't manufacture the density variance firefox lacks.
+            const size_t * d = sweep.deadCellTypeHist;
+            auto mort = [&](int i){ size_t t = h[i]+d[i]; return t ? 100.0*double(d[i])/double(t) : 0.0; };
+            std::fprintf(stderr,
+                "v3 mortality%% by type: Value=%.0f Closure=%.0f Thunk=%.0f Bindings=%.0f "
+                "List=%.0f Pair=%.0f Env=%.0f Chars=%.0f (dead: Thunk=%zu Pair=%zu Bindings=%zu Chars=%zu)\n",
+                mort(1), mort(2), mort(3), mort(4), mort(5), mort(6), mort(7), mort(8),
+                d[3], d[6], d[4], d[8]);
         }
         // Step 11′ (Immix, 2026-05-29): line-mark bitmap summary.
         // Each block has 131,072 lines of 128 B; a line is "live"
