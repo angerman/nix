@@ -71,7 +71,18 @@ inline void walkOneVMState(VMState & vm, RootVisitor & visitor) noexcept
             // not call walkOneVMState) tenured cells aren't moved, so
             // this is a no-op there.  For non-moving visitors
             // (NoOp default + auditor) visitSlot is also a no-op.
+            // S2.1b WB-TRACE: log whether the moving visitor RELOCATED this
+            // force-writeback target.  A moving evac that relocates the owner
+            // Bindings must rewrite f.forceWriteTarget here, else the later
+            // writeback lands on the moved-from cell → relocated copy keeps its
+            // pre-force Blackhole → tag=14.  changed=1 ⇒ relocated; changed=0 with
+            // a non-null arena ptr during an evac ⇒ left stale (the suspected bug).
+            static const bool s_wbTrace = std::getenv("NIX_V3_WB_TRACE") != nullptr;
+            Value * before = f.forceWriteTarget;
             visitor.visitSlot(f.forceWriteTarget);
+            if (__builtin_expect(s_wbTrace, 0) && before)
+                std::fprintf(stderr, "[wb-trace] frame.forceWriteTarget %p -> %p changed=%d\n",
+                             (void*)before, (void*)f.forceWriteTarget, before != f.forceWriteTarget);
             if (f.forceWriteTarget)
                 visitor.visitValue(*f.forceWriteTarget);
         }

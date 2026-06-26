@@ -65,6 +65,7 @@
 #include <cassert>
 #include <cctype>
 #include <cmath>
+#include <execinfo.h>  // S2.1b WB-TRACE: backtrace at the toString Blackhole abort
 #include <cstdio>
 #include <array>
 #include <cstdlib>
@@ -1160,6 +1161,20 @@ static std::string toStringCoerceCtx(EvalState & state, Value v,
                        ? "<anon>" : v.asClosure()->desc->name)
                 + "'";
             extra = nameInfo.c_str();
+        }
+        // S2.1b WB-TRACE: under the moving compactor a Tag::Blackhole (14) leaks
+        // into a coercible position.  Dump the raw word + a C-stack backtrace so we
+        // can see WHICH coercion path reads the leaked Blackhole (forceWriteTarget
+        // was falsified — STALE-leave=0, fwt-walks rare).  Gated; diagnostic only.
+        static const bool s_wbTrace = std::getenv("NIX_V3_WB_TRACE") != nullptr;
+        if (__builtin_expect(s_wbTrace, 0)) {
+            std::fprintf(stderr, "[wb-trace] toString tag=%u rawword=0x%llx &v=%p\n",
+                         (unsigned)v.tag(), (unsigned long long)v.rawWord(), (void*)&v);
+            void * fr[48]; int n = ::backtrace(fr, 48);
+            char ** syms = ::backtrace_symbols(fr, n);
+            for (int i = 0; i < n && syms; ++i)
+                if (syms[i]) std::fprintf(stderr, "[wb-trace]   #%02d %s\n", i, syms[i]);
+            if (syms) ::free(syms);
         }
         std::snprintf(buf, sizeof buf,
             "v3 toString: cannot stringify type tag=%u%s",

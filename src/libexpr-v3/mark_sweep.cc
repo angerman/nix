@@ -1223,6 +1223,16 @@ public:
                     p = reinterpret_cast<Value *>(static_cast<char *>(np) + off);
                     return;
                 }
+                // S2.1b WB-TRACE: a slot whose owner is a candidate but fwdRaw
+                // declined (unmovable type) is LEFT STALE.  If this slot is a
+                // force-writeback target (forceWriteTarget into a Bindings entry),
+                // the writeback later lands on the moved-FROM cell → the relocated
+                // copy keeps its pre-force Blackhole → tag=14.  Log the owner type
+                // to confirm/refute the Blackhole-leak mechanism.
+                static const bool s_wbTrace = std::getenv("NIX_V3_WB_TRACE") != nullptr;
+                if (__builtin_expect(s_wbTrace, 0))
+                    std::fprintf(stderr, "[wb-trace] visitSlot STALE-unmovable: owner=%p type=%d off=%zu (slot left at moved-from)\n",
+                                 (void*)owner, (int)ot, off);
                 ++pinnedCells;  // unmovable type → leave; verify pins block
                 return;
             }
@@ -1235,6 +1245,11 @@ public:
             // target granule (independent of cell-start), so
             // anyMarkInRange pins the block → freeWholeBlock skips it and
             // p remains valid.
+            // S2.1b WB-TRACE: owner-null interior slot in a candidate block — left
+            // stale.  Same risk as the unmovable case above for forceWriteTarget.
+            static const bool s_wbTrace = std::getenv("NIX_V3_WB_TRACE") != nullptr;
+            if (__builtin_expect(s_wbTrace, 0))
+                std::fprintf(stderr, "[wb-trace] visitSlot STALE-owner-null: p=%p (interior, no cell-start; slot left at moved-from)\n", (void*)p);
             ++pinnedCells;
             return;
         }
@@ -1425,6 +1440,26 @@ private:
         // pointer at the pinned cell; ev.pin(owner) separately walks its
         // fields so its referents follow the moves.
         if (!pinnedSet_.empty() && pinnedSet_.count(owner)) return nullptr;
+        // S2.1b FIX (CONSERV_PIN_PROVENANCE → S2_1B_EVAC_BLACKHOLE_RCA): never
+        // relocate an in-force (Blackhole-state) thunk.  A thunk mid-force is
+        // referenced by an un-rooted C-stack local (the forceValue caller /
+        // coercion local — under no-scan it is NOT a precise root), and its
+        // forced result is written back to that very cell.  Moving it leaves the
+        // stale C-local pointing at the moved-FROM blackholed copy; re-forcing via
+        // that stale ref re-enters the blackhole → the onMyFrames identity check
+        // (vm.cc:8742/14204) misfires → vBlackhole leaks (tag=14), or "infinite
+        // recursion" with NIX_V3_NO_BLACKHOLE_AS_VALUE.  RCA verified by bisection
+        // (lode/S2_1B_EVAC_BLACKHOLE_RCA_2026-06-26.md).  Blackhole thunks are FEW
+        // (bounded by live C-stack force depth) so pinning them costs negligible
+        // compaction.  Pin like an unmovable type (verify marks the block).
+        // Opt-out NIX_V3_EVAC_MOVE_BLACKHOLE=1 to A/B-confirm this is the fix.
+        if (ty == CellType::Thunk) {
+            static const bool s_moveBlackhole =
+                std::getenv("NIX_V3_EVAC_MOVE_BLACKHOLE") != nullptr;
+            if (!s_moveBlackhole
+                && static_cast<Thunk *>(owner)->state == ThunkState::Blackhole)
+                return nullptr;
+        }
         const size_t sz = evacCellSize(owner, ty);
         if (sz == 0) return nullptr;
         auto it = forward.find(owner);

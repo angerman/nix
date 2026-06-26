@@ -66,6 +66,74 @@ candidate but `fwdRaw` returns null (unmovable) → pinnedCells, left stale (vis
 window; (3) the `evacChars` default-skip interacting with a Chars cell that backs a
 context string. The verified bisect already excludes the munmap and the mark-phase scan.
 
+## RCA progress (2026-06-26, instruments NIX_V3_WB_TRACE) — narrowed, 3 hypotheses killed
+
+Built three gated diagnostics (mark_sweep.cc EvacVisitor::visitSlot stale-leave logs;
+precise_root.cc forceWriteTarget reloc trace; primops.cc backtrace at the tag=14 abort).
+Ran firefox under EVAC+PRECISE_ONLY+PCT=1.0. Findings (VERIFIED, not assumed):
+
+1. **forceWriteTarget is NOT the cause — FALSIFIED.** visitSlot STALE-unmovable=0,
+   STALE-owner-null=0 (it never leaves a force-writeback slot stale), and frame.
+   forceWriteTarget walks are RARE (3 total, 1 relocated cleanly). The armedWritebackValue()
+   stale-key theory is also moot (g_sharedWbDetect default-off; not consulted in cellWrite).
+
+2. **The leaked value is `Value::vBlackhole`** (rawword=0x7fff000000000000) at a STACK
+   address — the result of `forceValue` in `toStringCoerceCtx:965`, reached via
+   primDerivationFromPreprocessed → primDerivCoerce → toStringCoerceCtx (an env-var coercion).
+
+3. **It originates at vm.cc:8033 `retVal = Value::vBlackhole`** — the OP_RETURN SELF-CYCLE
+   defer. The detector (vm.cc:7958-7967): chase `retVal = retVal.asThunk()->evaluated`
+   through Evaluated indirections, then `if (retVal.asThunk() == fr.thunk)` → self-cycle →
+   vBlackhole. Under the moving evac this pointer-identity check MISFIRES (a non-cyclic
+   env-var thunk is spuriously detected as a self-cycle) → vBlackhole leaks into toString.
+   firefox WITHOUT evac never hits this (byte-id), so the evac INTRODUCES the false cycle.
+
+4. **The evac DOES rewrite the `evaluated` field** (mark_sweep.cc:1506 `case Evaluated:
+   visitValue(t->evaluated)`) and `fr.thunk` (precise_root.cc:58 visitThunk) — so the naive
+   "indirection not relocated" theory is also INSUFFICIENT. The misfire is a subtler
+   relocation/identity interaction (candidates: forward-map aliasing collapsing two thunks
+   to one; a thunk reachable only via a C-stack local — retVal mid-chase — not relocated
+   while fr.thunk is; or the chase reading a moved-from cell whose stale `evaluated` aliases
+   fr.thunk's new address). NOT YET pinned — needs V3_DBG_RETURN_SELF correlated with evac
+   relocation generations.
+
+## RCA RESOLVED-mechanism + FIX (sound) + repro LOST to nondeterminism (2026-06-26, later)
+
+**Mechanism VERIFIED.** vBlackhole sources 8033 (OP_RETURN self-cycle) and 14238
+(forceValue cross-stack) ruled out — their V3_DBG loggers showed 0 events while tag=14
+still fired. The remaining force-path vBlackhole sources are the `onMyFrames` pointer-
+identity checks (vm.cc:8742 OP_FORCE / 14204 forceValue: `frames[i].thunk == t`).
+DECISIVE TEST: `NIX_V3_NO_BLACKHOLE_AS_VALUE=1` (disables both onMyFrames defer paths)
+FLIPS the failure from `tag=14` to **"infinite recursion encountered"** — proving an
+in-force (Blackhole-state) thunk is being force-RE-ENTERED under the evac, with
+blackhole-as-value merely masking it as vBlackhole. ROOT CAUSE: the moving evac
+relocates an in-force blackholed thunk while a stale, un-rooted C-stack reference to it
+survives (no-scan) → re-forcing via the stale ref re-enters the blackhole → onMyFrames
+identity mismatch → vBlackhole/infinite-recursion.
+
+**FIX (sound, mark_sweep.cc fwdRaw): pin Blackhole-state thunks during evac** (don't
+relocate a mid-force thunk; opt-out NIX_V3_EVAC_MOVE_BLACKHOLE=1). Blackhole thunks are
+few (bounded by live C-stack force depth) → negligible compaction loss. With it, firefox
+byte-id + compacts (5.4M cells moved, blocksFreed, munmap).
+
+**⚠ FIX IS NOT e2e-VALIDATED — the repro is NONDETERMINISTIC (store-state-dependent).**
+The corruption reproduced ~7/7 on the FIRST firefox.drvPath evals (COLD store →
+copyPathToStore in toStringCoerceCtx's Path case is allocation-heavy → an evac fires in
+a window that catches an in-force thunk). After the store warmed (paths already copied →
+no copy → different allocation pattern), it VANISHED: the EXACT committed b2f621eb7
+binary (no fix, no instruments) is now 5/5 byte-id, AND 3/3 even at evac-every-1MB
+(NIX_V3_MIDEVAL_GC_THRESHOLD_MB=1 GROWTH=1.0). So fix-on and fix-off are BOTH byte-id now
+— the A/B cannot distinguish them. The fix targets the VERIFIED mechanism and is sound,
+but "fix makes firefox byte-id" is UNCONFIRMED because the window closed.
+
+**To validate (next):** a DETERMINISTIC repro — either (a) evict firefox's source paths
+from /nix/store to force the cold copyPathToStore path again, or (b) a synthetic that
+forces a thunk whose body does a re-entrant store/IO op (mimicking copyPathToStore) while
+an evac fires mid-force. Then A/B the blackhole-pin. Until then the fix ships gated
+(NIX_V3_EVAC default-off, experimental) as a sound RCA-motivated measure, NOT a validated
+one. LESSON: evac correctness repros that touch copyPathToStore are store-state-sensitive
+— pin the store state (or use a synthetic) before A/B-ing a fix.
+
 ## Next steps (S2.1b)
 
 1. VERIFY the armed-writeback-key hypothesis: instrument `armedWritebackValue()` rekeying
