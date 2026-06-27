@@ -2742,15 +2742,18 @@ private:
         return false;
     }
 
+public:
     /// B2.2: after a sweep rebuilds free spans, reset every lane so the next alloc
     /// re-acquires from the fresh spans — REQUIRED to avoid double-allocating a lane's
-    /// current-block tail (which the rebuild now lists as a span).
+    /// current-block tail (which the rebuild now lists as a span).  Called from
+    /// mark_sweep.cc (like rebuildFreeSpansFromLineMarks).
     void resetLanesForRecycle() noexcept {
         for (Lane & L : lanes_) {
             L.cur = nullptr; L.end = nullptr;
             L.recycleBlk = 0; L.recycleSpanIdx = 0;
         }
     }
+private:
 
     static int laneFor(CellType t) noexcept {
         switch (t) {

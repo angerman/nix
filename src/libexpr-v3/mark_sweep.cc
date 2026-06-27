@@ -2385,7 +2385,11 @@ MajorGcResult runMajorMarkSweep(VMState & vm) noexcept
     // is scattered → ~0 fully-dead blocks anyway).  Huge blocks (below) are safe:
     // freeHugeBlock picks std::free vs munmap to match how they were allocated.
     std::vector<std::pair<uintptr_t, uintptr_t>> freedRanges;
-    if (Arena::majorGcEnabled())
+    // B2.2: under BiBOP, blocks are mmap'd (blocksAreMmapped()), so fully-dead
+    // blocks CAN be munmap'd here — no moving needed.  Single-type lanes cluster
+    // same-type/same-phase cells, so whole-block death is far more likely than in
+    // the mixed-block case (where the histogram showed ~0 fully-dead blocks).
+    if (Arena::majorGcEnabled() || nix::v3::detail::g_bibopEnabled)
     for (const char * blk : blocksToFree) {
         const size_t freed = arena.freeWholeBlock(blk);
         if (freed > 0) {
