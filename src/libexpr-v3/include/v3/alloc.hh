@@ -883,21 +883,6 @@ inline const bool g_midEvalGcEnabled =
 inline const bool g_midEvalReuseEnabled =
     std::getenv("NIX_V3_MIDEVAL_REUSE") != nullptr;
 
-/// BiBOP (lode/BIBOP_DESIGN_2026-06-26.md) — per-CellType block-pool allocator +
-/// per-type Immix recycling evac, the S2.2 RSS foundation.  Default-OFF.  B0.2: when
-/// set, arena blocks are mmap'd (not calloc'd) so the recycling evac's freeWholeBlock
-/// can actually munmap them and return RSS — without this, mid-eval munmap on a calloc'd
-/// block fails silently on macOS (the phantom-freedRSS the S2.1 evac reported).  B1+ add
-/// the per-type lanes that consume this.  Retirement (Rule 0): flip default-on once the
-/// B3 darwin-4 ship gate shows net peak-RSS beats default-v3 (M5 projects ~587MB reclaim,
-/// B0.3) + --brute clean; or delete if the go/no-go is later overturned.
-inline const bool g_bibopEnabled =
-    std::getenv("NIX_V3_BIBOP") != nullptr;
-
-/// B1.1 diagnostic: count alloc()s routed through the per-type lane path (vs total),
-/// to confirm the bulk of arena cells are lane-segregated.  Single-threaded VM.
-inline size_t g_bibopLaneAllocs = 0;
-
 /// MIDEVAL_GC_DESIGN_2026-06-22 — reuse-safety diagnostic.  When set, freeListAdd
 /// stamps a sentinel into each binned cell and freeListTryPop verifies it survived
 /// to pop time; if the mutator overwrote it (the cell was actually LIVE when the
@@ -1243,22 +1228,16 @@ public:
     /// in-block free-list reuse, which needs no munmap.  Keeping the block method
     /// unchanged avoids the munmap-on-calloc hazard.
     static bool cellMetaEnabled() noexcept {
-        // B1.1: BiBOP also needs the per-block cell-start + cell-type metadata
-        // (the lane bump stamps it; the recycling evac + per-lane density read it).
-        return detail::g_majorGcEnabled || detail::g_midEvalGcEnabled
-            || detail::g_bibopEnabled;
+        return detail::g_majorGcEnabled || detail::g_midEvalGcEnabled;
     }
 
-    /// B0.2 (BiBOP): are arena blocks mmap'd (vs calloc'd)?  mmap'd blocks can be
-    /// munmap'd by freeWholeBlock → real RSS return on macOS; calloc'd cannot (munmap
-    /// fails silently → the phantom-freedRSS the S2.1 evac reported).  True under the
-    /// legacy major GC (always mmap'd) OR BiBOP (so the per-type recycling evac can
-    /// actually free blocks).  Plain mid-eval (no BiBOP) keeps calloc — its win is
-    /// in-block reuse, no munmap — preserving the validated calloc path.  This gate
-    /// keys alloc (refill/huge) AND free (freeWholeBlock/freeHugeBlock) to the SAME
-    /// primitive, so the inverse always matches (process-wide constant, set at startup).
+    /// Are arena blocks mmap'd (vs calloc'd)?  mmap'd blocks can be munmap'd by
+    /// freeWholeBlock → real RSS return on macOS; calloc'd cannot (munmap fails silently).
+    /// True under the legacy major GC (always mmap'd).  Plain mid-eval keeps calloc — its
+    /// win is in-block reuse, no munmap.  This gate keys alloc (refill/huge) AND free
+    /// (freeWholeBlock/freeHugeBlock) to the SAME primitive, so the inverse always matches.
     static bool blocksAreMmapped() noexcept {
-        return detail::g_majorGcEnabled || detail::g_bibopEnabled;
+        return detail::g_majorGcEnabled;
     }
 
     /// 16 MB blocks: each block holds many thousands of typical
@@ -1321,12 +1300,6 @@ public:
         /// Future Stage 6 Day 2-3 will free the backup region's
         /// blocks after a major scavenge.
         std::vector<char *> blocks;
-        /// B2.1 (BiBOP): per-block owning lane (parallel to `blocks`; 0xFF = non-lane
-        /// default/cold).  Lets the per-lane recycling evac (B2.2) find a lane's blocks +
-        /// their free spans without re-deriving from cell types (an emptied block has no
-        /// cells to derive from).  Maintained wherever `blocks` changes (refill/refillLane
-        /// push, freeWholeBlock erase).  Idle when BiBOP off.
-        std::vector<uint8_t> blockLane;
         /// Oversized allocations (> kHugeCutoff), tracked separately.
         std::vector<HugeBlock> hugeBlocks;
         size_t  totalBytes = 0;
@@ -1416,7 +1389,7 @@ public:
             // alloc-vs-free primitive is keyed on the same process-wide
             // majorGcEnabled() gate, so freeHugeBlock picks the matching
             // inverse — no per-block flag needed.
-            const bool gc = blocksAreMmapped();  // B0.2: BiBOP mmaps huge cells too (freeHugeBlock munmaps)
+            const bool gc = blocksAreMmapped();  // major GC mmaps huge cells too (freeHugeBlock munmaps)
             void * blk = gc ? static_cast<void *>(mapArenaBlock(bytes))
                             : std::calloc(1, bytes);
             // Review #3: OOM backstop — never push a null huge block.
@@ -1441,14 +1414,6 @@ public:
             active_.totalBytes += bytes;
             return blk;
         }
-        // B1.1 (BiBOP, lode/BIBOP_DESIGN_2026-06-26.md): per-CellType lane bump.
-        // Routes each non-huge alloc into a per-type lane so every block holds ONE
-        // CellType → high-mortality types (Closure/Bindings/List, 73-81% dead at
-        // firefox peak) cluster into SPARSE blocks the per-type recycling evac (B2)
-        // can empty + munmap.  Gated NIX_V3_BIBOP (default-off → branch skipped →
-        // the immix/free-list/bump paths below stay byte-identical for production).
-        if (__builtin_expect(detail::g_bibopEnabled, 0))
-            return bumpInLane(bytes, type);
         // Stage 6 Phase 3: free-list reuse.  Opt-in via
         // V3_DBG_FREELIST_REUSE=1.
         //
@@ -1717,9 +1682,7 @@ public:
     /// cell spans.
     void markLinesForCell(const void * addr, size_t bytes) noexcept
     {
-        // B2.2: BiBOP needs line marks too (the per-lane recycling evac reads the
-        // free spans rebuilt from them).
-        if ((!majorGcEnabled() && !detail::g_bibopEnabled) || !addr || bytes == 0) return;
+        if (!majorGcEnabled() || !addr || bytes == 0) return;
         const char * cp = static_cast<const char *>(addr);
         const size_t nBlocks = active_.blocks.size();
         if (nBlocks == 0 || nBlocks > active_.lineMarks.size()) return;
@@ -1820,7 +1783,7 @@ public:
     /// * mixed              → walk bits within word
     void rebuildFreeSpansFromLineMarks() noexcept
     {
-        if (!majorGcEnabled() && !detail::g_bibopEnabled) return;  // B2.2: BiBOP recycles these
+        if (!majorGcEnabled()) return;
         const size_t nBlocks = active_.blocks.size();
         active_.freeSpans.clear();
         active_.freeSpans.resize(nBlocks);
@@ -2340,12 +2303,11 @@ public:
 
         // 3. GC_remove_roots + release the block bytes.  R2.0: munmap
         //    (NOT std::free) is the only primitive that returns the
-        //    bytes to RSS on macOS (R1 spike).  B0.2: keyed on
-        //    blocksAreMmapped() (major GC OR BiBOP → mmap'd → munmap;
-        //    plain calloc'd → std::free) so the inverse matches how
-        //    refill() allocated the block.  Without this, a calloc'd
-        //    block hit by the evac's freeWholeBlock would munmap-fail
-        //    silently → phantom freedRSS (the S2.1 16.8MB illusion).
+        //    bytes to RSS on macOS (R1 spike).  Keyed on
+        //    blocksAreMmapped() (major GC → mmap'd → munmap; plain
+        //    calloc'd → std::free) so the inverse matches how refill()
+        //    allocated the block.  Without this, a calloc'd block hit by
+        //    freeWholeBlock would munmap-fail silently → phantom freedRSS.
 #if NIX_USE_BOEHMGC
         if (!arenaNorootEnabled())
             GC_remove_roots(const_cast<char *>(blockStart),
@@ -2359,8 +2321,6 @@ public:
         // 4. Remove from active_.blocks + parallel cellStarts +
         //    parallel lineMarks (Step 11′ Immix, 2026-05-29).
         active_.blocks.erase(active_.blocks.begin() + idx);
-        if (idx < active_.blockLane.size())          // B2.1: keep parallel to blocks
-            active_.blockLane.erase(active_.blockLane.begin() + idx);
         active_.cellStarts.erase(active_.cellStarts.begin() + idx);
         if (idx < active_.lineMarks.size()) {
             active_.lineMarks.erase(active_.lineMarks.begin() + idx);
@@ -2384,20 +2344,6 @@ public:
         immixCur_ = nullptr;
         immixEnd_ = nullptr;
         sortedBlocksDirty_ = true;  // Lever 1: block set changed (indices shifted)
-
-        // B2.2: re-point per-type lanes after the block-index shift (same hazard the
-        // immix cursor + active_.cur have above).  A lane whose current block was just
-        // freed must reset (cur=null → next bumpInLane refills); a lane indexing a
-        // block ABOVE idx shifts down by one.  Only matters under BiBOP.
-        if (detail::g_bibopEnabled) {
-            for (Lane & L : lanes_) {
-                if (L.blockIdx == idx) {        // lane's current block was freed
-                    L.cur = nullptr; L.end = nullptr; L.blockIdx = 0;
-                } else if (L.blockIdx > idx) {  // index shifted down by the erase
-                    --L.blockIdx;
-                }
-            }
-        }
 
         // 5. Update totalBytes + cur/end if we freed the current
         //    block.  After freeing, the next alloc will refill (since
@@ -2696,156 +2642,7 @@ public:
         immixEnd_ = nullptr;
     }
 
-    /// B2.2 (BiBOP): prepare the lanes to RECYCLE evac dest copies into existing
-    /// dead spans instead of bump-allocating fresh blocks (forceFreshBlock).  This is
-    /// what flips the evac from net-negative (movedBytes = fresh blocks) to net-positive
-    /// (movedBytes ≈ 0 new arena — survivors fill dead space in OTHER blocks of the same
-    /// lane).  Steps:
-    ///   1. rebuild free spans from the post-sweep line marks (so the dest has spans);
-    ///   2. clear the candidate (about-to-be-freed) blocks' spans so a survivor never
-    ///      recycles into a block we're trying to empty (a YIELD optimization — the evac
-    ///      verify re-marks from precise roots, so a survivor in a candidate would merely
-    ///      keep that block live, not cause a UAF; excluding them lets the candidate
-    ///      actually reach zero marks → freeWholeBlock);
-    ///   3. reset the lane cursors so the next dest alloc re-acquires from the fresh,
-    ///      candidate-excluded spans.
-    /// `excludeBlocks` are the candidate block begin pointers (cands[].first).
-    void prepareEvacRecycle(const std::vector<const char *> & excludeBlocks) noexcept
-    {
-        rebuildFreeSpansFromLineMarks();
-        for (const char * blk : excludeBlocks) {
-            for (size_t i = 0; i < active_.blocks.size(); ++i) {
-                if (active_.blocks[i] == blk) {
-                    if (i < active_.freeSpans.size()) active_.freeSpans[i].clear();
-                    break;
-                }
-            }
-        }
-        resetLanesForRecycle();
-        // The Immix span cursor is unused under BiBOP (alloc routes to bumpInLane),
-        // but null it for parity with forceFreshBlock's invariant.
-        immixCur_ = nullptr;
-        immixEnd_ = nullptr;
-    }
-
 private:
-    // B1.1 (BiBOP): per-CellType allocation lanes.  Each lane bump-allocates into
-    // its own block(s) so every block holds ONE CellType.  laneFor() maps the hot,
-    // high-mortality, movable types (Closure/Thunk/Bindings/List/Pair) to their own
-    // lanes; the cold types (Value/Env/Chars/None — low mortality + low volume) share
-    // lane 0, matching the B0.3 LANES(hot+cold) projection that cleared the firefox
-    // bar.  Only used when g_bibopEnabled (default-off); the array is tiny + idle
-    // otherwise.  NOTE: lanes_[].blockIdx is a raw index into active_.blocks; it is
-    // stable under BiBOP-only + BiBOP+mid-eval (neither frees blocks), but the B2
-    // recycling evac (which calls freeWholeBlock → erases + shifts block indices)
-    // MUST re-point the lanes after a free (handled in B2.2).
-    static constexpr int kNumLanes = 6;
-    struct Lane {
-        char * cur = nullptr; char * end = nullptr; size_t blockIdx = 0;
-        // B2.2 recycle cursor: next (block, span) to scan for reusable dead space.
-        size_t recycleBlk = 0; size_t recycleSpanIdx = 0;
-    };
-    Lane lanes_[kNumLanes];
-
-    /// B2.2: advance lane `li`'s cursor to the next free span (in one of ITS blocks,
-    /// blockLane==li) that fits `bytes`; set the lane's cur/end/blockIdx to it.  Mirrors
-    /// immixAdvanceToNextSpan but lane-filtered.  Returns false when the lane's spans are
-    /// exhausted (caller then refills a fresh block).  Spans are post-sweep dead-line
-    /// ranges (no live cell), so recycling into them is safe (in-place reuse, no move).
-    bool laneAdvanceToSpan(int li, size_t bytes) noexcept {
-        Lane & L = lanes_[li];
-        while (L.recycleBlk < active_.freeSpans.size()) {
-            if (L.recycleBlk >= active_.blockLane.size()
-                || active_.blockLane[L.recycleBlk] != static_cast<uint8_t>(li)) {
-                ++L.recycleBlk; L.recycleSpanIdx = 0; continue;   // not this lane's block
-            }
-            auto & spans = active_.freeSpans[L.recycleBlk];
-            while (L.recycleSpanIdx < spans.size()) {
-                const FreeSpan & s = spans[L.recycleSpanIdx];
-                ++L.recycleSpanIdx;
-                if (s.begin < s.end
-                    && static_cast<size_t>(s.end - s.begin) >= bytes) {
-                    L.cur = s.begin; L.end = s.end; L.blockIdx = L.recycleBlk;
-                    return true;
-                }
-            }
-            ++L.recycleBlk; L.recycleSpanIdx = 0;
-        }
-        return false;
-    }
-
-public:
-    /// B2.2: after a sweep rebuilds free spans, reset every lane so the next alloc
-    /// re-acquires from the fresh spans — REQUIRED to avoid double-allocating a lane's
-    /// current-block tail (which the rebuild now lists as a span).  Called from
-    /// mark_sweep.cc (like rebuildFreeSpansFromLineMarks).
-    void resetLanesForRecycle() noexcept {
-        for (Lane & L : lanes_) {
-            L.cur = nullptr; L.end = nullptr;
-            L.recycleBlk = 0; L.recycleSpanIdx = 0;
-        }
-    }
-private:
-
-    static int laneFor(CellType t) noexcept {
-        switch (t) {
-        case CellType::Closure:  return 1;
-        case CellType::Thunk:    return 2;
-        case CellType::Bindings: return 3;
-        case CellType::List:     return 4;
-        case CellType::Pair:     return 5;
-        // cold lane (low mortality + low volume): Value/Env/Chars/None
-        case CellType::None:
-        case CellType::Value:
-        case CellType::Env:
-        case CellType::Chars:    return 0;
-        }
-        return 0;  // unreachable; satisfies -Wreturn-type
-    }
-
-    // Refill a lane with a fresh block.  Reuses refill() (alloc block + push all
-    // per-block metadata + Boehm-register + set active_), then hands the just-
-    // allocated active block to the lane.  Under BiBOP every alloc goes through a
-    // lane, so active_ is otherwise unused — no contention.
-    void refillLane(int li) noexcept {
-        refill();
-        lanes_[li].cur      = active_.cur;
-        lanes_[li].end      = active_.end;
-        lanes_[li].blockIdx = active_.blocks.size() - 1;
-        active_.blockLane[lanes_[li].blockIdx] = static_cast<uint8_t>(li);  // B2.1: tag block's lane
-    }
-
-    // B1.1 per-lane bump.  Mirrors the default bump path's metadata stamp but indexes
-    // the LANE's current block (not active_.blocks.back(), which another lane may own).
-    void * bumpInLane(size_t bytes, CellType type) noexcept {
-        ++detail::g_bibopLaneAllocs;
-        const int li = laneFor(type);
-        Lane & L = lanes_[li];
-        bool recycled = false;
-        if (!L.cur || L.cur + bytes > L.end) {
-            // B2.2: current region exhausted.  First try to RECYCLE a post-sweep dead
-            // span in this lane's blocks (reuse dead space in place → arena reuses
-            // instead of growing).  Only if none fits, allocate a fresh block.
-            if (laneAdvanceToSpan(li, bytes)) recycled = true;
-            else refillLane(li);
-        }
-        void * p = L.cur;
-        L.cur += bytes;
-        // B2.2: recycled cells reuse a swept dead cell's space — zero it (a fresh block
-        // is already zero from mmap/calloc, so only the recycle path needs this).
-        if (recycled) std::memset(p, 0, bytes);
-        // cellMetaEnabled() is always true under BiBOP, so the metadata vectors exist
-        // for L.blockIdx.  Stamp cell-start + type at this granule (nibble-packed).
-        const size_t offset = static_cast<size_t>(
-            static_cast<char *>(p) - active_.blocks[L.blockIdx]);
-        const size_t bit = offset >> 4;
-        active_.cellStarts[L.blockIdx][bit >> 6] |= 1ULL << (bit & 63);
-        if (type != CellType::None)
-            cellTypePack(active_.cellTypes[L.blockIdx], bit, type);
-        clearInteriorCellStarts(p, bytes);
-        return p;
-    }
-
     void refill() noexcept
     {
         // Phase-13 review HIGH-6 fix: zero-fill the block before
@@ -2855,7 +2652,7 @@ private:
         // exit (phantom retention scaling with arena lifetime).
         // mmap(MAP_ANON) (GC path) and calloc (default path) both hand
         // back zero pages directly from the kernel.
-        char * blk = blocksAreMmapped()       // B0.2: BiBOP mmaps so freeWholeBlock can munmap
+        char * blk = blocksAreMmapped()       // major GC mmaps so freeWholeBlock can munmap
             ? mapArenaBlock(kBlockSize)
             : static_cast<char *>(std::calloc(1, kBlockSize));
         // Review #3: mapArenaBlock (mmap) / calloc return nullptr on OOM /
@@ -2873,7 +2670,6 @@ private:
             std::abort();
         }
         active_.blocks.push_back(blk);
-        active_.blockLane.push_back(0xFF);  // B2.1: default non-lane; refillLane overrides
         sortedBlocksDirty_ = true;  // Lever 1: block set changed
         active_.cur = blk;
         active_.end = blk + kBlockSize;

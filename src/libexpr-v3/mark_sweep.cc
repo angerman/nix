@@ -921,8 +921,6 @@ struct SweepStats {
     //   bins by live-byte fraction: [0-10) [10-25) [25-50) [50-75) [75-100]%
     size_t densityHist[5]  = {0, 0, 0, 0, 0};
     size_t sparseBlocks    = 0;  // < 25% live = good evacuation candidates
-    size_t singleTypeBlocks = 0; // B1.4: blocks whose live cells are all one CellType
-    size_t mixedTypeBlocks  = 0; // B1.4: blocks with >1 live CellType (BiBOP should ~0 these)
     size_t sparseLiveBytes = 0;  // live bytes in sparse blocks = copy cost
 
     // R2.1′ (2026-06-03): live-cell tally by CellType (index = CellType
@@ -931,31 +929,11 @@ struct SweepStats {
     // mover) vs None (unstamped → pinned).  None (index 0) counts
     // interior/huge/non-bump cells the mover can't directly type.
     size_t cellTypeHist[9] = {0,0,0,0,0,0,0,0,0};
-    // S2.2 DENSIFY: per-CellType DEAD-cell tally (mirrors cellTypeHist for the
-    // swept/unmarked cells).  mortality_by_type = dead/(dead+live).  If mortality
-    // is type-dependent (some type mostly dead), BiBOP type-segregation would
-    // cluster those deaths into whole sparse blocks → freeable.  If uniform across
-    // types, segregation-by-type can't create the density variance compaction needs.
-    size_t deadCellTypeHist[9] = {0,0,0,0,0,0,0,0,0};
-    // B0.3 GO/NO-GO: per-CellType LIVE bytes → project the per-type-segregated +
-    // compacted footprint (sum_T ceil(liveBytes_T / kBlockSize) blocks) vs the
-    // current mapped arena.  The reclaim is the realizable BiBOP RSS ceiling.
-    size_t liveBytesByType[9] = {0,0,0,0,0,0,0,0,0};
 
     // R2.4b: per regular-block (start, live-byte fraction).  The
     // evacuator filters this to the sparse candidate set.  Populated
     // in sweepOneBlock's density section.
     std::vector<std::pair<const char *, double>> blockDensities;
-
-    // B2.2 (BiBOP): set true when runEvacuation ran its precise-only VERIFY,
-    // which clears + re-marks the arena line marks from PRECISE roots only.
-    // Those marks UNDER-mark conservatively-live cells, so they are NOT a sound
-    // basis for the post-evac mutator span rebuild — prepareEvacRecycle already
-    // built sound full-mark spans for the dest, and the lane cursors point past
-    // the consumed regions into still-dead space.  The caller skips the post-evac
-    // rebuild+reset when this is set (else recycle-into-conservatively-live → UAF;
-    // the firefox SEGV).
-    bool evacClobberedMarks = false;
 };
 
 /// Sweep one arena block.  Walks the cell-start bitmap in address
@@ -1011,7 +989,6 @@ static bool sweepOneBlock(
     ++stats.blocksScanned;
     size_t blockLiveCells = 0;
     size_t blockLiveBytes = 0;
-    uint32_t blockTypeMask = 0;  // B1.4: bitmask of live CellTypes in this block
     for (size_t i = 0; i < starts.size(); ++i) {
         const size_t offset    = starts[i];
         const size_t endOffset = (i + 1 < starts.size())
@@ -1037,19 +1014,9 @@ static bool sweepOneBlock(
             const uint8_t ty =
                 static_cast<uint8_t>(nix::v3::cellTypeUnpack(cellTypeBytes, gran));
             stats.cellTypeHist[ty < 9 ? ty : 0]++;
-            stats.liveBytesByType[ty < 9 ? ty : 0] += cellSize;  // B0.3 projection
-            blockTypeMask |= (1u << (ty < 9 ? ty : 0));           // B1.4 homogeneity
         } else {
             ++stats.deadCells;
             stats.deadBytes += cellSize;
-            // S2.2 DENSIFY: tally the dead cell by its stamped type (same nibble
-            // unpack as the live branch) → per-type mortality.
-            {
-                const size_t gran = offset >> 4;
-                const uint8_t ty =
-                    static_cast<uint8_t>(nix::v3::cellTypeUnpack(cellTypeBytes, gran));
-                stats.deadCellTypeHist[ty < 9 ? ty : 0]++;
-            }
             // Phase 3: route dead cell to the per-exact-size free
             // list and clear its cell-start bit.  Subsequent allocs
             // of this size will reuse the freed slot.
@@ -1081,13 +1048,6 @@ static bool sweepOneBlock(
             if (!nix::v3::detail::g_midEvalGcEnabled)
                 arena.clearCellStartBitFor(cellAddr);
         }
-    }
-    // B1.4: classify the block's type-homogeneity (the BiBOP linchpin — lanes should
-    // make every block single-type).  popcount(mask)==1 → single-type; >1 → mixed.
-    if (blockLiveCells > 0) {
-        const uint32_t m = blockTypeMask & ~1u;  // ignore None (bit 0): unstamped/cold filler
-        if ((m & (m - 1)) == 0) ++stats.singleTypeBlocks;  // 0 or 1 typed bit = homogeneous
-        else                    ++stats.mixedTypeBlocks;
     }
     // R2.1: bin this block's live-byte density (evacuation opportunity).
     if (blockUsedBytes > 0) {
@@ -1851,22 +1811,7 @@ static void runEvacuation(VMState & vm, Arena & arena,
     // Dest copies must NOT land in a candidate block (that would keep it
     // live → unfreeable).  Force a fresh active block so all dest allocs
     // go into brand-new, non-candidate blocks.
-    //
-    // B2.2 (BiBOP): instead of fresh blocks (the net-negative cause —
-    // movedBytes = new arena), RECYCLE dest copies into the EXISTING dead
-    // spans of non-candidate blocks in the same lane.  movedBytes then adds
-    // ~0 new arena (survivors fill dead space we already mapped), so
-    // NET = freedRSS − ~0 > 0.  prepareEvacRecycle builds the spans, excludes
-    // the candidate blocks (yield, not safety — the verify re-mark protects),
-    // and resets the lanes so the dest bumpInLane recycles.
-    if (nix::v3::detail::g_bibopEnabled) {
-        std::vector<const char *> candBegins;
-        candBegins.reserve(cands.size());
-        for (auto & c : cands) candBegins.push_back(c.first);
-        arena.prepareEvacRecycle(candBegins);
-    } else {
-        arena.forceFreshBlock();
-    }
+    arena.forceFreshBlock();
 
     // Relocate + rewrite.  First enqueue the pinned cells for a field-
     // rewrite walk (they stay put but their fields must follow moved
@@ -1916,11 +1861,6 @@ static void runEvacuation(VMState & vm, Arena & arena,
     // stack, falsely pinning every moved block (this was the blocksFreed=0
     // cause).  The precise walk is the sound emptiness check.
     arena.clearAllLineMarks();
-    // B2.2: from here the arena line marks are precise-only (under-marks
-    // conservative cells) → not a sound basis for the post-evac mutator span
-    // rebuild.  Signal the caller to skip it (the dest already recycled into
-    // sound full-mark spans via prepareEvacRecycle).
-    sweep.evacClobberedMarks = true;
     BitmapMarker vmark(arena);
     MarkVisitor vverify(vmark);
     vverify.setArena(arena);
@@ -2415,11 +2355,7 @@ MajorGcResult runMajorMarkSweep(VMState & vm) noexcept
     // is scattered → ~0 fully-dead blocks anyway).  Huge blocks (below) are safe:
     // freeHugeBlock picks std::free vs munmap to match how they were allocated.
     std::vector<std::pair<uintptr_t, uintptr_t>> freedRanges;
-    // B2.2: under BiBOP, blocks are mmap'd (blocksAreMmapped()), so fully-dead
-    // blocks CAN be munmap'd here — no moving needed.  Single-type lanes cluster
-    // same-type/same-phase cells, so whole-block death is far more likely than in
-    // the mixed-block case (where the histogram showed ~0 fully-dead blocks).
-    if (Arena::majorGcEnabled() || nix::v3::detail::g_bibopEnabled)
+    if (Arena::majorGcEnabled())
     for (const char * blk : blocksToFree) {
         const size_t freed = arena.freeWholeBlock(blk);
         if (freed > 0) {
@@ -2494,18 +2430,8 @@ MajorGcResult runMajorMarkSweep(VMState & vm) noexcept
     // the Arena alloc path skips the Immix branch, so the rebuilt freeSpans
     // were computed and immediately ignored — per-GC dead work over every
     // surviving block.
-    // B2.2: skip the post-evac rebuild+reset when the evac clobbered the line
-    // marks with its precise-only verify (else the mutator would recycle into
-    // conservatively-live cells the verify under-marked → UAF / firefox SEGV).
-    // In that case prepareEvacRecycle already built sound full-mark spans for the
-    // dest and the lane cursors point past the consumed regions into still-dead
-    // space, which the mutator safely continues from until the next full sweep.
-    if (!sweep.evacClobberedMarks) {
-        if (nix::v3::detail::g_immixAllocEnabled || nix::v3::detail::g_bibopEnabled)
-            arena.rebuildFreeSpansFromLineMarks();  // B2.2: BiBOP recycles into these spans
-        if (nix::v3::detail::g_bibopEnabled)
-            arena.resetLanesForRecycle();  // B2.2: lanes re-acquire from the fresh spans
-    }
+    if (nix::v3::detail::g_immixAllocEnabled)
+        arena.rebuildFreeSpansFromLineMarks();
 
     const auto tSweepEnd = clock::now();
     const double markMs =
@@ -2603,56 +2529,6 @@ MajorGcResult runMajorMarkSweep(VMState & vm) noexcept
                 h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], h[8],
                 (typed + h[0]) > 0 ? 100.0 * double(typed)
                                      / double(typed + h[0]) : 0.0);
-            // B1.4: BiBOP block-homogeneity — single-type vs mixed blocks.  Without
-        // BiBOP, blocks are mixed-type (lanes off) → high mixed count.  With BiBOP,
-        // lanes make every block single-type → mixed≈0, which is what lets the
-        // high-mortality types' blocks go sparse (the density variance the evac needs).
-        std::fprintf(stderr, "v3 block-homogeneity: singleType=%zu mixedType=%zu laneAllocs=%zu\n",
-            sweep.singleTypeBlocks, sweep.mixedTypeBlocks,
-            nix::v3::detail::g_bibopLaneAllocs);
-        // S2.2 DENSIFY: per-type MORTALITY = dead/(dead+live).  A type that is
-            // mostly dead (high mortality) is a BiBOP-segregation candidate: cluster
-            // its allocations into dedicated blocks → those blocks go mostly-dead →
-            // sparse → freeable by compaction.  Uniform mortality across types ⇒
-            // segregation-by-type can't manufacture the density variance firefox lacks.
-            const size_t * d = sweep.deadCellTypeHist;
-            auto mort = [&](int i){ size_t t = h[i]+d[i]; return t ? 100.0*double(d[i])/double(t) : 0.0; };
-            std::fprintf(stderr,
-                "v3 mortality%% by type: Value=%.0f Closure=%.0f Thunk=%.0f Bindings=%.0f "
-                "List=%.0f Pair=%.0f Env=%.0f Chars=%.0f (dead: Thunk=%zu Pair=%zu Bindings=%zu Chars=%zu)\n",
-                mort(1), mort(2), mort(3), mort(4), mort(5), mort(6), mort(7), mort(8),
-                d[3], d[6], d[4], d[8]);
-        }
-        // B0.3 GO/NO-GO: project the realizable per-type-segregated + compacted arena
-        // footprint vs the current mapped arena.  Each lane needs ceil(liveBytes_T /
-        // kBlockSize) blocks (perfect within-type recycling).  Three projections:
-        //   mixed-perfect  = single lane, all types (no segregation rounding) — the floor.
-        //   lanes(hot+cold)= the actual BiBOP plan: Closure/Thunk/Bindings/List/Pair own
-        //                    lanes + a shared cold lane (Value+Env+Chars). THIS is the GO
-        //                    number to compare against the pre-committed ship threshold.
-        //   per-type-own   = every type its own lane (max segregation, max rounding waste).
-        // reclaim = current arena − projected footprint.  munmap-realizable iff the evac
-        // packing achieves the per-lane floor (B2 measures the real achievement).
-        {
-            const size_t * lb = sweep.liveBytesByType;
-            const size_t blk = Arena::kBlockSize;
-            auto cb = [&](size_t b){ return b ? (b + blk - 1) / blk : size_t(0); };
-            size_t ownBlk = 0; for (int i = 1; i <= 8; ++i) ownBlk += cb(lb[i]);
-            size_t hotBlk = cb(lb[2]) + cb(lb[3]) + cb(lb[4]) + cb(lb[5]) + cb(lb[6]);
-            size_t laneBlk = hotBlk + cb(lb[1] + lb[7] + lb[8]);
-            size_t totLive = 0; for (int i = 1; i <= 8; ++i) totLive += lb[i];
-            size_t mixBlk = cb(totLive);
-            const size_t cur = arenaBytesBefore;
-            auto MB = [](double b){ return b / 1e6; };
-            std::fprintf(stderr,
-                "v3 BiBOP-projection: arena=%.0fMB live=%.0fMB || mixed-perfect=%.0fMB(reclaim %.0fMB) "
-                "| LANES(hot+cold)=%.0fMB(reclaim %.0fMB) | per-type-own=%.0fMB(reclaim %.0fMB) "
-                "|| seg-overhead(lanes vs mixed)=+%.0fMB\n",
-                MB(cur), MB(totLive),
-                MB(double(mixBlk)*blk), MB(double(cur) - double(mixBlk)*blk),
-                MB(double(laneBlk)*blk), MB(double(cur) - double(laneBlk)*blk),
-                MB(double(ownBlk)*blk), MB(double(cur) - double(ownBlk)*blk),
-                MB(double(laneBlk - mixBlk)*blk));
         }
         // Step 11′ (Immix, 2026-05-29): line-mark bitmap summary.
         // Each block has 131,072 lines of 128 B; a line is "live"
