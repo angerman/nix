@@ -2696,6 +2696,38 @@ public:
         immixEnd_ = nullptr;
     }
 
+    /// B2.2 (BiBOP): prepare the lanes to RECYCLE evac dest copies into existing
+    /// dead spans instead of bump-allocating fresh blocks (forceFreshBlock).  This is
+    /// what flips the evac from net-negative (movedBytes = fresh blocks) to net-positive
+    /// (movedBytes ≈ 0 new arena — survivors fill dead space in OTHER blocks of the same
+    /// lane).  Steps:
+    ///   1. rebuild free spans from the post-sweep line marks (so the dest has spans);
+    ///   2. clear the candidate (about-to-be-freed) blocks' spans so a survivor never
+    ///      recycles into a block we're trying to empty (a YIELD optimization — the evac
+    ///      verify re-marks from precise roots, so a survivor in a candidate would merely
+    ///      keep that block live, not cause a UAF; excluding them lets the candidate
+    ///      actually reach zero marks → freeWholeBlock);
+    ///   3. reset the lane cursors so the next dest alloc re-acquires from the fresh,
+    ///      candidate-excluded spans.
+    /// `excludeBlocks` are the candidate block begin pointers (cands[].first).
+    void prepareEvacRecycle(const std::vector<const char *> & excludeBlocks) noexcept
+    {
+        rebuildFreeSpansFromLineMarks();
+        for (const char * blk : excludeBlocks) {
+            for (size_t i = 0; i < active_.blocks.size(); ++i) {
+                if (active_.blocks[i] == blk) {
+                    if (i < active_.freeSpans.size()) active_.freeSpans[i].clear();
+                    break;
+                }
+            }
+        }
+        resetLanesForRecycle();
+        // The Immix span cursor is unused under BiBOP (alloc routes to bumpInLane),
+        // but null it for parity with forceFreshBlock's invariant.
+        immixCur_ = nullptr;
+        immixEnd_ = nullptr;
+    }
+
 private:
     // B1.1 (BiBOP): per-CellType allocation lanes.  Each lane bump-allocates into
     // its own block(s) so every block holds ONE CellType.  laneFor() maps the hot,

@@ -946,6 +946,16 @@ struct SweepStats {
     // evacuator filters this to the sparse candidate set.  Populated
     // in sweepOneBlock's density section.
     std::vector<std::pair<const char *, double>> blockDensities;
+
+    // B2.2 (BiBOP): set true when runEvacuation ran its precise-only VERIFY,
+    // which clears + re-marks the arena line marks from PRECISE roots only.
+    // Those marks UNDER-mark conservatively-live cells, so they are NOT a sound
+    // basis for the post-evac mutator span rebuild — prepareEvacRecycle already
+    // built sound full-mark spans for the dest, and the lane cursors point past
+    // the consumed regions into still-dead space.  The caller skips the post-evac
+    // rebuild+reset when this is set (else recycle-into-conservatively-live → UAF;
+    // the firefox SEGV).
+    bool evacClobberedMarks = false;
 };
 
 /// Sweep one arena block.  Walks the cell-start bitmap in address
@@ -1841,7 +1851,22 @@ static void runEvacuation(VMState & vm, Arena & arena,
     // Dest copies must NOT land in a candidate block (that would keep it
     // live → unfreeable).  Force a fresh active block so all dest allocs
     // go into brand-new, non-candidate blocks.
-    arena.forceFreshBlock();
+    //
+    // B2.2 (BiBOP): instead of fresh blocks (the net-negative cause —
+    // movedBytes = new arena), RECYCLE dest copies into the EXISTING dead
+    // spans of non-candidate blocks in the same lane.  movedBytes then adds
+    // ~0 new arena (survivors fill dead space we already mapped), so
+    // NET = freedRSS − ~0 > 0.  prepareEvacRecycle builds the spans, excludes
+    // the candidate blocks (yield, not safety — the verify re-mark protects),
+    // and resets the lanes so the dest bumpInLane recycles.
+    if (nix::v3::detail::g_bibopEnabled) {
+        std::vector<const char *> candBegins;
+        candBegins.reserve(cands.size());
+        for (auto & c : cands) candBegins.push_back(c.first);
+        arena.prepareEvacRecycle(candBegins);
+    } else {
+        arena.forceFreshBlock();
+    }
 
     // Relocate + rewrite.  First enqueue the pinned cells for a field-
     // rewrite walk (they stay put but their fields must follow moved
@@ -1891,6 +1916,11 @@ static void runEvacuation(VMState & vm, Arena & arena,
     // stack, falsely pinning every moved block (this was the blocksFreed=0
     // cause).  The precise walk is the sound emptiness check.
     arena.clearAllLineMarks();
+    // B2.2: from here the arena line marks are precise-only (under-marks
+    // conservative cells) → not a sound basis for the post-evac mutator span
+    // rebuild.  Signal the caller to skip it (the dest already recycled into
+    // sound full-mark spans via prepareEvacRecycle).
+    sweep.evacClobberedMarks = true;
     BitmapMarker vmark(arena);
     MarkVisitor vverify(vmark);
     vverify.setArena(arena);
@@ -2464,10 +2494,18 @@ MajorGcResult runMajorMarkSweep(VMState & vm) noexcept
     // the Arena alloc path skips the Immix branch, so the rebuilt freeSpans
     // were computed and immediately ignored — per-GC dead work over every
     // surviving block.
-    if (nix::v3::detail::g_immixAllocEnabled || nix::v3::detail::g_bibopEnabled)
-        arena.rebuildFreeSpansFromLineMarks();  // B2.2: BiBOP recycles into these spans
-    if (nix::v3::detail::g_bibopEnabled)
-        arena.resetLanesForRecycle();  // B2.2: lanes re-acquire from the fresh spans
+    // B2.2: skip the post-evac rebuild+reset when the evac clobbered the line
+    // marks with its precise-only verify (else the mutator would recycle into
+    // conservatively-live cells the verify under-marked → UAF / firefox SEGV).
+    // In that case prepareEvacRecycle already built sound full-mark spans for the
+    // dest and the lane cursors point past the consumed regions into still-dead
+    // space, which the mutator safely continues from until the next full sweep.
+    if (!sweep.evacClobberedMarks) {
+        if (nix::v3::detail::g_immixAllocEnabled || nix::v3::detail::g_bibopEnabled)
+            arena.rebuildFreeSpansFromLineMarks();  // B2.2: BiBOP recycles into these spans
+        if (nix::v3::detail::g_bibopEnabled)
+            arena.resetLanesForRecycle();  // B2.2: lanes re-acquire from the fresh spans
+    }
 
     const auto tSweepEnd = clock::now();
     const double markMs =
