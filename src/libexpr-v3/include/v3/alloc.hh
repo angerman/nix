@@ -1717,7 +1717,9 @@ public:
     /// cell spans.
     void markLinesForCell(const void * addr, size_t bytes) noexcept
     {
-        if (!majorGcEnabled() || !addr || bytes == 0) return;
+        // B2.2: BiBOP needs line marks too (the per-lane recycling evac reads the
+        // free spans rebuilt from them).
+        if ((!majorGcEnabled() && !detail::g_bibopEnabled) || !addr || bytes == 0) return;
         const char * cp = static_cast<const char *>(addr);
         const size_t nBlocks = active_.blocks.size();
         if (nBlocks == 0 || nBlocks > active_.lineMarks.size()) return;
@@ -1818,7 +1820,7 @@ public:
     /// * mixed              → walk bits within word
     void rebuildFreeSpansFromLineMarks() noexcept
     {
-        if (!majorGcEnabled()) return;
+        if (!majorGcEnabled() && !detail::g_bibopEnabled) return;  // B2.2: BiBOP recycles these
         const size_t nBlocks = active_.blocks.size();
         active_.freeSpans.clear();
         active_.freeSpans.resize(nBlocks);

@@ -2460,8 +2460,8 @@ MajorGcResult runMajorMarkSweep(VMState & vm) noexcept
     // the Arena alloc path skips the Immix branch, so the rebuilt freeSpans
     // were computed and immediately ignored — per-GC dead work over every
     // surviving block.
-    if (nix::v3::detail::g_immixAllocEnabled)
-        arena.rebuildFreeSpansFromLineMarks();
+    if (nix::v3::detail::g_immixAllocEnabled || nix::v3::detail::g_bibopEnabled)
+        arena.rebuildFreeSpansFromLineMarks();  // B2.2: BiBOP recycles into these spans
 
     const auto tSweepEnd = clock::now();
     const double markMs =
