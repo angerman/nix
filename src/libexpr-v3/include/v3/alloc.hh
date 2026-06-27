@@ -2708,8 +2708,49 @@ private:
     // recycling evac (which calls freeWholeBlock → erases + shifts block indices)
     // MUST re-point the lanes after a free (handled in B2.2).
     static constexpr int kNumLanes = 6;
-    struct Lane { char * cur = nullptr; char * end = nullptr; size_t blockIdx = 0; };
+    struct Lane {
+        char * cur = nullptr; char * end = nullptr; size_t blockIdx = 0;
+        // B2.2 recycle cursor: next (block, span) to scan for reusable dead space.
+        size_t recycleBlk = 0; size_t recycleSpanIdx = 0;
+    };
     Lane lanes_[kNumLanes];
+
+    /// B2.2: advance lane `li`'s cursor to the next free span (in one of ITS blocks,
+    /// blockLane==li) that fits `bytes`; set the lane's cur/end/blockIdx to it.  Mirrors
+    /// immixAdvanceToNextSpan but lane-filtered.  Returns false when the lane's spans are
+    /// exhausted (caller then refills a fresh block).  Spans are post-sweep dead-line
+    /// ranges (no live cell), so recycling into them is safe (in-place reuse, no move).
+    bool laneAdvanceToSpan(int li, size_t bytes) noexcept {
+        Lane & L = lanes_[li];
+        while (L.recycleBlk < active_.freeSpans.size()) {
+            if (L.recycleBlk >= active_.blockLane.size()
+                || active_.blockLane[L.recycleBlk] != static_cast<uint8_t>(li)) {
+                ++L.recycleBlk; L.recycleSpanIdx = 0; continue;   // not this lane's block
+            }
+            auto & spans = active_.freeSpans[L.recycleBlk];
+            while (L.recycleSpanIdx < spans.size()) {
+                const FreeSpan & s = spans[L.recycleSpanIdx];
+                ++L.recycleSpanIdx;
+                if (s.begin < s.end
+                    && static_cast<size_t>(s.end - s.begin) >= bytes) {
+                    L.cur = s.begin; L.end = s.end; L.blockIdx = L.recycleBlk;
+                    return true;
+                }
+            }
+            ++L.recycleBlk; L.recycleSpanIdx = 0;
+        }
+        return false;
+    }
+
+    /// B2.2: after a sweep rebuilds free spans, reset every lane so the next alloc
+    /// re-acquires from the fresh spans — REQUIRED to avoid double-allocating a lane's
+    /// current-block tail (which the rebuild now lists as a span).
+    void resetLanesForRecycle() noexcept {
+        for (Lane & L : lanes_) {
+            L.cur = nullptr; L.end = nullptr;
+            L.recycleBlk = 0; L.recycleSpanIdx = 0;
+        }
+    }
 
     static int laneFor(CellType t) noexcept {
         switch (t) {
@@ -2745,9 +2786,19 @@ private:
         ++detail::g_bibopLaneAllocs;
         const int li = laneFor(type);
         Lane & L = lanes_[li];
-        if (!L.cur || L.cur + bytes > L.end) refillLane(li);
+        bool recycled = false;
+        if (!L.cur || L.cur + bytes > L.end) {
+            // B2.2: current region exhausted.  First try to RECYCLE a post-sweep dead
+            // span in this lane's blocks (reuse dead space in place → arena reuses
+            // instead of growing).  Only if none fits, allocate a fresh block.
+            if (laneAdvanceToSpan(li, bytes)) recycled = true;
+            else refillLane(li);
+        }
         void * p = L.cur;
         L.cur += bytes;
+        // B2.2: recycled cells reuse a swept dead cell's space — zero it (a fresh block
+        // is already zero from mmap/calloc, so only the recycle path needs this).
+        if (recycled) std::memset(p, 0, bytes);
         // cellMetaEnabled() is always true under BiBOP, so the metadata vectors exist
         // for L.blockIdx.  Stamp cell-start + type at this granule (nibble-packed).
         const size_t offset = static_cast<size_t>(

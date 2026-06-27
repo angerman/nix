@@ -2462,6 +2462,8 @@ MajorGcResult runMajorMarkSweep(VMState & vm) noexcept
     // surviving block.
     if (nix::v3::detail::g_immixAllocEnabled || nix::v3::detail::g_bibopEnabled)
         arena.rebuildFreeSpansFromLineMarks();  // B2.2: BiBOP recycles into these spans
+    if (nix::v3::detail::g_bibopEnabled)
+        arena.resetLanesForRecycle();  // B2.2: lanes re-acquire from the fresh spans
 
     const auto tSweepEnd = clock::now();
     const double markMs =
