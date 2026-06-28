@@ -559,6 +559,26 @@ struct AllocStats
     /// driving where to focus VM-level optimisation work.
     uint64_t opcodeCounts[256] = {};
 
+    /// REG-VM MEASUREMENT (2026-06-29): dynamically-weighted histogram of per-
+    /// instruction frame occupancy = valueStack.size() − frame.stackBaseOffset =
+    /// (live locals + live temporaries) = the register-window pressure a Lua-style
+    /// REGISTER VM would need.  Bucket i = #executed instructions at occupancy i
+    /// (clamped to 63).  From it: for a register file of K, the fraction of dynamic
+    /// instructions with occupancy ≤ K run WITHOUT spill — i.e. the ceiling on how
+    /// much of the GET/SET/PUSH stack traffic a K-register VM collapses into operands.
+    /// Gated by NIX_VM_OPCOUNTS=1 (the existing analysis mode; one subtract + array
+    /// bump per dispatch, only under the gate). Retire when the register-VM go/no-go
+    /// is decided (the #780 question this answers).
+    uint64_t regPressureHist[64] = {};
+
+    /// REG-VM MEASUREMENT companion: split the histogram by whether the current op is
+    /// a "collapsible" pure data-move (GET_LOCAL/GET_LOCAL2/GET_UPVALUE/SET_LOCAL/
+    /// SET_LOCAL_KEEP/GET_UPVALUE_REC_BINDING_SLOT) — these are the ops a register VM
+    /// folds into operands.  collapsibleAtDepth[i] = #collapsible ops at occupancy i.
+    /// Lets the dump compute the NET op reduction at register count K (collapse the
+    /// data-moves whose body fits in K; the rest stay).  Same gate.
+    uint64_t regCollapsibleHist[64] = {};
+
     /// #782 (2026-05-23) bigram (prev_op, current_op) counts.  Gated
     /// by NIX_VM_OPCOUNTS=1 with NIX_VM_BIGRAMS=1 to add the second
     /// counter increment (~1 ns extra dispatch when both are on).

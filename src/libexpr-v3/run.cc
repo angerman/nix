@@ -955,6 +955,55 @@ RootResult runRootExprModule(nix::EvalState & state, ir::Module module)
                     (unsigned long long)selFam,
                     100.0 * selFam / totalDispatch);
 
+                // REG-VM MEASUREMENT (2026-06-29): project a Lua-style REGISTER VM
+                // from the per-instruction frame-occupancy histogram.  Model: cap the
+                // register window at K; the bottom K frame slots are registers, slots
+                // ≥ K spill to memory.  A collapsible data-move op (GET/SET local/upval)
+                // accessing occupancy d FOLDS into an operand iff d < K (its slot is a
+                // register); at d ≥ K it stays as a spilled memory access.  So:
+                //   collapsed(K) = Σ_{d<K} regCollapsibleHist[d]
+                //   newOps(K)    = totalDispatch − collapsed(K)
+                //   opReduction  = collapsed(K) / totalDispatch
+                // This is EXACT for the cap-K-window+linear-spill model (per-instruction
+                // occupancy IS the operand's register index).  CPU win ≈ opReduction ×
+                // (dispatch + value-stack-traffic share of CPU) — NOT 1:1 (the folded
+                // ops are cheap); pair with the on-CPU profile for the wall estimate.
+                uint64_t totPress = 0, totCollapsible = 0;
+                for (size_t i = 0; i < 64; ++i) {
+                    totPress += a.regPressureHist[i];
+                    totCollapsible += a.regCollapsibleHist[i];
+                }
+                if (totPress > 0) {
+                    std::fprintf(stderr,
+                        "v3-direct REG-VM projection (frame occupancy = locals+temps; "
+                        "%llu collapsible data-moves = %.1f%% of dispatch):\n",
+                        (unsigned long long)totCollapsible,
+                        100.0 * totCollapsible / totPress);
+                    // occupancy distribution percentiles (where does pressure sit?)
+                    std::fprintf(stderr, "  occupancy histogram (%% of instrs at depth d):\n   ");
+                    uint64_t cum = 0;
+                    for (size_t d = 0; d < 20; ++d) {
+                        std::fprintf(stderr, " d%zu=%.0f%%", d,
+                            100.0 * a.regPressureHist[d] / totPress);
+                    }
+                    std::fprintf(stderr, "\n");
+                    static const int Ks[] = {3, 5, 7, 9, 12, 16, 24, 32};
+                    for (int K : Ks) {
+                        uint64_t fit = 0, collapsed = 0;
+                        for (int d = 0; d < K && d < 64; ++d) {
+                            fit += a.regPressureHist[d];
+                            collapsed += a.regCollapsibleHist[d];
+                        }
+                        std::fprintf(stderr,
+                            "  K=%-2d regs: %5.1f%% instrs fit (no spill) | "
+                            "collapse %5.1f%% of all ops (%.1f%% of the collapsible)\n",
+                            K,
+                            100.0 * fit / totPress,
+                            100.0 * collapsed / totPress,
+                            totCollapsible ? 100.0 * collapsed / totCollapsible : 0.0);
+                    }
+                }
+
                 // #786 OPCYCLES — observed per-op ns (avg) on this
                 // run.  Only present when NIX_VM_OPCYCLES=1 was set.
                 // Each row: opcode + total ns + count + ns/op.

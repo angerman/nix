@@ -4389,6 +4389,23 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
         }
         if (s_countOpcodes) {
             allocStats().opcodeCounts[static_cast<uint8_t>(op)]++;
+            // REG-VM MEASUREMENT (2026-06-29): per-instruction frame occupancy =
+            // (live locals + temps) = the register-window pressure a Lua-style
+            // register VM needs.  Histogram it (dynamically weighted) + split out the
+            // collapsible data-move ops, so the dump can project, for K registers, how
+            // much GET/SET/PUSH stack traffic folds into operands without spilling.
+            if (!vm.frames.empty()) {
+                size_t depth = vm.valueStack.size()
+                    - vm.frames.back().stackBaseOffset;
+                size_t d = depth < 64 ? depth : 63;
+                allocStats().regPressureHist[d]++;
+                const bool collapsible =
+                       op == OP_GET_LOCAL || op == OP_GET_LOCAL2
+                    || op == OP_GET_UPVALUE || op == OP_SET_LOCAL
+                    || op == OP_SET_LOCAL_KEEP
+                    || op == OP_GET_UPVALUE_REC_BINDING_SLOT;
+                if (collapsible) allocStats().regCollapsibleHist[d]++;
+            }
             // #782 bigram tracking — only when NIX_VM_BIGRAMS=1
             // alongside NIX_VM_OPCOUNTS=1.  Identifies common
             // (prev_op, current_op) sequences for super-instruction
