@@ -51,29 +51,66 @@ bytecode's primary advantage never appears.
 4. **8B NaN-boxed Value** costs encode/decode (tag extract + pointer untag) per access; TW's
    16B Value has a direct tag+union. The RSS-for-CPU trade Lever B made (+1–4% wall, baked).
 
-So for the SAME evaluation v3 executes 36.86M dispatched stack-ops where TW does the
-equivalent in native C++ control flow with values in registers. The interpreter's
-per-operation constant factor is higher than tuned recursive-descent C++, and graph reduction
-gives it no loop to amortize against. **This is architectural, not a bug** — the cheap CPU
-levers (countDistinct memoize, superinstructions, dispatch tweaks) were already explored
-(project_profile_at_scale): countDistinct shipped −9–15%, superinstructions neutral, the rest
-document-closed.
+CORRECTION (do not repeat the earlier error): TW is NOT compiled — it is a tree-walking
+INTERPRETER (`eval(Expr*, Env&)` recursive descent). The honest framing is below.
 
-## Why this is also the JIT ceiling
+## Why a bytecode VM loses to a tree-walker here (two distinct reasons)
 
-A NAIVE JIT removes #2 (dispatch) but its generated code still performs all the stack traffic
-from #1 (SET_LOCAL/GET_LOCAL → `mov`s) + alloc + real work → the measured 2.5×→~1.5–2.2×
-(#137). To actually beat TW you need an OPTIMIZING JIT with REGISTER ALLOCATION that
-eliminates the stack shuffles entirely — keeping values in registers the way TW's compiled
-C++ already does. That register-allocating codegen is the hard, multi-week part, and it is
-the real reason "beat TW on CPU" = native codegen, not a faster interpreter.
+Bytecode's advantages over tree-walking are (1) no AST re-traversal in loops, (2) flat
+cache-friendly code, (3) fewer dispatches. For Nix: (1) doesn't apply (force-once graph
+reduction; both walk once); (2) is small.
+
+REASON A — v3's STACK bytecode dispatches MORE than the tree-walk, not fewer. The tree-walk
+passes sub-results back in C++ return registers; the stack VM shuffles them through the value
+stack with explicit GET/SET/PUSH ops (the 49%). So v3 throws away bytecode's (3) advantage. A
+REGISTER VM would fold those into operands and reach ~dispatch-parity with the tree-walk —
+this is the ~25% of v3 CPU that is dispatch (see the JIT ceiling).
+
+REASON B (decisive) — even at ZERO dispatch, v3 is still 1.5–2.2× TW (the JIT ceiling, #137).
+So v3's per-operation SEMANTIC work is ~2× the tree-walker's TOTAL work, independent of
+stack-vs-register. That residual is:
+  - the 8B NaN-box codec on every Value access (TW's 16B Value has a direct tag field);
+  - the PRECISE MOVING-GC tax v3 pays per op/alloc — write barriers, nursery routing,
+    safepoint polls — that TW's Boehm (conservative, non-moving) simply does NOT pay;
+  - more/heavier allocations: separate thunk/pair cells + HAMT-node indirection vs TW's flat
+    sorted Bindings (great for the small attrsets that dominate);
+  - cppnix's TW being ~15 years tuned (tight switch dispatch, interned symbols, optimized Env).
+
+## The reframe — v3 pays its RSS bets' CPU cost without the RSS benefit
+
+The 8B NaN-box and the precise moving GC were taken on FOR RSS. v3 pays their CPU cost every
+op/alloc. The campaign showed the RSS payoff never materialized (arena never returns pages;
+all reclamation levers dead). So v3 currently carries the CPU COST of those bets WITHOUT the
+RSS benefit — a core reason the bytecode VM ended up slower than the tree-walker.
+
+## Implication for "stack vs register vs JIT"
+
+- REGISTER VM: fixes Reason A (self-inflicted extra dispatch) → ~dispatch-parity, ~10–15%,
+  lands ~2.1–2.2×. Big rewrite; STILL loses to TW because of Reason B.
+- JIT: removes all dispatch but not Reason B → 1.5–2.2× (#137); only an OPTIMIZING JIT with
+  register allocation removes the stack traffic too, and even then the semantic residual
+  (alloc/GC-tax/structures) remains.
+- The real lever is Reason B: the dispatch-free per-operation cost — the moving-GC tax + the
+  representation. That is broad constant-factor work against a very tuned target, OR
+  revisiting the RSS bets (is the moving-GC per-op tax worth paying when it buys no RSS?).
+  Cheap CPU levers already explored (project_profile_at_scale): countDistinct memoize shipped
+  −9–15%, superinstructions neutral, the rest document-closed.
+
+NEXT MEASUREMENT (the actionable gate): decompose the WARM dispatch-free on-CPU residual —
+alloc-path/barriers vs NaN-box vs attr-ops vs force machinery — to size how much of the
+1.5–2.2× is the moving-GC tax (potentially revisitable) vs irreducible work.
 
 ## One-line answer
 
-v3 is slower because a stack-based bytecode interpreter spends ~60% of its opcodes shuffling
-values through a dispatched stack machine that a tree-walker does for free in C++
-registers/recursion — and Nix's force-once graph reduction offers no loop re-walk for the
-bytecode to amortize that overhead against.
+Two reasons, both vs a tree-walking INTERPRETER (not compiled): (A) v3's STACK bytecode
+dispatches MORE than the tree-walk — ~60% of opcodes shuffle values through the value stack
+that the tree-walk passes in C++ return registers (a register VM would fix this, ~dispatch
+parity); and (B, decisive) even dispatch-free v3 is 1.5–2.2× TW, because its per-operation
+semantic work is ~2× heavier — the 8B NaN-box codec + the precise moving-GC per-op/alloc tax
+(barriers/nursery/safepoints that Boehm-TW never pays) + heavier structures (separate cells,
+HAMT) + cppnix's 15-year tuning. Nix's force-once graph reduction also gives the bytecode no
+loop re-walk to amortize against. v3 pays the CPU cost of its RSS bets (8B Value, moving GC)
+without the RSS benefit the campaign showed never materialized.
 
 Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>, Input Output Group.
 SPDX-License-Identifier: Apache-2.0
