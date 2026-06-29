@@ -688,6 +688,40 @@ RootResult runRootExprModule(nix::EvalState & state, ir::Module module)
             boehmUnmapped / 1e6,
             arenaPin      / 1e6,
             elsewhere     / 1e6);
+        // M0.1 (BOUNDED_MEMORY_PLAN_2026-06-29): unified RSS decomposition —
+        // attribute every MB of peak_rss to a NAMED, boundability-classified bucket
+        // so the bounded-memory levers can each be sized + measured against this:
+        //   peak_rss = arena + CU-bytecode + SQLite + Boehm-heap + residual
+        //   arena       — the never-munmap wall (M3); live/dead split on the
+        //                 "v3 major-mark-sweep" line (needs a sweep to know live).
+        //   CU-bytecode — libc-malloc'd CompilationUnits, held whole-eval (M2 evict).
+        //   SQLite      — disk-cache page-cache resident (M1.B cache_size cap).
+        //   Boehm-heap  — ~all reserved-free, pinned by arena-as-GC-root (M1.A dereg).
+        //   residual    — malloc fragmentation + posPool/symtab/stringContext + binary.
+        // GATE (M0.1): the named buckets reconcile to peak_rss (residual ≥ 0); the
+        // residual names what is NOT yet separately attributed.
+        {
+            // Reconcile EXACTLY: peak_rss = arena + CU-bytecode + SQLite + rest, where
+            // each of arena/CU/SQLite is a cleanly-measurable RESIDENT bucket and `rest`
+            // is the remainder.  Boehm is reported as a sub-figure of `rest` because its
+            // heap (boehm_heap) is RESERVED, not resident — its free pages are only
+            // partly faulted, so adding boehm_heap whole would oversum peak_rss.  `rest`
+            // therefore holds Boehm's RESIDENT pages (<= reserved) + malloc-frag +
+            // posPool/symtab/stringContext + binary.  Boehm-reserved is the M1.A target.
+            const size_t cuBytecode = importCacheBytecodeBytes();
+            const size_t cuCount    = importCacheCuCount();
+            const size_t sqliteRes  = disk_cache::approxResidentBytes();
+            const size_t measured   = arenaPin + cuBytecode + sqliteRes;
+            const size_t rest       = rssBytes > measured ? rssBytes - measured : 0;
+            std::fprintf(stderr,
+                "v3-direct RSS-decomp (peak_rss=%.0fMB): arena=%.0f + "
+                "CU-bytecode=%.0f(%zu CUs) + SQLite=%.0f + rest=%.0f  "
+                "[rest = Boehm-resident(<=reserved %.0f, free %.0f; M1.A) + malloc-frag "
+                "+ posPool/symtab + binary; arena live/dead -> major-mark-sweep line]\n",
+                rssBytes / 1e6, arenaPin / 1e6,
+                cuBytecode / 1e6, cuCount, sqliteRes / 1e6, rest / 1e6,
+                boehmHeap / 1e6, boehmFree / 1e6);
+        }
         // 2026-05-27: Boehm GC time/count line — input to the
         // "ditch Boehm" decision per IDEAL_GC_DESIGN_2026-05-26.md.
         // If boehm_gc_ms is sub-1 % of overall wall, the wall case
