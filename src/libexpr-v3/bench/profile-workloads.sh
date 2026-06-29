@@ -47,7 +47,7 @@ wl_expr() { case "$1" in
   firefox)      echo '(import <nixpkgs> { config.allowUnfree = true; }).firefox.drvPath' ;;
   cardano-node) echo "(builtins.getFlake \"path:$CN\").packages.aarch64-darwin.cardano-node.name" ;;
   HNE)          echo "(builtins.getFlake \"path:$HNE\").packages.aarch64-darwin.hello.drvPath" ;;
-  simplex-chat) echo "${SIMPLEX_EXPR:-}" ;;
+  simplex-chat) echo "${SIMPLEX_EXPR:-(builtins.getFlake \"path:$SIMPLEX\").packages.aarch64-darwin.\"exe:simplex-chat\".name}" ;;
   *) echo "" ;;
 esac; }
 # IFD workloads need IFD + flake eval-cache off (re-eval each run).
