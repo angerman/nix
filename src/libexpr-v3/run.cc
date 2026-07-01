@@ -43,6 +43,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <sys/resource.h>
+#ifdef __APPLE__
+#include <malloc/malloc.h>   // M1.D: malloc_zone_pressure_relief
+#include <mach/mach.h>       // M1.D: task_info TASK_VM_INFO phys_footprint (current RSS)
+#endif
 #if NIX_USE_BOEHMGC
 #include <gc/gc.h>
 #endif
@@ -722,6 +726,35 @@ RootResult runRootExprModule(nix::EvalState & state, ir::Module module)
                 cuBytecode / 1e6, cuCount, sqliteRes / 1e6, rest / 1e6,
                 boehmHeap / 1e6, boehmFree / 1e6);
         }
+#ifdef __APPLE__
+        // M1.D (BOUNDED_MEMORY_PLAN_2026-06-29): probe malloc-fragmentation
+        // reclaimability.  Reads CURRENT resident (phys_footprint, not maxrss),
+        // forces libmalloc to return freed-but-retained pages to the OS
+        // (malloc_zone_pressure_relief, all zones), re-reads.  A large drop => the
+        // "rest" bucket holds reclaimable malloc fragmentation => a MID-EVAL-safepoint
+        // pressure-relief could lower PEAK (the M1.D lever).  Gated
+        // NIX_V3_MALLOC_RECLAIM_PROBE; retire once the reclaim decision is made.
+        static const bool s_mallocReclaimProbe =
+            std::getenv("NIX_V3_MALLOC_RECLAIM_PROBE") != nullptr;
+        if (s_mallocReclaimProbe) {
+            auto curResident = []() -> size_t {
+                task_vm_info_data_t vmInfo;
+                mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT;
+                if (task_info(mach_task_self(), TASK_VM_INFO,
+                        reinterpret_cast<task_info_t>(&vmInfo), &cnt) == KERN_SUCCESS)
+                    return static_cast<size_t>(vmInfo.phys_footprint);
+                return 0;
+            };
+            const size_t before = curResident();
+            malloc_zone_pressure_relief(nullptr, 0);   // all zones, reclaim all
+            const size_t after = curResident();
+            std::fprintf(stderr,
+                "v3-direct malloc-reclaim probe: current_resident %.0fMB -> %.0fMB "
+                "(pressure_relief returned %.0fMB to OS)\n",
+                before / 1e6, after / 1e6,
+                (before > after ? before - after : 0) / 1e6);
+        }
+#endif
         // 2026-05-27: Boehm GC time/count line — input to the
         // "ditch Boehm" decision per IDEAL_GC_DESIGN_2026-05-26.md.
         // If boehm_gc_ms is sub-1 % of overall wall, the wall case
