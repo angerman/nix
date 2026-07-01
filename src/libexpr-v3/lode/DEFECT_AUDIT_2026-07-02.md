@@ -453,11 +453,23 @@ same-block + single-use + cloneable — ~never true in real code).
 `computeFunctionStrictness` additionally only scans the linear prefix of the
 entry block and bails at the first branch (`opt_func_strictness.cc:29-33`).
 So `thunkifyForAttr` (`lower_v3.hh:416-417`) thunkifies every non-trivial call
-arg in ~100 % of nixpkgs. **The right lever was designed but never built:** an
-`OP_CALL_STRICT` that consumes `Function::strictArgs` at emit/call time
-(forcing at the call site, no IR surgery) — documented as future work at
-`ir.hh:610-616`. The #774/#776 falsification killed the *inline-based* v4
-approach, not call-site strictness itself.
+arg in ~100 % of nixpkgs. The audit originally framed the fix as an
+`OP_CALL_STRICT` consuming `Function::strictArgs` at the call site (documented
+as future work at `ir.hh:610-616`).
+
+> ⚠ **CORRECTED 2026-07-02 (same day, Addendum A.0):** cross-checking
+> `lode/C1_P01_STRICT_CEILING_2026-06-23.md` shows this lever is already
+> bounded below the bar. The static analysis proves strictness for **0.1 %
+> (firefox) / 0.03 % (M5)** of the runtime-forced opportunity (142 of 100,781
+> args), and the *entire* call-arg ceiling — perfect analysis + perfect
+> consumer — is ~3.5 % of thunks ≈ ~1 % CPU
+> (`lode/THUNK_LEVER_VERDICT_2026-06-28.md`). Runtime speculation (#143) was
+> separately killed as un-deopt-safe. **P2.2 is CLOSED — do not build.** The
+> imports-skip-strictness fact above stands as a fact, but fixing it is
+> worthless at 0.1 % analysis coverage. Note this does NOT touch §4.1/§4.3:
+> formals wrappers and or-default/inherit wrappers are *not* call-arg thunks
+> (C1's instrument never counted them) and are not semantic laziness — see
+> Addendum A.0.
 
 ### 4.3 🔷 More per-evaluation thunks TW doesn't allocate
 - **`x.y or <non-trivial default>`**: default thunkified in the *parent* block,
@@ -743,8 +755,8 @@ Legend: effort H=hours, D=days, W=weeks. "BI" = must stay byte-identical
 | P1.2 | `primSort` barrier + brute repro | 2.2 | correctness | H | repro fails before, passes after |
 | P1.3 | Scope disk-hit catch to deserialize only | 2.3 | correctness | H | eval-error-through-import test |
 | P1.4 | Huge-block interior-mark repro attempt; fix if reproducible | 2.4 | correctness | D | targeted repro |
-| P2.1 | **Formals supplied-arg fast path** (kill per-formal wrapper thunks per call) | 4.1 | CPU+RSS | W | thunk-churn counter (allocated vs forced) + M5/ff CPU+arena; BI hard requirement |
-| P2.2 | `OP_CALL_STRICT` consuming strictArgs at call site (the unbuilt lever) | 4.2 | CPU+RSS | W | never-forced % drops; BI |
+| P2.1 | **Formals supplied-arg fast path** (kill per-formal wrapper thunks per call) — measure-first step 0 is decisive, see A.4 | 4.1 | CPU+RSS | W | wrapper share of thunk allocs ≥10 % → build; <5 % → close (A.4) |
+| ~~P2.2~~ | ~~`OP_CALL_STRICT`~~ **CLOSED by C1 ceiling (0.1 % analysis coverage; full call-arg ceiling ≈1 % CPU)** — see §4.2 correction + A.0 | 4.2 | — | — | already falsified — do not build |
 | P2.3 | `or`-default lowered into else block; `inherit`-in-rec aliasing | 4.3 | CPU+RSS | D | thunk counters; BI |
 | P3.1 | Chain-aware read IC + MapAttrs parent memo | 3.2, 3.3 | CPU | D-W | SELECT-heavy workloads (git/firefox); BI |
 | P3.2 | Formals-call validation: needsForce guard, error-path string, merge-scan | 3.1 | CPU | H-D | callPackage-heavy eval; BI |
@@ -767,9 +779,11 @@ Legend: effort H=hours, D=days, W=weeks. "BI" = must stay byte-identical
 | P6 | Compile-time: occur-DCE default-on decision, scope-map interning, freeVars worklist | 6 | cold CPU | D-W | PARSE+LOWER share (cold + CI) |
 
 **Suggested sequencing:** P0 (re-baseline — everything else is judged against
-it) → P1 (correctness, all cheap except 1.4) → P2.1/P2.2 (the thunk cluster —
-the only items here with plausible >10 % single-lever upside on both CPU and
-RSS) → P3/P4 as a paired CPU/RSS sweep → P5/P6 opportunistically.
+it) → P1 (correctness, all cheap except 1.4) → P2.1/P2.3 (the compiler-plumbing
+thunk cluster; expectations tempered per A.0 — plausibly low-to-mid single-digit
+% CPU, small RSS, decided by the A.4 measure-first steps) → P3/P4 as a paired
+CPU/RSS sweep → P5/P6 opportunistically. **Execution details, dependency graph,
+work packets, and the shorthand glossary are in Addendum A below.**
 
 **Honest expectation.** The audit does not overturn the structural verdict:
 flat transitive capture, switch dispatch, NaN-box decode, and
@@ -788,3 +802,303 @@ verification of all headline findings. Reviewer transcripts:
 session task outputs (afdd… alloc/headers, a3105… vm.cc-1, af9f3… vm.cc-2,
 a4631… primops, a1160… GC, a7581… compiler, aac19… FFI/caching, a7921…
 hygiene).*
+
+---
+---
+
+# Addendum A — execution handoff (2026-07-02)
+
+Written for the engineer/agent executing §9. Read `src/libexpr-v3/CLAUDE.md`
+FIRST (it is the process contract: Rule 0, the `--brute` gate, darwin-4
+protocol, Phase-D constraint #0); this addendum does not repeat it, only
+cross-references it.
+
+## A.0 Corrections & reconciliation with the 2026-06-28 verdicts (read before touching P2)
+
+Cross-checking `lode/THUNK_LEVER_VERDICT_2026-06-28.md` and
+`lode/C1_P01_STRICT_CEILING_2026-06-23.md` after the audit was written:
+
+1. **P2.2 (`OP_CALL_STRICT`) is CLOSED, not open work.** C1's runtime
+   instrument measured the static `strictArgs` analysis proving **142 of
+   100,781** runtime-forced call-arg thunks on firefox (0.1 %; M5 0.03 %), and
+   bounded the *entire* call-arg ceiling (perfect analysis + perfect consumer +
+   PAP completions) at ~3.5-10 % of thunks ≈ ~1 % CPU. Runtime speculation
+   (#143) was separately killed as un-deopt-safe. §4.2 carries an inline
+   correction; the §9 row is struck. Do not rebuild this in any form without
+   new data that overturns C1.
+2. **P2.1 and P2.3 SURVIVE the reconciliation — they are a different
+   population.** C1 counted thunks passed *as call arguments*. The formals
+   wrappers (§4.1) are allocated *inside the callee body on entry* — C1's
+   instrument never saw them — and the 06-28 verdict's "65.7 % never-forced =
+   real lazy data, structurally untouchable" classification does not cover
+   them either: a wrapper whose body is `if param ? X then param.X else def`
+   for a *supplied* argument is compiler plumbing around a pure attrset
+   lookup, not semantic laziness. Removing it forces nothing user-visible
+   (`param` is already WHNF at formals-validation time; `HasAttr` is pure; the
+   underlying attr value stays lazy). Same reasoning for §4.3's or-default and
+   inherit wrappers. **If the A.4/P2.1 step-0 measurement shows wrappers are a
+   material share of the never-forced population, it partially overturns the
+   06-28 "structurally untouchable" claim; if not, P2.1 closes.** Either
+   outcome is a Rule-0 result.
+3. **Tempered expectations for P2.1/P2.3.** #135 measured the v3-vs-TW total
+   thunk-count excess at ~730 K on firefox ≈ ≤17-25 MB arena — so the RSS side
+   is small. The CPU side (alloc + double-force per used formal, on every
+   `callPackage`/`mkDerivation` call) is plausibly low-to-mid single-digit %.
+   The earlier ">10 % single-lever upside" phrasing in §9 was corrected.
+4. **Baseline supersession.** Every ×-factor and % in this document was
+   measured (or inherited from measurements) on instrumented builds (§1).
+   **P0.4's re-baseline supersedes all of them**; after P0 lands, judge every
+   subsequent item against the new darwin4-rows.tsv rows, not against numbers
+   quoted here.
+
+## A.1 Glossary of campaign shorthand used in this report
+
+| Tag | Meaning | Where documented |
+|---|---|---|
+| Rule 0 | Every commit must kill/confirm a hypothesis | `src/libexpr-v3/CLAUDE.md` |
+| PhD-6 | Missed-root UAF class: tenured container holding nursery payload without barrier + scavenger walker | CLAUDE.md constraint 0; `lode/NURSERY_PHASE_D_DESIGN_2026-05-18.md` |
+| M-3 trap | Re-enabling per-op major GC (`alloc.hh g_majorGcEnabled`) alongside the always-on nursery = UAF | `alloc.hh:1170` comment; CLAUDE.md constraint 0 |
+| M-2 | Pointer-keyed side-table aliasing class (stale entry inherited by a reused address) | `alloc.hh:4313` comment |
+| M-10 | Process-wide string-constant intern pool | `serialize.cc:39-53` |
+| M-1, C-1, C-3, C-13, C-21, P-1…P-6 | Codebase-review action items (C-1 = chain shared-parent write corruption; C-3 = IC name-validation; P-6 = kAnySlowGate folding) | `lode/CODEBASE_REVIEW_2026-06-11.md`, `_2026-06-15.md` |
+| #131-#143 | BEAT_TW-v2 todo numbers (#134 ImportCache-results eviction KILLED; #135 trivial-maybeThunk KILLED, commit `207c9b414`; #136 page-release KILLED `9729bf873`; #139 CU-shrink RCA `134d04911`; #143 speculative strictness KILLED) | `lode/BEAT_TW_PLAN_2026-06-23.md`, `lode/ARCH_BEAT_TW_PROGRAM_2026-06-23.md` |
+| #696 | App-memo-drop CPU-regression class | App-memo comments in vm.cc |
+| #733 / #768 | Counter-gating sweep / magic-static→namespace-scope promotion (~2 % measured) | `alloc.hh` + `barrier.hh:145-153` comments |
+| #774 / #776 | Strictness passes kept root-only (1 elision / 40,961 Apps) / inline funnel 0-of-12,356 | `run.cc:250-266` comment |
+| A2 | `v3_release` strip option + its never-run falsifier (≥2 % wall or ≥20 MB) | `meson.options`, `meson.build:26-30` |
+| C1, P0.1/P0.2 (program) | Strict-ceiling RCA / warm head-to-head (NOT this report's P0.x) | `lode/C1_P01_STRICT_CEILING_2026-06-23.md`, `lode/P02_WARM_HEADTOHEAD_2026-06-23.md` |
+| FP-2 / FP-3 | Thunk header at 24 B floor (done) / pair-tax shrink (closed, not built) | `lode/THUNK_LEVER_VERDICT_2026-06-28.md` recap; git notes |
+| L1 / L2 / L3 | countDistinct memo (SHIPPED) / nursery sizing (CLOSED, 32 MB stays) / reuseScope extension to arity-1 strict primop callers (PROMISING-UNTESTED — this report's P3.7) | `lode/PROFILE_AT_SCALE_2026-06-21.md`, `lode/L2_NURSERY_SIZING_2026-06-22.md`, `lode/AUTORESEARCH_V3_DESIGN_2026-06-16.md` |
+| T1a | Per-alloc TLS caching lever FALSIFIED | profile-campaign git notes (2026-06-22) |
+| WS-A | Chain-lookup SELECT workstream | comments at vm.cc:9854 |
+| #821 | mergeBindings-by-site instrumentation | `run.cc:516-580` |
+| GC_AUDIT_ROUND_2 | GC audit that documented the deepForceList stale-writeback (§2.5) | `lode/GC_AUDIT_ROUND_2_2026-05-21.md` |
+| M0-M4 (bounded memory) | Active bounded-memory plan; M2 = CU-graph eviction (aligns with §5.9) | `lode/BOUNDED_MEMORY_PLAN_2026-06-29.md` |
+| brute battery | The 22-suite pre-merge gate (1 MB nursery + audit stress) | CLAUDE.md "Pre-merge gate" |
+
+## A.2 Invariants & traps checklist (applies to EVERY item)
+
+1. **Gate:** `nix develop -c bash src/libexpr-v3/test/all-v3-tests.sh --brute`
+   → expect **22/22** before every commit. Subsets (lang/drv-parity/…) are
+   inner-loop only; they have shipped regressions before.
+2. **Byte-identity (BI):** where the §9 matrix says BI, `hello`/`git`/
+   `firefox` drvPath must be byte-identical pre/post change (and to TW where
+   the suite checks it). Extra care on drv-hash-critical surfaces: string
+   context, sort stability (C-21), attrset entry order.
+3. **Moving-GC semantics are always on** (nursery + Phase-D barriers +
+   gen-major; opt-outs retired). Any new tenured container that can hold
+   nursery payloads needs a post-construct/entry barrier AND scavenger-walker
+   coverage, or it is a PhD-6 UAF. When in doubt, the brute battery's 1 MB
+   nursery + `V3_DBG_NURSERY_AUDIT=1` is the detector.
+4. **Never** set `alloc.hh g_majorGcEnabled` true (M-3). `NIX_V3_EVAC` stays
+   unrevived.
+5. **Perf numbers only from darwin-4** (`aarch64-darwin-4.lan`), commit-stamped
+   in `bench/baselines/darwin4-rows.tsv` + git-noted. Laptop = correctness
+   only (~5-10 % noise floor). Until P0.3 lands, do NOT measure with
+   `NIX_V3_MAX_*` env vars set (they activate per-op slow gates, §1.4);
+   after P0.3, re-verify they are cost-free.
+6. **Every bug fix ships a failing-first regression test** (positive +
+   negative); keep repros forever (`test/repro-*.nix` convention).
+7. **Rule 0 commit bodies** (which hypothesis does this kill/confirm); no new
+   env gate without an inline retirement criterion at the first getenv site;
+   `test/lint-no-inline-getenv.sh` must pass.
+8. **V3-NATIVE:** never route pure data ops through the FFI (LESSONS §1.2).
+9. **Measure-first:** every D/W-scale packet starts with its instrument step
+   and pre-committed threshold. Below threshold ⇒ close with a dated doc note
+   here, don't build.
+
+## A.3 Workstreams, dependencies, conflicts (parallelization map)
+
+At most ONE agent per workstream (they share files); workstreams marked ∥ may
+run concurrently.
+
+- **WS-0 — de-instrumentation + re-baseline** (P0.1→P0.2→P0.3→P0.4). Runs
+  FIRST and ALONE; blocks all perf judgments. Files: primops.cc (counter),
+  vm.cc (mergeBindings counters, kAnySlowGate, selector/intrinsic counters),
+  meson options/packaging, bench scripts.
+- **WS-1 — correctness** (P1.1, P1.2, P1.3 independent of each other; P1.4
+  timeboxed repro attempt). ∥ with WS-6. P1.2 must land before WS-3's P3.5
+  (both touch barrier call sites).
+- **WS-2 — lowering/thunk plumbing** (P2.1 → P2.3; P2.2 closed per A.0).
+  Files: `cli/lower_v3.hh`, emit.cc, vm.cc call/validation paths. Sequential
+  within; conflicts with WS-3 (vm.cc) and WS-4/P4.1 (emit.cc, closure.hh) —
+  coordinate or serialize.
+- **WS-3 — VM hot path** (P3.1-P3.8). Nearly all touch vm.cc ⇒ one workstream.
+  P3.5 after P1.2. P3.3's emit half coordinates with WS-2.
+- **WS-4 — RSS/CU** (P4.1-P4.7). P4.6 (disk_cache/serialize) is independent ∥
+  anytime after WS-0. P4.1 (closure.hh/serialize.cc/emit.cc) serializes
+  against WS-2. P4.4 is wide (alloc.hh/primops.cc/vm.cc/ffi.cc/mark_sweep.cc)
+  — run it when WS-2/WS-3 are quiescent. P4.5 is BI-critical (drv hashes).
+- **WS-5 — GC/policy** (P5.1 decision gates P5.3; P5.2 independent). Note
+  P5.1 should be decided WITH the bounded-memory plan owner (M2 needs the same
+  metadata).
+- **WS-6 — compile-time** (P6). Independent except emit.cc contact with WS-2.
+
+Suggested schedule: WS-0 alone → (WS-1 ∥ WS-6 ∥ WS-4/P4.6) → (WS-2 ∥ WS-3-non-
+emit items) → WS-4 remainder → WS-5.
+
+## A.4 Work packets
+
+### P0 packet (hours each; land as separate commits)
+1. `bumpPrimOpCallCount`: either gate behind a namespace-scope cached
+   `NIX_VM_STATS` bool, or (better) replace with a per-`PrimOp` inline
+   `uint64_t` counter (registry entries are stable; the exit dump iterates the
+   registry). Keep the exit dump working. Also pass/plumb the existing
+   `bumpStats=false` discipline consistently (vm.cc:6112 vs 7652).
+2. mergeBindings: convert the raw `allocStats()` bumps/histograms
+   (vm.cc:1631-1663, 1761, 1886, 2084) to `V3_STATS_*` macros; promote the 4
+   function-local static gates (vm.cc:1673-1699) to namespace-scope
+   `inline const` (#768 pattern).
+3. Gate `selectorLambdaCalls` (vm.cc:6579, 13361, 15218),
+   `intrinsicExtends/ComposeCalls` (vm.cc:15148/15178), `g_keepPapDisarmCount`
+   (vm.cc:3283).
+4. `kAnySlowGate`: remove `limitsActive()` from the fold (vm.cc:3841-3844);
+   poll limits via a plain function-local countdown re-armed at dispatchLoop
+   entry (keep the 10 000-op interval); verify with limits set that per-op
+   cost is unchanged vs unset.
+5. Execute the A2 falsifier: A/B `-Dlibexpr-v3:v3_release=true` on darwin-4
+   (firefox + M5, cache-off + warm). ≥2 % wall or ≥20 MB ⇒ flip the default in
+   packaging + bench scripts; either way record the number.
+6. **P0.4:** re-run the standard baseline (bench/beat-tw-compare.sh + warm
+   mode; darwin-4), append rows to darwin4-rows.tsv, git-note, and add a dated
+   note at the top of this file stating the new authoritative numbers.
+
+### P1.1 packet (branch-opcode type check)
+Add `if (!v.isBool()) throwTypeError(...)` (predicted-true isBool) to
+OP_BRANCH_FALSE / OP_AND_BRANCH / OP_OR_BRANCH / OP_IMPL_BRANCH /
+OP_R_BRANCH_FALSE (vm.cc:4981-5052). Match TW's message ("expected a Boolean
+but found …" class). Tests: `if 1 then "a" else "b"`, `1 && true`, `"x" ||
+true`, `1 -> true` must all error identically to TW; valid-code BI unchanged.
+Check the lang-test suite for existing error-format fixtures first.
+
+### P1.2 packet (primSort barrier) — repro recipe included
+- **Why suites missed it:** the UAF window needs (a) `result` TENURED (nursery
+  full at alloc time), (b) source elements NURSERY-resident (only direct
+  Closure/Thunk/ListVec values qualify — `map`-produced elements are tenured
+  App pairs, which is why sort-over-map fixtures never trip it), (c) a
+  scavenge at the NEXT outer safepoint before the list dies. Scavenge cannot
+  fire during the sort itself (exitDepth>0), so the corruption is deferred —
+  classic PhD-6.
+- **Repro:** fixture whose source list holds directly-allocated
+  nursery-eligible cells, e.g. literal inner lists
+  (`[ [3 "c"] [1 "a"] [2 "b"] ]` scaled up) or closures sorted via a key
+  attrset; sort at top level; then allocate churn at exitDepth==0 to cross the
+  75 % trigger; then deep-read the sorted result. Run under
+  `NIX_V3_NURSERY_SIZE=1 V3_DBG_NURSERY_AUDIT=1 V3_DBG_NURSERY_BRUTE=1`
+  (optionally `V3_DBG_GC_STRESS`) — the audit must flag a missed root
+  PRE-fix and be clean POST-fix. If the window won't open with literals,
+  force `result` tenuring by pre-filling the nursery first.
+- **Fix:** `Barrier::listPostConstructBarrier(result)` before `out.mkList`
+  publication — copy the exact placement from `primFilter`
+  (primops.cc:1669). Add the fixture to the brute battery permanently.
+
+### P1.3 packet (disk-hit catch)
+Split the try at primops.cc:7271-7789: only `deserializeCU` (+ subChecks
+verification) inside the corrupt-blob catch; `run()` executes OUTSIDE it. On
+eval-error the CU must stay in `cus` (matching the invalidation path's
+deliberate-leak policy) and the error must propagate — no silent re-parse +
+re-run. Test: an import whose evaluation throws, evaluated twice warm — assert
+single execution + stable error.
+
+### P2.1 packet (formals supplied-arg fast path)
+- **Step 0 — measure (0.5 d, decides everything):** tag formal-wrapper
+  descriptors at lower time (a flags bit on `LambdaDescriptor`, set for
+  Functions minted at lower_v3.hh:599-635) and count their runtime
+  allocations + forces under `NIX_VM_STATS` on firefox + M5.
+  **Pre-committed:** wrappers ≥10 % of total thunk allocs → build; <5 % →
+  close (dated note here + update A.0); 5-10 % → judgment call with a CPU
+  estimate (alloc-cost × count + double-force × forced-count).
+- **Design sketch (v1 scope = the demoted "independent formals" path ONLY;**
+  the sibling-referencing `formalsRec` path keeps current lowering**):** at
+  formals-validation time (vm.cc OP_CALL ~6645-6780) `param` is already WHNF
+  and formals are checked. Bind each *supplied* formal's local directly to the
+  attrset entry Value (itself usually a lazy thunk — laziness of the value is
+  preserved); allocate the wrapper thunk ONLY for missing-with-default.
+  Options: (a) new `OP_BIND_FORMALS` doing one O(n+m) merge scan over sorted
+  formals × sorted Bindings, filling K locals + allocating default thunks for
+  the missing subset (this also subsumes P3.2's merge-scan fix); (b) keep the
+  lowering shape but emit per-formal `HasAttr`-guarded direct binds. Prefer
+  (a).
+- **Invariants:** default exprs stay lazy (allocated only when the attr is
+  missing); defaults referencing siblings unchanged (rec path); `@`-binding
+  unchanged; missing/unexpected-attr error text unchanged (coordinate with
+  P3.2, same code region); full BI gate.
+- **Expectations (honest, per A.0):** RSS small (≤ ~25 MB firefox-class);
+  CPU plausibly low-to-mid single-digit % on formals-heavy workloads.
+  Validation: thunk-churn deterministic counters (profile-at-scale), brute,
+  BI, darwin-4.
+
+### P2.3 packet (or-defaults + inherit aliasing)
+- Measure-first with the same descriptor-tagging trick (or-default thunks and
+  inherit-wrapper thunks separately); pre-commit ≥2 % of thunk allocs each.
+- **or-default:** lower the default body inside the else-block of the select
+  (lower_v3.hh:1246 + emitSelectChain) instead of thunkifying in the parent
+  block. Watch multi-step chains (`a.b.c or d`): the default fires on ANY
+  missing step — the else block is shared across steps; ensure single
+  lowering with shared branch target, and that a default that *is* a
+  side-effect-free literal keeps the existing trivial escape.
+- **inherit-in-rec:** bind the name to the parent-scope VarId directly
+  (aliasing, as non-rec attrset inherit already does at lower_v3.hh:1166-1169)
+  instead of minting a wrapper Function (lower_v3.hh:840-843). Trap: the
+  alias must resolve in the PARENT scope (pre-rec), not the rec scope —
+  shadowing tests required (`let x = 1; in let x = 2; inherit-in-rec…`
+  shapes + `inherit (e) x` two-layer case).
+
+### P4.4 packet (string-context representation)
+- **Step 0 — run the falsifier the code already defines** (primops.cc:309-316):
+  `V3_DBG_CTX_PARSE_MEMO=1` on firefox + M5; the in-code pre-commit is
+  "firefox CPU drop ≥3 % ⇒ fund lever 1.1". Also count side-table bytes +
+  entry duplication on M5 (drv-heavy = the workload that matters).
+- **Target design ("lever 1.1"):** global intern pool of PARSED context
+  elements (u32 id each); side table maps `char* → sorted id-array`; derived
+  strings share/merge id-arrays (no per-string token copies, no re-parse);
+  FFI crossings encode from the parsed form on demand.
+- **Files:** alloc.hh:4281-4321 (table), primops.cc context helpers
+  (~299-426, 2843-3008, 4546+), vm.cc OP_STR_CONCAT (11820-12110),
+  ffi.cc crossings (~15 `to_string()`/parse sites), mark_sweep.cc
+  sweepStringContextRanges (1654-1672) must track the new table shape.
+- **Open design decision** (document the choice): the table stays keyed by
+  buffer pointer ⇒ `unsafeDiscardStringContext`/`appendContext` still need a
+  distinct key (clone payload — status quo) OR a context-id slot moves into
+  the Chars cell header (+bytes per string, kills the M-2 hazard class
+  outright). Bound both before choosing.
+- **Gate:** BI on drvPaths is absolute (context = inputDrvs). Expect CPU on
+  M5-class (kill the per-drv re-parse) + MALLOC_SMALL RSS (kill token copies).
+
+### P3.1 note (chain-aware IC)
+Key `(leaf Bindings*, SymbolId) → (ownerLayer*, slot)` with the flat IC's
+4-way + name-validation discipline (C-3). Chain STRUCTURE is immutable after
+construction (only leaf-owned entry writebacks occur — C-1), so a resolved
+read slot is cacheable; gen-major already clears ICs (vm.cc:4112). The
+MapAttrs parent memo (§3.3) must write only into leaf-owned storage or a
+side memo — never the shared parent (C-1). Measure per-site IC hit rates
+first (cheap counter) to size both this and the §3.14 megamorphic question.
+
+## A.5 Validation & measurement command reference
+
+```bash
+# pre-merge gate (expect 22/22):
+nix develop -c bash src/libexpr-v3/test/all-v3-tests.sh --brute
+# pinned nixpkgs for ANY <nixpkgs> eval:
+source src/libexpr-v3/test/nixpkgs-pin.sh
+# deterministic counters + phase breakdown (exact counters; CPU % directional):
+bench/profile-at-scale.sh          # or: make profile / make profile-note
+# baseline comparison (cold + WARM=1):
+bench/beat-tw-compare.sh
+# darwin-4 sync + build (push key often fails):
+rsync -az --exclude='*.o' --exclude='*.dylib' src/libexpr-v3/ \
+  aarch64-darwin-4.lan:Projects/iohk/nix/src/libexpr-v3/
+ssh aarch64-darwin-4.lan 'cd ~/Projects/iohk/nix && nix develop -c ninja -C build src/libexpr-v3/v3-eval src/nix/nix'
+# darwin-4 caveat: its checkout lags the rsync'd binary — pass COMMIT=<laptop HEAD> to profile scripts.
+```
+Probe-safety env vars (`NIX_V3_MAX_WALL_TIME` etc.): until P0.3 lands these
+activate per-op slow gates (§1.4) — never measure with them set.
+
+## A.6 Handback format
+
+Per phase/workstream, append a dated section to THIS file (do not silently
+diverge from the audit) containing: commits landed; each falsifier's measured
+result vs its pre-committed threshold (including closes — a kill is a
+deliverable); corrections to any audit claim found wrong; new darwin-4 rows
+(also in darwin4-rows.tsv + git notes). Update the project memory index the
+same way the campaigns did.

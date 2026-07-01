@@ -112,6 +112,14 @@ void walkImportCacheRoots(const std::function<void(Value &)> & visit);
 size_t importCacheBytecodeBytes() noexcept;
 size_t importCacheCuCount() noexcept;
 size_t importCacheResultCount() noexcept;
+struct CompilationUnit;  // fwd (full decl at bytecode.hh; also below) for the M2.1 helper
+/// M2.1 (BOUNDED_MEMORY_PLAN): sum approxBytesUsed + count of cached CUs the mark did NOT
+/// reach (cold = no live thunk/closure/frame references them = evictable). `isCold(&cu)`
+/// returns true for an unreferenced CU (the caller checks the mark's referenced-CU set).
+/// Sizes the realizable CU-eviction win (the M2 GO/NO-GO) without evicting.
+size_t importCacheColdBytes(
+    const std::function<bool(const CompilationUnit *)> & isCold,
+    size_t & coldCount) noexcept;
 size_t importCacheStringConstRefs() noexcept;  // M-10: total interned-string refs
 /// #139 CU-shrink RCA: per-field decomposition of the libc-malloc'd CU footprint
 /// across all cached CUs, printed to stderr.  Separates runtime-irreducible fields

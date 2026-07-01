@@ -39,6 +39,7 @@
 
 #include "v3/mark_sweep.hh"
 #include "v3/alloc.hh"
+#include "v3/primop.hh"  // M2.1: importCacheColdBytes / importCacheCuCount / BytecodeBytes
 #include "v3/precise_root.hh"
 #include "v3/fiber.hh"  // M-5: walkLiveFiberStacks (conservative yielded-fiber scan)
 #include "v3/nursery.hh"  // MIDEVAL_GC: threadNursery().forEachUsedRange conservative scan
@@ -603,6 +604,13 @@ private:
     // (nursery_ is set solely under g_midEvalGcEnabled); gen-major clears the IC
     // before its mark, so it never relied on this.  Dedup CUs via walkedCUs_.
     std::unordered_set<const CompilationUnit *> walkedCUs_;
+public:
+    /// M2.1 (BOUNDED_MEMORY_PLAN): the set of CUs referenced by a live thunk/closure
+    /// reached in THIS mark (mid-eval only; walkCuIC gates on nursery_).  A cached CU
+    /// absent from this set is COLD = no live reference = evictable.
+    const std::unordered_set<const CompilationUnit *> & walkedCUs() const noexcept
+        { return walkedCUs_; }
+private:
     void walkCuIC(const CompilationUnit * cu) noexcept {
         if (!nursery_ || !cu || !walkedCUs_.insert(cu).second) return;
         for (const auto & ic : cu->attrSelectCache)
@@ -2291,6 +2299,25 @@ MajorGcResult runMajorMarkSweep(VMState & vm) noexcept
                 "v3 mark-split: preciseWalk=%.0fms drainConservative=%.0fms "
                 "cStackConservative=%.0fms\n",
                 ms(tm0, tm1), ms(tm1, tm2), ms(tm2, tMarkEnd));
+            // M2.1 (BOUNDED_MEMORY_PLAN): size the CU-eviction win at THIS safepoint.
+            // A cached CU absent from the mark's referenced-CU set (visitor.walkedCUs())
+            // has no live thunk/closure → COLD = evictable now.  Mid-eval, the mark fires
+            // near peak, so this is the realizable peak-reducing win (the M2 GO/NO-GO).
+            // walkedCUs() is only populated under mid-eval (NIX_V3_MIDEVAL_GC=1).
+            {
+                size_t coldCount = 0;
+                const size_t cuCount  = importCacheCuCount();
+                const size_t coldB    = importCacheColdBytes(
+                    [&](const CompilationUnit * cu) {
+                        return visitor.walkedCUs().count(cu) == 0; },
+                    coldCount);
+                const size_t totB = importCacheBytecodeBytes();
+                std::fprintf(stderr,
+                    "v3 M2.1 cold-CU: %zu/%zu CUs cold, %.0f/%.0fMB evictable "
+                    "(%.0f%% of CU-bytecode; referenced=%zu)\n",
+                    coldCount, cuCount, coldB / 1e6, totB / 1e6,
+                    totB ? 100.0 * coldB / totB : 0.0, visitor.walkedCUs().size());
+            }
         }
     }
 

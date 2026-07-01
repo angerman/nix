@@ -6520,6 +6520,17 @@ size_t importCacheBytecodeBytes() noexcept
     return total;
 }
 
+// M2.1 (BOUNDED_MEMORY_PLAN): cold (unreferenced-by-the-mark) CU bytecode bytes + count.
+size_t importCacheColdBytes(
+    const std::function<bool(const CompilationUnit *)> & isCold,
+    size_t & coldCount) noexcept
+{
+    size_t total = 0; coldCount = 0;
+    for (const CompilationUnit & cu : importCache().cus)
+        if (isCold(&cu)) { total += cu.approxBytesUsed(); ++coldCount; }
+    return total;
+}
+
 /// Number of cached CompilationUnits (one per imported file).
 size_t importCacheCuCount() noexcept
 {
