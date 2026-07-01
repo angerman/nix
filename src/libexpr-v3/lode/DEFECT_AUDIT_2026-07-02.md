@@ -635,8 +635,10 @@ kill covers. Same class: `Closure::cu` (8 B/closure) derivable from
 - **ImportCache `cus` deque never shrinks** — not on LRU (results-only), not on
   invalidation (CU *deliberately leaked*, `primops.cc:6944-6948`) ⇒ unbounded
   growth per file edit in daemon/LSP reuse; this is malloc-side memory
-  (distinct from the killed arena-pinned *results* eviction) and is exactly the
-  bounded-memory plan's M2 target.
+  (distinct from the killed arena-pinned *results* eviction). *(⚠ scoped by
+  M2.1, commit `fd8768a4f`, same day: CUs are fully live at peak ⇒ eviction
+  recovers ~0 MB peak RSS — the finding's value is daemon-reuse boundedness +
+  the invalidation leak only. See A.0 item 5.)*
 - **`derivationStrict` bytecode wrapper allocates ~6 intermediate collections +
   2 full attrset merges per derivation** (`bytecode_primops.cc:912-1030`,
   default-ON): `attrNames → map(2-entry attrset each) → filter → listToAttrs →
@@ -850,6 +852,19 @@ Cross-checking `lode/THUNK_LEVER_VERDICT_2026-06-28.md` and
    **P0.4's re-baseline supersedes all of them**; after P0 lands, judge every
    subsequent item against the new darwin4-rows.tsv rows, not against numbers
    quoted here.
+5. **(added same day, after commit `fd8768a4f`) CU eviction for peak RSS is
+   NO-GO per M2.1** — the CU-liveness instrument measured **0 MB cold CUs at
+   peak** on firefox and M5 (every cached CU is referenced by a live
+   thunk/closure during eval; CU bytecode is fully LIVE mid-eval), falsifying
+   bounded-memory M2.2-M2.4. Consequences for this report: §5.9's ImportCache
+   CU-deque finding retains its value ONLY for daemon/LSP-reuse unboundedness
+   (the invalidation leak) and teardown memory — NOT peak RSS. Conversely this
+   *strengthens* P4.1 (LambdaDescriptor diet): since CU bytes are fully live
+   at peak, shrinking each descriptor reduces peak directly, which eviction
+   cannot. The bounded-memory program's interim conclusion (only remaining
+   reclaim lever = M3/the arena wall) is consistent with this audit's frame:
+   the RSS items here attack *allocation and live-representation size*, not
+   reclaim.
 
 ## A.1 Glossary of campaign shorthand used in this report
 
