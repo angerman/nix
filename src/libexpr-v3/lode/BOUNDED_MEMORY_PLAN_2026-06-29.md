@@ -96,6 +96,27 @@ ceiling; every step has a byte-id + `--brute` + measured-bound gate.
 - **M4.3** nixpkgs byte-id soak + default-flip decision (or document + leave gated).
   GATE: full soak diverge=0; decision recorded.
 
+## RESULT UPDATE (2026-07-02, after M0+M1 execution) — M1 EVAPORATED
+
+Measure-first killed the entire "safe ~750MB M1 tier":
+- M0.1/M0.2 DONE: unified RSS-decomp reconciles exactly; baseline + ceilings set (git-noted).
+- M1.A (Boehm dereg) MOOT: arena-noroot is ALREADY the default (NIX_V3_ARENA_ROOT inverted);
+  darwin-4 A/B shows Boehm 402.9MB identical root-on/off → the 403MB is Boehm-native, unmap
+  FALSIFIED on macOS. Nothing to recover via dereg.
+- M1.B (SQLite cap) MOOT: disk cache REDUCES peak (firefox cache-ON 615 vs OFF 710); the 326M
+  DB is mmap'd/OS-evictable already; in-process SQLite=2MB. Capping would hurt.
+- M1.C (descriptor diag) DEFERRED: 87-site refactor for ~10MB, M2-subsumed.
+- M1.D (malloc-frag reclaim) FALSIFIED: pressure_relief returned 0MB (system libmalloc, no
+  reclaimable frag; nothing frees mid-eval). #139's 360MB was jemalloc-specific.
+
+⇒ The ONLY non-arena lever standing is M2 (CU-bytecode eviction, 149-158MB on M5/HNE) — and
+M1.D implies freed malloc may not return to OS, so M2 must use per-CU mmap+munmap. The
+dominant memory (arena 1544 M5 + Boehm-reserved ~200) is WALLED/unrecoverable. So bounded
+memory BELOW TW requires cracking the arena (M3, the wall); M2 is a modest ~5% side-lever.
+
+REVISED ceilings (M2-only, arena unbounded): firefox ≤600 · M5 ≤2200 · HNE ≤1150 · simplex
+≤560. Sub-TW needs M3. Next: M2.1 (measure cold-CU — may itself kill M2 if few CUs are cold).
+
 ## Expected outcome (honest)
 - M1 alone: ~750MB recovered on every workload (Boehm 403 + SQLite ~270 + diag ~75), low–med
   risk, shippable independently. This is the safe near-term win.
