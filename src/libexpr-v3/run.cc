@@ -479,21 +479,6 @@ RootResult runRootExprModule(nix::EvalState & state, ir::Module module)
                 (unsigned long long)a.formalsDeferredComplex,
                 (unsigned long long)tot);
         }
-        // P3.1 M5 chain-SELECT depth probe (TEMPORARY): decides chain-IC
-        // re-apply — firefox/git avg depth ~2.4 (shallow, wash); is M5 ≫4?
-        {
-            double avgDepth = a.chainSelectCount
-                ? (double)a.chainSelectHops / (double)a.chainSelectCount : 0.0;
-            uint64_t totSel = a.chainSelectCount + a.flatSelectCount;
-            double chainFrac = totSel
-                ? 100.0 * (double)a.chainSelectCount / (double)totSel : 0.0;
-            std::fprintf(stderr,
-                "v3 P3.1 chain-SELECT: chain=%llu (%.1f%% of %llu selects) "
-                "avgDepth=%.2f | flat=%llu\n",
-                (unsigned long long)a.chainSelectCount, chainFrac,
-                (unsigned long long)totSel, avgDepth,
-                (unsigned long long)a.flatSelectCount);
-        }
         // #702: BYTES per allocation category.  The count counters
         // above are partly bumped at primop call sites and miss
         // Alloc::* invocations from vm.cc dispatch; the byte

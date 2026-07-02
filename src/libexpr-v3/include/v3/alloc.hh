@@ -678,15 +678,6 @@ struct AllocStats
     uint64_t formalsRawBindable    = 0;  // no-default formals, arg = plain Bindings
     uint64_t formalsDeferredComplex = 0; // no-default formals, arg = mapAttrs/chain
 
-    /// P3.1 M5 depth probe (TEMPORARY, V3_STATS): decides whether the deleted
-    /// chain-aware read IC (commit 0cb2f88b5) should be re-applied for M5.
-    /// firefox/git had avg chain depth ~2.4 (shallow → the IC was a wash → it
-    /// was deleted).  If M5's avg depth (chainSelectHops/chainSelectCount) is
-    /// ≫4, the layer-walk is expensive there and the IC would win.
-    uint64_t chainSelectCount = 0;  // times the b->isChain() SELECT path runs
-    uint64_t chainSelectHops  = 0;  // Σ layers visited by the walk (avg = hops/count)
-    uint64_t flatSelectCount  = 0;  // the flat-attrset SELECT path (for the chain fraction)
-
     /// #495: how many OP_CALL invocations dispatched to the v3-native
     /// `lib.fix` intrinsic (instead of running its bytecode body).
     /// Mirrors selectorLambdaCalls -- confirms that lower.cc's
