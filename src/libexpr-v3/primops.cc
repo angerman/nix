@@ -9101,6 +9101,18 @@ void primSort(EvalState & state, Value * args, Value & out)
             if (!r.isBool()) typeError("sort", "comparator returning bool");
             return r.asInt() == 1;
         });
+    // P1.2 (2026-07-02): PhD-6 missed-root barrier (audit §2.2).  `result`
+    // is bulk-copied from arbitrary source elements (which may be
+    // nursery-resident Closure/Thunk/ListVec cells) and, when the nursery
+    // is full at allocList time, is itself TENURED.  A tenured container
+    // holding nursery payloads must be added to the remembered set or the
+    // next scavenge moves/frees those cells out from under it (verified: a
+    // 40 000-element sort over a nursery-filling literal list flags
+    // thousands of "reachable via ListVec(...).elems[N]
+    // lastWriter=(no-recorded-writer=raw/bulk-path)" missed roots pre-fix).
+    // Sixteen sibling list-producing primops already do this; primSort was
+    // the gap.  Idiom copied from primFilter.
+    listPostConstructBarrier(result);  // Phase D coverage (primSort; PhD-6)
     out.mkList(result);
 }
 
