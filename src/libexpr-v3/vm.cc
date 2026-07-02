@@ -3853,20 +3853,25 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
     const uint16_t s_trace_nup = s_trace_nup_static;
     // P-6 (CODEBASE_REVIEW_2026-06-11): fold the per-dispatch *default-off*
     // diagnostic gates into ONE loop-invariant disjunction.  Without it the
-    // hot path pays ~6 separate branch-predicted-not-taken tests every
-    // iteration (periodic-live-trace, thunk-body-trace, instr-count, limit
-    // poll, opcycles, opcounts).  Every term is either a startup env const or
-    // `limitsActive()` (set once per run by initLimits() before dispatch
-    // begins, constant for this dispatchLoop invocation), so the disjunction
-    // is loop-invariant and the compiler hoists it; the common no-gate path
-    // then tests a single bool instead of six.  The major-GC safepoint is
-    // NOT folded in here — it is default-ON, not a diagnostic gate.
+    // hot path pays several separate branch-predicted-not-taken tests
+    // every iteration (periodic-live-trace, thunk-body-trace, instr-count,
+    // opcycles, opcounts).  Every term is a startup env const, so the
+    // disjunction is loop-invariant and the compiler hoists it; the common
+    // no-gate path then tests a single bool.  The major-GC safepoint is NOT
+    // folded in here — it is default-ON, not a diagnostic gate.
+    // P0.3 (2026-07-02): the resource-limit poll was REMOVED from this fold
+    // — see kPollLimits below — so that setting NIX_V3_MAX_* no longer
+    // drags every opcode through this whole diagnostic cluster (audit §1.4).
     // Retire when computed-goto dispatch lands (the bigger lever per P-6;
     // measure the mask first — measure-twice).
     const bool kAnySlowGate =
         kCountInstructions | (s_trace_env != nullptr)
-        | g_periodicLiveTrace | g_countOpcodes | g_countOpCycles
-        | nix::v3::limitsActive();
+        | g_periodicLiveTrace | g_countOpcodes | g_countOpCycles;
+    // P0.3: limits are polled OUTSIDE kAnySlowGate (at the top of the
+    // dispatch loop) via a plain function-local countdown.  limitsActive()
+    // is fixed for this invocation (initLimits() runs before dispatch), so
+    // kPollLimits is loop-invariant just like the gates above.
+    const bool kPollLimits = nix::v3::limitsActive();
     // Cheney nursery (#434 Phase C): scavenge gate at top-of-loop.
     // We avoid the per-iteration env-var check by promoting the gate
     // to a function-scope const.  When nursery+scavenge are both on,
@@ -3945,6 +3950,25 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
     // every iteration; fires force-scavenge + reset on zero.
     uint32_t gcStressCountdown = s_kGcStressBudget;
 
+    // P0.3 (2026-07-02): plain function-local resource-limit poll counter,
+    // re-armed (0) at each dispatchLoop entry.  Replaces the former per-op
+    // `static thread_local uint32_t s_pollCounter`, which cost a macOS
+    // TLS-wrapper call + guard on EVERY opcode whenever any NIX_V3_MAX_*
+    // cap was set (audit §1.4).  Only ticks when kPollLimits is true; the
+    // poll itself is at the top of the loop below.
+    //
+    // Per-invocation re-arm semantics (vs. the old process-wide
+    // thread_local, which accumulated across ALL nesting): a SHORT-lived
+    // nested dispatchLoop that runs < kPollInterval ops makes no progress
+    // toward the cap, so enforcement is slightly LESS timely under
+    // pathological deep-nesting of tiny inner loops.  This is immaterial in
+    // practice: the outermost loop (and any loop running >= kPollInterval
+    // ops) still polls; tail-recursive runaways fire promptly (verified —
+    // WallTime/CpuTime caps trip on `let f = x: f x; in f 0`);
+    // deep-recursion runaways are caught first by kMaxCallDepth; and 10 000
+    // ops is sub-millisecond against the second-granularity caps.
+    uint32_t limitPollCountdown = 0;
+
     // 2026-05-17: internal exception barrier.  Any exception that
     // escapes the dispatch loop (from a primop body, from forceValue,
     // from any opcode handler) triggers clearBlackMarksOnException
@@ -3957,6 +3981,19 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
     // clearBlackMarksOnException's docstring for the protocol details.
     try {
     while (running) {
+        // P0.3 (2026-07-02): resource-limit poll, decoupled from the
+        // kAnySlowGate diagnostic cluster (audit §1.4).  When no cap is set,
+        // kPollLimits is a loop-invariant false ⇒ the compiler hoists this
+        // to a single predicted-not-taken branch, so per-op cost with a cap
+        // set == per-op cost with none (P0.3's exit criterion).  Plain local
+        // counter (no TLS); 10 000-op interval preserved; checkLimits() just
+        // reads rusage/clock/heap and throws, touching no VM state.
+        if (__builtin_expect(kPollLimits, 0)) [[unlikely]] {
+            if (__builtin_expect(++limitPollCountdown >= nix::v3::kPollInterval, 0)) {
+                limitPollCountdown = 0;
+                nix::v3::checkLimits();   // throws on cap exceed
+            }
+        }
         // Phase C scavenge trigger.  Only inspected when the gate
         // is on (kNurseryGate covers env-var + exitDepth == 0).
         // The shouldScavenge() body is a small arithmetic compare;
@@ -4371,25 +4408,14 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             vm.nrInstructions++;
             allocStats().bytecodeInstructions++;
         }
-        // Phase 1.6 (2026-05-18) — resource-limit polling.  When no
-        // cap is configured (`limitsActive()` is false), the outer
-        // branch elides everything; per-opcode overhead is one
-        // branch-predicted-not-taken (≤1 cycle).  When caps ARE set,
-        // a thread-local poll counter gates the actual getrusage /
-        // steady_clock / atomic-OOM check to once per kPollInterval
-        // (10000) opcodes — amortised ≤2ns per opcode.
-        //
-        // Gate: NIX_V3_MAX_HEAP / NIX_V3_MAX_CPU_TIME / NIX_V3_MAX_WALL_TIME.
-        // Retire individual gates when bounded-memory / termination
-        // / bounded-wall-time guarantees become structural (see
-        // limits.cc).
-        if (nix::v3::limitsActive()) {
-            static thread_local uint32_t s_pollCounter = 0;
-            if (__builtin_expect(++s_pollCounter >= nix::v3::kPollInterval, 0)) {
-                s_pollCounter = 0;
-                nix::v3::checkLimits();  // throws on cap exceed
-            }
-        }
+        // P0.3 (2026-07-02): resource-limit polling MOVED out of this
+        // kAnySlowGate cluster to the top of the dispatch loop (see
+        // kPollLimits) — a configured NIX_V3_MAX_* cap must not force every
+        // opcode through the diagnostic slow-gate branches, and the former
+        // per-op `static thread_local` poll counter (a macOS TLS-wrapper
+        // call + guard on every op) is now a plain function-local
+        // countdown.  Gate: NIX_V3_MAX_HEAP / MAX_CPU_TIME / MAX_WALL_TIME.
+        // See limits.cc + audit §1.4.
         // (op already decoded above for the shared mask)
         // 2026-05-18 per-opcode profiling: bump under NIX_VM_OPCOUNTS=1.
         // P-2: gates are now file-scope (g_countOpcodes / g_countOpCycles) —
