@@ -9776,28 +9776,12 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // (vm.cc:withLookup) but for direct Select access.  Both
             // paths share the same registry chain (populated by
             // OP_ATTRS_REC_INIT_TAIL via publishToAllThunkFrames).
-            // #558 (2026-05-10) Chase Evaluated thunks to find a
-            // potentially-Black target.  When `attrs` is a thunk that
-            // was Evaluated to another thunk (e.g., the inherit-from
-            // cache thunk's `evaluated` was set to a recovered
-            // Tag::Thunk for the outer Black fix-point), the chain
-            // peek path SHOULD fire on the chased target.  Without
-            // this chase, we'd see Tag::Attrs (from STG WHNF's
-            // recovery in the cache thunk's body) which doesn't have
-            // all the chain layers' keys.
-            {
-                Value chase = attrs;
-                int hops = 0;
-                while (hops < 8
-                       && chase.isThunk()
-                       && chase.asThunk()
-                       && chase.asThunk()->state == ThunkState::Evaluated
-                       && chase.asThunk()->evaluated.isThunk())
-                {
-                    chase = chase.asThunk()->evaluated;
-                    ++hops;
-                }
-            }
+            // P3.6/§3.14 (2026-07-02): removed a vestigial #558 "chase
+            // Evaluated thunks" loop here — it computed a local `chase` (up
+            // to 8 hops) and then DISCARDED it; the chain-peek path that
+            // would have consumed the chased target was retired, leaving the
+            // walk dead.  Pure field reads only ⇒ BI-neutral removal; stops
+            // the wasted per-SELECT thunk walk.
             // A8: force is handled at case entry (iterative).  By here
             // `attrs` is WHNF.
             // Phase A3: when SELECT operates on a 1-entry attrset
