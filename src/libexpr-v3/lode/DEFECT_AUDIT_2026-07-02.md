@@ -618,6 +618,23 @@ elements. The scoped lever (parsed, pointer-shared context objects — "lever
 correctness hazard at once. Week-scale; the biggest drv-workload item in
 primops.
 
+**P4.4 step-0 FALSIFIER RESULT (2026-07-02, commit 362f87be9, darwin-4): the
+CPU half is NOT MATERIAL — lever 1.1 is UNFUNDED FOR CPU.** Ran the in-code
+falsifier (`V3_DBG_CTX_PARSE_MEMO=1`) on firefox.drvPath (drv-heavy, full
+inputDrvs context) cache-off, user-CPU median-of-5: memo-OFF = **2.67s** vs
+memo-ON = **2.66s** = **−0.4% (noise)**, far below the pre-committed ≥3% bar.
+So the per-drv `NixStringContextElem::parse` re-parse the memo attacks is
+negligible CPU; the cost the audit attributed partly to re-parse lives instead
+in the token COPIES (an RSS/MALLOC_SMALL concern the beat-tw campaign already
+graded modest/foundational) and the pointer-keyed side-table shape (the §2.6
+hazard). VERDICT: do NOT build lever 1.1 as a CPU play. It survives ONLY as (a)
+an RSS/span-sharing lever (bounded, foundational) and (b) the §2.6 correctness
+hazard fix — both W-scale and BI-critical on drvPaths; neither is a
+single-lever CPU win. M5 (more drv-heavy) is IFD-blocked on aarch64, but the
+firefox null result already refutes the CPU hypothesis on a genuine drv
+workload. The debug memo (`V3_DBG_CTX_PARSE_MEMO`) has now served its Rule-0
+purpose and may be deleted when §5.6's RSS scope is decided.
+
 ### 5.7 🔷 Chain flatten every 16 layers: O(N²/16) copies, each generation pinned
 `vm.cc:1816-1825` (chain-extend cap) + `1862-1919` (full Cursor merge):
 `foldl' (//)` accumulators flatten every 16th merge — better than TW's O(N²)

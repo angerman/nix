@@ -94,6 +94,34 @@ M5	6.40	3.60	1.78	2217	yes	warm	4a7055a22	2026-07-02
 #   vs P0.4 (2d7efdb97): ff cold 2.68->2.66 (-0.7%), M5 cold 10.96->10.84
 #   (-1.1%), ff warm 1.80->1.79 (-0.6%), M5 warm 6.54->6.40 (-2.1%).
 # ============================================================================
+# WS-3 CUMULATIVE VALIDATION + P4.4 FALSIFIER (2026-07-02, commit 362f87be9 =
+# HEAD after the full shipped WS-3 batch: §3.14 dead-code (803b0af11), P3.3
+# FALSIFIED+reverted (152c6605f), P3.5 constexpr phaseDActive + P3.8 std::move
+# (362f87be9); on top of WS-1 + P3.2/P3.4/P3.5a already in 4a7055a22).
+# 5th column = peak_RSS MB (beat-tw-compare median-of-5).
+# row	v3_cpu	tw_cpu	ratio	peakRSS_MB	impure	cache	commit	date
+firefox	2.67	0.73	3.66	679	yes	off	362f87be9	2026-07-02
+firefox	1.79	0.73	2.45	586	yes	warm	362f87be9	2026-07-02
+#   vs P0.4 (2d7efdb97): ff cold 2.68->2.67 (NEUTRAL), ff warm 1.80->1.79
+#   (NEUTRAL).  RESULT: the entire shipped WS-3 batch (correctness P1.1-1.4 +
+#   the P3.2/P3.4/P3.5a/§3.14/P3.5-constexpr/P3.8 micro-opts) is CPU-NEUTRAL /
+#   cost-free at firefox scale — no regression, no material win (each micro-op
+#   is individually noise-level, as the beat-tw campaign predicted).  The value
+#   of WS-1 is CORRECTNESS (TW-parity + a PhD-6 UAF barrier), not CPU.
+# ---------------------------------------------------------------------------
+# P4.4 step-0 FALSIFIER (§5.6 string-context re-parse; V3_DBG_CTX_PARSE_MEMO=1):
+#   firefox COLD (drvPath, drv-heavy) user-CPU median-of-5:
+#     memo-OFF (default) = 2.67s   vs   memo-ON = 2.66s   =>  -0.4% (NOISE).
+#   Pre-committed bar: firefox CPU drop >=3% => fund the interned-context lever
+#   1.1.  RESULT = FALSIFIED (NO-GO for CPU): the per-drv context re-parse
+#   (NixStringContextElem::parse) is NOT a material CPU cost — memoizing it buys
+#   nothing.  The cost, if any, is in the token COPIES (a MALLOC_SMALL/RSS
+#   concern the beat-tw campaign already graded modest/foundational), not the
+#   parse-back.  Lever 1.1 stays UNFUNDED for CPU; the RSS/span-sharing angle is
+#   a separate deferred W-scale item.  firefox.drvPath is a valid drv-heavy
+#   proxy (full inputDrvs context); M5 (more drv-heavy) is IFD-blocked on
+#   aarch64 but the firefox null result already refutes the CPU hypothesis.
+# ============================================================================
 # synthetic v3-only rows below NOT re-measured at 20758fad5 — last at 3ff650587:
 fib	2.29	NA	NA	NA	no	off	3ff650587	2026-06-19
 attrNames	0.57	NA	NA	NA	yes	off	3ff650587	2026-06-19
