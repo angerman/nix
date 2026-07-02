@@ -442,6 +442,24 @@ static const bool g_chainLookupSelect = [] {
     return v == nullptr || (v[0] != '0');  // default-ON unless explicitly =0
 }();
 
+// P3.1/§3.2 chain-aware read IC (NIX_V3_CHAIN_IC, default-OFF, EXPERIMENTAL).
+// The chain-SELECT path (g_chainLookupSelect) walks EVERY layer with a per-layer
+// binary search on every access, bypassing the inline cache — §3.2's headline
+// per-lookup tax on the dominant `base // small` chain shape.  This gate caches
+// the resolved (ownerLayer, slot) in the SAME per-call-site attrSelectCache the
+// flat path uses (chain entries set Entry::ownerLayer), keyed by the chain LEAF
+// pointer.  SAFE because chain STRUCTURE is immutable after construction (only
+// leaf-owned entry-value writebacks — the C-1 rule), so a resolved read slot
+// stays valid while the leaf pointer is unchanged; name-validation (C-3) guards
+// the slot, and the leaf-vs-parent writeback decision (leafHit) is recomputed on
+// hit and unchanged.  RETIREMENT (Rule 0): flip default-ON after a darwin-4
+// SELECT-heavy CPU win (git/firefox) + a full nixpkgs byte-identity soak; else
+// delete.  gen-major already clears the IC (vm.cc major-GC safepoint); the
+// cached leaf + ownerLayer pointers are scavenge roots (gc.cc IC-walk forwards
+// both).
+static const bool g_chainIC =
+    std::getenv("NIX_V3_CHAIN_IC") != nullptr;
+
 // Provenance assert (the precise C-1 guard, gated V3_DBG_SHARED_WB): records the
 // value at each KEEP-armed forceWriteTarget at ARM time; at FIRE time the target
 // must STILL hold that value.  A mismatch means a re-entrant force overwrote the
@@ -4253,7 +4271,10 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     for (const CompilationUnit * icu : cuRegistry()) {
                         if (!icu) continue;
                         for (auto & ic : icu->attrSelectCache)
-                            for (auto & e : ic.entries) e.bindings = nullptr;
+                            for (auto & e : ic.entries) {
+                                e.bindings = nullptr;
+                                e.ownerLayer = nullptr;  // P3.1: clear the chain-IC layer too, else gc.cc would gray a stale (freed) layer
+                            }
                         for (auto & rc : icu->recSlotCache) rc.bindings = nullptr;
                     }
                     // M-1 (CODEBASE_REVIEW_2026-06-11): the Bindings::materialize
@@ -4381,7 +4402,10 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     for (auto & rc : icu->recSlotCache) rc.bindings = nullptr;
                     if (s_midEvalEvac)
                         for (auto & ic : icu->attrSelectCache)
-                            for (auto & e : ic.entries) e.bindings = nullptr;
+                            for (auto & e : ic.entries) {
+                                e.bindings = nullptr;
+                                e.ownerLayer = nullptr;  // P3.1: clear chain-IC layer too (stale-gray guard)
+                            }
                 }
                 Bindings::clearMaterializeMemo();
                 clearEnvInternTable();
@@ -10007,12 +10031,44 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     Value * lslot = nullptr;
                     uint32_t ownerSlot = UINT32_MAX;
                     const SymbolId want = static_cast<SymbolId>(operand);
-                    for (const Bindings * L = b; L; L = L->isChain() ? L->parent : nullptr) {
-                        if (const Bindings::Entry * e = L->lookupLocalEntry(want)) {
-                            lslot = const_cast<Value *>(&e->value);
-                            ownerLayer = L;
-                            ownerSlot = static_cast<uint32_t>(e - L->entries);
-                            break;
+                    // P3.1 chain-IC lookup (gated): a validated hit skips the
+                    // full layer walk.  Validate the LEAF pointer + name (C-3);
+                    // chain structure immutability (C-1) makes the cached
+                    // ownerLayer/slot valid while the leaf is unchanged.
+                    bool chainIcHit = false;
+                    if (g_chainIC) {
+                        for (int w = 0; w < CompilationUnit::AttrSelectIC::kWays; ++w) {
+                            auto & e = ic.entries[w];
+                            if (e.bindings == b && e.ownerLayer
+                                && e.slot < e.ownerLayer->size
+                                && e.ownerLayer->entries[e.slot].name == want) {
+                                ownerLayer = e.ownerLayer;
+                                ownerSlot  = e.slot;
+                                lslot = const_cast<Value *>(
+                                    &e.ownerLayer->entries[e.slot].value);
+                                chainIcHit = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (!chainIcHit) {
+                        for (const Bindings * L = b; L; L = L->isChain() ? L->parent : nullptr) {
+                            if (const Bindings::Entry * e = L->lookupLocalEntry(want)) {
+                                lslot = const_cast<Value *>(&e->value);
+                                ownerLayer = L;
+                                ownerSlot = static_cast<uint32_t>(e - L->entries);
+                                break;
+                            }
+                        }
+                        // P3.1 chain-IC install (gated, round-robin) on a
+                        // resolved miss: cache (leaf, ownerLayer, slot).
+                        if (g_chainIC && lslot) {
+                            auto & e = ic.entries[ic.evictIdx];
+                            e.bindings   = b;          // the chain LEAF
+                            e.ownerLayer = ownerLayer; // the owning layer
+                            e.slot       = ownerSlot;
+                            ic.evictIdx  = static_cast<uint8_t>(
+                                (ic.evictIdx + 1) % CompilationUnit::AttrSelectIC::kWays);
                         }
                     }
                     if (lslot) {
@@ -10441,6 +10497,11 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 auto & evicted = ic.entries[ic.evictIdx];
                 evicted.bindings = b;
                 evicted.slot     = lo;
+                // P3.1: this is a FLAT install (slot indexes `b` directly).
+                // Clear any chain `ownerLayer` this slot may have held, so the
+                // flat entry is self-consistent and gc.cc never grays a stale
+                // layer for a slot that is no longer a chain entry.
+                evicted.ownerLayer = nullptr;
                 ic.evictIdx = (ic.evictIdx + 1)
                     % CompilationUnit::AttrSelectIC::kWays;
                 MapAttrsSelectResult mapAttrsSelect =

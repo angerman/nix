@@ -1475,23 +1475,33 @@ removal + BI-neutral cleanup + one falsification with a durable guardrail.
 
 ## WS-3 remaining items — dispositions
 
-- **P3.1 (§3.2/§3.3 chain-aware read IC + MapAttrs parent memo) — THE HEADLINE
-  CPU LEVER, scoped, NOT yet built.**  §3.2 (chain-Bindings SELECT bypasses the
-  IC; every lookup walks all ≤16 layers with a per-layer binary search) is the
-  single biggest per-lookup tax the audit found, and `mergeBindings` makes the
-  chain shape the dominant nixpkgs attrset.  Design (from the P3.1 note): a
-  per-call-site chain IC keyed `(chainLeaf Bindings*, sym) → (ownerLayer*,
-  slot)`, mirroring the flat 4-way IC (`vm.cc:10220-10240`: `{bindings, slot}`
-  entries, name-validated, scavenge-rooted).  Chain STRUCTURE is immutable
-  post-construction (only leaf-owned writebacks — C-1), so a resolved read slot
-  is cacheable; the cached `ownerLayer*`/`leaf*` become scavenge roots
-  (walkAllV3Roots must scavenge them, exactly as it does the flat IC's
-  Bindings*); gen-major already clears ICs.  MapAttrs parent memo (§3.3) must
-  write ONLY into leaf-owned storage / a side memo (never the shared parent —
-  C-1).  This is a genuine D-W change (new CU cache struct + install/lookup +
-  GC root registration + serialize + adversarial + brute + darwin-4) and is the
-  recommended NEXT major CPU effort.  Step 0 (cheap, do first): a per-site
-  chain-SELECT + IC-hit-rate counter to size the win + the megamorphic question.
+- **P3.1 (§3.2 chain-aware read IC) — BUILT + validated, SHIPPED GATED
+  (`NIX_V3_CHAIN_IC`, default-off); pending darwin-4 flip.**  §3.2 (chain-Bindings
+  SELECT walks all ≤16 layers with a per-layer binary search, bypassing the IC)
+  is the single biggest per-lookup tax the audit found; `mergeBindings` makes the
+  chain shape the dominant nixpkgs attrset.  Implemented as designed: the chain
+  path (`vm.cc` OP_ATTRS_SELECT, `g_chainIC`) caches the resolved
+  `(chainLeaf, ownerLayer, slot)` in the SAME per-call-site `attrSelectCache`
+  (extended `AttrSelectIC::Entry` with `ownerLayer`; flat entries keep it null —
+  disjoint by construction).  Validation on hit: `e.bindings==b(leaf) &&
+  e.ownerLayer && e.slot < ownerLayer->size && ownerLayer->entries[slot].name ==
+  want`; the leaf-vs-parent writeback decision (`leafHit`) + mapAttrs handling
+  are recomputed identically to the walk path (a hit is a pure fast-forward).
+  GC: gc.cc's 5 IC scavenge/audit sites gray/visit `ownerLayer` too (Bindings are
+  ALWAYS tenured — `allocBindings`/`allocChainBindings` use `threadArena`,
+  `fwdBindings` aborts on a nursery Bindings — so the discarded-return gray is
+  safe, and ownerLayer is even a leaf-ancestor so reachability is already
+  covered); both IC-clear sites + the flat install null `ownerLayer` (no stale
+  gray).  **Validated: adversarial review NOT-REFUTED (all 5 angles: stale-layer/
+  UAF, GC forwarding, wrong-result, C-1 writeback safety, flat/chain cross-hit);
+  full --brute 28/28 with `NIX_V3_CHAIN_IC=1` (moving-GC missed-root stress +
+  drv-parity byte-identity) AND 28/28 default (gate-off); ON-vs-OFF byte-identical
+  on 5 chain-SELECT-heavy exprs incl. a 20-layer `foldl //` chain.**  RETIREMENT:
+  a darwin-4 SELECT-heavy A/B (git/firefox, gate-on vs off) decides the flip —
+  flip default-on if a CPU win holds + a full nixpkgs byte-identity soak passes,
+  else delete.  (§3.3 MapAttrs parent memo — the recompute-on-parent-hit fix —
+  is a separate remaining sub-lever, must write only leaf-owned storage; not in
+  this IC.)
 - **P3.6 §3.8 (magic-static env-gate sweep + code-ptr dispatch local) —
   ASSESSED, DEFERRED (low EV).**  (a) The ~40 function-local `static const bool
   s_*` env gates in the dispatch region each cost a magic-static guard load per

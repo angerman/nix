@@ -653,6 +653,11 @@ void Scavenger::walkClosure(Closure * c)
             for (int w = 0; w < CompilationUnit::AttrSelectIC::kWays; ++w) {
                 if (Bindings * b = const_cast<Bindings *>(ic.entries[w].bindings))
                     fwdBindings(b);
+                // P3.1 chain-IC: the owning layer of a cached chain-SELECT is a
+                // separate (tenured) Bindings; gray it too so its entries'
+                // nursery payloads are scavenged (mirror the leaf above).
+                if (Bindings * o = const_cast<Bindings *>(ic.entries[w].ownerLayer))
+                    fwdBindings(o);
             }
         }
     }
@@ -705,6 +710,9 @@ void Scavenger::walkThunk(Thunk * t)
                 for (int w = 0; w < CompilationUnit::AttrSelectIC::kWays; ++w) {
                     if (Bindings * b = const_cast<Bindings *>(ic.entries[w].bindings))
                         fwdBindings(b);
+                    // P3.1 chain-IC: gray the owning layer too (see the leaf).
+                    if (Bindings * o = const_cast<Bindings *>(ic.entries[w].ownerLayer))
+                        fwdBindings(o);
                 }
             }
         }
@@ -737,6 +745,9 @@ void Scavenger::walkThunk(Thunk * t)
                 for (int w = 0; w < CompilationUnit::AttrSelectIC::kWays; ++w) {
                     if (Bindings * b = const_cast<Bindings *>(ic.entries[w].bindings))
                         fwdBindings(b);
+                    // P3.1 chain-IC: gray the owning layer too (see the leaf).
+                    if (Bindings * o = const_cast<Bindings *>(ic.entries[w].ownerLayer))
+                        fwdBindings(o);
                 }
             }
         }
@@ -975,6 +986,9 @@ void Scavenger::run()
                 for (int w = 0; w < CompilationUnit::AttrSelectIC::kWays; ++w) {
                     if (Bindings * b = const_cast<Bindings *>(ic.entries[w].bindings))
                         fwdBindings(b);
+                    // P3.1 chain-IC: gray the owning layer too (see the leaf).
+                    if (Bindings * o = const_cast<Bindings *>(ic.entries[w].ownerLayer))
+                        fwdBindings(o);
                 }
             }
         };
@@ -1238,6 +1252,9 @@ struct Auditor {
             for (int w = 0; w < CompilationUnit::AttrSelectIC::kWays; ++w) {
                 if (const Bindings * b = ic.entries[w].bindings)
                     visitBindings(b, "CU.attrSelectCache");
+                // P3.1 chain-IC: audit the owning layer too.
+                if (const Bindings * o = ic.entries[w].ownerLayer)
+                    visitBindings(o, "CU.attrSelectCache.ownerLayer");
             }
         }
     }

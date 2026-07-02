@@ -617,6 +617,13 @@ private:
             for (int w = 0; w < CompilationUnit::AttrSelectIC::kWays; ++w)
                 if (Bindings * b = const_cast<Bindings *>(ic.entries[w].bindings))
                     visitBindings(b);
+        // P3.1 chain-IC: no separate visit of `ic.entries[w].ownerLayer` is
+        // needed here.  A chain entry's ownerLayer is ALWAYS an ancestor of its
+        // leaf `bindings` (the install walks `L = b; L = L->parent`), and
+        // visitBindings→walkBindings follows `->parent` transitively, so marking
+        // the leaf keeps the owning layer live.  (The moving scavenger in gc.cc
+        // grays ownerLayer explicitly only because it forwards nursery payloads
+        // in place and the extra gray is idempotent.)
     }
 
     void walkClosure(Closure * c) noexcept
