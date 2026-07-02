@@ -1180,3 +1180,80 @@ made probe-config timing cost-free (P0.3), proved the V3_STATS-counter tax is
 noise (P0.2 NO-GO ⇒ no packaging change), and re-baselined. Every subsequent
 item is now judged against the P0.4 rows above, not the numbers quoted earlier
 in this document.
+
+---
+---
+
+# Handback — WS-1 (correctness), 2026-07-02
+
+**Commits landed:**
+- `c3657c94b` P1.1 — branch opcodes (OP_BRANCH_FALSE / AND / OR / IMPL /
+  R_BRANCH_FALSE) reject non-Boolean conditions with TW-parity errors.
+- `c9948463f` P1.2 — primSort `listPostConstructBarrier(result)` (PhD-6).
+- `5235df5e9` P1.3 — disk-cache-HIT catch scoped to deserialize; run() errors
+  propagate.
+
+Each shipped a failing-first regression test wired into the core/brute battery
+(now 25 suites) and an independent adversarial review (all NOT-REFUTED); each
+landed under full `--brute` 25/25.
+
+**Falsifier / verification results vs the always-add-tests + failing-first rule:**
+- **P1.1** (test/run-branch-bool-typecheck-tests.sh, 17 cases): 6 negative
+  (`if 1`, `1 && true`, `"x" || true`, `1 -> true`, forced/slot cond, `null`)
+  now error with byte-parity to TW's `expected a Boolean but found <type>:
+  <value>` (eval.cc:1228) — verified v3==TW; 11 positive valid-boolean cases
+  unchanged + TW-equal. Pre-fix the negatives *evaluated* (`if 1`→then,
+  `1 && false`→false); post-fix they throw. Corrections: OP_NOT already errors
+  (isTrueValue, non-parity message — out of §2.1 scope); OP_ASSERT unchanged;
+  string-with-context/primop-named/external message deviations are edge cases
+  that never occur in boolean position.
+- **P1.2** (test/run-primsort-barrier-tests.sh): a 40 000-element literal-list
+  sort fills the 1 MB nursery so `result` tenures with nursery-resident cells;
+  under `NIX_V3_NURSERY_SIZE=1 V3_DBG_NURSERY_AUDIT` the scavenge audit flags
+  ~33 000 "reachable via ListVec(sz=40000).elems[N] lastWriter=(no-recorded-
+  writer=raw/bulk-path)" missed roots PRE-fix, **0** POST-fix (both directions
+  verified; also clean under +BRUTE). Correction to the A.4 recipe: genList/map
+  sources do NOT trip it (tenured App-pair elements) — a LITERAL nested list is
+  required to make the elements direct nursery cells.
+- **P1.3** (test/run-primimport-eval-error-tests.sh): a throwing import is
+  disk-cached (CU written before run()), then evaluated in a second process
+  (real disk HIT). A seq-forced trace marker (a plain `trace msg (throw)` does
+  NOT fire — trace's value arg is strict, so the throw beats the print) counts
+  warm-HIT executions: **A/B verified PRE-fix = 2 (dup re-run), POST-fix = 1**;
+  stable error; post-error cache uncorrupted.
+- **P1.4 (§2.4 huge-block interior-mark UAF) — CLOSED, NO FIX (fix-if-
+  reproducible rule).** Mechanism CONFIRMED by code inspection: visitSlot's
+  interior-owner rescue (mark_sweep.cc:313-350) calls `findContainingCellStart`
+  which returns null when `cellMetaEnabled()` is false (the default), so a
+  Tag::Slot into a huge (≥ kHugeCutoff = 4 MB) Bindings interior marks the
+  entry value but NOT the container's block-begin; the huge-block reclaim
+  (mark_sweep.cc:2404) tests `isMarked(block-begin)` and frees it. Reachable by
+  default (huge blocks are calloc'd, pushed to `hugeBlocks`, and reclaimed).
+  **Repro NOT achieved** in two bounded attempts (250 k-entry attrset with
+  in-place selects + churn → correct 374 625 000; mapAttrs + `//` overlay +
+  churn → correct 62 375 507), because gen-major is exitDepth==0-gated so the
+  transient in-place-force slots (created at exitDepth>0) are gone when it
+  fires — the M5 "slot-only-reachable huge Bindings at exitDepth==0" is a
+  persistent, M5-specific pattern, and M5 is IFD-blocked on aarch64. The UAF is
+  latent even when triggered (calloc'd block → `std::free`; needs freed-memory
+  reuse before the dangling access to manifest). Per the fix-if-reproducible
+  rule this is CLOSED without a fix (an unvalidated change to GC-critical
+  mark_sweep.cc is higher-risk than the rare, unmeasured bug).
+  **Recommended fix when M5-validation is available:** in visitSlot's
+  interior-owner rescue, handle the huge-block case independently of
+  `cellMetaEnabled()` — resolve an interior slot pointer to its huge-block
+  begin via an `arena.hugeBlockRanges()` range lookup (which needs no cell
+  metadata) and mark THAT, so the reclaim's `isMarked(block-begin)` succeeds.
+
+**Discovered (orthogonal to WS-1, logged for follow-up):** the brute-audit
+firefox-name workload intermittently (~1-in-7; 1 hit then 7 consecutive clean)
+reports "SCAVENGE BRUTE: 40 tenured words point into nursery" — a rare
+pre-existing scavenger missed-root, P1.3-orthogonal (primImport touches no
+walker). A real (if rare) latent bug; captured as a separate investigation
+task (identify the object class/field at the hit address → the missing gc.cc
+walk → failing-first repro + fix).
+
+**Net:** WS-1 fixed both live correctness divergences (P1.1 semantic, P1.2
+missed-root UAF) and the latent import-cache exception-safety bug (P1.3), each
+with a failing-first regression permanently in the brute battery. P1.4 is a
+documented close (mechanism real, repro M5-scale/unavailable, fix deferred).
