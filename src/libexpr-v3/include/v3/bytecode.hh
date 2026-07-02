@@ -607,16 +607,6 @@ struct CompilationUnit
         struct Entry {
             const Bindings * bindings = nullptr;
             uint32_t slot = 0;
-            // P3.1/§3.2 chain-aware read IC (NIX_V3_CHAIN_IC, default-off):
-            // for a CHAIN-Bindings select, `bindings` is the chain LEAF and
-            // `ownerLayer` is the layer that owns the resolved entry (`slot`
-            // indexes ownerLayer, not the leaf).  nullptr for the flat path
-            // (where slot indexes `bindings` directly).  A flat `b` and a chain
-            // leaf are distinct pointers, so flat and chain entries never
-            // false-hit.  BOTH `bindings` and `ownerLayer` are GC scavenge roots
-            // (gc.cc IC-walk forwards both; ownerLayer is reachable from the
-            // leaf so forwarding is idempotent).
-            const Bindings * ownerLayer = nullptr;
         };
         Entry entries[kWays] = {};
         /// Round-robin replacement: index of the next slot to evict.

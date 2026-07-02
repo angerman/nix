@@ -140,3 +140,14 @@ attrNames	0.57	NA	NA	NA	yes	off	3ff650587	2026-06-19
 #   GATED default-off (validated, zero prod risk); flip decision awaits an
 #   x86_64 M5 A/B + a per-site chain-SELECT hit-rate counter (DELETE if M5 also
 #   ~0%).  Another measure-first "headline lever doesn't materialize" result.
+#   --- FOLLOW-UP (same day): a chain-SELECT depth/hit-rate counter settled it ---
+#   firefox.drvPath: chain-SELECTs = 60.4% of 511776 selects (COMMON, not rare),
+#     gate-off avg chain depth = 2.44 layers (SHALLOW), gate-on IC hit-rate 45.9%.
+#   git.drvPath:     57.5% of selects, avg depth 2.35, IC hit-rate 44.9%.
+#   => The IC fires + hits ~45% but each hit saves only a ~2.4-hop walk over small
+#      overlays ~= the IC's own 4-way scan+validate => STRUCTURAL WASH => 0% CPU.
+#      §3.2's "walks all <=16 layers" refuted (mergeBindings flattens every 16 +
+#      SELECTs short-circuit at the top overlay => effective depth ~2.4).  For M5
+#      to win, avg depth would need >>4 (contradicted by the flatten-cap).
+#   VERDICT: DELETED per Rule 0 (no-win gate retires).  Validated design preserved
+#   at commit 0cb2f88b5; re-apply only if a future x86_64 M5 depth probe shows >>4.

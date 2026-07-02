@@ -12,9 +12,10 @@ Group. SPDX-License-Identifier: Apache-2.0.
 Every §9 item was driven to a **measured decision**. All cheap/safe wins
 shipped; **five** audit proposals were **falsified/measured-NO-GO** (kills are
 deliverables): P0.2, P3.3, P4.4-CPU, P2.3-inherit, and **P3.1** (chain-aware read
-IC — built + adversarially-validated + brute-28/28, but measured **0% CPU** on
-firefox+git → kept gated pending an unmeasurable-here M5 A/B). The one real
-latent bug was investigated + resolved. The remaining lever (P2.1-a) is a
+IC — built + adversarially-validated + brute-28/28, then a depth counter proved
+chains are shallow (avg 2.44) so the IC is a structural wash → measured **0% CPU**
+→ **DELETED** per Rule 0, design preserved at `0cb2f88b5`). The one real latent
+bug was investigated + resolved. The remaining lever (P2.1-a) is a
 genuine W-scale, drv-hash-critical build — fully designed + de-risked. This
 matches the audit's own §9 honest expectation: **no single remaining CHEAP lever
 moves the gap** — even the §3.2 "headline per-lookup tax" yields 0% once built
@@ -102,15 +103,21 @@ way and measured:
   (moving-GC missed-root + drv byte-id) AND 28/28 default; ON-vs-OFF byte-id on 5
   chain-SELECT exprs incl. a 20-layer `foldl //` chain.
 - `30269d3ab` — darwin-4 A/B (git-noted): firefox.drvPath **0%** (2.66s==2.66s),
-  git.drvPath **0%** (1.41s==1.41s). **No measurable CPU win** — real-nixpkgs `//`
-  chains are SHALLOW (SELECT short-circuits at the first matching layer), so
-  §3.2's "walks all ≤16 layers" is overstated for firefox/git and the IC's scan+
-  validation ≈ the shallow walk. Another measure-first "headline lever doesn't
-  materialize on measurable workloads" result (cf. P3.3, P4.4-CPU).
-- **Kept GATED default-off** (validated, zero prod risk). The flip/delete
-  decision needs the audit's named deep-chain target M5 (IFD-blocked on aarch64):
-  on an x86_64 host add a per-site chain-SELECT hit-rate counter + A/B on M5 →
-  flip if ≥3% + byte-id soak, else DELETE.
+  git.drvPath **0%** (1.41s==1.41s). No measurable CPU win.
+- **A chain-SELECT depth/hit-rate counter settled WHY (the decisive data):**
+  firefox — chain-SELECTs are **60.4 %** of all selects (COMMON, not rare), avg
+  chain depth **2.44 layers** (SHALLOW), IC hit-rate **45.9 %**; git — 57.5 %,
+  depth 2.35, 44.9 %. So the IC fires + hits ~45 %, but each hit saves only a
+  ~2.4-hop walk over small overlays ≈ the IC's own 4-way scan+validate → a
+  **structural wash → 0 % CPU**. §3.2's "walks all ≤16 layers" is refuted
+  (`mergeBindings` flattens every 16 + SELECTs short-circuit at the top overlay →
+  effective depth ~2.4 even though chains dominate).
+- **DELETED per Rule 0** (a gate with no proven win must retire, not coexist):
+  code restored to pre-P3.1; the validated implementation is preserved at
+  `0cb2f88b5` for a trivial re-apply IF a future x86_64 run first measures M5 avg
+  chain depth ≫ 4 (unlikely, given the flatten-cap + short-circuit). Third
+  measure-first "the §-headline lever doesn't materialize" result (cf. P3.3,
+  P4.4-CPU) — the deliverable is the design + the shallow-chain finding.
 
 ## Remaining levers (dedicated next-session efforts)
 

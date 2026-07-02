@@ -1475,48 +1475,32 @@ removal + BI-neutral cleanup + one falsification with a durable guardrail.
 
 ## WS-3 remaining items — dispositions
 
-- **P3.1 (§3.2 chain-aware read IC) — BUILT + validated, SHIPPED GATED
-  (`NIX_V3_CHAIN_IC`, default-off); pending darwin-4 flip.**  §3.2 (chain-Bindings
-  SELECT walks all ≤16 layers with a per-layer binary search, bypassing the IC)
-  is the single biggest per-lookup tax the audit found; `mergeBindings` makes the
-  chain shape the dominant nixpkgs attrset.  Implemented as designed: the chain
-  path (`vm.cc` OP_ATTRS_SELECT, `g_chainIC`) caches the resolved
-  `(chainLeaf, ownerLayer, slot)` in the SAME per-call-site `attrSelectCache`
-  (extended `AttrSelectIC::Entry` with `ownerLayer`; flat entries keep it null —
-  disjoint by construction).  Validation on hit: `e.bindings==b(leaf) &&
-  e.ownerLayer && e.slot < ownerLayer->size && ownerLayer->entries[slot].name ==
-  want`; the leaf-vs-parent writeback decision (`leafHit`) + mapAttrs handling
-  are recomputed identically to the walk path (a hit is a pure fast-forward).
-  GC: gc.cc's 5 IC scavenge/audit sites gray/visit `ownerLayer` too (Bindings are
-  ALWAYS tenured — `allocBindings`/`allocChainBindings` use `threadArena`,
-  `fwdBindings` aborts on a nursery Bindings — so the discarded-return gray is
-  safe, and ownerLayer is even a leaf-ancestor so reachability is already
-  covered); both IC-clear sites + the flat install null `ownerLayer` (no stale
-  gray).  **Validated: adversarial review NOT-REFUTED (all 5 angles: stale-layer/
-  UAF, GC forwarding, wrong-result, C-1 writeback safety, flat/chain cross-hit);
-  full --brute 28/28 with `NIX_V3_CHAIN_IC=1` (moving-GC missed-root stress +
-  drv-parity byte-identity) AND 28/28 default (gate-off); ON-vs-OFF byte-identical
-  on 5 chain-SELECT-heavy exprs incl. a 20-layer `foldl //` chain.**  **darwin-4 A/B RESULT (2026-07-02, commit 0cb2f88b5, git-noted): NO measurable
-  CPU win on the measurable workloads.**  firefox.drvPath cold gate-OFF 2.66s ==
-  gate-ON 2.66s (0%); git.drvPath cold gate-OFF 1.41s == gate-ON 1.41s (0%).
-  Likely cause: real-nixpkgs `//` chains are SHALLOW — a SELECT short-circuits at
-  the first layer containing the attr, so the "walks all ≤16 layers" premise of
-  §3.2 is overstated for firefox/git, and the IC's 4-way scan + name-validation
-  costs about the same as the shallow walk it replaces.  The audit's NAMED
-  deep-chain target — M5 (cardano overlay stacks) — is IFD-blocked on aarch64 and
-  UNMEASURED, and I have no per-site chain-SELECT hit-rate counter to say whether
-  firefox/git are 0% because chains are cheap (falsified) or because chain-SELECTs
-  are rare on them (M5-pending).  **DISPOSITION: kept GATED default-off (validated
-  + zero production risk); NOT flipped (no measurable win).  SHARP RETIREMENT: an
-  x86_64 host that can build M5 must (a) add the per-site chain-SELECT + IC-hit
-  counter and (b) A/B gate-on vs off on M5 — flip default-on ONLY if a ≥3% M5
-  SELECT-CPU win holds + a full nixpkgs byte-identity soak passes; DELETE the
-  lever if M5 is also ~0% or firing is negligible.**  This is another
-  measure-first "the headline lever doesn't materialize on measurable workloads"
-  result (cf. P3.3, P4.4-CPU) — the deliverable is the validated design + the
-  shallow-chain finding.  (§3.3 MapAttrs parent memo — the recompute-on-parent-hit
-  fix — is a separate remaining sub-lever, must write only leaf-owned storage;
-  not in this IC.)
+- **P3.1 (§3.2 chain-aware read IC) — BUILT, validated, MEASURED, and DELETED
+  (measure-first NO-GO: chains are shallow → the IC is a structural wash).**  §3.2
+  claimed chain-Bindings SELECT "walks all ≤16 layers" as the single biggest
+  per-lookup tax.  Built as designed (commit `0cb2f88b5`; gated `NIX_V3_CHAIN_IC`;
+  caches `(chainLeaf, ownerLayer, slot)` in the shared per-call-site
+  `attrSelectCache`, full moving-GC integration), adversarially NOT-REFUTED (5
+  angles), `--brute` 28/28 gate-on + off, ON-vs-OFF byte-identical.  **Then a
+  chain-SELECT depth/hit-rate counter settled WHY the darwin-4 A/B measured 0%:**
+  firefox.drvPath — chain-SELECTs are **60.4 %** of all 511,776 selects (common,
+  NOT rare), gate-off **avg chain depth = 2.44 layers** (SHALLOW), gate-on IC
+  **hit-rate 45.9 %**; git.drvPath — **57.5 %**, depth **2.35**, hit-rate 44.9 %.
+  So the IC fires + hits ~45 %, but each hit only saves a ~2.4-hop walk over small
+  overlays — about the same cost as the IC's own 4-way scan + name-validation → a
+  **structural wash → 0 % CPU** (firefox 2.66→2.66s, git 1.41→1.41s).  §3.2's
+  "walks all ≤16 layers" is refuted: `mergeBindings` flattens every 16 layers AND
+  SELECTs short-circuit at the top overlay, so effective depth is ~2.4 even though
+  chains dominate.  The audit's named deep-chain target M5 is IFD-blocked on
+  aarch64 (unmeasured), but for the IC to win M5 would need avg depth ≫ 4 —
+  contradicted by the flatten-cap + the observed short-circuit.  **DELETED per
+  Rule 0** (a gate with no proven win must retire, not coexist): code restored to
+  pre-P3.1.  The validated implementation is preserved at commit `0cb2f88b5` for a
+  trivial re-apply IF a future x86_64 run first measures M5 avg chain depth ≫ 4
+  (re-add the cheap depth counter to check — do NOT re-build the IC blind).  Third
+  measure-first "the §-headline lever doesn't materialize" result (cf. P3.3,
+  P4.4-CPU).  (§3.3 MapAttrs parent memo — the recompute-on-parent-hit fix — is a
+  separate remaining sub-lever, not part of this IC.)
 - **P3.6 §3.8 (magic-static env-gate sweep + code-ptr dispatch local) —
   ASSESSED, DEFERRED (low EV).**  (a) The ~40 function-local `static const bool
   s_*` env gates in the dispatch region each cost a magic-static guard load per
