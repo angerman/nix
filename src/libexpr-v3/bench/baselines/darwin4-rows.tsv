@@ -81,6 +81,19 @@ M5	6.54	3.61	1.81	2217	yes	warm	2d7efdb97	2026-07-02
 #   default build; the residual per-alloc/histogram/fastpath counters are
 #   noise-level, so stripping them (v3_release=true) buys nothing.
 # ============================================================================
+# WS-1 + P3.4 VALIDATION (2026-07-02, commit 4a7055a22 = HEAD after P1.1/1.2/1.3
+# + P2.1-measure + P3.4).  Aggregate CPU/RSS vs the 2d7efdb97 P0.4 baseline
+# above.  RESULT: WS-1 correctness fixes are COST-FREE (no regression); P3.4
+# (valueEqual per-compare malloc-avoidance) is a small net win, most visible on
+# compare-heavy M5 warm.  5th column = peak_RSS MB (beat-tw-compare).
+# row	v3_cpu	tw_cpu	ratio	peakRSS_MB	impure	cache	commit	date
+firefox	2.66	0.74	3.59	678	yes	off	4a7055a22	2026-07-02
+M5	10.84	3.60	3.01	2996	yes	off	4a7055a22	2026-07-02
+firefox	1.79	0.74	2.42	586	yes	warm	4a7055a22	2026-07-02
+M5	6.40	3.60	1.78	2217	yes	warm	4a7055a22	2026-07-02
+#   vs P0.4 (2d7efdb97): ff cold 2.68->2.66 (-0.7%), M5 cold 10.96->10.84
+#   (-1.1%), ff warm 1.80->1.79 (-0.6%), M5 warm 6.54->6.40 (-2.1%).
+# ============================================================================
 # synthetic v3-only rows below NOT re-measured at 20758fad5 — last at 3ff650587:
 fib	2.29	NA	NA	NA	no	off	3ff650587	2026-06-19
 attrNames	0.57	NA	NA	NA	yes	off	3ff650587	2026-06-19
