@@ -1007,6 +1007,52 @@ inline bool valueEqual(VMState & vm, Value a0, Value b0, bool insideContainer0 =
     // throw).  GC-safety: the major GC is non-moving (evacuation default-off),
     // and the source containers stay reachable via a0/b0 for the whole loop, so
     // these raw slot pointers remain valid across the forceValue calls below.
+
+    // P3.4 (2026-07-02): scalar fast path (audit §3.5).  The overwhelmingly
+    // common OP_EQ/OP_NEQ shape is a single SCALAR compare (`system ==
+    // "x86_64-linux"`, `n == 0`, string/bool checks).  Force the top pair
+    // (top pair has null slots ⇒ no writeback, exactly as the first loop
+    // iteration below would do) and, when the result is a scalar tag (or the
+    // int/float coercion pair), compare directly and RETURN — avoiding the
+    // 16-entry (~640 B) `std::vector<Task>` malloc that every non-int compare
+    // otherwise pays.  The tag-mismatch and per-tag scalar logic MIRROR the
+    // loop's cases (1050-1080) verbatim, so the equality result is
+    // byte-identical.  Compound (List/Attrs) and any other same-tag shape
+    // (Closure/PrimOp/…) fall through UNCHANGED to the iterative loop; a0/b0
+    // are re-seeded with the FORCED values so the loop's first pop does not
+    // re-force.
+    {
+        Value fa = a0, fb = b0;
+        Tag at = fa.tag();
+        if (__builtin_expect(at == Tag::Thunk || at == Tag::App
+                             || at == Tag::App3 || at == Tag::Slot, 0))
+            fa = forceValue(vm, fa);
+        Tag bt = fb.tag();
+        if (__builtin_expect(bt == Tag::Thunk || bt == Tag::App
+                             || bt == Tag::App3 || bt == Tag::Slot, 0))
+            fb = forceValue(vm, fb);
+        if (fa.tag() != fb.tag()) {
+            if (fa.isInt() && fb.isFloat())
+                return static_cast<double>(fa.asInt()) == fb.asFloat();
+            if (fa.isFloat() && fb.isInt())
+                return fa.asFloat() == static_cast<double>(fb.asInt());
+            return false;
+        }
+        // if/else (not switch) to avoid -Werror=switch-enum on the tags we
+        // deliberately don't spell out (List/Attrs/Closure/… fall through).
+        const Tag tg = fa.tag();
+        if (tg == Tag::Int)    return fa.asInt() == fb.asInt();
+        if (tg == Tag::Float)  return fa.asFloat() == fb.asFloat();
+        if (tg == Tag::Bool)   return fa.asInt() == fb.asInt();
+        if (tg == Tag::Null)   return true;
+        if (tg == Tag::String)
+            return std::string_view(fa.asString()) == std::string_view(fb.asString());
+        if (tg == Tag::Path)
+            return std::string_view(fa.asPath()) == std::string_view(fb.asPath());
+        // List/Attrs/Closure/… → iterative loop (unchanged).
+        a0 = fa; b0 = fb;  // re-seed forced values so the loop doesn't re-force
+    }
+
     struct Task { Value a, b; bool insideContainer; Value * aSlot; Value * bSlot; };
     std::vector<Task> stack;
     stack.reserve(16);

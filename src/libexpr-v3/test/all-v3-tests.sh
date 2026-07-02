@@ -171,6 +171,7 @@ if [[ "$mode" == "core" || "$mode" == "full" || "$mode" == "brute" ]]; then
   SUITES+=( "branch-bool-typecheck|P1.1 §2.1 branch-opcode non-Boolean condition errors (TW-parity) + valid-bool BI|NIX=$NIX $TEST_DIR/run-branch-bool-typecheck-tests.sh" )
   SUITES+=( "primsort-barrier|P1.2 §2.2 primSort Phase-D missed-root barrier (tenured sorted list holding nursery cells)|$TEST_DIR/run-primsort-barrier-tests.sh" )
   SUITES+=( "primimport-eval-error|P1.3 §2.3 disk-hit catch scoped to deserialize (erroring warm import runs once, error propagates)|NIX=$NIX $TEST_DIR/run-primimport-eval-error-tests.sh" )
+  SUITES+=( "value-equal|P3.4 §3.5 valueEqual scalar fast path + general equality-engine parity vs TW|NIX=$NIX $TEST_DIR/run-value-equal-tests.sh" )
   SUITES+=( "lint-no-inline-getenv|cached env-var lint|$TEST_DIR/lint-no-inline-getenv.sh" )
   SUITES+=( "lint-no-direct-tw-include|FFI consolidation: no new direct TW #includes|$TEST_DIR/lint-no-direct-tw-include.sh" )
   SUITES+=( "lint-cache-coherence|#814/#815 schema-bump operating rules|$TEST_DIR/lint-cache-coherence.sh" )
@@ -190,6 +191,7 @@ if [[ "$mode" == "full" ]]; then
   already_added[run-branch-bool-typecheck-tests.sh]=1  # in core
   already_added[run-primsort-barrier-tests.sh]=1  # in core
   already_added[run-primimport-eval-error-tests.sh]=1  # in core
+  already_added[run-value-equal-tests.sh]=1  # in core
 
   for script in "$TEST_DIR"/run-*.sh; do
     base="$(basename "$script")"
