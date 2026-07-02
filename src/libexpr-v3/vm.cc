@@ -1485,6 +1485,39 @@ inline std::string valueRepr(const Value & v, int depth)
     return "«value»";
 }
 
+/// P1.1 (2026-07-02): TW-parity type error for a non-Boolean value used in
+/// a boolean context (the condition of `if` / `&&` / `||` / `->`).  Mirrors
+/// libexpr/eval.cc:1228 `expected a Boolean but found <type>: <value>`
+/// (showType + ValuePrinter).  Before this, the branch opcodes
+/// (OP_BRANCH_FALSE / OP_AND_BRANCH / OP_OR_BRANCH / OP_IMPL_BRANCH /
+/// OP_R_BRANCH_FALSE) silently treated a non-bool condition as truthy —
+/// `if 1 then a else b` evaluated `a`, `1 && x` returned `x` — a live
+/// semantic divergence from TW (audit DEFECT_AUDIT_2026-07-02 §2.1).
+/// Called only off the cold `!isBool()` path, so its cost is irrelevant to
+/// the hot path.  if/else (not switch) to avoid -Wswitch-enum, matching the
+/// coerce-error typeName lambda's style.
+[[noreturn]] static void throwNonBooleanCondition(const Value & v)
+{
+    const char * art = "a";
+    const char * name = "value";
+    Tag t = v.tag();
+    if (t == Tag::Int)         { art = "an"; name = "integer"; }
+    else if (t == Tag::Float)  { art = "a";  name = "float"; }
+    else if (t == Tag::Null)   { art = "";   name = "null"; }
+    else if (t == Tag::String) { art = "a";  name = "string"; }
+    else if (t == Tag::Path)   { art = "a";  name = "path"; }
+    else if (t == Tag::List)   { art = "a";  name = "list"; }
+    else if (t == Tag::Attrs)  { art = "a";  name = "set"; }
+    else if (t == Tag::Closure || t == Tag::PrimOp || t == Tag::PrimOpApp)
+                               { art = "a";  name = "function"; }
+    std::string msg = "expected a Boolean but found ";
+    if (*art) { msg += art; msg += ' '; }
+    msg += name;
+    msg += ": ";
+    msg += valueRepr(v);
+    throw std::runtime_error(msg);
+}
+
 /// #685 — opcode-side mirror of TW's `forceStringNoCtx`
 /// (libexpr/eval.cc:2826).  Throws TW's exact error text when the
 /// string value carries any context.  Used for dynamic attr names
@@ -5037,6 +5070,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 vm.frames.back().flags |= CFF_FORCE_RETRY;
                 goto op_force_slow;
             }
+            if (__builtin_expect(!v.isBool(), 0)) throwNonBooleanCondition(v);  // P1.1 §2.1
             if (v.isBool() && v.asInt() == 0) ip = operand;
             else                                 vm.valueStack.pop_back();
             break;
@@ -5048,6 +5082,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 vm.frames.back().flags |= CFF_FORCE_RETRY;
                 goto op_force_slow;
             }
+            if (__builtin_expect(!v.isBool(), 0)) throwNonBooleanCondition(v);  // P1.1 §2.1
             if (v.isBool() && v.asInt() == 1) ip = operand;
             else                                 vm.valueStack.pop_back();
             break;
@@ -5063,6 +5098,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 goto op_force_slow;
             }
             Value v = pop(vm);
+            if (__builtin_expect(!v.isBool(), 0)) throwNonBooleanCondition(v);  // P1.1 §2.1
             if (v.isBool() && v.asInt() == 0) { push(vm, Value::vTrue); ip = operand; }
             break;
         }
@@ -5078,6 +5114,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 goto op_force_slow;
             }
             Value v = pop(vm);
+            if (__builtin_expect(!v.isBool(), 0)) throwNonBooleanCondition(v);  // P1.1 §2.1
             if (v.isBool() && v.asInt() == 0) ip = operand;
             break;
         }
@@ -5098,6 +5135,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 goto op_force_slow;
             }
             ip++;                       // consume the cond_slot follow-up
+            if (__builtin_expect(!cval.isBool(), 0)) throwNonBooleanCondition(cval);  // P1.1 §2.1
             if (cval.isBool() && cval.asInt() == 0) ip = operand;
             break;
         }
