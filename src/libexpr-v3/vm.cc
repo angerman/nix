@@ -1618,6 +1618,35 @@ enum class MergeBindingsSite : uint8_t {
     // 8+ reserved (primops.cc, future sites)
 };
 
+// P0.1b / #768 (2026-07-02): mergeBindings' env-gate knobs, promoted
+// from function-local `static const` to file-scope `static const`.  As
+// function-locals each read paid a magic-static guard load — and the
+// chain paths read them ~11× per call, in the #1 Bindings producer.  At
+// file scope they are initialized once at dynamic-init from the SAME
+// getenv logic (byte-identical values ⇒ BI preserved) with no per-read
+// guard.  Used only by mergeBindings.
+//   NIX_V3_NO_MAPATTRS_MERGE_LAZY  — disable the MapAttrs no-realize merge.
+//   NIX_V3_NO_CHAIN_BINDINGS / NIX_V3_CHAIN_BINDINGS(=0) — chain on/off.
+//   NIX_V3_CHAIN_MIN_NA=1    — parent must be non-empty to chain-construct.
+//   NIX_V3_CHAIN_MAX_NB=8192 — overlay cap (bounds chain materialization).
+static const bool s_mapAttrsMergeLazy = []{
+    return std::getenv("NIX_V3_NO_MAPATTRS_MERGE_LAZY") == nullptr;
+}();
+static const bool s_chain = []{
+    if (std::getenv("NIX_V3_NO_CHAIN_BINDINGS")) return false;
+    const char * e = std::getenv("NIX_V3_CHAIN_BINDINGS");
+    if (e) return e[0] != '0';   // explicit force on/off (=0 → off)
+    return true;                 // default ON
+}();
+static const uint32_t s_minNa = []{
+    const char * e = std::getenv("NIX_V3_CHAIN_MIN_NA");
+    return e ? (uint32_t) std::strtoul(e, nullptr, 10) : 1u;
+}();
+static const uint32_t s_maxNb = []{
+    const char * e = std::getenv("NIX_V3_CHAIN_MAX_NB");
+    return e ? (uint32_t) std::strtoul(e, nullptr, 10) : 8192u;
+}();
+
 inline Bindings * mergeBindings(const Bindings * a, const Bindings * b,
                                 MergeBindingsSite siteId =
                                     MergeBindingsSite::AttrsUpdate)
@@ -1627,7 +1656,12 @@ inline Bindings * mergeBindings(const Bindings * a, const Bindings * b,
     // count even though it doesn't allocate; the BYTES counter is
     // updated only after `Alloc::allocBindings` so its sum matches
     // `bytesBindings` for the merge-attributed slice.
-    {
+    // P0.1b (2026-07-02): wrapped in V3_STATS_BLOCK so the #821 raw
+    // counters strip under -Dv3_release=true (audit §1.3 — they bypassed
+    // even V3_STATS before).  No change under the default instrumented
+    // build (V3_STATS_BLOCK == `if (true)`); the counters still feed the
+    // NIX_VM_STATS mergeBindings-by-site table (run.cc:516-580).
+    V3_STATS_BLOCK {
         const uint8_t s = static_cast<uint8_t>(siteId);
         if (s < AllocStats::kMergeBindingsSiteSlots)
             ++allocStats().mergeBindingsCallsBySite[s];
@@ -1638,7 +1672,14 @@ inline Bindings * mergeBindings(const Bindings * a, const Bindings * b,
     // current register VM profile routes the hot path through
     // OP_ATTRS_UPDATE.  Bucket via a small switch (5 cmps avg) —
     // negligible cost compared to the merge itself.
-    if (siteId == MergeBindingsSite::AttrsUpdate
+    // P0.1b: V3_STATS_BLOCK guard strips the whole histogram (incl. the
+    // bucket_of lambda) under -Dv3_release=true; no-op under the default
+    // instrumented build.  NB (dangling-else guard): V3_STATS_BLOCK
+    // expands to `if (true/false)`, so this is `if (…) if (siteId …) {…}`
+    // — do NOT add an `else` to the inner `if` below; it would bind to
+    // the V3_STATS_BLOCK `if`.  Wrap in explicit braces first if an else
+    // is ever needed.
+    V3_STATS_BLOCK if (siteId == MergeBindingsSite::AttrsUpdate
         || siteId == MergeBindingsSite::AttrsUpdateTail) {
         // #821 follow-on: split the 0..1 bucket into nb=0 (short-
         // circuit) vs nb=1 (single-key patch).  The two have very
@@ -1670,31 +1711,9 @@ inline Bindings * mergeBindings(const Bindings * a, const Bindings * b,
     if (b && !b->isChain() && b->size == 0) return const_cast<Bindings *>(a);
     if (a && !a->isChain() && a->size == 0) return const_cast<Bindings *>(b);
 
-    static const bool s_mapAttrsMergeLazy = []{
-        return std::getenv("NIX_V3_NO_MAPATTRS_MERGE_LAZY") == nullptr;
-    }();
-
-    // Chain knobs — hoisted so the MapAttrs no-realize merge can avoid
-    // defeating the existing large-parent/small-overlay chain path.
-    //   NIX_V3_CHAIN_MIN_NA=1    — parent must be non-empty to chain-construct.
-    //   NIX_V3_CHAIN_MAX_NB=8192 — overlay cap; high enough to catch the
-    //                               real nixpkgs `//` volume, finite enough
-    //                               to avoid unbounded-chain materialization
-    //                               regressions.
-    static const bool s_chain = []{
-        if (std::getenv("NIX_V3_NO_CHAIN_BINDINGS")) return false;
-        const char * e = std::getenv("NIX_V3_CHAIN_BINDINGS");
-        if (e) return e[0] != '0';   // explicit force on/off (=0 → off)
-        return true;                 // default ON
-    }();
-    static const uint32_t s_minNa = []{
-        const char * e = std::getenv("NIX_V3_CHAIN_MIN_NA");
-        return e ? (uint32_t) std::strtoul(e, nullptr, 10) : 1u;
-    }();
-    static const uint32_t s_maxNb = []{
-        const char * e = std::getenv("NIX_V3_CHAIN_MAX_NB");
-        return e ? (uint32_t) std::strtoul(e, nullptr, 10) : 8192u;
-    }();
+    // P0.1b / #768: s_mapAttrsMergeLazy / s_chain / s_minNa / s_maxNb
+    // are now file-scope statics (defined just above this function) so
+    // the ~11 reads below no longer each pay a magic-static guard load.
 
     if (s_mapAttrsMergeLazy && s_chain
         && a && b && a->isMapAttrs() && !b->isMapAttrs() && !b->isChain()
@@ -1755,7 +1774,7 @@ inline Bindings * mergeBindings(const Bindings * a, const Bindings * b,
         out->parent = mapShape->parent;
         out->aux = mapShape->aux;
 
-        {
+        V3_STATS_BLOCK {
             const uint8_t s = static_cast<uint8_t>(siteId);
             if (s < AllocStats::kMergeBindingsSiteSlots)
                 allocStats().mergeBindingsBytesBySite[s]
@@ -1880,7 +1899,7 @@ inline Bindings * mergeBindings(const Bindings * a, const Bindings * b,
         }
 
         Bindings * out = Alloc::allocBindings(kExact);
-        {
+        V3_STATS_BLOCK {
             const uint8_t s = static_cast<uint8_t>(siteId);
             if (s < AllocStats::kMergeBindingsSiteSlots)
                 allocStats().mergeBindingsBytesBySite[s]
@@ -2078,7 +2097,7 @@ inline Bindings * mergeBindings(const Bindings * a, const Bindings * b,
     // (24 B post-#752 inline-pos).  Calls counter is bumped at
     // function entry above; bytes counter accumulates only on the
     // allocating path.
-    {
+    V3_STATS_BLOCK {
         const uint8_t s = static_cast<uint8_t>(siteId);
         if (s < AllocStats::kMergeBindingsSiteSlots)
             allocStats().mergeBindingsBytesBySite[s]
