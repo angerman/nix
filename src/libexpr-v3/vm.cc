@@ -6841,7 +6841,12 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                             std::fprintf(stderr, "\n");
                         }
                     }
-                    Value forcedArg = forceValue(vm, arg);
+                    // P3.2 (2026-07-02, audit §3.1): skip the out-of-line
+                    // forceValue call when `arg` is already WHNF (the common
+                    // case — a supplied attrset).  forceValue on a WHNF value
+                    // is a no-op returning it unchanged, so this is BI-neutral;
+                    // it just removes the per-formals-call function-call cost.
+                    Value forcedArg = needsForce(arg) ? forceValue(vm, arg) : arg;
                     // #680 — TW raises "expected a set but found <type>"
                     // when a formals-lambda is called with a non-attrset
                     // argument (libexpr/eval.cc:1434 forceAttrs).  Pre-fix
@@ -6880,9 +6885,13 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                         // uses `contextualName` (set by lower.cc from
                         // ExprLambda::name) when present, else falls
                         // back to TW's literal "anonymous lambda".
-                        std::string lambdaName = desc && !desc->contextualName.empty()
-                            ? desc->contextualName
-                            : std::string("anonymous lambda");
+                        // P3.2: lazy — only the error branches below use it,
+                        // so the success path builds no string (audit §3.1).
+                        auto lambdaName = [&]() -> std::string {
+                            return desc && !desc->contextualName.empty()
+                                ? desc->contextualName
+                                : std::string("anonymous lambda");
+                        };
                         const Bindings * b = forcedArg.asAttrs();
                         const auto & tbl = ir::globalSymbolTable();
                         // #809 (2026-05-24): diagnostic gate.  When
@@ -7013,7 +7022,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                                     }
                                     if (!s_permissiveFormals)
                                         throw std::runtime_error(
-                                            "function '" + lambdaName
+                                            "function '" + lambdaName()
                                             + "' called with unexpected argument '"
                                             + nm + "'");
                                     // PERMISSIVE: continue silently
@@ -7034,7 +7043,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                             if (!b->lookup(f.name)) {
                                 std::string nm = (f.name < tbl.size()) ? tbl[f.name] : "?";
                                 throw std::runtime_error(
-                                    "function '" + lambdaName
+                                    "function '" + lambdaName()
                                     + "' called without required argument '"
                                     + nm + "'");
                             }
@@ -7542,7 +7551,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                             std::fprintf(stderr, "\n");
                         }
                     }
-                    Value forcedArg = forceValue(vm, arg);
+                    // P3.2 (audit §3.1): skip the out-of-line force when arg
+                    // is already WHNF (BI-neutral — forceValue no-ops on WHNF).
+                    Value forcedArg = needsForce(arg) ? forceValue(vm, arg) : arg;
                     // #680 — TAIL_CALL path mirror of OP_CALL formals
                     // validation.  Type-check arg is a set; emit TW's
                     // exact phrasing for extra/missing args.
@@ -7570,9 +7581,12 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                         throw std::runtime_error(msg);
                     }
                     if (forcedArg.asAttrs()) {
-                        std::string lambdaName = tcDesc && !tcDesc->contextualName.empty()
-                            ? tcDesc->contextualName
-                            : std::string("anonymous lambda");
+                        // P3.2: lazy — built only in the error branches.
+                        auto lambdaName = [&]() -> std::string {
+                            return tcDesc && !tcDesc->contextualName.empty()
+                                ? tcDesc->contextualName
+                                : std::string("anonymous lambda");
+                        };
                         const Bindings * b = forcedArg.asAttrs();
                         const auto & tbl = ir::globalSymbolTable();
                         // #809: same NIX_V3_PERMISSIVE_FORMALS gate as
@@ -7598,7 +7612,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                                 if (!hasFormal(name)) {
                                     std::string nm = (name < tbl.size()) ? tbl[name] : "?";
                                     throw std::runtime_error(
-                                        "function '" + lambdaName
+                                        "function '" + lambdaName()
                                         + "' called with unexpected argument '"
                                         + nm + "'");
                                 }
@@ -7609,7 +7623,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                             if (!b->lookup(f.name)) {
                                 std::string nm = (f.name < tbl.size()) ? tbl[f.name] : "?";
                                 throw std::runtime_error(
-                                    "function '" + lambdaName
+                                    "function '" + lambdaName()
                                     + "' called without required argument '"
                                     + nm + "'");
                             }
