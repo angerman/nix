@@ -421,4 +421,9 @@ struct CompilationUnit;
 void dumpHotDescriptors(std::FILE * out, size_t limit,
                          const CompilationUnit * entryCu);
 
+/// P2.1 step-0 measure (2026-07-02, TEMPORARY): print the per-formal wrapper
+/// thunk share of runtime thunk allocations (audit §4.1).  Remove with the
+/// instrument once P2.1 is decided.
+void dumpFormalWrapperStats(std::FILE * out, const CompilationUnit * entryCu);
+
 } // namespace nix::v3

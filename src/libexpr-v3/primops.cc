@@ -9438,6 +9438,41 @@ void dumpPrimOpStats(std::FILE * out)
     }
 }
 
+// P2.1 step-0 measure (2026-07-02, TEMPORARY instrument): size the per-formal
+// WRAPPER thunk share of runtime thunk allocations (audit §4.1 / A.4 P2.1
+// step 0).  Per-descriptor `allocCount` is populated under NIX_VM_STATS
+// (dbgForceStatsActive, vm.cc:5706).  Walks all CUs (import cache + optional
+// entry) exactly like dumpHotDescriptors.  Remove with the instrument once
+// P2.1 is decided.
+void dumpFormalWrapperStats(std::FILE * out, const CompilationUnit * entryCu)
+{
+    uint64_t wrapAlloc = 0, wrapForce = 0, totAlloc = 0, totForce = 0;
+    size_t wrapDescs = 0, totDescs = 0;
+    auto walk = [&](const CompilationUnit & cu) {
+        for (const auto & d : cu.lambdas) {
+            ++totDescs;
+            totAlloc += d.allocCount;
+            totForce += d.forceCount;
+            if (d.isFormalWrapper) {
+                ++wrapDescs;
+                wrapAlloc += d.allocCount;
+                wrapForce += d.forceCount;
+            }
+        }
+    };
+    auto & cache = importCache();
+    for (const auto & cu : cache.cus) walk(cu);
+    if (entryCu) walk(*entryCu);
+    const double pctA = totAlloc ? 100.0 * (double)wrapAlloc / (double)totAlloc : 0.0;
+    const double forcedFrac = wrapAlloc ? 100.0 * (double)wrapForce / (double)wrapAlloc : 0.0;
+    std::fprintf(out,
+        "v3 P2.1 formal-wrapper thunks: alloc=%llu (%.2f%% of %llu descriptor "
+        "thunk allocs) forced=%llu (%.1f%% of wrappers) descs=%zu/%zu totForce=%llu\n",
+        (unsigned long long)wrapAlloc, pctA, (unsigned long long)totAlloc,
+        (unsigned long long)wrapForce, forcedFrac, wrapDescs, totDescs,
+        (unsigned long long)totForce);
+}
+
 void dumpHotDescriptors(std::FILE * out, size_t limit,
                          const CompilationUnit * entryCu)
 {

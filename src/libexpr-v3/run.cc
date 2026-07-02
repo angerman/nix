@@ -801,6 +801,10 @@ RootResult runRootExprModule(nix::EvalState & state, ir::Module module)
         // goes through `runRootExpr`) reports the same data without
         // depending on the CLI specifically.
         dumpPrimOpStats(stderr);
+        // P2.1 step-0 measure (2026-07-02, TEMPORARY): formal-wrapper thunk
+        // alloc share (audit §4.1).  entryCu=nullptr — the import cache holds
+        // the bulk (nixpkgs formals); the tiny top-level CU is negligible.
+        dumpFormalWrapperStats(stderr, nullptr);
         // #777b (2026-05-23) deserialize per-section breakdown.
         // Only printed when V3_DBG_DESERIALIZE=1 (gated to avoid
         // ~50 ns / clock_gettime overhead on every section in

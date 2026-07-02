@@ -603,6 +603,7 @@ struct LowererV3 {
             auto teb = m.freshBlock();
             m.functions[tfid].entryBlock = teb;
             m.functions[tfid].name = f->name;
+            m.functions[tfid].isFormalWrapper = true;  // P2.1 step-0 measure
             // Thunk body: `if param ? X then param.X else <default>`
             // (or `param.X` when no default), lowered in the rec scope.
             blockStack.push_back(teb);

@@ -463,6 +463,19 @@ struct LambdaDescriptor
     /// arity-2 lambda whose body is exactly `name: value: value`.
     bool secondArgIdentityLambda = false;
 
+    /// P2.1 step-0 measure (2026-07-02, TEMPORARY): mirrors
+    /// ir::Function::isFormalWrapper — true for a per-formal wrapper thunk
+    /// body.  Summed against total allocCount under NIX_VM_STATS to size the
+    /// wrapper share of runtime thunk allocations (audit §4.1).  NOT
+    /// serialized — the P2.1 measure runs cache-off (fresh emit).  Remove
+    /// with the instrument once P2.1 is decided.
+    // CACHE-COHERENCE-EXEMPT: isFormalWrapper is diagnostic-only and is NOT
+    // part of the LambdaDescriptor serialize/deserialize round-trip
+    // (serialize.cc untouched) — the on-disk cache format is unchanged, so no
+    // kSchemaVersion bump is warranted; deserialized descriptors default it to
+    // false, which is correct for the cache-off P2.1 measure.
+    bool isFormalWrapper = false;
+
     /// #495: native intrinsic kind.  When recognised at lower-time,
     /// the lambda's body matches a canonical Nix-stdlib pattern (lib.fix,
     /// lib.extends, lib.composeExtensions, ...) and OP_CALL dispatches

@@ -497,6 +497,14 @@ struct Function {
     bool                hasFormals = false;
     bool                ellipsis   = false;
 
+    /// P2.1 step-0 measure (2026-07-02, TEMPORARY instrument): true for a
+    /// per-formal WRAPPER thunk Function minted at lower_v3.hh:599-635
+    /// (body `if param ? X then param.X else <default>`).  Propagated to
+    /// LambdaDescriptor::isFormalWrapper so the NIX_VM_STATS dump can size
+    /// the wrapper share of runtime thunk allocations (audit §4.1 / A.4
+    /// P2.1 step 0).  Remove with the instrument once P2.1 is decided.
+    bool                isFormalWrapper = false;
+
     /// Free vars referenced by the body block (and recursively by any
     /// sub-blocks / nested functions reachable from the body), in the
     /// order they appear as upvalues at runtime.  Populated by

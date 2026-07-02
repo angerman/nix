@@ -2441,6 +2441,10 @@ struct Emitter
             // lowering); the bridge falls back to refusal in that case.
             .astLambda      = f.astLambda,
         };
+        // P2.1 step-0 measure (2026-07-02, TEMPORARY): carry the formal-
+        // wrapper tag from ir::Function into the descriptor (set post-init
+        // like identityLambda below to avoid the -Wreorder-init-list order).
+        unit.lambdas[fid].isFormalWrapper = f.isFormalWrapper;
         // STG-13b (#509/#511): for ExtendsBody / ComposeBody dispatch,
         // find the upvalue index of each captured VarId by searching
         // freeVars.  Linear search is fine -- freeVars typically has 2
