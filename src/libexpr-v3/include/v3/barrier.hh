@@ -223,7 +223,7 @@ extern const bool g_phaseDActive;
 bindingsSetValue(Bindings * b, uint32_t i, Value v) noexcept
 {
     b->entries[i].value = v;
-    if (__builtin_expect(phaseDActive(), 0)) [[unlikely]] {
+    if (__builtin_expect(phaseDActive(), 1)) [[likely]] {  // P3.5: always-true (opt-out retired)
         const Nursery & n = threadNursery();
         // b must be tenured AND v must carry a nursery payload.
         // Bindings are always tenured today (`Alloc::allocBindings`
@@ -247,7 +247,7 @@ bindingsSetValue(Bindings * b, uint32_t i, Value v) noexcept
 bindingsSetEntry(Bindings * b, uint32_t i, Bindings::Entry e) noexcept
 {
     b->entries[i] = e;
-    if (__builtin_expect(phaseDActive(), 0)) [[unlikely]] {
+    if (__builtin_expect(phaseDActive(), 1)) [[likely]] {  // P3.5: always-true (opt-out retired)
         const Nursery & n = threadNursery();
         const bool inter = !n.contains(b) && isNurseryPayload(e.value, n);
         if (inter)
@@ -266,7 +266,7 @@ bindingsSetEntry(Bindings * b, uint32_t i, Bindings::Entry e) noexcept
 pairSetEvaluated(ValuePair * p, Value v) noexcept
 {
     p->evaluated = v;
-    if (__builtin_expect(phaseDActive(), 0)) [[unlikely]] {
+    if (__builtin_expect(phaseDActive(), 1)) [[likely]] {  // P3.5: always-true (opt-out retired)
         const Nursery & n = threadNursery();
         if (isNurseryPayload(v, n))
             dirtyContainers().push_back({DirtyKind::Pair, p});
@@ -283,7 +283,7 @@ pairSetEvaluated(ValuePair * p, Value v) noexcept
 thunkSetEvaluated(Thunk * t, Value v) noexcept
 {
     t->evaluated = v;
-    if (__builtin_expect(phaseDActive(), 0)) [[unlikely]] {
+    if (__builtin_expect(phaseDActive(), 1)) [[likely]] {  // P3.5: always-true (opt-out retired)
         const Nursery & n = threadNursery();
         if (!n.contains(t) && isNurseryPayload(v, n))
             dirtyContainers().push_back({DirtyKind::Thunk, t});
@@ -326,7 +326,7 @@ thunkSetEvaluated(Thunk * t, Value v) noexcept
 [[gnu::always_inline]] inline void
 closurePostConstructBarrier(Closure * c) noexcept
 {
-    if (__builtin_expect(phaseDActive(), 0)) [[unlikely]] {
+    if (__builtin_expect(phaseDActive(), 1)) [[likely]] {  // P3.5: always-true (opt-out retired)
         const Nursery & n = threadNursery();
         if (n.contains(c)) return;  // nursery closure, no inter-gen
         // Scan upvalues + capturedWiths.  Single break on first nursery
@@ -360,7 +360,7 @@ closurePostConstructBarrier(Closure * c) noexcept
 [[gnu::always_inline]] inline void
 envPostConstructBarrier(Env * e) noexcept
 {
-    if (__builtin_expect(phaseDActive(), 0)) [[unlikely]] {
+    if (__builtin_expect(phaseDActive(), 1)) [[likely]] {  // P3.5: always-true (opt-out retired)
         const Nursery & n = threadNursery();
         if (n.contains(e)) return;  // (Envs are tenured, but mirror the guard)
         for (uint16_t i = 0; i < e->nValues; ++i) {
@@ -382,7 +382,7 @@ envPostConstructBarrier(Env * e) noexcept
 [[gnu::always_inline]] inline void
 thunkPostConstructBarrier(Thunk * t) noexcept
 {
-    if (__builtin_expect(phaseDActive(), 0)) [[unlikely]] {
+    if (__builtin_expect(phaseDActive(), 1)) [[likely]] {  // P3.5: always-true (opt-out retired)
         const Nursery & n = threadNursery();
         if (n.contains(t)) return;
         bool dirty = false;
@@ -418,7 +418,7 @@ thunkPostConstructBarrier(Thunk * t) noexcept
 [[gnu::always_inline]] inline void
 listPostConstructBarrier(ListVec * l) noexcept
 {
-    if (__builtin_expect(phaseDActive(), 0)) [[unlikely]] {
+    if (__builtin_expect(phaseDActive(), 1)) [[likely]] {  // P3.5: always-true (opt-out retired)
         const Nursery & n = threadNursery();
         if (n.contains(l)) return;
         for (uint32_t i = 0; i < l->size; ++i) {
@@ -444,7 +444,7 @@ listPostConstructBarrier(ListVec * l) noexcept
 [[gnu::always_inline]] inline void
 pairPostConstructBarrier(ValuePair * p) noexcept
 {
-    if (__builtin_expect(phaseDActive(), 0)) [[unlikely]] {
+    if (__builtin_expect(phaseDActive(), 1)) [[likely]] {  // P3.5: always-true (opt-out retired)
         const Nursery & n = threadNursery();
         // ValuePair always tenured by design (Alloc::allocPair
         // calls threadArena directly); defensive double-check.
@@ -472,7 +472,7 @@ pairPostConstructBarrier(ValuePair * p) noexcept
 [[gnu::always_inline]] inline void
 bindingsPostConstructBarrier(Bindings * b) noexcept
 {
-    if (__builtin_expect(phaseDActive(), 0)) [[unlikely]] {
+    if (__builtin_expect(phaseDActive(), 1)) [[likely]] {  // P3.5: always-true (opt-out retired)
         const Nursery & n = threadNursery();
         // Defensive double-check: Bindings always tenured today.
         if (n.contains(b)) return;
@@ -503,7 +503,7 @@ bindingsPostConstructBarrier(Bindings * b) noexcept
 cellWrite(Value * cell, Value v, Bindings * cellContainer) noexcept
 {
     *cell = v;
-    if (__builtin_expect(phaseDActive(), 0)) [[unlikely]] {
+    if (__builtin_expect(phaseDActive(), 1)) [[likely]] {  // P3.5: always-true (opt-out retired)
         const Nursery & n = threadNursery();
         const bool np = isNurseryPayload(v, n);
         if (np) {
