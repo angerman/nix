@@ -3299,8 +3299,14 @@ inline bool applyForceWriteback(VMState & vm)
         // (the previously-leaked case).  Nonzero on firefox.drvPath confirms
         // the mechanism is live.  Retirement criterion: delete this counter
         // once the firefox getLib residual is closed and byte-identical to TW.
-        if (__builtin_expect(isUnderappliedClosurePap(top), 0))
-            ++g_keepPapDisarmCount;
+        // P0.1c (2026-07-02): V3_STATS_BLOCK strips both the counter AND its
+        // extra isUnderappliedClosurePap() probe under -Dv3_release (the
+        // load-bearing call is the `nonWhnf` compute above; this one is
+        // diagnostic-only).  No-op under the default instrumented build.
+        V3_STATS_BLOCK {
+            if (__builtin_expect(isUnderappliedClosurePap(top), 0))
+                ++g_keepPapDisarmCount;
+        }
         // C-4 (CODEBASE_REVIEW_2026-06-11): never memoize the transient
         // Blackhole sentinel into shared storage — it means "value not yet
         // known" (a self-cycle in progress), not a real value.  Disarm without
@@ -6435,7 +6441,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     // Fall through to the regular bytecode dispatch
                     // which already knows how to bridge across.
                     // (Bridge-thunk arg guard retired; TW_VALUE_ERADICATION F4, 2026-06-02.)
-                    allocStats().intrinsicFixCalls++;
+                    V3_STATS_INC(intrinsicFixCalls);   // P0.1c: strip under -Dv3_release
                     static const bool s_dbg =
                         std::getenv("V3_DBG_INTRINSIC") != nullptr;
                     if (s_dbg) std::fprintf(stderr,
@@ -6485,7 +6491,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     && desc->intrinsicVar0 >= 0 && desc->intrinsicVar1 >= 0
                     && (uint16_t)desc->intrinsicVar0 < callee->nUpvalues
                     && (uint16_t)desc->intrinsicVar1 < callee->nUpvalues) {
-                    allocStats().intrinsicExtendsCalls++;
+                    V3_STATS_INC(intrinsicExtendsCalls);   // P0.1c: strip under -Dv3_release
                     static const bool s_dbg =
                         std::getenv("V3_DBG_INTRINSIC") != nullptr;
                     Value overlay = closureUpvalue(callee, (uint16_t)desc->intrinsicVar0);
@@ -6533,7 +6539,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     && (uint16_t)desc->intrinsicVar0 < callee->nUpvalues
                     && (uint16_t)desc->intrinsicVar1 < callee->nUpvalues
                     && (uint16_t)desc->intrinsicVar2 < callee->nUpvalues) {
-                    allocStats().intrinsicComposeCalls++;
+                    V3_STATS_INC(intrinsicComposeCalls);   // P0.1c: strip under -Dv3_release
                     static const bool s_dbg =
                         std::getenv("V3_DBG_INTRINSIC") != nullptr;
                     Value f       = closureUpvalue(callee, (uint16_t)desc->intrinsicVar0);
@@ -6595,7 +6601,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // frame's withStack invariants are unaffected since we
             // never allocate one.
             if (__builtin_expect(desc->selectorSym != 0, 0)) {
-                allocStats().selectorLambdaCalls++;
+                V3_STATS_INC(selectorLambdaCalls);   // P0.1c: strip under -Dv3_release
                 Value sArg = arg;
                 if (sArg.isThunk() || sArg.isAppLike()
                     || sArg.tag() == Tag::Slot) {
@@ -13377,7 +13383,7 @@ Value runLambda(const CompilationUnit & cu, uint32_t funcIdx,
     // routes here (bypassing OP_CALL).  Same shape -- force arg,
     // project, return.  Skips the entire frame setup + dispatch loop.
     if (__builtin_expect(desc.selectorSym != 0, 0)) {
-        allocStats().selectorLambdaCalls++;
+        V3_STATS_INC(selectorLambdaCalls);   // P0.1c: strip under -Dv3_release
         // The arg may still be a Thunk/App/Slot; force first.
         //
         // STG-10 (#498): re-use the active VM's forceValue rather than
@@ -15138,7 +15144,7 @@ Value callClosure(VMState & vm, Value fun, Value arg)
             // (Bridge-thunk arg guard retired; TW_VALUE_ERADICATION F4, 2026-06-02.)
             bool argIsBridge = false;
             if (!argIsBridge) {
-                allocStats().intrinsicFixCalls++;
+                V3_STATS_INC(intrinsicFixCalls);   // P0.1c: strip under -Dv3_release
                 static const bool s_dbg =
                     std::getenv("V3_DBG_INTRINSIC") != nullptr;
                 if (s_dbg) std::fprintf(stderr,
@@ -15164,7 +15170,7 @@ Value callClosure(VMState & vm, Value fun, Value arg)
             && desc->intrinsicVar0 >= 0 && desc->intrinsicVar1 >= 0
             && (uint16_t)desc->intrinsicVar0 < callee->nUpvalues
             && (uint16_t)desc->intrinsicVar1 < callee->nUpvalues) {
-            allocStats().intrinsicExtendsCalls++;
+            V3_STATS_INC(intrinsicExtendsCalls);   // P0.1c: strip under -Dv3_release
             Value overlay = closureUpvalue(callee, (uint16_t)desc->intrinsicVar0);
             Value f       = closureUpvalue(callee, (uint16_t)desc->intrinsicVar1);
             Value final_  = arg;
@@ -15194,7 +15200,7 @@ Value callClosure(VMState & vm, Value fun, Value arg)
             && (uint16_t)desc->intrinsicVar0 < callee->nUpvalues
             && (uint16_t)desc->intrinsicVar1 < callee->nUpvalues
             && (uint16_t)desc->intrinsicVar2 < callee->nUpvalues) {
-            allocStats().intrinsicComposeCalls++;
+            V3_STATS_INC(intrinsicComposeCalls);   // P0.1c: strip under -Dv3_release
             Value f       = closureUpvalue(callee, (uint16_t)desc->intrinsicVar0);
             Value g       = closureUpvalue(callee, (uint16_t)desc->intrinsicVar1);
             Value final_  = closureUpvalue(callee, (uint16_t)desc->intrinsicVar2);
@@ -15234,7 +15240,7 @@ Value callClosure(VMState & vm, Value fun, Value arg)
     // (map, filter, foldl', etc.), so this fires on the dominant
     // `(p: p.name)`-style nixpkgs callbacks.
     if (__builtin_expect(desc->selectorSym != 0, 0)) {
-        allocStats().selectorLambdaCalls++;
+        V3_STATS_INC(selectorLambdaCalls);   // P0.1c: strip under -Dv3_release
         Value sArg = arg;
         if (sArg.isThunk() || sArg.isAppLike()
             || sArg.tag() == Tag::Slot) {
