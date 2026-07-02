@@ -9378,7 +9378,14 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             }
             ip += 2 * n;
             for (uint32_t i = n; i > 0; --i) entries[i - 1].value = pop(vm);
-            // Sort by name; duplicates become adjacent.
+            // Sort by name; duplicates become adjacent.  This runtime sort is
+            // LOAD-BEARING and cannot be moved to emit time (P3.3/§3.4
+            // attempted + reverted): OP_ATTRS_INIT values are pushed
+            // positionally, so a cross-process cache remap (which permutes
+            // SymbolIds) has no way to reorder the value pushes to match a
+            // pre-sorted trailer — only the runtime, sorting by the reader's
+            // local SymbolIds, gets the order right.  See emit.cc emitOne(
+            // AttrSet) + DEFECT_AUDIT §3.4 note.
             std::sort(entries, entries + n,
                       [](const Entry & a, const Entry & b) { return a.name < b.name; });
             for (uint32_t i = 1; i < n; ++i) {

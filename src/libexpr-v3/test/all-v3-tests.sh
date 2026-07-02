@@ -173,6 +173,7 @@ if [[ "$mode" == "core" || "$mode" == "full" || "$mode" == "brute" ]]; then
   SUITES+=( "primimport-eval-error|P1.3 §2.3 disk-hit catch scoped to deserialize (erroring warm import runs once, error propagates)|NIX=$NIX $TEST_DIR/run-primimport-eval-error-tests.sh" )
   SUITES+=( "value-equal|P3.4 §3.5 valueEqual scalar fast path + general equality-engine parity vs TW|NIX=$NIX $TEST_DIR/run-value-equal-tests.sh" )
   SUITES+=( "formals-error|P3.2 §3.1 formals-validation error parity (unexpected/missing/non-set) + valid-formals vs TW|NIX=$NIX $TEST_DIR/run-formals-error-tests.sh" )
+  SUITES+=( "attrs-init-cache|P3.3 §3.4 warm-disk-cache OP_ATTRS_INIT round-trip (non-rec attrset import; guards the reverted pre-sort lever)|$TEST_DIR/run-attrs-init-cache-roundtrip-tests.sh" )
   SUITES+=( "lint-no-inline-getenv|cached env-var lint|$TEST_DIR/lint-no-inline-getenv.sh" )
   SUITES+=( "lint-no-direct-tw-include|FFI consolidation: no new direct TW #includes|$TEST_DIR/lint-no-direct-tw-include.sh" )
   SUITES+=( "lint-cache-coherence|#814/#815 schema-bump operating rules|$TEST_DIR/lint-cache-coherence.sh" )
@@ -194,6 +195,7 @@ if [[ "$mode" == "full" ]]; then
   already_added[run-primimport-eval-error-tests.sh]=1  # in core
   already_added[run-value-equal-tests.sh]=1  # in core
   already_added[run-formals-error-tests.sh]=1  # in core
+  already_added[run-attrs-init-cache-roundtrip-tests.sh]=1  # in core
 
   for script in "$TEST_DIR"/run-*.sh; do
     base="$(basename "$script")"

@@ -275,13 +275,34 @@ reached from chain-SELECT parent hits (`vm.cc:9880-9891, 10636-10645`).
 the chain-parent case. A leaf-owned memo (or the result App's own `evaluated`)
 preserves the no-shared-writes rule.
 
-### 3.4 ✅ `OP_ATTRS_INIT` re-sorts compile-time-constant names at runtime, every execution
+### 3.4 ✅→❌ `OP_ATTRS_INIT` re-sorts compile-time-constant names at runtime, every execution — **PROPOSED FIX FALSIFIED (2026-07-02); the runtime sort is LOAD-BEARING**
 `vm.cc:9232-9243`: literal `{ a=…; b=…; }` inside a lambda re-sorts 24-B
 entries + re-runs a statically-decidable duplicate check per call.
 OP_ATTRS_REC_INIT already gets pre-sorted names from emit (`vm.cc:9386-9390`,
 `emit.cc` LetRec path); ATTRS_INIT — made *more* common by the 2026-06-16
-non-rec demotion lever — was left with the runtime sort. Emit the (name,pos)
-trailer sorted and push values in sorted order; runtime becomes a straight fill.
+non-rec demotion lever — was left with the runtime sort. The audit proposed:
+"Emit the (name,pos) trailer sorted and push values in sorted order; runtime
+becomes a straight fill."
+
+**That proposal is UNSAFE and was reverted (see WS-3 handback below).** The
+runtime sort cannot be moved to emit time because it is load-bearing for the
+CROSS-PROCESS DISK CACHE. `OP_ATTRS_INIT` pushes its values POSITIONALLY on the
+stack (in trailer order), with no per-value operand. On a cross-process cache
+hit, `remapAllSymbols` (serialize.cc) translates the writer's SymbolIds to the
+reader's — an order-changing permutation in general (this is why deserialize
+re-sorts formals, #814) — but it cannot reorder the already-emitted value-push
+instructions to match a re-sorted trailer. Only the RUNTIME, sorting by the
+reader's local SymbolIds, gets the order right. `OP_ATTRS_REC_INIT` escapes this
+solely because its values are SLOT-indexed (`OP_ATTRS_REC_SET`) and the remap
+rewrites the slots (serialize.cc:576-614) — `OP_ATTRS_INIT` has no such handle.
+A safe variant (set a presorted flag on cold emit, CLEAR it on deserialize so
+warm CUs re-sort) yields only a COLD-path win on a small-`n` sort — below the
+darwin-4 noise floor — at the cost of a permanent operand-flag footgun (an
+adversarial review of the first attempt found that four serialize walkers + the
+CU comparator + the disassembler all read the operand as a raw count and would
+overshoot the trailer once bit 23 was set → warm-cache corruption). **Net: do
+NOT re-attempt.** Guardrail added: `test/run-attrs-init-cache-roundtrip-tests.sh`
+(in the brute core suite) locks the warm-cache round-trip invariant.
 
 ### 3.5 ✅ `valueEqual` heap-allocates its work stack per comparison
 `vm.cc:1010-1013`: every non-int-int `OP_EQ`/`OP_NEQ` — i.e. **every string

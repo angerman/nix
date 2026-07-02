@@ -1368,6 +1368,23 @@ struct Emitter
                 unit.code.push_back(encode(OP_ATTRS_INIT, 0));
                 return;
             }
+            // P3.3/§3.4 ATTEMPTED + REVERTED (2026-07-02): moving the runtime
+            // entry sort here (emit the trailer + value pushes SymbolId-sorted,
+            // let the VM straight-fill) is UNSAFE for the cross-process disk
+            // cache.  OP_ATTRS_INIT pushes its values POSITIONALLY on the stack
+            // (in trailer order), with no per-value operand.  On a cross-process
+            // cache hit, remapAllSymbols translates the writer's SymbolIds to
+            // the reader's — an order-changing permutation in general (see the
+            // #814 formals re-sort in deserialize) — but it cannot reorder the
+            // already-emitted value-push instructions to match a re-sorted
+            // trailer.  So the trailer MUST be sorted at RUNTIME, by the reader's
+            // local SymbolIds, AFTER remap.  OP_ATTRS_REC_INIT escapes this only
+            // because its values are SLOT-indexed (OP_ATTRS_REC_SET) and
+            // remapAllSymbols rewrites the slots (serialize.cc:576-614).  Keep
+            // the source-order emit; the VM sorts.  (The sort is small-n and its
+            // cost is below the darwin-4 noise floor — the cold-only win from a
+            // clear-flag-on-deserialize variant did not justify the 7-site
+            // operand-masking footgun.)  Full write-up: DEFECT_AUDIT §3.4 note.
             for (const auto & en : e.entries) emitVarRef(en.value);
             unit.code.push_back(encode(OP_ATTRS_INIT, static_cast<uint32_t>(nn)));
             for (const auto & en : e.entries) {
