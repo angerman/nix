@@ -9319,9 +9319,26 @@ PrimOpCounter & primOpCounter()
 // referenced only from vm.cc; their call sites are now no-ops.  See
 // PROFILE_HELLO_NAME_2026-05-18.md option #1.
 
+// P0.1 (2026-07-02): collection gate for the per-primop call counter.
+// The count is ONLY ever dumped under NIX_VM_STATS (run.cc:803,
+// cli/v3-eval.cc:567), so collecting it on every primop call otherwise
+// is pure overhead — the former unconditional version ran a
+// `mutex + std::string(po->name) + unordered_map` probe on EVERY primop
+// call, in every build (the "gated on NIX_VM_STATS" comment only ever
+// covered the dump; audit §1.1).  Cache the env read once at static-init
+// time (file-scope `static const` ⇒ no per-call magic-static guard,
+// unlike a function-local static) and early-return when off.
+//
+// Kept name-keyed into a side map (NOT an inline `PrimOp::callCount`
+// field): some PrimOps are `static const` and live in read-only memory
+// (e.g. the `plusOnePo`/`returnSecondPo` fixtures in test/smoke.cc), so
+// a mutable inline counter would fault (EXC_BAD_ACCESS) when the VM
+// dispatches them.  Reading `po->name` is safe on read-only PrimOps.
+static const bool g_primOpCountOn = std::getenv("NIX_VM_STATS") != nullptr;
+
 void bumpPrimOpCallCount(const PrimOp * po)
 {
-    if (!po) return;
+    if (!g_primOpCountOn || !po) return;
     auto & c = primOpCounter();
     std::lock_guard<std::mutex> g(c.mtx);
     c.counts[std::string(po->name)]++;
