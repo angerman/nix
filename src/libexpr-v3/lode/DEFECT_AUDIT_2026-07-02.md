@@ -1339,3 +1339,92 @@ BI-critical (new opcode + emit + VM; drv-hash byte-identity) and requires the
 lookup to be provably force-free — DEFERRED to a dedicated effort.  The
 `isFormalWrapper` instrument + `dumpFormalWrapperStats` are retained to verify
 the eventual alloc drop.
+
+## P2.3 (or-defaults + inherit-in-rec) — MEASURE-FIRST PENDING (task open)
+
+Not yet measured.  The measure-first (tag or-default + inherit-wrapper thunks
+separately, pre-commit ≥2 % of thunk allocs each) is the gate; given the
+formal-wrapper measurement (12.79 %, the dominant wrapper class) and that
+or-default / inherit-in-rec are strictly rarer syntactic forms, the prior is a
+CLOSE, but it must be measured, not assumed.  Deferred alongside the WS-2
+build items.
+
+---
+---
+
+# Handback — WS-3 (VM hot path), 2026-07-02
+
+Commits (branch `angerman/2.35-eval-profiling-v2`), each gated full `--brute`
+28/28 + independent adversarial review where non-trivial:
+
+- **P3.2** (§3.1, `4a7055a22` prior) formals-call `needsForce` guard + lazy
+  error-path `lambdaName` string.  Shipped.
+- **P3.4** (§3.5, `4a7055a22` prior) `valueEqual` scalar fast path.  Shipped.
+- **P3.5a** (§3.7, prior) barrier `phaseDActive()` hints `[[unlikely]]→[[likely]]`.
+- **§3.14 dead-code** (`803b0af11`): SELECT_DYN double `shouldForceSelectedEntry`
+  hoisted; emit.cc dead dup-detection loop removed; (earlier `c27d12f09`
+  removed the OP_ATTRS_SELECT dead `chase` block).  BI-neutral.
+- **P3.3** (§3.4) — **FALSIFIED + REVERTED** (`152c6605f`).  Moving the
+  OP_ATTRS_INIT runtime sort to emit time is UNSAFE: positional value pushes
+  can't be remapped to a pre-sorted trailer across the cross-process disk cache
+  (only slot-indexed REC_INIT can).  Adversarial review caught a warm-cache
+  corruption in the first attempt.  New guardrail suite
+  `run-attrs-init-cache-roundtrip-tests.sh` (brute core, now 28) + a §3.4 note.
+  See the §3.4 write-up above.  DELIVERABLE = the finding + guardrail (kill).
+- **P3.5 (constexpr `phaseDActive`) + P3.8 (`std::move`)** (`362f87be9`):
+  `phaseDActive()` is now `constexpr … return true` (barrier guards fold across
+  all TUs without LTO; dead `g_phaseDActive` retired); two `mkStringValueOwned`
+  call sites in `primConcatStringsSep`/`primReplaceStrings` pass `std::move`
+  (one fewer full-payload copy per concat/replace).  BI-neutral.  (Lesson: a
+  barrier.hh change needs `ninja -C build` for ALL test binaries — a stale
+  v3-smoke referencing the removed symbol tripped the brute once.)
+
+**darwin-4 CPU validation** (`995983bcf`, git-noted): the entire shipped WS-3
+batch is **CPU-NEUTRAL / cost-free** (firefox cold 2.68→2.67s, warm 1.80→1.79s
+vs the P0.4 baseline).  No regression; no material CPU win at firefox scale —
+each micro-op is individually noise-level, consistent with the beat-tw campaign
+verdict.  WS-1's value is CORRECTNESS; WS-3's committed value is dead-code
+removal + BI-neutral cleanup + one falsification with a durable guardrail.
+
+## WS-3 remaining items — dispositions
+
+- **P3.1 (§3.2/§3.3 chain-aware read IC + MapAttrs parent memo) — THE HEADLINE
+  CPU LEVER, scoped, NOT yet built.**  §3.2 (chain-Bindings SELECT bypasses the
+  IC; every lookup walks all ≤16 layers with a per-layer binary search) is the
+  single biggest per-lookup tax the audit found, and `mergeBindings` makes the
+  chain shape the dominant nixpkgs attrset.  Design (from the P3.1 note): a
+  per-call-site chain IC keyed `(chainLeaf Bindings*, sym) → (ownerLayer*,
+  slot)`, mirroring the flat 4-way IC (`vm.cc:10220-10240`: `{bindings, slot}`
+  entries, name-validated, scavenge-rooted).  Chain STRUCTURE is immutable
+  post-construction (only leaf-owned writebacks — C-1), so a resolved read slot
+  is cacheable; the cached `ownerLayer*`/`leaf*` become scavenge roots
+  (walkAllV3Roots must scavenge them, exactly as it does the flat IC's
+  Bindings*); gen-major already clears ICs.  MapAttrs parent memo (§3.3) must
+  write ONLY into leaf-owned storage / a side memo (never the shared parent —
+  C-1).  This is a genuine D-W change (new CU cache struct + install/lookup +
+  GC root registration + serialize + adversarial + brute + darwin-4) and is the
+  recommended NEXT major CPU effort.  Step 0 (cheap, do first): a per-site
+  chain-SELECT + IC-hit-rate counter to size the win + the megamorphic question.
+- **P3.6 §3.8 (magic-static env-gate sweep + code-ptr dispatch local) —
+  ASSESSED, DEFERRED (low EV).**  (a) The ~40 function-local `static const bool
+  s_*` env gates in the dispatch region each cost a magic-static guard load per
+  access; hoisting to file scope removes it — but they sit on mostly-[[unlikely]]
+  cold branches, so the incremental win over the already-shipped #768 hoists is
+  likely <1 %, against a 15-40-site error-prone edit surface.  (b) The code-ptr
+  dispatch local (`cache cu->code.data()`) is DELICATE: `cu` is reassigned at
+  7+ inline tail-call/return/thunk-force sites within one dispatchLoop, so a
+  cached pointer needs refreshing at every one (a single miss = wrong-bytecode
+  corruption) — not the "cheap win" the audit framed.  Given the WS-3 batch
+  measured CPU-neutral (dispatch micro-opts are noise at firefox scale), the
+  effort/risk is not justified now.  Revisit only if a darwin-4 dispatch
+  profile shows guard-variable / code-reload cost material.
+- **P3.5 remainder (nursery-bounds cache + post-construct short-circuit +
+  inverted dispatch hints vm.cc:3941/5254/5279) — remaining, GC-adjacent, low
+  EV** (same neutral-batch reasoning; the constexpr `phaseDActive` half, the
+  main win, shipped).  Bounded follow-up if a profile motivates it.
+- **P3.7 (reuseScope for arity-1 strict primop callers) — DEFERRED**; the
+  autoresearch L3 idea, plausible but D-scale and the batch-neutral result
+  lowers its prior.
+- **P3.8 single-pass concat / context id-array** = the W-scale part of P4.4
+  (string-context), whose CPU half is now FALSIFIED (§5.6 P4.4 note) — only the
+  RSS/correctness halves survive, W-scale.
