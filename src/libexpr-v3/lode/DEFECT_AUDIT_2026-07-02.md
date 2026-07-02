@@ -1428,3 +1428,91 @@ removal + BI-neutral cleanup + one falsification with a durable guardrail.
 - **P3.8 single-pass concat / context id-array** = the W-scale part of P4.4
   (string-context), whose CPU half is now FALSIFIED (§5.6 P4.4 note) — only the
   RSS/correctness halves survive, W-scale.
+
+---
+---
+
+# Handback — WS-2/WS-4/WS-5/WS-6 + cross-cutting dispositions, 2026-07-02
+
+Honest accounting of every remaining §9 item.  Two classes: (A)
+**already measure-informed → documented-defer** (prior beat-tw campaign +
+this session's batch-neutral CPU result are the evidence), and (B)
+**not-yet-measured → measure-first-pending next-step** (open, scoped, NOT
+claimed closed).
+
+## WS-2
+
+- **P2.1 build (design a, `OP_BIND_FORMALS`)** — the correct path (design b
+  falsified); W-scale + BI-critical; the highest-value THUNK lever (12.79 % of
+  firefox thunk allocs measured).  **Next-step (B): build it** — new opcode +
+  emit + a force-free raw `Bindings::lookup` at OP_CALL, default-thunk only for
+  the missing subset.  Kept the `isFormalWrapper` instrument to verify the
+  alloc drop.  (task #16)
+- **P2.3 (or-default + inherit-in-rec)** — **measure-first-pending (B)**; tag
+  the two thunk classes, ≥2 % each ⇒ build.  Prior is a CLOSE (both are rarer
+  than the 12.79 % formal wrappers), but must be measured. (task #28)
+
+## WS-4 (RSS/CU)
+
+- **P4.4 lever 1.1 (string-context)** — CPU half **FALSIFIED** this session
+  (§5.6 note; −0.4 % firefox).  RSS/span-sharing + §2.6-correctness halves
+  survive, W-scale, BI-critical on drvPaths — **(A) defer**: the beat-tw
+  campaign already graded the MALLOC_SMALL/context-copy bucket
+  modest/foundational, and RSS is "shrink the live representation," a broad
+  program with no single lever.
+- **P4.1 (LambdaDescriptor diet) / P4.2 (DAG double-lowering) / P4.3
+  (literal-pool + PosSnapshot interning, symbol-mirror delete) / P4.7 (Bindings
+  Kind-split, drop `Closure::cu`)** — the arena/MALLOC_SMALL RSS-reduction
+  program.  **(A) defer with evidence:** the beat-tw campaign (see project
+  memory `project_beat_tw_v2_2026-06-23`, `project_bibop_campaign_2026-06-27`)
+  established that ALL reclaim-based RSS levers are dead and the gap is the LIVE
+  representation (v3 cells + CU structs + Boehm heavier than TW's 16 B
+  niche-tagged Value) — a broad foundational program, NOT a single lever.  P4.2
+  (fix the DAG double-lowering, so an expression isn't lowered twice into two
+  descriptors) + P4.3 (delete the diagnostics-only `Module::internSymbol`
+  mirror, §5.5) are the two SMALL, self-contained, low-risk wins here worth a
+  D-scale pass if RSS becomes the priority; the rest is the foundational
+  program.
+- **P4.5 (derivationStrict env-building as one C leaf)** — **(B)
+  measure-first-pending**, BI-CRITICAL (drv hashes); D-scale; needs the
+  mergeBindings-by-site table first.
+- **P4.6 (import single read + key memo, AOT string_view, SQLITE_STATIC)** —
+  **(B) measure-first-pending**; warm-CPU lever, independent ∥.  The warm gap
+  is ~2.4× (firefox); import I/O + deserialize is a plausible warm slice.  Next
+  step: the warm-run import timing buckets (the audit's own falsifier), then
+  the D-scale build if a bucket is material.
+
+## WS-5 (GC/policy)
+
+- **P5.1 (default gen-major: stop paying vs enable metadata)** — **(B)
+  measure-first-pending**; §5.1 says the default config cannot reclaim dead
+  tenured cells yet pays full GC cost.  This is a POLICY decision to co-own with
+  the bounded-memory M2 owner (A.3 note); measure the per-fire cost + no-op
+  rate first.  NB the M-3 trap: `alloc.hh g_majorGcEnabled` must stay hard-false
+  (re-enabling the legacy per-op major alongside the always-on nursery is a UAF).
+- **P5.2 (nursery permanently-full latch) / P5.3 (dirtyContainers dedup, drop
+  liveTenuredRanges when un-brute'd)** — **(A) low-EV defer**: bounded by GC's
+  ≤7 % CPU share; the batch-neutral result lowers the prior further.
+- **§2.5 (deepForceList writeback stale-across-scavenge)** — latent; overlaps
+  the task #14 missed-root investigation (see WS-1 handback + task #14).
+
+## WS-6 (compile-time)
+
+- **P6 (occur-DCE default-on decision, scope-map interning, freeVars worklist)**
+  — **(B) measure-first-pending**; PARSE+LOWER is 20-29 % of COLD CPU (a real
+  cold/CI slice, amortized warm).  Next step: the PARSE+LOWER share on cold +
+  CI, then the occur-DCE default-on A/B (the decisive sub-lever).
+
+## Cross-cutting honest verdict
+
+This session shipped the cheap/safe WS-3 items, decisively FALSIFIED two audit
+proposals (P3.3 emit-sort, P4.4-CPU) with durable artifacts, and validated the
+batch as CPU-neutral on darwin-4.  The audit's own §9 honest expectation holds:
+there is no single remaining CHEAP lever that materially moves the gap.  The
+real remaining levers are (1) **P3.1 chain-aware IC** — the one scoped D-W CPU
+lever with a headline mechanism; (2) **P2.1-design-a** — the one scoped THUNK
+lever with a measured 12.79 % target; (3) the **foundational RSS program**
+(leaner live representation) the beat-tw campaign already characterized as
+multi-week; (4) **JIT** (removes dispatch entirely) — the campaign's deferred
+multi-week play.  Everything else is measure-first-pending (P2.3, P4.5, P4.6,
+P5.1, P6) or low-EV-deferred.
