@@ -7759,18 +7759,7 @@ void primImport(EvalState & state, Value * args, Value & out)
                     }
                 }
 
-                auto tRun = impStamp();
-                out = run(cache.cus.back());
-                impBumpNs(importTimingTotals().runNs, tRun);
-                if (s_impTimingEn) ++importTimingTotals().diskCacheHits;
-                auto [mt, sz] = importStat(path);
-                {
-                    auto [iter, inserted] = cache.results.emplace(path,
-                        ImportCacheEntry{out, mt, sz, 0});
-                    if (inserted) bumpImportEntry(iter->second, cache);  // Phase 4b LRU
-                }
-                maybeEvictOldImportEntries(cache);  // Phase 4b LRU
-                return;
+                // (run() moved OUT of this try — see below, P1.3)
             } catch (const std::exception & ex) {
                 cache.cus.pop_back();
                 // Phase-13 review: a corrupt or stale disk-cache blob
@@ -7785,7 +7774,35 @@ void primImport(EvalState & state, Value * args, Value & out)
                         std::string("v3 disk-cache restore failed for ")
                             + path + ": " + ex.what());
                 }
-                // Fall through to fresh lower+compile.
+                // P1.3 (audit §2.3): this try now scopes ONLY deserializeCU
+                // (+ the verify block).  The CU has already been popped, so
+                // jump to the fresh lower+compile path rather than falling
+                // into the run() below (which is now outside the try).
+                goto skipDiskCacheLookup;
+            }
+            // Deserialize (+ verify) succeeded — run OUTSIDE the corrupt-blob
+            // try (P1.3, audit §2.3).  An error from run() (an eval failure,
+            // WallTimeExceeded, or OOM thrown mid-eval) must PROPAGATE, not be
+            // caught as if the blob were corrupt: the old code caught it here,
+            // popped the just-run CU — which partially-evaluated closures /
+            // thunks already reference, so a later force is a dangling-CU
+            // deref — and re-ran the fresh compile, DUPLICATING any IFD side
+            // effects.  On error the CU now stays in cache.cus (matching the
+            // invalidation path's deliberate-leak policy) and the error
+            // reaches the caller unchanged.
+            {
+                auto tRun = impStamp();
+                out = run(cache.cus.back());
+                impBumpNs(importTimingTotals().runNs, tRun);
+                if (s_impTimingEn) ++importTimingTotals().diskCacheHits;
+                auto [mt, sz] = importStat(path);
+                {
+                    auto [iter, inserted] = cache.results.emplace(path,
+                        ImportCacheEntry{out, mt, sz, 0});
+                    if (inserted) bumpImportEntry(iter->second, cache);  // Phase 4b LRU
+                }
+                maybeEvictOldImportEntries(cache);  // Phase 4b LRU
+                return;
             }
         } else {
             logCacheEvent("MISS", diskKey);
