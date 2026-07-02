@@ -1454,14 +1454,25 @@ wrapper allocs 313,787 → 282,151 (−31,636 = −10% of wrappers, of which ~24
 were the never-forced waste; total descriptor thunks 12.79%→11.65%).**  MODEST —
 smaller than the 70% raw-bindable sizing because the clean `nUp==1 && nWiths==0`
 guard skips with-scoped formal wrappers (common under `with lib;`) + the runtime
-plain-param check defers mapAttrs/chain args.  Relaxing the `nWiths` guard (pop
-the captured with-targets too) would capture more — a bounded follow-up.  CPU
-impact (~1.3% of thunks ⇒ ~sub-0.5% by the alloc-share heuristic) is likely below
-the darwin-4 noise floor; A/B pending.  It is nonetheless the FIRST lever this
-session that removes REAL allocations (churn), correct + validated + zero
-production risk (gated).  RETIREMENT: flip default-on after a darwin-4 A/B (+ a
-full nixpkgs byte-id soak); if the CPU win is sub-noise, keep gated as a
-churn/RSS lever or retire.
+plain-param check defers mapAttrs/chain args.  **nWiths relaxation DONE (commit
+`e3daf70c3`):** the emit guard was relaxed to `freeVars.size()==1` (any nWiths)
+and the handler generalized to `resize(size-(1+nWiths)); push(v)` (drop param +
+dead captured with-targets, with-scoped-formal sanity matched, hello byte-id,
+`--brute` 28/28) — but it captured only **+281 more wrappers on firefox**
+(313,787→281,870 vs the pre-relax 282,151), negligible; its value hinged on M5.
+**darwin-4 A/B — COMPLETE (2026-07-03; #35 resolved the M5-measurability
+contradiction, M5 evals cleanly on aarch64):** firefox (fresh emit, opcode fires)
+= **0 % CPU**, negligible RSS.  M5 peak RSS = **2322 MB (gate-off) vs 2324 MB
+(gate-on) = +1.9 MB (noise)**, value byte-identical (the wrapper counters read 0
+on M5 — `dumpFormalWrapperStats` walks `importCache`, which is blind to M5's
+flake-eval CUs — so firing is unconfirmable via counters, but the clean peak-RSS
+signal is conclusive).  So P2.1-a has **NO measurable CPU or RSS win on any
+measurable workload** (firefox 0 %/negligible, M5 noise).  It is nonetheless the
+one lever this session that removes REAL allocations (churn: ~24.5K never-forced
+waste wrappers on firefox), correct + validated + zero production risk (gated).
+**DISPOSITION: do NOT flip default-on** (no proven win, per the flip criterion).
+Kept gated as a correct, zero-risk churn-reduction opt-in (`NIX_V3_RAW_FORMALS`);
+retire-eligible if no future default-on alloc-reduction program adopts it.
 
 ## P2.1-a DESIGN REFINED + DE-RISKED (2026-07-02, bytecode-evidence) — NOT a greenfield opcode; a cycle-safety/strictness-analysis extension
 
@@ -1583,16 +1594,21 @@ removal + BI-neutral cleanup + one falsification with a durable guardrail.
   **structural wash → 0 % CPU** (firefox 2.66→2.66s, git 1.41→1.41s).  §3.2's
   "walks all ≤16 layers" is refuted: `mergeBindings` flattens every 16 layers AND
   SELECTs short-circuit at the top overlay, so effective depth is ~2.4 even though
-  chains dominate.  The audit's named deep-chain target M5 is IFD-blocked on
-  aarch64 (unmeasured), but for the IC to win M5 would need avg depth ≫ 4 —
-  contradicted by the flatten-cap + the observed short-circuit.  **DELETED per
-  Rule 0** (a gate with no proven win must retire, not coexist): code restored to
-  pre-P3.1.  The validated implementation is preserved at commit `0cb2f88b5` for a
-  trivial re-apply IF a future x86_64 run first measures M5 avg chain depth ≫ 4
-  (re-add the cheap depth counter to check — do NOT re-build the IC blind).  Third
-  measure-first "the §-headline lever doesn't materialize" result (cf. P3.3,
-  P4.4-CPU).  (§3.3 MapAttrs parent memo — the recompute-on-parent-hit fix — is a
-  separate remaining sub-lever, not part of this IC.)
+  chains dominate.  **M5 NOW MEASURED (2026-07-03, darwin-4 — the "IFD-blocked on
+  aarch64" note was stale; M5 evals cleanly via `getFlake path:~/Projects/iohk/
+  cardano-node`, `.cardano-node.name`):** the re-added depth counter (commit
+  `3017c4274`) reads M5 **avg chain depth = 1.99** (even SHALLOWER than firefox/
+  git's ~2.4) with chain-SELECTs only **24.7 %** of all 8,525,736 selects (a
+  MINORITY, unlike firefox's 60 %).  So M5 is the LEAST chain-SELECT-bound of the
+  three — the audit's deep-chain hypothesis (avg depth ≫ 4) is **FALSIFIED**; the
+  IC would be a wash on M5 too.  **DELETED per Rule 0** (a gate with no proven win
+  must retire, not coexist): code restored to pre-P3.1.  The validated
+  implementation is preserved at commit `0cb2f88b5` should new evidence of a
+  deep-chain workload ever appear — but M5 (the last named candidate) is now
+  measured shallow, so **P3.1 is closed everywhere** (do NOT re-build the IC
+  blind).  Third measure-first "the §-headline lever doesn't materialize" result
+  (cf. P3.3, P4.4-CPU).  (§3.3 MapAttrs parent memo — the recompute-on-parent-hit
+  fix — is a separate remaining sub-lever, not part of this IC.)
 - **P3.6 §3.8 (magic-static env-gate sweep + code-ptr dispatch local) —
   ASSESSED, DEFERRED (low EV).**  (a) The ~40 function-local `static const bool
   s_*` env gates in the dispatch region each cost a magic-static guard load per
