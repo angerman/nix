@@ -5149,6 +5149,38 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             break;
         }
 
+        case OP_RAW_FORMAL: {
+            // P2.1-a (NIX_V3_RAW_FORMALS): a 1-word prefix of the FOLLOWING
+            // OP_MAKE_THUNK (which binds a no-default demoted formal).  ip now
+            // points AT that OP_MAKE_THUNK: [op, nUp, nWiths].  See bytecode.hh.
+            const SymbolId sym = static_cast<SymbolId>(operand);
+            const uint32_t nUp    = cu->code[ip + 1];
+            const uint32_t nWiths = cu->code[ip + 2];
+            // Only the clean single-param / no-with shape is raw-bindable, and
+            // only when `param` (the pushed free var, stack top) is a PLAIN WHNF
+            // sorted Bindings (callPackage arg).  A mapAttrs/chain arg (module
+            // system) must keep the wrapper so the select-from-param stays
+            // deferred (task #33 RCA) — fall through to the real OP_MAKE_THUNK.
+            if (nUp == 1 && nWiths == 0 && !vm.valueStack.empty()) {
+                Value & param = vm.valueStack.back();
+                if (param.isAttrs()) {
+                    Bindings * pb = param.asAttrs();
+                    if (pb && !pb->isChain() && !pb->isMapAttrs()) {
+                        if (const Bindings::Entry * en = pb->lookupLocalEntry(sym)) {
+                            // Replace param (top) with the RAW lazy entry Value —
+                            // no force, no mapAttrs realize.  This is exactly the
+                            // value the wrapper would have produced when forced,
+                            // minus the wrapper thunk alloc.  Skip the MkThunk.
+                            vm.valueStack.back() = en->value;
+                            ip += 3;
+                            break;
+                        }
+                    }
+                }
+            }
+            // Fall through (no ip advance): the real OP_MAKE_THUNK runs next.
+            break;
+        }
         case OP_JUMP: ip = operand; break;
         case OP_BRANCH_FALSE: {
             Value & top = vm.valueStack.back();

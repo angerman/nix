@@ -1433,6 +1433,36 @@ drv-hash byte-identity (hello/git/firefox) + adversarial + `--brute` 28/28 +
 darwin-4 A/B.  The `formalsRawBindable`/`formalsDeferredComplex` counters verify
 the eventual wrapper-alloc drop.
 
+**P2.1-a BUILT + VALIDATED, SHIPPED GATED (`NIX_V3_RAW_FORMALS`, default-off).**
+Implemented as a 1-word prefix opcode `OP_RAW_FORMAL` (0x89) emitted immediately
+before a demoted no-default formal wrapper's `OP_MAKE_THUNK` (emit.cc emitOne(
+MkThunk), reading `ir::Function::rawFormalEligible`/`formalSym`).  Runtime: reads
+the following MkThunk's `[nUp,nWiths]`; if `nUp==1 && nWiths==0` and `param`
+(stack top) is a PLAIN sorted Bindings (`isAttrs() && !isChain() &&
+!isMapAttrs()`), replaces param with the RAW lazy `lookupLocalEntry(sym)` value
+(no force, no mapAttrs realize) and skips the MkThunk; else falls through to the
+wrapper (mapAttrs/chain args — module system — keep the deferral, avoiding the
+#33 recursion).  serialize remaps the operand sym (no trailer, mirrors
+OP_ATTRS_SELECT); disasm named.  **Validation:** hello/git/firefox/python3
+drvPath BYTE-IDENTICAL gate-off vs on (python3 = the #696 PAP class);
+`--brute` 28/28 with `NIX_V3_RAW_FORMALS=1` (moving-GC missed-root stress +
+drv-parity + brute-audit) AND default; adversarial review NOT-REFUTED (6 angles,
+built in an isolated worktree; the only diff is v3-eval's non-forcing debug
+printer showing an already-WHNF value — irrelevant to drv-hashes/`==`/coercion,
+and TW's printer diverges there too).  **Realized win (firefox, cache-off):
+wrapper allocs 313,787 → 282,151 (−31,636 = −10% of wrappers, of which ~24.5K
+were the never-forced waste; total descriptor thunks 12.79%→11.65%).**  MODEST —
+smaller than the 70% raw-bindable sizing because the clean `nUp==1 && nWiths==0`
+guard skips with-scoped formal wrappers (common under `with lib;`) + the runtime
+plain-param check defers mapAttrs/chain args.  Relaxing the `nWiths` guard (pop
+the captured with-targets too) would capture more — a bounded follow-up.  CPU
+impact (~1.3% of thunks ⇒ ~sub-0.5% by the alloc-share heuristic) is likely below
+the darwin-4 noise floor; A/B pending.  It is nonetheless the FIRST lever this
+session that removes REAL allocations (churn), correct + validated + zero
+production risk (gated).  RETIREMENT: flip default-on after a darwin-4 A/B (+ a
+full nixpkgs byte-id soak); if the CPU win is sub-noise, keep gated as a
+churn/RSS lever or retire.
+
 ## P2.1-a DESIGN REFINED + DE-RISKED (2026-07-02, bytecode-evidence) — NOT a greenfield opcode; a cycle-safety/strictness-analysis extension
 
 A full calling-convention map + bytecode inspection this session **reframes**

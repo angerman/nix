@@ -193,7 +193,8 @@ collectReferencedSymbols(const CompilationUnit & cu)
          || op == OP_ATTRS_SELECT
          || op == OP_REC_BINDING_SLOT_REF
          || op == OP_GET_UPVALUE_REC_BINDING
-         || op == OP_GET_UPVALUE_REC_BINDING_SLOT) {
+         || op == OP_GET_UPVALUE_REC_BINDING_SLOT
+         || op == OP_RAW_FORMAL) {  // P2.1-a: operand=sym, no trailer
             bump(operand);
             // OP_ATTRS_SELECT has 1 IC follow-up word.
             // #779 Schema 10: OP_REC_BINDING_SLOT_REF also has 1 IC
@@ -286,7 +287,8 @@ collectReferencedPositions(const CompilationUnit & cu)
         ++ip;
 
         if (op == OP_ATTRS_HAS
-         || op == OP_WITH_LOOKUP) {
+         || op == OP_WITH_LOOKUP
+         || op == OP_RAW_FORMAL) {  // P2.1-a: operand=sym, no trailer, no PosIdx
             // No trailer.
         } else if (op == OP_ATTRS_SELECT
                 || op == OP_REC_BINDING_SLOT_REF) {
@@ -524,6 +526,9 @@ void remapSymbolsInBytecode(CompilationUnit & cu,
         // Patch SymbolId operands in-place + walk trailing data
         // words.  See bytecode.hh + emit.cc for opcode layouts.
         if (op == OP_ATTRS_HAS) {
+            word = encode(op, remapId(operand));
+        } else if (op == OP_RAW_FORMAL) {
+            // P2.1-a: operand = formal SymbolId, no trailer (prefixes MkThunk).
             word = encode(op, remapId(operand));
         } else if (op == OP_WITH_LOOKUP) {
             word = encode(op, remapId(operand));

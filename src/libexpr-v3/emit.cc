@@ -1105,6 +1105,20 @@ struct Emitter
         // Same push order as ir::Lambda — see comment there.
         for (auto wv : e.lexicalWiths) emitVarRef(wv);
         for (auto fv : e.freeVars) emitVarRef(fv);
+        // P2.1-a (NIX_V3_RAW_FORMALS, default-off): prefix a no-default demoted
+        // formal wrapper's MkThunk with OP_RAW_FORMAL(formalSym), so the runtime
+        // raw-binds the formal (plain arg) instead of allocating the wrapper.
+        // Guarded to the clean nUp==1 (param only) / nWiths==0 shape every
+        // no-default `param.X` wrapper has; any other shape keeps the MkThunk.
+        static const bool s_rawFormals =
+            std::getenv("NIX_V3_RAW_FORMALS") != nullptr;
+        if (__builtin_expect(s_rawFormals, 0)
+            && e.funcIdx < m.functions.size()
+            && m.functions[e.funcIdx].rawFormalEligible
+            && e.freeVars.size() == 1 && e.lexicalWiths.empty()) {
+            unit.code.push_back(encode(OP_RAW_FORMAL,
+                m.functions[e.funcIdx].formalSym));
+        }
         unit.code.push_back(encode(OP_MAKE_THUNK, e.funcIdx));
         unit.code.push_back(static_cast<uint32_t>(e.freeVars.size()));
         unit.code.push_back(static_cast<uint32_t>(e.lexicalWiths.size()));

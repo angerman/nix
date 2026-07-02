@@ -91,6 +91,7 @@ const char * opName(Op op)
     case OP_ATTRS_REC_INIT_TAIL: return "OP_ATTRS_REC_INIT_TAIL";
     case OP_ATTRS_REC_SET:     return "OP_ATTRS_REC_SET";
     case OP_ATTRS_SELECT:      return "OP_ATTRS_SELECT";
+    case OP_RAW_FORMAL:        return "OP_RAW_FORMAL";
     case OP_ATTRS_SELECT_DYN:  return "OP_ATTRS_SELECT_DYN";
     case OP_ATTRS_HAS:         return "OP_ATTRS_HAS";
     case OP_ATTRS_HAS_DYN:     return "OP_ATTRS_HAS_DYN";

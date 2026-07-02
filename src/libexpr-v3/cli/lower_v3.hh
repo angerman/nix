@@ -604,6 +604,11 @@ struct LowererV3 {
             m.functions[tfid].entryBlock = teb;
             m.functions[tfid].name = f->name;
             m.functions[tfid].isFormalWrapper = true;  // P2.1 step-0 measure
+            // P2.1-a: a no-default formal wrapper is `param.X` — raw-bindable
+            // (plain arg) via the OP_RAW_FORMAL prefix.  Defaults keep the wrapper
+            // (their body has an else-branch that must stay deferred).
+            m.functions[tfid].formalSym = sym;
+            m.functions[tfid].rawFormalEligible = (f->def == nullptr);
             // Thunk body: `if param ? X then param.X else <default>`
             // (or `param.X` when no default), lowered in the rec scope.
             blockStack.push_back(teb);

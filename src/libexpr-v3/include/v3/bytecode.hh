@@ -396,6 +396,28 @@ enum Op : uint8_t
     /// See ir::Update::isFunctionReturn for the lower-time tagging.
     OP_ATTRS_UPDATE_TAIL = 0x88,
 
+    /// P2.1-a (NIX_V3_RAW_FORMALS, default-off): a 1-word PREFIX emitted
+    /// immediately before the `OP_MAKE_THUNK <wrapperFid>` that binds a DEMOTED
+    /// NO-DEFAULT formal.  Reuses ALL of OP_MAKE_THUNK's logic (no duplication)
+    /// and fits its dataflow (produces exactly one stack value, so the following
+    /// SET_LOCAL_KEEP/body flow is byte-for-byte unchanged).  Encoding:
+    ///   operand = sym (the formal name; REMAPPED in serialize like OP_ATTRS_SELECT)
+    ///   NO trailer (it PREFIXES the real OP_MAKE_THUNK, which follows).
+    /// At entry the wrapper's free vars are already pushed; for a no-default
+    /// formal wrapper that is exactly `param` (nUp=1, nWiths=0), on the stack
+    /// top.  The handler reads the FOLLOWING OP_MAKE_THUNK's [nUp,nWiths] to know
+    /// the shape.  If nUp==1 && nWiths==0 AND `param` (stack top) is a PLAIN WHNF
+    /// sorted Bindings (`isAttrs() && !isChain() && !isMapAttrs()` — the
+    /// callPackage case): pop `param`, `lookupLocalEntry(sym)` and push the RAW
+    /// lazy entry Value (NO force, NO mapAttrs realize — laziness preserved),
+    /// then SKIP the following OP_MAKE_THUNK (ip += 3).  Otherwise (mapAttrs/chain
+    /// arg — module-system args — or an unexpected shape) FALL THROUGH: the real
+    /// OP_MAKE_THUNK builds the wrapper thunk, keeping the select-from-param
+    /// DEFERRED (task #33 RCA: realizing a mapAttrs `config` entry at entry
+    /// recurses).  Only no-default formals get the prefix; defaults + `@`-arg
+    /// keep their bindings.
+    OP_RAW_FORMAL = 0x89,
+
     // --- Strings --------------------------------------------------------
     OP_STR_CONCAT     = 0x90,  // [n:24] forceString stored in low bit of n; pops n parts
 

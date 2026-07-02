@@ -505,6 +505,16 @@ struct Function {
     /// P2.1 step 0).  Remove with the instrument once P2.1 is decided.
     bool                isFormalWrapper = false;
 
+    /// P2.1-a (NIX_V3_RAW_FORMALS): set on a NO-DEFAULT demoted formal wrapper.
+    /// `formalSym` is the formal's SymbolId; when `rawFormalEligible`, emit
+    /// prefixes this wrapper's OP_MAKE_THUNK with OP_RAW_FORMAL(formalSym) so the
+    /// runtime can raw-bind the formal (plain arg) instead of allocating the
+    /// wrapper.  emit reads these off the IR Function directly (no descriptor
+    /// propagation needed).  Only the DEMOTED-plainScope path emits the wrapper
+    /// via emitOne(MkThunk); the LetRec path is untouched.
+    bool                rawFormalEligible = false;
+    SymbolId            formalSym = 0;
+
     /// P2.3 step-0 measure (2026-07-02, TEMPORARY instrument): tag the two
     /// other "per-evaluation wrapper thunk TW doesn't allocate" classes from
     /// audit §4.3, so the NIX_VM_STATS dump can size their share vs the ≥2 %
