@@ -1371,6 +1371,68 @@ lookup to be provably force-free — DEFERRED to a dedicated effort.  The
 `isFormalWrapper` instrument + `dumpFormalWrapperStats` are retained to verify
 the eventual alloc drop.
 
+## P2.1 design-b RCA — COMPLETE (2026-07-02, reproduced + instrumented; task #33)
+
+The design-b recursion is now definitively RCA'd (reproduced gated + bisected
+with two discriminator flags), correcting BOTH the a7948a2f3 commit's account
+AND an intermediate hypothesis of mine:
+
+- **Reproduced:** re-implementing design-b gated (bind each no-default demoted
+  formal to `AttrSelect{Force(param), X}` at ENTRY instead of the wrapper thunk)
+  reliably throws "infinite recursion … referencing `config` in `imports` … while
+  evaluating the module argument `config`" on hello/git/firefox.drvPath;
+  gate-off is correct.
+- **Discriminator 1 — NOT `shouldForceSelectedEntry`:** a `V3_DBG_NO_FORCE_SELECT`
+  gate making `shouldForceSelectedEntry` always false did NOT clear the recursion.
+  So the App-force-memoize is NOT the cause (this refutes the intermediate
+  "config is a Tag::App the select force-memoizes" hypothesis).
+- **Discriminator 2 — IT IS `tryPushDirectMapAttrsEntry`:** ALSO making that
+  helper a no-op (skip mapAttrs realization) DID clear the config recursion (it
+  then failed later with an unrelated `assertion failed` from globally breaking
+  mapAttrs elsewhere — a different, expected artifact).
+- **MECHANISM:** the module argument attrset `param` is a **mapAttrs Bindings**
+  (evalModules builds module args by mapping over `_module.args`).  design-b's
+  entry-time `AttrSelect{param, config}` hits `tryPushDirectMapAttrsEntry`, which
+  **realizes** the `config` mapAttrs entry by CALLING the arg-map function AT
+  ENTRY — during the module collect phase, before `config` is ready → the config
+  fix-point re-enters → recursion.  The wrapper thunk's load-bearing property is
+  that it DEFERS the whole select-from-param (and thus the mapAttrs realization)
+  to the formal's USE-time, when config is ready.  (Corrects a7948a2f3's
+  "forceVal(param) deferral" framing — param is force-validated at OP_CALL
+  regardless; the real deferral that matters is of the mapAttrs-entry
+  REALIZATION.)
+
+**Consequence for design-a:** a raw copy of a mapAttrs entry to a formal local is
+UNSAFE — the unrealized mapAttrs placeholder is meaningful only inside its
+Bindings' realization context, so binding it standalone loses that context.
+Therefore raw-binding is safe ONLY when `param` is a PLAIN sorted Bindings
+(non-mapAttrs, non-chain) — the callPackage/`intersectAttrs` case.  Module-system
+formals (mapAttrs param) MUST keep the wrapper (deferral).  So design-a is
+**param-shape-aware and PARTIAL** (a runtime plain-vs-mapAttrs check per call),
+not the audit's blanket "raw Bindings::lookup."  Its capturable win = the
+plain-param fraction of the 12.79% wrapper allocs (measured via
+`formalsRawBindable` vs `formalsDeferredComplex` — the P2.1-a sizing counter).
+
+**Sizing RESULT (2026-07-02, NIX_VM_STATS): ~70% of no-default formal instances
+are on a PLAIN arg (raw-bindable).**  firefox = 36,936 raw-bindable (70.2%) vs
+15,688 deferred (mapAttrs/chain), git = 12,889 (71.8%) vs 5,066.  So design-a
+(param-shape-aware) can eliminate the wrapper for a MAJORITY of no-default
+formals (the callPackage/`intersectAttrs`-arg case), deferring only the ~30%
+module-system (mapAttrs/chain-arg) formals — the build is justified.  **BUILD
+SPEC (safe by construction):** a new entry-block opcode (e.g.
+`OP_BIND_FORMALS_RAW skipTarget [K slot words]`) for demoted formals lambdas —
+read the sorted formal names from `desc->formals` (already serialize-remapped, so
+the trailer carries only PROCESS-INDEPENDENT local-slot indices → NO SymbolId
+remap, avoiding the P3.3 serialize footgun); at runtime, if `param` (slot 0) is a
+plain sorted Bindings (`!isChain() && !isMapAttrs()`), raw
+`lookupLocalEntry` each supplied no-default formal → bind its local to the raw
+lazy entry Value (NO force, NO mapAttrs realize) + jump `skipTarget` past the
+no-default wrapper MkThunks; else fall through to the wrappers.  Default formals +
+`@`-arg keep their current bindings on both paths.  Gate default-off; validate
+drv-hash byte-identity (hello/git/firefox) + adversarial + `--brute` 28/28 +
+darwin-4 A/B.  The `formalsRawBindable`/`formalsDeferredComplex` counters verify
+the eventual wrapper-alloc drop.
+
 ## P2.1-a DESIGN REFINED + DE-RISKED (2026-07-02, bytecode-evidence) — NOT a greenfield opcode; a cycle-safety/strictness-analysis extension
 
 A full calling-convention map + bytecode inspection this session **reframes**

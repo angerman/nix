@@ -668,6 +668,16 @@ struct AllocStats
     /// emit-time peephole is firing on real workloads.
     uint64_t selectorLambdaCalls = 0;
 
+    /// P2.1-a design-a sizing (TEMPORARY, V3_STATS; NIX_VM_STATS dump).  The RCA
+    /// (task #33) showed a raw formal bind is SAFE only when the arg attrset is a
+    /// PLAIN sorted Bindings (module-system args are mapAttrs/chain → the entry
+    /// must stay deferred via the wrapper, else realizing it at entry recurses on
+    /// `config`).  So design-a can only eliminate wrappers for plain-param calls.
+    /// These count no-default formal INSTANCES per formals-lambda call, split by
+    /// arg shape, to size the capturable fraction of the 12.79% wrapper allocs.
+    uint64_t formalsRawBindable    = 0;  // no-default formals, arg = plain Bindings
+    uint64_t formalsDeferredComplex = 0; // no-default formals, arg = mapAttrs/chain
+
     /// #495: how many OP_CALL invocations dispatched to the v3-native
     /// `lib.fix` intrinsic (instead of running its bytecode body).
     /// Mirrors selectorLambdaCalls -- confirms that lower.cc's

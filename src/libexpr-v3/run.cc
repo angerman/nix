@@ -466,6 +466,19 @@ RootResult runRootExprModule(nix::EvalState & state, ir::Module module)
             (unsigned long long)a.thunksForced,
             (unsigned long long)a.bridgeThunksForced,
             (unsigned long long)a.bytecodeInstructions);
+        // P2.1-a design-a sizing (TEMPORARY): what fraction of no-default formal
+        // instances are on a PLAIN arg (raw-bindable → wrapper removable) vs a
+        // mapAttrs/chain arg (must keep the wrapper per the #33 RCA)?
+        {
+            uint64_t tot = a.formalsRawBindable + a.formalsDeferredComplex;
+            double pctRaw = tot ? 100.0 * (double)a.formalsRawBindable / (double)tot : 0.0;
+            std::fprintf(stderr,
+                "v3 P2.1-a formals-by-arg-shape: raw-bindable(plain)=%llu (%.1f%%) "
+                "deferred(mapAttrs/chain)=%llu of %llu no-default formal-calls\n",
+                (unsigned long long)a.formalsRawBindable, pctRaw,
+                (unsigned long long)a.formalsDeferredComplex,
+                (unsigned long long)tot);
+        }
         // #702: BYTES per allocation category.  The count counters
         // above are partly bumped at primop call sites and miss
         // Alloc::* invocations from vm.cc dispatch; the byte
