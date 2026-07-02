@@ -97,27 +97,15 @@ const bool g_dbgCellWriteSite = [] {
 }();
 }
 
-// #767 (2026-05-22): exposed as a namespace-scope `const bool` so
-// every barrier emit just loads a single byte instead of going
-// through the C++ magic-static guard the prior `static const bool`
-// inside a function required.  The barrier helper declarations in
-// `include/v3/barrier.hh` inline `phaseDActive()` as a direct read
-// of this variable, which the compiler can hoist across multiple
-// adjacent barrier writes.
-//
-// Gating on NIX_V3_NURSERY (not NIX_V3_NURSERY_SCAVENGE) because
-// the barrier must record inter-gen writes whenever ALLOCATIONS
-// route through the nursery — independent of whether scavenge is
-// enabled.  An allocation-only-no-scavenge run still wants the
-// diagnostic correctness (BRUTE+AUDIT distinguish LIVE vs DEAD);
-// gating on _SCAVENGE would silently lose dirty-list entries.
-namespace detail {
-// OPT-OUT RETIRED (2026-06-15): the NIX_V3_NURSERY flip soaked clean across all
-// of nixpkgs on darwin-4 (24882 attrs, 0 divergence).  The nursery is now
-// unconditional, so the Phase D write barriers are ALWAYS active.  (The barrier
-// helpers still no-op cheaply when phaseDActive() is true but no inter-gen edge
-// exists — see barrier.hh; this constant only removes the env opt-out.)
-const bool g_phaseDActive = true;
-}
+// #767 (2026-05-22) → P3.5/§3.7 (2026-07-02): the process-wide Phase-D gate was
+// once a namespace-scope `const bool g_phaseDActive` (read via the inline
+// phaseDActive() in barrier.hh) so barrier emits loaded a byte instead of
+// paying the magic-static guard the prior function-local form required.  The
+// NIX_V3_NURSERY opt-out was RETIRED (2026-06-15; the flip soaked clean across
+// all of nixpkgs on darwin-4, 24882 attrs / 0 divergence), so the gate is
+// permanently true.  phaseDActive() is now `constexpr … return true`
+// (barrier.hh), which folds the barrier guards at compile time across all TUs
+// even without LTO — strictly better than the extern-const load — so the
+// g_phaseDActive definition it depended on is removed here.
 
 } // namespace nix::v3

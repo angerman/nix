@@ -1517,7 +1517,10 @@ void primConcatStringsSep(EvalState & state, Value * args, Value & out)
         absorb(el.asString());
         result += el.asString();
     }
-    out = mkStringValueOwned(result);
+    // P3.8/§3.6: `result` is dead after this (the trailing block reads `ctx`),
+    // so move it into the by-value parameter instead of copying the whole
+    // concatenated payload one extra time.
+    out = mkStringValueOwned(std::move(result));
     if (!ctx.empty()) {
         std::sort(ctx.begin(), ctx.end());
         ctx.erase(std::unique(ctx.begin(), ctx.end()), ctx.end());
@@ -2556,7 +2559,9 @@ void primReplaceStrings(EvalState & state, Value * args, Value & out)
     }
     // Final empty-match at end-of-string (handles `["" ...]` -> trailing X).
     tryReplaceAt(s.size());
-    out = mkStringValueOwned(result);
+    // P3.8/§3.6: `result` is dead after this (the trailing block reads
+    // `ctxAccum`), so move rather than copy the whole replaced payload.
+    out = mkStringValueOwned(std::move(result));
     if (!ctxAccum.empty()) {
         std::sort(ctxAccum.begin(), ctxAccum.end());
         ctxAccum.erase(std::unique(ctxAccum.begin(), ctxAccum.end()), ctxAccum.end());

@@ -151,13 +151,17 @@ namespace detail { extern const bool g_dbgCellWriteSite; }
 /// call.  Profile data (#765, hello.drvPath) showed the function
 /// at ~2% self-time despite being a flag check — the guard load
 /// was the cost.
-namespace detail {
-extern const bool g_phaseDActive;
-}
-
-[[gnu::always_inline]] inline bool phaseDActive() noexcept
+/// P3.5/§3.7 (2026-07-02): the NIX_V3_NURSERY opt-out is RETIRED (the flip
+/// soaked clean across all of nixpkgs on darwin-4, 24882 attrs / 0 divergence),
+/// so Phase D is UNCONDITIONALLY active.  phaseDActive() is now
+/// `constexpr … return true`, so every caller constant-folds its
+/// `if (phaseDActive())` barrier guard at compile time — even across
+/// translation units WITHOUT LTO, which the prior `extern const bool
+/// g_phaseDActive` read could not do (each barrier site still loaded the global
+/// + branched).  The extern-const global is retired along with the opt-out.
+[[gnu::always_inline]] constexpr bool phaseDActive() noexcept
 {
-    return detail::g_phaseDActive;
+    return true;
 }
 
 // ---------------------------------------------------------------------------
