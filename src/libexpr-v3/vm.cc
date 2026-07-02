@@ -5156,22 +5156,27 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             const SymbolId sym = static_cast<SymbolId>(operand);
             const uint32_t nUp    = cu->code[ip + 1];
             const uint32_t nWiths = cu->code[ip + 2];
-            // Only the clean single-param / no-with shape is raw-bindable, and
-            // only when `param` (the pushed free var, stack top) is a PLAIN WHNF
-            // sorted Bindings (callPackage arg).  A mapAttrs/chain arg (module
-            // system) must keep the wrapper so the select-from-param stays
-            // deferred (task #33 RCA) — fall through to the real OP_MAKE_THUNK.
-            if (nUp == 1 && nWiths == 0 && !vm.valueStack.empty()) {
-                Value & param = vm.valueStack.back();
+            // Raw-bindable iff nUp==1 (a `param.X` wrapper's only free var is
+            // param, on the stack TOP; the nWiths captured with-targets sit just
+            // BELOW it and are DEAD for a `param.X` body) AND `param` is a PLAIN
+            // WHNF sorted Bindings (callPackage arg).  A mapAttrs/chain arg
+            // (module system) must keep the wrapper so the select-from-param
+            // stays deferred (task #33 RCA) — fall through to the real MkThunk.
+            if (nUp == 1 && vm.valueStack.size() >= (1u + nWiths)) {
+                Value param = vm.valueStack.back();  // the single upvalue (copy; we shrink below)
                 if (param.isAttrs()) {
                     Bindings * pb = param.asAttrs();
                     if (pb && !pb->isChain() && !pb->isMapAttrs()) {
                         if (const Bindings::Entry * en = pb->lookupLocalEntry(sym)) {
-                            // Replace param (top) with the RAW lazy entry Value —
-                            // no force, no mapAttrs realize.  This is exactly the
-                            // value the wrapper would have produced when forced,
-                            // minus the wrapper thunk alloc.  Skip the MkThunk.
-                            vm.valueStack.back() = en->value;
+                            // Drop param + the nWiths dead captured with-targets
+                            // (the top 1+nWiths values this thunk pushed), then
+                            // push the RAW lazy entry Value — no force, no mapAttrs
+                            // realize.  This is exactly what the wrapper would have
+                            // produced when forced, minus the wrapper alloc + the
+                            // dead with capture.  Skip the following OP_MAKE_THUNK.
+                            const Value v = en->value;
+                            vm.valueStack.resize(vm.valueStack.size() - (1u + nWiths));
+                            vm.valueStack.push_back(v);
                             ip += 3;
                             break;
                         }

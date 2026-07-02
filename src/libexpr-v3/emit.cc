@@ -1108,14 +1108,16 @@ struct Emitter
         // P2.1-a (NIX_V3_RAW_FORMALS, default-off): prefix a no-default demoted
         // formal wrapper's MkThunk with OP_RAW_FORMAL(formalSym), so the runtime
         // raw-binds the formal (plain arg) instead of allocating the wrapper.
-        // Guarded to the clean nUp==1 (param only) / nWiths==0 shape every
-        // no-default `param.X` wrapper has; any other shape keeps the MkThunk.
+        // Guarded to nUp==1 (a `param.X` wrapper's only free var is param); the
+        // captured lexical withs (nWiths, common under `with lib;`) are DEAD for
+        // a `param.X` body (no with-lookup), so the handler drops them on the
+        // raw path — no nWiths guard needed.
         static const bool s_rawFormals =
             std::getenv("NIX_V3_RAW_FORMALS") != nullptr;
         if (__builtin_expect(s_rawFormals, 0)
             && e.funcIdx < m.functions.size()
             && m.functions[e.funcIdx].rawFormalEligible
-            && e.freeVars.size() == 1 && e.lexicalWiths.empty()) {
+            && e.freeVars.size() == 1) {
             unit.code.push_back(encode(OP_RAW_FORMAL,
                 m.functions[e.funcIdx].formalSym));
         }
