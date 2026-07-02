@@ -10063,7 +10063,10 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     Value * lslot = nullptr;
                     uint32_t ownerSlot = UINT32_MAX;
                     const SymbolId want = static_cast<SymbolId>(operand);
+                    V3_STATS_INC(chainSelectCount);  // P3.1 M5 depth probe
+                    uint32_t chainHops = 0;          // P3.1 M5 depth probe
                     for (const Bindings * L = b; L; L = L->isChain() ? L->parent : nullptr) {
+                        ++chainHops;
                         if (const Bindings::Entry * e = L->lookupLocalEntry(want)) {
                             lslot = const_cast<Value *>(&e->value);
                             ownerLayer = L;
@@ -10071,6 +10074,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                             break;
                         }
                     }
+                    V3_STATS_BUMP(chainSelectHops, chainHops);  // P3.1 M5 depth probe
                     if (lslot) {
                         const bool leafHit = (ownerLayer == b);
                         if (ownerLayer && ownerLayer->isMapAttrs()) {
@@ -10281,6 +10285,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // V3_DBG_NO_IC disables the fast-path -- bisect aid for
             // suspected IC corruption.
             static const bool s_no_ic = std::getenv("V3_DBG_NO_IC") != nullptr;
+            V3_STATS_INC(flatSelectCount);  // P3.1 M5 depth probe (flat vs chain fraction)
             uint32_t hitSlot = UINT32_MAX;
             if (!s_no_ic) {
                 for (int w = 0; w < cu->attrSelectCache[icIdx].kWays; ++w) {
