@@ -10,12 +10,15 @@ Group. SPDX-License-Identifier: Apache-2.0.
 ## Bottom line
 
 Every §9 item was driven to a **measured decision**. All cheap/safe wins
-shipped; four audit proposals were **falsified** (kills are deliverables); the
-one real latent bug was investigated + resolved; the two remaining levers are
-genuine W-scale, drv-hash-critical builds — **fully designed + de-risked**, and
-by explicit user decision taken on as **dedicated next-session efforts** (not
-rushed at session-tail). This matches the audit's own §9 honest expectation:
-**no single remaining CHEAP lever moves the gap.**
+shipped; **five** audit proposals were **falsified/measured-NO-GO** (kills are
+deliverables): P0.2, P3.3, P4.4-CPU, P2.3-inherit, and **P3.1** (chain-aware read
+IC — built + adversarially-validated + brute-28/28, but measured **0% CPU** on
+firefox+git → kept gated pending an unmeasurable-here M5 A/B). The one real
+latent bug was investigated + resolved. The remaining lever (P2.1-a) is a
+genuine W-scale, drv-hash-critical build — fully designed + de-risked. This
+matches the audit's own §9 honest expectation: **no single remaining CHEAP lever
+moves the gap** — even the §3.2 "headline per-lookup tax" yields 0% once built
+and measured, because real-nixpkgs chains are shallow.
 
 ## Arc (oldest → newest)
 
@@ -86,17 +89,34 @@ rushed at session-tail). This matches the audit's own §9 honest expectation:
   (param is force-validated before entry), so a variant can't be built safely
   until design-b's recursion is RCA'd.
 
-## Remaining levers (dedicated next-session efforts — user decision 2026-07-02)
+## P3.1 chain-aware read IC — BUILT this session (user "continue!"), gated, measured NO-GO on measurable workloads
 
-Both are W-scale + drv-hash-critical, fully designed + de-risked here:
+After the user chose the boundary then said "continue!", P3.1 was built the safe
+way and measured:
+- `0cb2f88b5` — chain-aware read IC (`NIX_V3_CHAIN_IC`, default-off): caches the
+  resolved `(chainLeaf, ownerLayer, slot)` in the shared per-call-site
+  `attrSelectCache` (extended `AttrSelectIC::Entry` with `ownerLayer`); the 5
+  gc.cc IC scavenge/audit sites gray/visit `ownerLayer` (Bindings are always
+  tenured → safe); both IC-clear sites + the flat install null `ownerLayer` (no
+  stale gray). Adversarial review NOT-REFUTED (5 angles); `--brute` 28/28 gate-ON
+  (moving-GC missed-root + drv byte-id) AND 28/28 default; ON-vs-OFF byte-id on 5
+  chain-SELECT exprs incl. a 20-layer `foldl //` chain.
+- `30269d3ab` — darwin-4 A/B (git-noted): firefox.drvPath **0%** (2.66s==2.66s),
+  git.drvPath **0%** (1.41s==1.41s). **No measurable CPU win** — real-nixpkgs `//`
+  chains are SHALLOW (SELECT short-circuits at the first matching layer), so
+  §3.2's "walks all ≤16 layers" is overstated for firefox/git and the IC's scan+
+  validation ≈ the shallow walk. Another measure-first "headline lever doesn't
+  materialize on measurable workloads" result (cf. P3.3, P4.4-CPU).
+- **Kept GATED default-off** (validated, zero prod risk). The flip/delete
+  decision needs the audit's named deep-chain target M5 (IFD-blocked on aarch64):
+  on an x86_64 host add a per-site chain-SELECT hit-rate counter + A/B on M5 →
+  flip if ≥3% + byte-id soak, else DELETE.
 
-- **P3.1 — chain-aware read IC** (§3.2 headline; the biggest per-lookup tax).
-  Per-call-site IC keyed `(chainLeaf Bindings*, sym) → (ownerLayer*, slot)`,
-  mirroring the flat 4-way IC (`vm.cc:10220`); chain structure is immutable
-  post-construction so read slots are cacheable; needs `walkAllV3Roots` GC-root
-  registration + serialize + the C-1/C-3 discipline. Gate `NIX_V3_CHAIN_IC`
-  default-off; step-0 = a per-site chain-SELECT + IC-hit-rate counter. **Lower
-  risk to attempt first** (no falsified precursor).
+## Remaining levers (dedicated next-session efforts)
+
+Fully designed + de-risked here:
+
+- **P3.1 flip decision** — needs an x86_64 M5 A/B + hit-rate counter (above).
 - **P2.1-a — formals wrapper elimination** (12.79% thunk allocs, ~2.5% CPU —
   the one micro-lever plausibly above darwin-4 noise). NOT a greenfield opcode:
   v3 already inlines formal selects at entry when cycle-safe
