@@ -1371,6 +1371,42 @@ lookup to be provably force-free — DEFERRED to a dedicated effort.  The
 `isFormalWrapper` instrument + `dumpFormalWrapperStats` are retained to verify
 the eventual alloc drop.
 
+## P2.1-a DESIGN REFINED + DE-RISKED (2026-07-02, bytecode-evidence) — NOT a greenfield opcode; a cycle-safety/strictness-analysis extension
+
+A full calling-convention map + bytecode inspection this session **reframes**
+P2.1-a and explains WHY it is genuinely W-scale (not a quick opcode add):
+
+1. **v3 ALREADY inlines formal selects at entry when SAFE.**  `{ a, b ? 5 }:
+   a + b` emits NO wrapper thunk — the entry block does
+   `OP_GET_LOCAL_FORCE 0; OP_ATTRS_SELECT a; OP_SET_LOCAL 2` (binds the local
+   directly to the lazy `param.a` select) + the inlined `if param?b …` for the
+   default.  This is the DEFAULT shipping path, so the inlined-select approach
+   is already proven byte-identity-safe for the cases it fires on.
+2. **The 12.79 % residual wrappers are the cases the inliner CONSERVATIVELY
+   SKIPS.**  `{ a }: a` (a lazy tail-return of the formal) keeps the wrapper
+   MkThunk (`OP_MAKE_THUNK` of a `Force(param).a` body).  The inlining is driven
+   by strictness/cycle-safety analysis: `opt_func_strictness.cc` populates
+   `strictArgs`; `opt_strict_call_unthunk.cc` uses it to skip MkThunk wraps —
+   but it EXPLICITLY handles **`callee.hasFormals == false` (single-arg lambdas
+   only)** and notes *"formals-style would need attrset-entry-level rewriting."*
+   So formals-lambda residuals are not covered by the current analysis at all.
+3. **Naive extension = design (b) = FALSIFIED.**  Inlining the select at entry
+   UNCONDITIONALLY for all no-default formals is exactly design (b), which threw
+   module-system infinite recursion — the deferral past entry is load-bearing
+   for the config fix-point.  So capturing the residual REQUIRES the
+   cycle-safety analysis, not a blanket inline.
+
+**Refined disposition:** P2.1-a = extend the strictness/cycle-safety analysis
+(`opt_func_strictness` + `opt_strict_call_unthunk`) to **formals-style
+attrset-entry rewriting** — the exact capability the code flags as not-yet-built
+— gated + validated byte-identical (drv-hash) across nixpkgs.  This is a
+focused-but-real W-scale analysis change, drv-hash-critical, whose naive
+shortcut is already falsified; it is deliberately NOT rushed at session-tail
+(that risks re-introducing the design-b recursion class).  Realized-win prior:
+~2.5 % CPU (the one micro-lever plausibly above darwin-4 noise) + churn/RSS.
+Recommended top next dedicated effort alongside P3.1.  Design + insertion points
++ byte-identity hazards are fully mapped (this section + the WS-2 handback).
+
 ## P2.3 (or-defaults + inherit-in-rec) — MEASURED; SPLIT verdict
 
 Measured on firefox.drvPath cache-off (deterministic per-descriptor
