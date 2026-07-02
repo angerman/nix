@@ -10777,7 +10777,10 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     break;
                 found = &directMapAttrsB->entries[directMapAttrsSlot].value;
             }
-            if (__builtin_expect(shouldForceSelectedEntry(directMapAttrsB, *found), 0)
+            // P3.6/§3.14: compute the force-decision ONCE — shouldForceSelectedEntry
+            // is a side-effect-free predicate; it was called back-to-back below.
+            const bool sfseDyn = shouldForceSelectedEntry(directMapAttrsB, *found);
+            if (__builtin_expect(sfseDyn, 0)
                 && dynLeafSafe) {   // WS-A step 3: no writeback into a shared parent
                 push(vm, *found);
                 CallFrame & f = vm.frames.back();
@@ -10789,8 +10792,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 f.ip = ip;
                 goto op_force_slow;
             }
-            if (__builtin_expect(
-                    shouldForceSelectedEntry(directMapAttrsB, *found), 0)
+            if (__builtin_expect(sfseDyn, 0)
                 && !dynLeafSafe) {
                 push(vm, *found);
                 CallFrame & f = vm.frames.back();

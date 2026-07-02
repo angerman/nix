@@ -1427,21 +1427,12 @@ struct Emitter
             [&](uint32_t a, uint32_t b) {
                 return e.entries[a].name < e.entries[b].name;
             });
-        // Detect duplicates at lower-time so we reject earlier than
-        // OP_ATTRS_INIT's runtime dup check would (matches the prior
-        // OP_ATTRS_INIT path which was an emit of [push N values];
-        // OP_ATTRS_INIT N).
-        for (size_t k = 1; k < n; ++k) {
-            if (e.entries[sortedIdx[k]].name
-                == e.entries[sortedIdx[k - 1]].name)
-            {
-                // Defer the throw to runtime so the error message is
-                // identical to the OP_ATTRS_INIT path's.  Just allow
-                // the duplicate trailer here; OP_ATTRS_REC_SET to the
-                // same slot twice is harmless (last write wins).
-                break;
-            }
-        }
+        // P3.6/§3.14 (2026-07-02): removed a dead duplicate-detection loop
+        // here — it scanned the sorted entries for an adjacent duplicate and
+        // then merely `break`'d (the throw was deferred to the runtime
+        // OP_ATTRS_REC/INIT dup-check for message-identity), so it computed
+        // and discarded.  Pure scan ⇒ BI-neutral removal; the runtime check
+        // still rejects duplicate attrs with the identical message.
         // Flush any pending deferred values to their slots BEFORE we
         // push the Bindings.  The deferring optimisation (#542) keeps
         // recently-computed OnceLinear values on the runtime stack
