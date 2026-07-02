@@ -151,3 +151,17 @@ attrNames	0.57	NA	NA	NA	yes	off	3ff650587	2026-06-19
 #      to win, avg depth would need >>4 (contradicted by the flatten-cap).
 #   VERDICT: DELETED per Rule 0 (no-win gate retires).  Validated design preserved
 #   at commit 0cb2f88b5; re-apply only if a future x86_64 M5 depth probe shows >>4.
+# ============================================================================
+# P2.1-a OP_RAW_FORMAL A/B (2026-07-03, commit d035e71f7, NIX_V3_RAW_FORMALS):
+#   firefox COLD: gate-OFF 2.66s / 679MB  vs  gate-ON 2.66s / 680MB  => 0% CPU,
+#   ~0 RSS (noise).  BUT gate-ON eliminates 31,636 wrapper thunk allocs
+#   (313787->282151, -10% of wrappers, ~24.5K never-forced waste; total
+#   descriptor thunks 12.79%->11.65%) — byte-identical (hello/git/firefox/python3
+#   drvPath) + --brute 28/28 gate-on & off + adversarial NOT-REFUTED.
+#   VERDICT: 0% measurable CPU/RSS at firefox scale (the alloc drop is real but
+#   ~0.76MB, sub-noise).  UNLIKE the chain-IC (pure wash, deleted), this removes
+#   REAL allocations that SCALE with thunk count — and thunks are M5's DOMINANT
+#   RSS (637MB, IFD-blocked/unmeasured on aarch64).  Kept GATED default-off; flip
+#   decision awaits an x86_64 M5 peak-RSS A/B (flip if the wrapper-alloc cut
+#   lowers M5 RSS materially; else retire).  Relaxing the nUp==1/nWiths==0 guard
+#   (with-scoped wrappers) would capture more — bounded follow-up.
