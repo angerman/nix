@@ -165,3 +165,22 @@ attrNames	0.57	NA	NA	NA	yes	off	3ff650587	2026-06-19
 #   decision awaits an x86_64 M5 peak-RSS A/B (flip if the wrapper-alloc cut
 #   lowers M5 RSS materially; else retire).  Relaxing the nUp==1/nWiths==0 guard
 #   (with-scoped wrappers) would capture more — bounded follow-up.
+# ============================================================================
+# M5 A/B on darwin-4 (2026-07-03, commit e3daf70c3 + depth counter; M5 IS
+# measurable here — flake ~/Projects/iohk/cardano-node, .cardano-node.name,
+# cache-off, NIX_V3_MAX_HEAP=16G; byte-id value cardano-node-exe-cardano-node-11.0.1):
+#   P3.1 chain-SELECT depth probe: chain=2,105,571 (24.7% of 8,525,736 selects)
+#     avgDepth=1.99 | flat=6,420,165.  => M5 chains are SHALLOW (1.99, even
+#     shallower than firefox/git ~2.4) and chain-SELECTs are a MINORITY (24.7%).
+#     The chain-IC would be a WASH on M5 too — the M5-deep-chain hypothesis is
+#     FALSIFIED.  P3.1 chain-IC CONFIRMED DELETED everywhere (0cb2f88b5 archived).
+#   P2.1-a OP_RAW_FORMAL (NIX_V3_RAW_FORMALS): peak RSS gate-OFF 2322MB vs gate-ON
+#     2324MB = +1.9MB (noise); byte-id value.  NO M5 RSS win.  (The wrapper
+#     counters read 0 on M5 — dumpFormalWrapperStats walks importCache, blind to
+#     M5's flake-eval CUs — so firing is unconfirmable via counters, but the clean
+#     peak-RSS signal is conclusive.)  Combined with firefox (0% CPU, negligible
+#     RSS), P2.1-a has NO measurable CPU/RSS win on any measurable workload =>
+#     do NOT flip default-on.  Kept gated as a correct, validated, zero-risk
+#     churn-reduction opt-in (removes ~24.5K never-forced-waste wrapper allocs on
+#     firefox); retire-eligible if no future default-on alloc-reduction program.
+# ============================================================================
