@@ -1257,3 +1257,47 @@ walk → failing-first repro + fix).
 missed-root UAF) and the latent import-cache exception-safety bug (P1.3), each
 with a failing-first regression permanently in the brute battery. P1.4 is a
 documented close (mechanism real, repro M5-scale/unavailable, fix deferred).
+
+---
+---
+
+# Handback — WS-2 (lowering/thunk plumbing), 2026-07-02 (in progress)
+
+## P2.1 step-0 measure — GO (commit `09bb48f51`)
+
+Per-formal WRAPPER thunks are a MATERIAL share of runtime thunk allocation
+(audit §4.1).  firefox (cache-off, deterministic per-descriptor allocCount via
+a temporary `isFormalWrapper` flag): **alloc = 313,787 = 12.79 %** of 2,453,220
+descriptor thunk allocs (8,712 / 110,978 descriptors); 166,468 forced = 53.1 %
+⇒ **~47 % of wrapper thunks are NEVER forced.**  ≥10 % threshold ⇒ GO.  This
+partially overturns A.0's tempered "maybe-close" expectation and the 06-28
+"structurally untouchable" framing for the ALLOC side.
+
+## P2.1 build — design (b) FALSIFIED; design (a) is the remaining path (DEFERRED)
+
+**Design (b) — bind no-default formals directly to `AttrSelect{param, X}` at
+lambda entry (instead of a per-call wrapper thunk) — is FALSIFIED by
+execution.**  Implemented + built; hello/git/firefox drvPath all threw
+**"infinite recursion encountered … referencing `config` in `imports`"** (the
+nixpkgs module system).  Root cause: the wrapper thunk defers both the
+attr-select AND the `forceVal(param)` to the formal's USE-time; the module
+system builds its config fix-point by evaluating formals in a specific
+use-order, so accessing a formal (selecting through `param`, forcing `param`
+as a mid-construction fix-point) at lambda ENTRY breaks the cycle.  **The
+wrapper thunk's deferral-to-use is load-bearing, not pure plumbing** — so the
+"12.79 % is removable" reading is too optimistic for design (b).  Reverted;
+hello.drvPath byte-identity confirmed restored.  Correction to §4.1: the fix
+"bind param.X directly" is unsafe if it forces/selects at entry.
+
+**Design (a) — a new `OP_BIND_FORMALS` at OP_CALL formals-validation (where
+`param` is ALREADY WHNF, safely, exactly as the wrapper path relies on) doing a
+RAW `Bindings::lookup` per supplied formal (a pointer read, NO re-force of
+`param`, NO OP_ATTRS_SELECT fix-point chase) and binding the formal local to
+the entry's (still-lazy) Value, allocating a default thunk only for the missing
+subset** — is the correct remaining candidate.  It removes the per-call wrapper
+thunk ALLOC (the 12.79 %) while preserving use-time deferral (the entry Value
+stays a lazy thunk, forced only when the formal is used).  It is W-scale +
+BI-critical (new opcode + emit + VM; drv-hash byte-identity) and requires the
+lookup to be provably force-free — DEFERRED to a dedicated effort.  The
+`isFormalWrapper` instrument + `dumpFormalWrapperStats` are retained to verify
+the eventual alloc drop.
