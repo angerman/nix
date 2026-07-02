@@ -841,6 +841,7 @@ struct LowererV3 {
             if (d->kind == nix::v3::ast::Attrs::AttrKind::Inherited) {
                 // `inherit x;` binds x to the PARENT-scope x (not the rec
                 // slot) — lower the var WITHOUT the rec scope pushed.
+                m.functions[fid].isInheritWrapper = true;  // P2.3 step-0 (TEMP)
                 setReturn(lowerVarByName(d->name));
             } else if (d->kind == nix::v3::ast::Attrs::AttrKind::InheritedFrom) {
                 // `inherit (e) x;` → e.x, sharing the hidden source thunk.
@@ -1244,7 +1245,20 @@ struct LowererV3 {
             }
         }
         ir::VarId v = lowerExpr(e->e);
-        ir::VarId def = e->def ? thunkifyForAttr(e->def) : ir::kInvalid;
+        // P2.3 step-0 measure (2026-07-02, TEMPORARY): mirror thunkifyForAttr
+        // but tag the or-default thunk descriptor.  thunkify() appends its own
+        // Function FIRST, so `before` is that thunk's fid (nested lowering
+        // appends after); a trivial default is inlined and allocates no thunk.
+        ir::VarId def = ir::kInvalid;
+        if (e->def) {
+            if (isTrivialForValue(e->def)) {
+                def = lowerExpr(e->def);
+            } else {
+                size_t before = m.functions.size();
+                def = thunkify(e->def);
+                m.functions[before].isOrDefault = true;
+            }
+        }
         return emitSelectChain(v, e->path, def, 0);
     }
 

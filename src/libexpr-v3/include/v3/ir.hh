@@ -505,6 +505,16 @@ struct Function {
     /// P2.1 step 0).  Remove with the instrument once P2.1 is decided.
     bool                isFormalWrapper = false;
 
+    /// P2.3 step-0 measure (2026-07-02, TEMPORARY instrument): tag the two
+    /// other "per-evaluation wrapper thunk TW doesn't allocate" classes from
+    /// audit §4.3, so the NIX_VM_STATS dump can size their share vs the ≥2 %
+    /// pre-commit.  isOrDefault = the `x.y or DEFAULT` default thunk minted at
+    /// lower_v3.hh (lowerSelect), allocated in the PARENT block even when the
+    /// attr is present; isInheritWrapper = the per-`inherit x;` wrapper Function
+    /// minted in the rec-attrset path.  Remove with the instrument once decided.
+    bool                isOrDefault = false;
+    bool                isInheritWrapper = false;
+
     /// Free vars referenced by the body block (and recursively by any
     /// sub-blocks / nested functions reachable from the body), in the
     /// order they appear as upvalues at runtime.  Populated by

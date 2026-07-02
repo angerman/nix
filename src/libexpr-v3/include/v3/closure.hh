@@ -476,6 +476,14 @@ struct LambdaDescriptor
     // false, which is correct for the cache-off P2.1 measure.
     bool isFormalWrapper = false;
 
+    /// P2.3 step-0 measure (2026-07-02, TEMPORARY): mirror
+    /// ir::Function::isOrDefault / isInheritWrapper for the audit §4.3 thunk
+    /// classes.  Same measure-only, cache-off discipline as isFormalWrapper.
+    // CACHE-COHERENCE-EXEMPT: diagnostic-only, not serialized (same rationale
+    // as isFormalWrapper above); deserialized descriptors default to false.
+    bool isOrDefault = false;
+    bool isInheritWrapper = false;
+
     /// #495: native intrinsic kind.  When recognised at lower-time,
     /// the lambda's body matches a canonical Nix-stdlib pattern (lib.fix,
     /// lib.extends, lib.composeExtensions, ...) and OP_CALL dispatches

@@ -9453,6 +9453,10 @@ void dumpFormalWrapperStats(std::FILE * out, const CompilationUnit * entryCu)
 {
     uint64_t wrapAlloc = 0, wrapForce = 0, totAlloc = 0, totForce = 0;
     size_t wrapDescs = 0, totDescs = 0;
+    // P2.3 step-0 measure (2026-07-02, TEMPORARY): or-default + inherit-in-rec
+    // thunk classes (audit §4.3), pre-commit ≥2 % of thunk allocs EACH.
+    uint64_t odAlloc = 0, odForce = 0, ihAlloc = 0, ihForce = 0;
+    size_t odDescs = 0, ihDescs = 0;
     auto walk = [&](const CompilationUnit & cu) {
         for (const auto & d : cu.lambdas) {
             ++totDescs;
@@ -9462,6 +9466,12 @@ void dumpFormalWrapperStats(std::FILE * out, const CompilationUnit * entryCu)
                 ++wrapDescs;
                 wrapAlloc += d.allocCount;
                 wrapForce += d.forceCount;
+            }
+            if (d.isOrDefault) {
+                ++odDescs; odAlloc += d.allocCount; odForce += d.forceCount;
+            }
+            if (d.isInheritWrapper) {
+                ++ihDescs; ihAlloc += d.allocCount; ihForce += d.forceCount;
             }
         }
     };
@@ -9476,6 +9486,18 @@ void dumpFormalWrapperStats(std::FILE * out, const CompilationUnit * entryCu)
         (unsigned long long)wrapAlloc, pctA, (unsigned long long)totAlloc,
         (unsigned long long)wrapForce, forcedFrac, wrapDescs, totDescs,
         (unsigned long long)totForce);
+    const double pctOd = totAlloc ? 100.0 * (double)odAlloc / (double)totAlloc : 0.0;
+    const double pctIh = totAlloc ? 100.0 * (double)ihAlloc / (double)totAlloc : 0.0;
+    const double odForced = odAlloc ? 100.0 * (double)odForce / (double)odAlloc : 0.0;
+    const double ihForced = ihAlloc ? 100.0 * (double)ihForce / (double)ihAlloc : 0.0;
+    std::fprintf(out,
+        "v3 P2.3 or-default thunks:     alloc=%llu (%.2f%% of thunk allocs) "
+        "forced=%.1f%% descs=%zu   [pre-commit >=2%%]\n",
+        (unsigned long long)odAlloc, pctOd, odForced, odDescs);
+    std::fprintf(out,
+        "v3 P2.3 inherit-in-rec thunks: alloc=%llu (%.2f%% of thunk allocs) "
+        "forced=%.1f%% descs=%zu   [pre-commit >=2%%]\n",
+        (unsigned long long)ihAlloc, pctIh, ihForced, ihDescs);
 }
 
 void dumpHotDescriptors(std::FILE * out, size_t limit,

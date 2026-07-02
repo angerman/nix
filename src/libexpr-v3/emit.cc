@@ -2453,6 +2453,9 @@ struct Emitter
         // wrapper tag from ir::Function into the descriptor (set post-init
         // like identityLambda below to avoid the -Wreorder-init-list order).
         unit.lambdas[fid].isFormalWrapper = f.isFormalWrapper;
+        // P2.3 step-0 measure (2026-07-02, TEMPORARY): same for the §4.3 classes.
+        unit.lambdas[fid].isOrDefault = f.isOrDefault;
+        unit.lambdas[fid].isInheritWrapper = f.isInheritWrapper;
         // STG-13b (#509/#511): for ExtendsBody / ComposeBody dispatch,
         // find the upvalue index of each captured VarId by searching
         // freeVars.  Linear search is fine -- freeVars typically has 2

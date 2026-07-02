@@ -1371,14 +1371,34 @@ lookup to be provably force-free — DEFERRED to a dedicated effort.  The
 `isFormalWrapper` instrument + `dumpFormalWrapperStats` are retained to verify
 the eventual alloc drop.
 
-## P2.3 (or-defaults + inherit-in-rec) — MEASURE-FIRST PENDING (task open)
+## P2.3 (or-defaults + inherit-in-rec) — MEASURED; SPLIT verdict
 
-Not yet measured.  The measure-first (tag or-default + inherit-wrapper thunks
-separately, pre-commit ≥2 % of thunk allocs each) is the gate; given the
-formal-wrapper measurement (12.79 %, the dominant wrapper class) and that
-or-default / inherit-in-rec are strictly rarer syntactic forms, the prior is a
-CLOSE, but it must be measured, not assumed.  Deferred alongside the WS-2
-build items.
+Measured on firefox.drvPath cache-off (deterministic per-descriptor
+allocCount/forceCount via temporary `isOrDefault`/`isInheritWrapper` flags +
+extended `dumpFormalWrapperStats`, host-independent counters):
+
+- **or-default thunks: alloc = 89,841 = 3.66 % of 2,453,220 thunk allocs, only
+  29.0 % forced (347 descriptors).  ≥2 % ⇒ GO.**  The 71 %-never-forced confirms
+  the §4.3 waste exactly: `x.y or DEFAULT` thunkifies the default in the PARENT
+  block (lowerSelect), but the attr is usually PRESENT, so ~63.8 K of those
+  thunk allocations are pure churn that is never forced.
+- **inherit-in-rec thunks: alloc = 1,313 = 0.05 % of thunk allocs (81
+  descriptors).  <2 % ⇒ CLOSE.**  Negligible, as the prior predicted.
+
+**Disposition: inherit-in-rec CLOSED; or-default GO-on-threshold but LOW
+REALIZED VALUE ⇒ scoped, not built this session.**  The fix (relower the
+default inside a SINGLE shared else-block of `emitSelectChain` instead of
+pre-thunkifying in the parent — audit P2.3 packet) eliminates the ~63.8 K
+wasted allocs, but that is only ~2.6 % of thunk allocs → by the alloc-share→CPU
+math (ALLOC ≈20 % of CPU) and this session's CPU-NEUTRAL WS-3 batch result,
+the realized win is ~0.5 % CPU (below the darwin-4 noise floor) and ~1.5 MB RSS
+(63.8 K × 24 B) — negligible.  It is a clean, downside-free churn reduction
+(the wasted thunks are never forced, so laziness is trivially preserved) worth
+doing WITH the WS-2 build pass, but it ranks below P3.1 (chain IC) and
+P2.1-design-a (12.79 %).  The `isOrDefault`/`isInheritWrapper` instrument is
+retained (like `isFormalWrapper`) to verify the eventual alloc drop.  Another
+instance of the FP-2 "allocated ≠ realized" pattern: a construct clears the
+alloc-share proxy threshold yet the realized CPU/RSS win is sub-noise.
 
 ---
 ---
