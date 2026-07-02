@@ -1496,12 +1496,27 @@ removal + BI-neutral cleanup + one falsification with a durable guardrail.
   UAF, GC forwarding, wrong-result, C-1 writeback safety, flat/chain cross-hit);
   full --brute 28/28 with `NIX_V3_CHAIN_IC=1` (moving-GC missed-root stress +
   drv-parity byte-identity) AND 28/28 default (gate-off); ON-vs-OFF byte-identical
-  on 5 chain-SELECT-heavy exprs incl. a 20-layer `foldl //` chain.**  RETIREMENT:
-  a darwin-4 SELECT-heavy A/B (git/firefox, gate-on vs off) decides the flip —
-  flip default-on if a CPU win holds + a full nixpkgs byte-identity soak passes,
-  else delete.  (§3.3 MapAttrs parent memo — the recompute-on-parent-hit fix —
-  is a separate remaining sub-lever, must write only leaf-owned storage; not in
-  this IC.)
+  on 5 chain-SELECT-heavy exprs incl. a 20-layer `foldl //` chain.**  **darwin-4 A/B RESULT (2026-07-02, commit 0cb2f88b5, git-noted): NO measurable
+  CPU win on the measurable workloads.**  firefox.drvPath cold gate-OFF 2.66s ==
+  gate-ON 2.66s (0%); git.drvPath cold gate-OFF 1.41s == gate-ON 1.41s (0%).
+  Likely cause: real-nixpkgs `//` chains are SHALLOW — a SELECT short-circuits at
+  the first layer containing the attr, so the "walks all ≤16 layers" premise of
+  §3.2 is overstated for firefox/git, and the IC's 4-way scan + name-validation
+  costs about the same as the shallow walk it replaces.  The audit's NAMED
+  deep-chain target — M5 (cardano overlay stacks) — is IFD-blocked on aarch64 and
+  UNMEASURED, and I have no per-site chain-SELECT hit-rate counter to say whether
+  firefox/git are 0% because chains are cheap (falsified) or because chain-SELECTs
+  are rare on them (M5-pending).  **DISPOSITION: kept GATED default-off (validated
+  + zero production risk); NOT flipped (no measurable win).  SHARP RETIREMENT: an
+  x86_64 host that can build M5 must (a) add the per-site chain-SELECT + IC-hit
+  counter and (b) A/B gate-on vs off on M5 — flip default-on ONLY if a ≥3% M5
+  SELECT-CPU win holds + a full nixpkgs byte-identity soak passes; DELETE the
+  lever if M5 is also ~0% or firing is negligible.**  This is another
+  measure-first "the headline lever doesn't materialize on measurable workloads"
+  result (cf. P3.3, P4.4-CPU) — the deliverable is the validated design + the
+  shallow-chain finding.  (§3.3 MapAttrs parent memo — the recompute-on-parent-hit
+  fix — is a separate remaining sub-lever, must write only leaf-owned storage;
+  not in this IC.)
 - **P3.6 §3.8 (magic-static env-gate sweep + code-ptr dispatch local) —
   ASSESSED, DEFERRED (low EV).**  (a) The ~40 function-local `static const bool
   s_*` env gates in the dispatch region each cost a magic-static guard load per

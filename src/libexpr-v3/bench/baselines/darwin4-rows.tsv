@@ -128,3 +128,15 @@ attrNames	0.57	NA	NA	NA	yes	off	3ff650587	2026-06-19
 # foldl: pending (ssh-quoting of the foldl' apostrophe; synthetic row, low priority)
 # M5/cardano/HNE: IFD-blocked on aarch64 (cardano-node needs x86_64-linux IFD);
 #   big-workload CPU+peak-RSS remain UNMEASURED until an x86_64-linux host builds.
+# ============================================================================
+# P3.1 chain-aware read IC A/B (2026-07-02, commit 0cb2f88b5, NIX_V3_CHAIN_IC):
+#   firefox.drvPath cold: gate-OFF 2.66s == gate-ON 2.66s  => 0% (no win)
+#   git.drvPath     cold: gate-OFF 1.41s == gate-ON 1.41s  => 0% (no win)
+#   VERDICT: NO measurable CPU win on the measurable SELECT workloads — real
+#   nixpkgs // chains are shallow (SELECT short-circuits at the first matching
+#   layer), so §3.2's "walks all ≤16 layers" is overstated for firefox/git and
+#   the IC lookup+validation ~= the shallow walk it replaces.  M5 (the audit's
+#   named deep-chain target) is IFD-blocked on aarch64 => unmeasured.  Kept
+#   GATED default-off (validated, zero prod risk); flip decision awaits an
+#   x86_64 M5 A/B + a per-site chain-SELECT hit-rate counter (DELETE if M5 also
+#   ~0%).  Another measure-first "headline lever doesn't materialize" result.
