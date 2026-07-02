@@ -49,6 +49,38 @@ git	0.71	0.34	2.09	117.4	yes	warm	7e6cc3534	2026-06-22
 firefox	1.78	0.73	2.44	352.3	yes	warm	7e6cc3534	2026-06-22
 HNE	2.66	1.54	1.73	453.0	yes	warm	7e6cc3534	2026-06-22
 M5	6.45	3.60	1.79	1543.5	yes	warm	7e6cc3534	2026-06-22
+# ============================================================================
+# P0.4 RE-BASELINE (2026-07-02, commit 2d7efdb97) — AUTHORITATIVE post-WS-0
+# de-instrumentation baseline (v3_release=false, the shipped config).  These
+# SUPERSEDE the 7e6cc3534 firefox/M5 rows above.  Measured by beat-tw-compare.sh
+# (median-of-5, back-to-back TW-vs-v3).  NB: the 5th column here is peak_RSS MB
+# (NOT arena — beat-tw-compare skips NIX_VM_STATS to avoid its teardown-GC RSS
+# perturbation).  P0.1a (primop-counter gating) shaved a small slice off the
+# DEFAULT build: firefox warm 2.49->2.43x, cold 3.68->3.62x; M5 cold v3
+# 11.10->10.96s.  The larger P0.1b/c de-instrumentation win needs
+# -Dv3_release=true (see the P0.2 A/B rows below).
+# row	v3_cpu	tw_cpu	ratio	peakRSS_MB	impure	cache	commit	date
+firefox	2.68	0.74	3.62	677	yes	off	2d7efdb97	2026-07-02
+M5	10.96	3.60	3.04	2950	yes	off	2d7efdb97	2026-07-02
+firefox	1.80	0.74	2.43	586	yes	warm	2d7efdb97	2026-07-02
+M5	6.54	3.61	1.81	2217	yes	warm	2d7efdb97	2026-07-02
+# P0.3 FALSIFIER (2026-07-02, 2d7efdb97): firefox user-CPU median-of-5,
+#   caps UNSET=2.68s  vs  caps SET(NIX_V3_MAX_WALL/HEAP/CPU)=2.69s  => +0.4%
+#   (noise).  EXIT CRITERION MET: probe-config CPU == default-config CPU.  The
+#   CLAUDE.md-mandated NIX_V3_MAX_* probe vars no longer inflate timing.
+# P0.2 A2 FALSIFIER (2026-07-02, 2d7efdb97): -Dv3_release=true A/B vs the
+#   v3_release=false rows above.  Pre-committed bar: ship if >=2% wall OR
+#   >=20MB RSS reduction.  RESULT = NO-GO (within noise, marginally WORSE):
+#     firefox cold  release 2.69s/679MB  vs false 2.68s/677MB  (+0.4% / +2MB)
+#     M5      cold  release 11.07s/3005MB vs false 10.96s/2950MB (+1.0% / +55MB)
+#     firefox warm  release 1.81s/586MB  vs false 1.80s/586MB  (~0)
+#     M5      warm  release 6.53s/2218MB vs false 6.54s/2217MB (~0)
+#   => KEEP v3_release=false.  The audit §1.2 "instrumentation tax" hypothesis
+#   is FALSIFIED for the V3_STATS counters: the only MATERIAL instrumentation
+#   was the primop counter (mutex+string+map), already gated by P0.1a in the
+#   default build; the residual per-alloc/histogram/fastpath counters are
+#   noise-level, so stripping them (v3_release=true) buys nothing.
+# ============================================================================
 # synthetic v3-only rows below NOT re-measured at 20758fad5 — last at 3ff650587:
 fib	2.29	NA	NA	NA	no	off	3ff650587	2026-06-19
 attrNames	0.57	NA	NA	NA	yes	off	3ff650587	2026-06-19

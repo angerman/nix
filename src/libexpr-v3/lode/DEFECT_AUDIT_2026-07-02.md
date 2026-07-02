@@ -1117,3 +1117,66 @@ result vs its pre-committed threshold (including closes — a kill is a
 deliverable); corrections to any audit claim found wrong; new darwin-4 rows
 (also in darwin4-rows.tsv + git notes). Update the project memory index the
 same way the campaigns did.
+
+---
+---
+
+# Handback — WS-0 (de-instrumentation + re-baseline), 2026-07-02
+
+**Commits landed** (branch `angerman/2.35-eval-profiling-v2`):
+- `d6729f753` P0.1a — gate `bumpPrimOpCallCount` behind a cached `NIX_VM_STATS` bool.
+- `016bef7f0` P0.1b — gate mergeBindings #821 counters (V3_STATS_BLOCK); hoist the 4 chain knobs to file scope (#768).
+- `2b565401d` P0.1c — gate selector/intrinsic/keepPap fast-path counters (V3_STATS_INC/BLOCK).
+- `2d7efdb97` P0.3 — decouple resource-limit polling from `kAnySlowGate` (plain-local countdown; poll at loop top).
+
+Each landed under full `--brute` 22/22 + an independent adversarial review
+(all NOT-REFUTED). P0.4/P0.2/P0.3 numbers git-noted to `2d7efdb97`; rows in
+`bench/baselines/darwin4-rows.tsv`.
+
+**Falsifier results vs pre-committed thresholds:**
+- **P0.2 (A2, `-Dv3_release=true`, ship if ≥2 % wall OR ≥20 MB RSS): NO-GO.**
+  darwin-4 A/B (2d7efdb97): firefox cold release 2.69 s/679 MB vs false
+  2.68 s/677 MB (+0.4 % / +2 MB, *worse*); M5 cold 11.07 s/3005 MB vs
+  10.96 s/2950 MB (+1.0 % / +55 MB, *worse*); warm ~0 both. Within noise,
+  marginally worse. **Keep `v3_release=false`.**
+- **P0.3 (probe-config CPU == default-config CPU): PASS.** firefox user-CPU
+  median-of-5, caps UNSET 2.68 s vs caps SET 2.69 s = +0.4 % (noise). The
+  CLAUDE.md-mandated `NIX_V3_MAX_*` probe vars are now cost-free (§1.4 was
+  real, now fixed).
+- **P0.4 re-baseline (authoritative, supersedes every ×-factor in this doc):**
+  COLD firefox 3.62×CPU/1.89×RSS (2.68 s/677 MB), M5 3.04×/3.00×
+  (10.96 s/2950 MB); WARM firefox 2.43×/1.64× (1.80 s/586 MB), M5 1.81×/2.26×
+  (6.54 s/2217 MB). vs the audit's instrumented numbers: firefox warm
+  2.49→2.43×, cold 3.68→3.62×; M5 cold v3 11.10→10.96 s — a small, real
+  default-build CPU win from P0.1a.
+
+**Corrections to audit claims:**
+1. **§1.2 overstated.** The "benchmarks measure an instrumented build ⇒
+   unknown CPU tax" concern is now bounded: the ONLY *material* instrumentation
+   was §1.1's per-primop `mutex + std::string + unordered_map` counter (fixed
+   by P0.1a — it ran in *every* build regardless of `v3_release`). The ~97
+   `V3_STATS` byte/histogram/fastpath counters (§1.2/§1.3) are noise-level:
+   stripping them via `v3_release=true` bought <2 % wall and <20 MB RSS (P0.2
+   NO-GO). So the published gap was NOT meaningfully inflated by the V3_STATS
+   counters; it *was* slightly inflated by the primop counter, now removed.
+2. **P0.1a design pivot (§1.1's "better inline counter" is WRONG).** The
+   audit's preferred "per-`PrimOp` inline `uint64_t callCount` field" was
+   implemented, then FALSIFIED by execution: some PrimOps are `static const`
+   (read-only memory — the `plusOnePo`/`returnSecondPo` fixtures in
+   `test/smoke.cc`), so a mutable inline counter faults (EXC_BAD_ACCESS/SIGBUS
+   — v3-smoke exit 138) the moment the VM dispatches them. Shipped the audit's
+   *first* option instead (name-keyed side map gated on cached `NIX_VM_STATS`);
+   it only ever READS `po->name`, safe on read-only PrimOps. This is a latent
+   landmine for any future production `static const PrimOp`, now documented at
+   the counter.
+3. **P0.1c scope note.** A.4 packet 3 named the vm.cc counters; the nursery
+   `tryAlloc` counters (§1.3's 5th bullet, nursery.hh:84-97) were deliberately
+   NOT gated — `nursery.hh` cannot reach the `V3_STATS` macros without breaking
+   the `alloc.hh`↔`nursery.hh` include cycle, and they are plain cache-resident
+   increments (negligible). Revisit only if a future profile shows residual.
+
+**Net:** WS-0 removed the one material instrumentation cost (primop counter),
+made probe-config timing cost-free (P0.3), proved the V3_STATS-counter tax is
+noise (P0.2 NO-GO ⇒ no packaging change), and re-baselined. Every subsequent
+item is now judged against the P0.4 rows above, not the numbers quoted earlier
+in this document.
