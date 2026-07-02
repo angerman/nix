@@ -1291,6 +1291,37 @@ walker). A real (if rare) latent bug; captured as a separate investigation
 task (identify the object class/field at the hit address → the missing gc.cc
 walk → failing-first repro + fix).
 
+**INVESTIGATION RESOLVED (2026-07-02, task #14): known latent, RCA'd,
+default-path barrier-complete, currently UNREPRODUCIBLE — no default-path fix
+warranted.**  A dedicated investigation (56+ stressed evals: 30× firefox-name @
+1 MB nursery + AUDIT/BRUTE, `V3_DBG_GC_STRESS` variants on hello/git, and a full
+`run-brute-audit.sh` @ STRESS=50 = 17/17) could NOT reproduce a single LIVE
+missed-root on this branch — the earlier once-off (6-case) brute hit this
+session did not recur (plausibly closed by the WS-1 primSort barrier
+`c9948463f`, or simply the rare window not opening).  The bug is already RCA'd
+in `SAFEPOINT_FOUNDATION_S2.1_RCA_2026-06-25.md` (fix `6d6805a4a`): the holder is
+an ORIGINAL (non-relocated) tenured `Bindings` at `entries[k].value` holding a
+nursery `Closure`; the mechanism is the scavenger's `fwd*()` Step-7
+"trust-the-dirty-list" optimization (`gc.cc:132` `phaseDStep7Active`, default-on)
+early-returning root-reached tenured cells WITHOUT a transitive walk, so a
+tenured→nursery edge is caught only if the write went through a `barrier.hh`
+helper into `dirtyContainers`.  A raw/bulk write bypassing the barrier is then
+in neither the walk nor the remembered set → missed root.  It is
+LATENT-BENIGN on the default path (scavenge fires only at `exitDepth==0`, so the
+post-write/pre-overwrite window is almost never open) and surfaced
+deterministically only under EVAC's raw-memcpy relocation — which is ALREADY
+FIXED (`6d6805a4a` makes Step-7 full-walk under `NIX_V3_EVAC`).  A static audit
+of every raw/bulk `Bindings`/`ValuePair`/`ListVec`/`Env` writer on the default
+path found COMPLETE post-construct-barrier coverage (OP_ATTRS_INIT/_DYN, OP_UPDATE
+merge, listToAttrs/mapAttrs/intersectAttrs, all `cellWrite`/`bindingsSetValue`
+sites).  **Disposition: no reproducible default-path bug to fix; do NOT chase a
+specific site.**  Recommended future HARDENING (not a correctness fix, so not
+built here — unreproducible ⇒ no failing-first test possible): the RCA's
+belt-and-suspenders instrument (extend `cellWriteSiteMap` to record EVERY
+`Bindings.entries[].value` store incl. raw ones) so any future recurrence
+self-names its writer for a one-line barrier add — worth landing WITH the S2.1
+safepoint / EVAC work that needs Step-7 disabled anyway.
+
 **Net:** WS-1 fixed both live correctness divergences (P1.1 semantic, P1.2
 missed-root UAF) and the latent import-cache exception-safety bug (P1.3), each
 with a failing-first regression permanently in the brute battery. P1.4 is a
