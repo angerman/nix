@@ -669,6 +669,13 @@ void Scavenger::walkClosure(Closure * c)
             visitValue(c->upvalues[i]);
         }
     }
+    // NIX_V3_ENV_CAPTURE (W2b): also gray the captured frame Env (a SEPARATE
+    // field from upvalEnv — env-capture closures keep upvalEnv=null so the FAM
+    // branch above walks their residual flat upvalues; capturedDefEnv holds the
+    // shared frame Env, walked as a tenured Env + parent chain like upvalEnv).
+    // null until W2b emission ⇒ inert.
+    if (c->capturedDefEnv && walked.insert(c->capturedDefEnv).second)
+        graylist.push_back({c->capturedDefEnv, GK_ENV});
     // #738 Phase E v0.2 post-walk barrier — see walkList.
     if (n.isPhaseEActive()) closurePostConstructBarrier(c);
 }
@@ -1279,6 +1286,10 @@ struct Auditor {
         else
             for (uint16_t i = 0; i < c->nUpvalues; ++i)
                 visitValue(c->upvalues[i], "Closure.upvalues[]");
+        // NIX_V3_ENV_CAPTURE (W2b): audit the captured frame Env (separate field;
+        // env-capture closures keep upvalEnv=null → FAM audited above).
+        if (c->capturedDefEnv)
+            visitEnv(c->capturedDefEnv, "Closure.capturedDefEnv");
     }
 
     void visitEnv(const Env * e, const char * site)

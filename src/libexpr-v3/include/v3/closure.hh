@@ -77,6 +77,19 @@ struct Closure
     /// `upvalEnv->values[n]` when set, else `upvalues[n]`. The inline-FAM path
     /// remains available via NIX_V3_NO_ENV_SHARING / NIX_V3_ENV_SHARING=0.
     Env *                    upvalEnv;
+    /// NIX_V3_ENV_CAPTURE (Track E v1 W2b): when this closure's function
+    /// `usesDefEnv`, the shared frame Env it captured at MAKE time (= the maker
+    /// frame's defEnv).  Installed as the callee frame's `defEnv` register at
+    /// entry; the body reads escaping locals + ancestor captures via
+    /// OP_GET_ENV(depth,idx).  Kept SEPARATE from upvalEnv (not a repurpose) so
+    /// closureUpvalue()/GET_UPVALUE keep reading the residual-flat FAM unchanged
+    /// and the NIX_V3_ENV_SHARE_AFTER override is unaffected (W2b design
+    /// decision, plan handback).  null unless env-capture is emitted for the
+    /// function ⇒ inert until W2b emission.  GC: walked as a tenured Env
+    /// alongside upvalEnv in walkClosure/mark/evac/auditor.  Explicitly
+    /// initialized (null) at every closure-alloc site (raw arena alloc runs no
+    /// ctor), mirroring upvalEnv.
+    Env *                    capturedDefEnv;
     uint16_t                 nUpvalues;
     uint16_t                 _pad;
     Value                    upvalues[]; // FAM (unused when upvalEnv != null)

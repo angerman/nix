@@ -2877,6 +2877,7 @@ struct Alloc
         c->capturedWiths = nullptr;
         c->cu = nullptr;
         c->upvalEnv = nullptr;   // env-sharing: inline-FAM path until a gate builds an Env
+        c->capturedDefEnv = nullptr;  // NIX_V3_ENV_CAPTURE (W2b): set by MAKE if usesDefEnv
         closureAllocSiteRecord(c, file, line, nUpvalues);
         return c;
     }
@@ -2919,6 +2920,7 @@ struct Alloc
         c->capturedWiths = nullptr;
         c->cu = nullptr;
         c->upvalEnv = nullptr;   // env-sharing: inline-FAM path until a gate builds an Env
+        c->capturedDefEnv = nullptr;  // NIX_V3_ENV_CAPTURE (W2b): set by MAKE if usesDefEnv
         closureAllocSiteRecord(c, file, line, nUpvalues);
         return c;
     }
@@ -3370,6 +3372,7 @@ inline Closure * Alloc::allocFakeClo(uint16_t nUpvalues) noexcept
             // stale Env into a non-env-shared reuse (closureUpvalue reads it →
             // wrong value/UAF).  Callers that share set it again after.
             c->upvalEnv = nullptr;
+            c->capturedDefEnv = nullptr;  // NIX_V3_ENV_CAPTURE (W2b): reset on recycle too
             return c;
         }
     }
@@ -3384,6 +3387,7 @@ inline Closure * Alloc::allocFakeClo(uint16_t nUpvalues) noexcept
     c->capturedWiths = nullptr;
     c->cu = nullptr;
     c->upvalEnv = nullptr;   // env-sharing: inline-FAM path (fakeClos never share an Env)
+    c->capturedDefEnv = nullptr;  // NIX_V3_ENV_CAPTURE (W2b)
     return c;
 }
 

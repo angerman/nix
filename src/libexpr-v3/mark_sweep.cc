@@ -691,6 +691,22 @@ private:
             for (uint16_t i = 0; i < c->nUpvalues; ++i)
                 visitValue(c->upvalues[i]);
         }
+        // NIX_V3_ENV_CAPTURE (W2b): the captured frame Env is a SEPARATE field
+        // (env-capture closures keep upvalEnv=null → their residual FAM was
+        // walked above).  Mark it + its parent chain exactly as upvalEnv above;
+        // the SAME W2 PRECONDITION on the early-break applies (task #8 — close
+        // before emit populates parent chains).  null until W2b emission ⇒ inert.
+        for (Env * e = c->capturedDefEnv; e; e = e->parent) {
+            const bool fresh = marker_.tryMark(e)
+                || (nursery_ && nursery_->contains(e)
+                    && nurseryVisited_.insert(e).second);
+            if (!fresh) break;
+            if (arenaSetForSlot_)
+                arenaSetForSlot_->markLinesForCell(
+                    e, sizeof(Env) + sizeof(Value) * e->nValues);
+            for (uint16_t i = 0; i < e->nValues; ++i)
+                visitValue(e->values[i]);
+        }
     }
     void walkThunk(Thunk * t) noexcept
     {
@@ -1581,6 +1597,12 @@ private:
             } else {
                 for (uint16_t i = 0; i < c->nUpvalues; ++i) visitValue(c->upvalues[i]);
             }
+            // NIX_V3_ENV_CAPTURE (W2b): rewrite the captured frame Env's value
+            // pointers (separate field; env-capture closures keep upvalEnv=null →
+            // residual FAM rewritten above).  Same walked_ dedup + W2 PRECONDITION
+            // on the early-stop as upvalEnv (task #8).  null until emit ⇒ inert.
+            for (Env * e = c->capturedDefEnv; e && walked_.insert(e).second; e = e->parent)
+                for (uint16_t i = 0; i < e->nValues; ++i) visitValue(e->values[i]);
             break;
         }
         case CellType::Thunk: {
@@ -2092,6 +2114,12 @@ static void runEvacuation(VMState & vm, Arena & arena,
                         } else
                         for (uint16_t i = 0; i < c->nUpvalues; ++i)
                             if (refCand(c->upvalues[i])) { note("Closure.upvalue", cs); break; }
+                        // NIX_V3_ENV_CAPTURE (W2b): captured frame Env (separate field).
+                        if (c->capturedDefEnv) {
+                            if (inFreeable(reinterpret_cast<uintptr_t>(c->capturedDefEnv))) note("Closure.capturedDefEnv", cs);
+                            for (uint16_t i = 0; i < c->capturedDefEnv->nValues; ++i)
+                                if (refCand(c->capturedDefEnv->values[i])) { note("Closure.capturedDefEnv.value", cs); break; }
+                        }
                         break; }
                     case CellType::Thunk: {
                         auto * t = reinterpret_cast<const Thunk *>(cs);
