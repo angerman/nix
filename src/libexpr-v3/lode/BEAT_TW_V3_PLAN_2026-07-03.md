@@ -805,6 +805,35 @@ shows 4 suites — CORRECTED HERE):
       aborts with `OP_GET_UPVALUE_REC_BINDING_SLOT: upvalue index out of range`.
   (c) **583-tag-app-cache** (mapAttrs-style App/App3 capture).
   (d) **apply-overrides-1.7** (__overrides rec-attrset override chain).
+
+#### W2b-runtime — post-hybrid-thunk root-cause (2026-07-04, HEAD 52aab9fa1)
+The hybrid-thunk fix (52aab9fa1) resolved the rec-binding-SLOT index error:
+`(import <nixpkgs/lib>).version` now evaluates gate-ON == gate-OFF, and real
+minfeatures.missing==[]. But full `import <nixpkgs> {}` + the 4 gate-on brute
+fails PERSIST, and were root-caused to ONE precise bug by empirical bisection:
+**env-capture breaks for a closure invoked via `callClosure` re-entry from a
+NATIVE higher-order primop** (groupBy/foldl'/filter/… — the DEFECT_REVIEW §2.1
+capture cluster).  MINIMAL REPRO: `builtins.groupBy (x: "k") [1 2]` gate-ON →
+`OP_ATTRS_INIT_DYN: dynamic name must be a string`.  Localized (V3_DBG diag):
+the failing frame is groupBy's Nix-prelude `acc` foldl'-accumulator (codeOff=17,
+usesDefEnv=1, defEnv installed); it reads the outer keyFn via `OP_GET_ENV(depth=1,
+0)` and gets a WRONG value (tag=2, not a closure), so keyFn(x) returns garbage →
+the dynamic group-key name is non-string.  Confirmed NOT GC (big nursery +
+NO_MIDEVAL_GC still fail; gate-off under 1MB nursery = "ok") and NOT the emit of
+the innocent function (byte-identical gate-on/off) — it is a DEFENV-STATE bug on
+the native-primop→callClosure→bytecode re-entry: acc's `capturedDefEnv` /
+installed `frame.defEnv` does not point at the groupBy-scope env holding keyFn
+when acc is entered via callClosure from native foldl'.  Hand-written foldl'-shape
+repros PASS (shallow); only the real primop-callback re-entry with depth≥1
+env-reads fails.  ALL 4 gate-on brute fails use higher-order primops with
+capturing callbacks ⇒ same root.  **NEXT (task #12): fix the callClosure /
+runOnExistingVm frame-entry to install the callee's capturedDefEnv (the 3 fakeClo
+sites I left null-safe — vm.cc runFunctionWithUpvalues/runOnExistingVm ~13440/
+13618/13744 — likely DO need capturedDefEnv threaded now; a callback closure made
+by bytecode has capturedDefEnv set, but if the primop→callClosure path enters via
+a fakeClo synthesized from raw upvalues, the defEnv is lost).**  This is the
+CRUX: the env-capture PERF WIN is exactly on the higher-order-primop-callback path
+(where v3 spends time), so it MUST work there for Gate C.  Gate C blocked on this.
 Both point at the SAME root: a function that READS a rec-binding via
 RecBindingSlotRef (OP_GET_UPVALUE_REC_BINDING[_SLOT], which uses the recVar's flat
 upvalue index) while ALSO env-routing OTHER freeVars — the env-routed vars are
