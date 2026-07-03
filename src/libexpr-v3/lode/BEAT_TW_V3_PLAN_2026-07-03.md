@@ -870,3 +870,55 @@ adversarial-reviewed (all NOT REFUTED). Delivered: Gate A = GO (plan's first
 decision gate, reliable data) + Phase-0 prereqs + W0 (opcode foundation) + W1
 (escape analysis, validated vs C3). W2→W6 is the multi-week remainder; W2
 (emission, above) is the risky core — close the precondition first.
+
+#### W2b-runtime EMIT DESIGN — KEY SIMPLIFICATION (2026-07-04): NO HYBRID RESIDUAL
+Worked out the full emit and found the plan's "hybrid residual flat FAM" hedge is
+UNNECESSARY and higher-risk than a clean single path. Proof: **every free var of a
+function F is BY DEFINITION an escaping local of its owner** — v ∈ F.freeVars means
+F (a nested function) uses v and v is bound in an ancestor A ⇒ v escaped A into F ⇒
+v ∈ E(A). So the eligible-escape set = ALL freeVars; there is nothing left to route
+flat. ⇒ For an env-capture function the flat FAM upvalue path (OP_GET_UPVALUE) is
+simply UNUSED: the closure/thunk captures ONE `capturedDefEnv` pointer with
+`nUpvalues=0` (the model's win, directly). with-targets (lexicalWiths) and
+const-remat vars are NOT freeVars, so their existing paths are untouched — no
+special exclusion needed. This kills the two-path hybrid + its index-shifting
+bookkeeping. Analysis passes (module-level, once, before the emitFunction loop):
+1. **ownLocals(F)** = paramVar + extraParams + every Binding.var in F's block-tree
+   (entryBlock + If/With/Assert/And/Or sub-blocks, NOT descending into nested
+   Lambda/MkThunk funcIdx bodies). Also build **varOwner[v] = F**.
+2. **lexParent(F)** = the Function whose block-tree contains the Lambda/MkThunk node
+   with funcIdx==F (scan all nodes).
+3. **E(A)** (escape set): for every Function G, for every v ∈ G.freeVars, add v to
+   E(varOwner[v]). (Propagation guarantees intermediates carry v too.)
+4. **createsEnv(F)=|E(F)|>0; envSlotCount(F)=|E(F)|; envSlotOf[F][v]=idx** (0-based,
+   stable order).
+5. **usesDefEnv(F) = createsEnv(F) OR (∃ v∈F.freeVars : v∈E(varOwner[v]))** — the
+   2nd clause (always true when freeVars non-empty, since all freeVars are env-
+   routed) also covers FORWARDING: propagation puts an ancestor's escaping var in
+   every intermediate F's freeVars, so intermediates get usesDefEnv=true and pass
+   the incoming defEnv through (they create no env ⇒ defEnv passes through unchanged).
+6. **depth(F,v)** for a ref to v owned by A (emit-time): `d=0; walk=F; while walk!=A:
+   if createsEnv(walk) d++; walk=lexParent(walk); return d`. (Own escaping local:
+   A==F ⇒ depth 0. Non-env-creating intermediates don't increment ⇒ pass-through.)
+EMIT:
+- **emitVarRef(v)** under g_envCapture: constRemat→LIT (unchanged); else if v is a
+  NON-escaping own local (v∈ctx->slot, i.e. varOwner[v]==F ∧ v∉E(F)) → OP_GET_LOCAL
+  (unchanged); else (env-routed) → OP_GET_ENV(depth(F,varOwner[v]),
+  envSlotOf[varOwner[v]][v]).  Do NOT populate ctx->upvalue when env-capture.
+- **binding store** for an escaping local (v∈E(F)) → OP_SET_ENV(envSlotOf[F][v])
+  instead of OP_SET_LOCAL; and such a binding must NOT be #542-deferred (it needs a
+  real store into the env). Non-escaping bindings unchanged.
+- **prologue**: if createsEnv(F): emit OP_MAKE_ENV(envSlotCount) at entry, then for
+  each ESCAPING param/extraParam copy stack→env (OP_GET_LOCAL(paramSlot);
+  OP_SET_ENV(envIdx)). (Eager-at-entry, not lazy, for a correct first version — let-
+  bindings in the entry block always execute; lazy is a later CPU refinement.)
+- **MAKE_CLOSURE/MAKE_THUNK push list**: env-capture ⇒ push NO freeVars (nUp=0),
+  only lexicalWiths; runtime sets capturedDefEnv=cur.defEnv (handler, W2b-runtime b).
+- **letrec knot**: the env-pointer model handles it NATURALLY (OP_MAKE_ENV allocs
+  uninit rec slots; the closure captures the env POINTER; OP_SET_ENV fills the rec
+  slot with the closure; later invocations see it) — but it REPLACES the current
+  slot-based rec lowering (OP_GET_UPVALUE_REC_BINDING_SLOT etc.), a known bug-nest —
+  validate letrec cases explicitly in the brute broadening.
+Runtime handlers (W2b-runtime a) DONE; MAKE/frame-entry (b) + thunk tail-slot +
+this emit (c) land + byte-id-validate TOGETHER (gate-on==gate-off on the minimal
+slice, then hello→git→firefox→python3 + full brute).

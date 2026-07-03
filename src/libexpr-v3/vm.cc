@@ -13066,18 +13066,57 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             break;
         }
 
-        case OP_MAKE_ENV:
-        case OP_SET_ENV:
+        case OP_MAKE_ENV: {
+            // NIX_V3_ENV_CAPTURE (Track E v1 W2b): allocate this frame's shared
+            // "definition environment" holding its ESCAPING locals.  parent = the
+            // Env captured at entry (defEnv, installed by the call/force path from
+            // the closure's capturedDefEnv).  allocEnv leaves values[] RAW, so
+            // stamp every slot Uninitialized before publishing — a GC that fires
+            // mid-fill must not read a zero word as Float 0.0 (value.hh maps
+            // all-zero → Float).  Publish into the frame register, then run the
+            // Phase-D post-construct barrier (the Env is tenured; its slots will
+            // hold possibly-nursery payloads written by OP_SET_ENV).  operand =
+            // envSlotCount.  Unreachable until the emitter emits it (gate + emit).
+            CallFrame & cur = vm.frames.back();
+            const uint16_t n = static_cast<uint16_t>(operand);
+            Env * e = Alloc::allocEnv(n);
+            e->parent = cur.defEnv;
+            for (uint16_t i = 0; i < n; ++i) e->values[i].mkUninitialized();
+            cur.defEnv = e;
+            envPostConstructBarrier(e);
+            break;
+        }
+        case OP_SET_ENV: {
+            // Store stack-top into the frame Env's slot `idx` (operand).  cellWrite
+            // = the PhD-6 intergenerational barrier: the Env is tenured and the
+            // popped payload may be nursery-resident, so the write must be tracked
+            // (standalone-cell registry; cellContainer=nullptr — an Env is not a
+            // Bindings).  A null defEnv here is an emit bug (SET before MAKE), never
+            // valid input — trap rather than segfault during bring-up.
+            CallFrame & cur = vm.frames.back();
+            if (__builtin_expect(!cur.defEnv, 0))
+                throw std::runtime_error("v3 OP_SET_ENV: no frame defEnv (emit bug)");
+            const uint16_t idx = static_cast<uint16_t>(operand);
+            cellWrite(&cur.defEnv->values[idx], pop(vm), nullptr);
+            break;
+        }
         case OP_GET_ENV: {
-            // NIX_V3_ENV_CAPTURE (Track E v1) — W0 STUBS.  The opcodes are
-            // defined, fingerprinted, serialized (OP_GET_ENV's 1-word depth
-            // trailer is declared in all four serialize walkers + disasm), and
-            // disassembled, but NO emitter emits them yet — emission + the real
-            // handlers land at W2.  Trap loudly if the opcode stream ever reaches
-            // here: a reached stub means an emitter/gate bug, never valid input.
-            throw std::runtime_error(
-                "v3 env-capture opcode reached the dispatch loop before W2 "
-                "emission exists (OP_MAKE_ENV/OP_SET_ENV/OP_GET_ENV are W0 stubs)");
+            // Walk `depth` parents from the frame's defEnv and push slot `idx`.
+            // operand = idx; the following code word = depth (depth==0 = this
+            // frame's own env, the common case).  A null defEnv / short parent
+            // chain is an emit/depth bug, never valid input.
+            const uint16_t idx = static_cast<uint16_t>(operand);
+            const uint32_t depth = static_cast<uint32_t>(cu->code[ip++]);  // 1-word trailer
+            Env * e = vm.frames.back().defEnv;
+            for (uint32_t d = 0; d < depth; ++d) {
+                if (__builtin_expect(!e, 0))
+                    throw std::runtime_error("v3 OP_GET_ENV: parent chain too short (emit bug)");
+                e = e->parent;
+            }
+            if (__builtin_expect(!e, 0))
+                throw std::runtime_error("v3 OP_GET_ENV: null defEnv (emit bug)");
+            push(vm, e->values[idx]);
+            break;
         }
         case OP_HALT: {
             // Defensive: chase Tag::Thunk/App/Slot before exiting so the
