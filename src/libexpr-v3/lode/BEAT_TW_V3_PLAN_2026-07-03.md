@@ -680,11 +680,29 @@ stale-binary gotcha; ALWAYS rebuild v3-smoke on an AllocStats change).
 tree, validate byte-id + brute, commit only when GREEN; it is ATOMIC — emission +
 runtime + GC must land together to be byte-id-validatable, so build it all then
 validate; ~3-5 focused days):
-- **CallFrame** (vm.hh:66) += `Env * defEnv = nullptr;` (+8 B). **GC-CRITICAL**:
-  the scavenger + mark walk `vm.frames` DIRECTLY as roots (vm.hh:118 note) — so
-  add `defEnv` to the frame-root walk (visit/forward it) in gc.cc + mark_sweep.cc
-  + auditor, ELSE a non-null defEnv is a missed root. (This is the runtime
-  counterpart of P0.A-4's Env::parent walk; do it the same way.)
+- **CallFrame** (vm.hh:66) += `Env * defEnv = nullptr;` (+8 B). **GC-CRITICAL —
+  and the frame-root walk is in TWO places with different mechanisms** (verified
+  by a build attempt 2026-07-04; a correction to the earlier one-line note):
+  1. **Scavenger** (gc.cc:902 main loop + gc.cc:888 nested-VMState loop) walks
+     `vm.frames` directly — add `if (f.defEnv && walked.insert(f.defEnv).second)
+     graylist.push_back({f.defEnv, GK_ENV});` (walkEnv + P0.A-4 handle the chain).
+  2. **Auditor** (gc.cc:1479) — add `if (f.defEnv) a.visitEnv(f.defEnv, ...)`.
+  3. **Mark + evac** do NOT walk frames directly — they use the SHARED
+     `walkAllV3Roots` (precise_root.cc:52). **BLOCKER FOUND**: `RootVisitor`
+     (precise_root.hh:85) has visitClosure/Thunk/Bindings/List/Pair/Slot but **NO
+     `visitEnv`** — and a frame `defEnv` is a root reachable ONLY via the frame
+     register until a child captures it, so it MUST be walked here.  visiting its
+     values via `visitValue` is NOT enough: the MARK visitor must also set the
+     Env cell's mark bit (else sweep reclaims a live Env → UAF), which only a
+     visitEnv can do.  ⇒ **W2 must add `virtual void visitEnv(Env*&)` to
+     RootVisitor + implement it in every subclass** (the mark + evac visitors in
+     mark_sweep.cc route to their existing inline Env-walk — the same code P0.A-4
+     edited; the NoOp/auditor-style visitors no-op or walk values).  Then
+     walkAllV3Roots gains `if (f.defEnv) visitor.visitEnv(f.defEnv);`.  This is a
+     broad GC-interface change best landed COHERENTLY WITH W2b's emission so live
+     Env chains + V3_DBG_ENV_CAPTURE_AUDIT validate it (not as unexercised
+     scaffold).  The plan's "reuse the upvalEnv walkers" note was incomplete: the
+     frame defEnv is a NEW root class the upvalEnv walkers don't cover.
 - **allocEnv(n)** (alloc.hh:2998) returns a TENURED Env, parent=null, nValues=n,
   values[] UNINITIALIZED → OP_MAKE_ENV MUST stamp the n slots (Uninitialized tag,
   not leave them — value.hh maps all-zero to Float 0.0; a mid-fill GC would
