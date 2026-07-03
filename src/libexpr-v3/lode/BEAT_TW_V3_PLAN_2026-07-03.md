@@ -1000,3 +1000,58 @@ EMIT:
 Runtime handlers (W2b-runtime a) DONE; MAKE/frame-entry (b) + thunk tail-slot +
 this emit (c) land + byte-id-validate TOGETHER (gate-on==gate-off on the minimal
 slice, then hello→git→firefox→python3 + full brute).
+
+## ══════ GATE C VERDICT: KILL (2026-07-04, HEAD 8eebbe25b) ══════
+The capture-model trial reached its terminal gate.  env-pointer capture is fully
+BUILT + validated correct (v3 evaluates nixpkgs byte-identically gate-ON: the
+drvPath ladder hello/git/firefox/python3 == gate-OFF == golden; gate-OFF --brute
+32/32; gate-ON 31/32).  With a correct implementation, the DETERMINISTIC
+allocation counters (host-independent, cache-off, firefox.drvPath, NIX_VM_STATS,
+NIX_V3_NO_DISK_CACHE) give a RELIABLE perf verdict WITHOUT darwin-4 (darwin-4 was
+unreachable this session; but bytes+insns are host-independent, and CPU-time would
+only confirm the negative since env-capture ADDS dispatch):
+
+  metric            gate-OFF   gate-ON    Δ
+  closure bytes     17.50 MB   15.07 MB   −2.4 MB   ✓ (closures shrank, as designed)
+  thunk bytes      117.24 MB  107.77 MB   −9.5 MB   ✓ (thunks shrank too)
+  ENV bytes          0.00 MB   24.06 MB  +24.1 MB   ✗ (the shared-Env cost)
+  capture-repr net 134.74 MB  146.90 MB  +12.2 MB (+9.0%)  WORSE
+  total_alloc      345.1 MB   357.3 MB   +12.2 MB (+3.5%)  worse
+  arena_pinned     369.1 MB   385.9 MB   +16.8 MB (+4.6%)  worse
+  peak RSS         713 MB     753 MB     +40 MB (+5.6%)    WORSE
+  instructions     36.86 M    37.38 M    +1.4%             MORE
+  closure COUNT    254 986    258 880    +1.5% (singleton-lift excluded for envcap)
+
+VERDICT vs the PRE-COMMITTED Gate C thresholds (SHIP ≥3% CPU / KILL <1.5% CPU;
+v2 ≥15% CPU + ≥20% RSS): the result is NEGATIVE on every axis — RSS +5.6% WORSE,
+insns +1.4% MORE.  This is far below the 1.5% KILL floor (it is a regression, not
+a small win).  ⇒ **KILL.**
+
+ROOT CAUSE (exactly the Gate A C2 risk, now confirmed at Gate C): the model shrinks
+each closure/thunk (−12 MB total: fewer inline upvalues, one defEnv pointer) EXACTLY
+as designed — but replacing v3's SMALL capture sets (Gate A C2 measured avg
+1.88–2.10 upvalues/MAKE) with a shared Env (16 B header + N value slots + a defEnv
+pointer per capturer + OP_MAKE_ENV/SET_ENV/GET_ENV dispatch) COSTS +24 MB of Envs
+and +1.4% insns — the Env overhead exceeds the inline-upvalue savings BECAUSE the
+captures are small.  The env-pointer model wins only when capture sets are LARGE
+and HIGHLY SHARED (amortizing the Env header across many closures); v3's are small
+and low-sharing (C2), so it is a net PESSIMIZATION.  Env INTERNING (v2, share one
+Env across many closures) cannot rescue it: C2's low sharing means little to
+amortize.  The tree-walker's 16 B niche-tagged Value + direct Env pointers are
+already near-optimal for these sizes.
+
+DELIVERABLE (per the goal): RELIABLE DATA that env-pointer capture does NOT close
+v3's gap to the tree-walker — it WIDENS it (+40 MB RSS, +1.4% insns on firefox) at
+v3's measured capture sizes.  A clean KILL is a successful outcome.
+
+DISPOSITION: env-capture stays DEFAULT-OFF (NIX_V3_ENV_CAPTURE); production is
+unaffected + byte-identical.  Per the gate's retirement criterion (KILL → delete,
+preserving the branch point in git per the P3.1 precedent) the path MAY be deleted;
+the branch point is HEAD 8eebbe25b (11 W2b commits 02871bc3b→8eebbe25b).  Left
+committed+gated for now as a validated reference implementation of the mechanism
+(it is CORRECT, just not a win) — deletion is a follow-up decision.
+
+REMAINING (non-verdict-affecting): the one gate-ON brute-audit fail (git-drvPath
+missed-root under 1 MB-nursery stress — a raw/bulk list-fill exposed by env-capture's
+tenure split; production default-nursery is byte-id correct) would be fixed before
+any hypothetical ship — moot given KILL.
