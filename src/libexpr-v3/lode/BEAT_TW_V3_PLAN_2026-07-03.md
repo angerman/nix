@@ -711,9 +711,25 @@ the plan's "reuse upvalEnv" note is incomplete):
   BOTH — the defEnv as an Env (gray/mark/rewrite, already done for upvalEnv) AND
   the nUpvalues residual FAM.  Today XOR is a no-op (upvalEnv null → walks FAM);
   the both-walk must land before the emit sets upvalEnv=defEnv.
+- **upvalEnv reuse is ENTANGLED (design decision for W2b-runtime)**: the plan
+  §5.4 "reuse Closure::upvalEnv for defEnv" is broader than a one-liner —
+  `closureUpvalue`/`closureUpvaluePtr` (closure.hh:89-102) and ~10 call sites
+  read `upvalEnv ? upvalEnv->values[i] : upvalues[i]`, INCLUDING the extends/
+  compose intrinsic paths (vm.cc:6702/6750/15407, `intrinsicVar0/1/2`) + the
+  ENV_SHARED thunk mechanism.  Repurposing upvalEnv=defEnv requires all of them
+  to stop treating upvalEnv as an upvalue-store (read the FAM instead) — a broad,
+  subtle semantic change (design-b class).  CLEANER ALTERNATIVE (recommended for
+  W2b): add a SEPARATE `Closure::capturedDefEnv` field (+8 B) — closureUpvalue
+  unchanged, no XOR→both entanglement, walkClosure walks the FAM (as now) + the
+  new field.  Decide reuse-vs-new-field in the coherent W2b-runtime build.
+
 These, the handlers, MAKE/frame-entry install, the escape-analysis emit, and the
 marker/evac precondition are the interdependent, GC-critical, exercised-together
-core — the multi-day fresh-focus remainder.
+core — the multi-day fresh-focus remainder.  Four build-attempt findings
+(RootVisitor::visitEnv, closureUpvalue→FAM, walkClosure XOR→both, upvalEnv
+entanglement) confirm this is NOT fragmentable into safe unexercised slices
+beyond W2b-prep; the runtime repurposing + emit must land + byte-id-validate
+together.
 
 #### W2b — emission + runtime (the atomic, intricate remainder) — spec refined
 With W2a done, W2b = descriptor + runtime handlers + MAKE/frame-entry + the
