@@ -634,13 +634,31 @@ private:
         // (non-moving) Env rather than the inline FAM.  Mark the Env's lines and
         // visit its values precisely; the inline FAM is unused when upvalEnv is set.
         if (c->upvalEnv) {
-            Env * e = c->upvalEnv;
+            // P0.A-4 (§1.9): mark the Env AND its parent chain (NIX_V3_ENV_CAPTURE).
             // MIDEVAL_GC: also traverse a nursery-resident Env (tryMark fails for
-            // non-arena cells); dedup via the nursery set.
-            const bool fresh = marker_.tryMark(e)
-                || (nursery_ && nursery_->contains(e)
-                    && nurseryVisited_.insert(e).second);
-            if (fresh) {
+            // non-arena cells); dedup via the nursery set.  Stop at the first
+            // already-marked Env — its parents were walked with it on a prior
+            // visit (first-visit-wins ⇒ dedup + cycle-safe).
+            //
+            // ⚠ W2 PRECONDITION (adversarial review 2026-07-03): the early-break
+            // assumes "already-marked Env ⇒ its whole parent chain was walked".
+            // That holds for the P0.A-4 loops in isolation, but an Env can be
+            // mark-bit-set WITHOUT a precise values-walk via the interior
+            // Tag::Slot→Env conservative-mark path (visitSlot → CellType::Env
+            // markConservative), and the gen-major byte-scan does NOT de-box
+            // (gated on g_midEvalGcEnabled).  So once real Env chains exist
+            // (NIX_V3_ENV_CAPTURE), a `break` here could skip an ancestor Env's
+            // boxed values[] → missed tenured root.  INERT today (parent always
+            // null; the loop runs exactly once).  Before NIX_V3_ENV_CAPTURE lands,
+            // close it: track precise-Env-walk in a separate set (don't reuse the
+            // mark bit), or forbid interior-Slot owner-marking of Env cells.  The
+            // SCAVENGER (production generational collector) is immune — it grays
+            // each parent as an independent GK_ENV item, no early-break.
+            for (Env * e = c->upvalEnv; e; e = e->parent) {
+                const bool fresh = marker_.tryMark(e)
+                    || (nursery_ && nursery_->contains(e)
+                        && nurseryVisited_.insert(e).second);
+                if (!fresh) break;
                 if (arenaSetForSlot_)
                     arenaSetForSlot_->markLinesForCell(
                         e, sizeof(Env) + sizeof(Value) * e->nValues);
@@ -689,16 +707,19 @@ private:
                 visitList(w);
             if (Env * te = thunkUpvalEnv(t)) {
                 // env-sharing: upvalues live in the shared, tenured Env (tail[0]).
-                // MIDEVAL_GC: also traverse a nursery-resident Env.
-                const bool fresh = marker_.tryMark(te)
-                    || (nursery_ && nursery_->contains(te)
-                        && nurseryVisited_.insert(te).second);
-                if (fresh) {
+                // P0.A-4 (§1.9): mark te AND its parent chain (NIX_V3_ENV_CAPTURE).
+                // MIDEVAL_GC: also traverse a nursery-resident Env.  Stop at the
+                // first already-marked Env (first-visit-wins ⇒ dedup + cycle-safe).
+                for (Env * e = te; e; e = e->parent) {
+                    const bool fresh = marker_.tryMark(e)
+                        || (nursery_ && nursery_->contains(e)
+                            && nurseryVisited_.insert(e).second);
+                    if (!fresh) break;
                     if (arenaSetForSlot_)
                         arenaSetForSlot_->markLinesForCell(
-                            te, sizeof(Env) + sizeof(Value) * te->nValues);
-                    for (uint16_t i = 0; i < te->nValues; ++i)
-                        visitValue(te->values[i]);
+                            e, sizeof(Env) + sizeof(Value) * e->nValues);
+                    for (uint16_t i = 0; i < e->nValues; ++i)
+                        visitValue(e->values[i]);
                 }
             } else {
                 for (uint16_t i = 0; i < t->nUpvalues; ++i)
@@ -1512,8 +1533,17 @@ private:
             // dedup via the evac walked_ set — rewrite each Env's values exactly
             // once per pass (else a shared Env is content-walked once per referrer).
             if (c->upvalEnv) {
-                Env * e = c->upvalEnv;
-                if (walked_.insert(e).second)
+                // P0.A-4 (§1.9): rewrite value ptrs of the Env AND its parent
+                // chain (NIX_V3_ENV_CAPTURE).  walked_ dedups + stops at an
+                // already-evacuated Env (its chain was rewritten with it).
+                // ⚠ W2 PRECONDITION (same class as the marker loop above): the
+                // interior Tag::Slot→Env path inserts an Env into walked_ while
+                // walkFields(CellType::Env) is a no-op (below), so the early-stop
+                // could skip an ancestor's pointer rewrite once chains exist.
+                // INERT today (NIX_V3_EVAC unrevived per M-3; parent always null).
+                // Close before reviving EVAC: make walkFields rewrite Env values[]
+                // + chain, or forbid interior-Slot owner-enqueue of Env cells.
+                for (Env * e = c->upvalEnv; e && walked_.insert(e).second; e = e->parent)
                     for (uint16_t i = 0; i < e->nValues; ++i) visitValue(e->values[i]);
             } else {
                 for (uint16_t i = 0; i < c->nUpvalues; ++i) visitValue(c->upvalues[i]);
@@ -1539,9 +1569,11 @@ private:
                 if (ListVec * w = thunkCapturedWiths(t)) visitList(w);  // FP-2b: tail slot
                 // env-sharing: rewrite the shared (non-moving) Env's value ptrs,
                 // deduped via walked_ (interning shares one Env across referrers).
+                // P0.A-4 (§1.9): also the Env::parent chain (NIX_V3_ENV_CAPTURE);
+                // walked_ dedups + stops at an already-evacuated Env.
                 if (Env * te = thunkUpvalEnv(t)) {
-                    if (walked_.insert(te).second)
-                        for (uint16_t i = 0; i < te->nValues; ++i) visitValue(te->values[i]);
+                    for (Env * e = te; e && walked_.insert(e).second; e = e->parent)
+                        for (uint16_t i = 0; i < e->nValues; ++i) visitValue(e->values[i]);
                 } else {
                     for (uint16_t i = 0; i < t->nUpvalues; ++i) visitValue(t->tail[i]);
                 }

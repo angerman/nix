@@ -660,6 +660,13 @@ Env * maybeInternFromStack(VMState & vm, uint16_t nUp)
         Env * env = Alloc::allocEnv(nUp);
         for (uint16_t i = 0; i < nUp; ++i)
             env->values[i] = vm.valueStack[base + i];
+        // P0.A-4 (DEFECT_REVIEW_2026-07-03 §1.9): the interned Env is TENURED but
+        // its values[] copy nursery cells off the value stack; register it as a
+        // barriered root source at creation.  Previously covered only
+        // TRANSITIVELY via each consumer's closure/thunk post-construct scan —
+        // one new consumer (e.g. NIX_V3_ENV_CAPTURE's frame Env) away from a
+        // missed root.  One line closes it.
+        envPostConstructBarrier(env);
         vm.valueStack.resize(base);
         seed->env = env;
         return env;

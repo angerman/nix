@@ -683,6 +683,15 @@ void Scavenger::walkEnv(Env * e)
     for (uint16_t i = 0; i < e->nValues; ++i) {
         visitValue(e->values[i]);
     }
+    // P0.A-4 (DEFECT_REVIEW_2026-07-03 §1.9): walk the Env::parent chain.  Env is
+    // TENURED (allocEnv → threadArena) and never moves, so gray the parent via
+    // GK_ENV (deduped by `walked`); the graylist drains it back through walkEnv,
+    // so an arbitrary-depth chain is handled iteratively (no C recursion).  This
+    // is a benign no-op today (no allocEnv caller sets `parent`), added BEFORE
+    // NIX_V3_ENV_CAPTURE (Track E) materializes Env chains so no walker silently
+    // drops the chain the day it exists.
+    if (e->parent && walked.insert(e->parent).second)
+        graylist.push_back({e->parent, GK_ENV});
     if (n.isPhaseEActive()) envPostConstructBarrier(e);
 }
 
@@ -1268,6 +1277,9 @@ struct Auditor {
         if (!visited.insert(e).second) return;
         for (uint16_t i = 0; i < e->nValues; ++i)
             visitValue(e->values[i], "Env.values[]");
+        // P0.A-4 (§1.9): walk the Env::parent chain (populated by
+        // NIX_V3_ENV_CAPTURE).  `visited` dedups, so this recursion is cycle-safe.
+        if (e->parent) visitEnv(e->parent, "Env.parent");
     }
 
     void visitThunk(const Thunk * t, const char * site)
