@@ -6983,17 +6983,12 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                                 : std::string("anonymous lambda");
                         };
                         const Bindings * b = forcedArg.asAttrs();
-                        // P2.1-a sizing (TEMP): split no-default formals by arg
-                        // shape — raw-bindable (plain Bindings) vs deferred
-                        // (mapAttrs/chain, must keep the wrapper per the #33 RCA).
-                        {
-                            uint32_t nd = 0;
-                            for (auto & ff : desc->formals) if (!ff.hasDefault) ++nd;
-                            if (b && !b->isChain() && !b->isMapAttrs())
-                                V3_STATS_BUMP(formalsRawBindable, nd);
-                            else
-                                V3_STATS_BUMP(formalsDeferredComplex, nd);
-                        }
+                        // P0.B: the TEMP P2.1-a formals-by-arg-shape sizing probe
+                        // was deleted here (measurement complete — WS-2 handback:
+                        // ~70% raw-bindable but P2.1-a shows no measurable win, so
+                        // it stays gated).  Removing the per-call formals walk + 2
+                        // V3_STATS bumps off the OP_CALL hot path the capture-model
+                        // trial edits, per DEFECT_REVIEW §2.5 / the WS-0 no-creep rule.
                         const auto & tbl = ir::globalSymbolTable();
                         // #809 (2026-05-24): diagnostic gate.  When
                         // NIX_V3_PERMISSIVE_FORMALS=1, treat every
@@ -7689,14 +7684,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                                 : std::string("anonymous lambda");
                         };
                         const Bindings * b = forcedArg.asAttrs();
-                        {   // P2.1-a sizing (TEMP): tail-call formals by arg shape
-                            uint32_t nd = 0;
-                            for (auto & ff : tcDesc->formals) if (!ff.hasDefault) ++nd;
-                            if (b && !b->isChain() && !b->isMapAttrs())
-                                V3_STATS_BUMP(formalsRawBindable, nd);
-                            else
-                                V3_STATS_BUMP(formalsDeferredComplex, nd);
-                        }
+                        // P0.B: TEMP P2.1-a sizing probe deleted (twin of the
+                        // OP_CALL site above; see that comment).
                         const auto & tbl = ir::globalSymbolTable();
                         // #809: same NIX_V3_PERMISSIVE_FORMALS gate as
                         // the call-site path above.  Both OP_CALL and
