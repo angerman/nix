@@ -436,3 +436,75 @@ Update the project memory index on Gate A and Gate C resolutions.
 §5, §6 matrix) + DEFECT_AUDIT_2026-07-02 handbacks (design-b RCA, P3.1/P3.3
 falsifications) + JIT scoping 2026-06-29. Baseline: P0.4 rows at 2d7efdb97;
 HEAD at authoring 0e32dbfb3.*
+
+---
+
+# Handback — Phase 0 execution, 2026-07-03 (in progress)
+
+Executor session started from HEAD `0c7dfdcc3`. Full `--brute` = **29 suites**
+(was 28; P0.A-1 added `cache-gate-coverage`). Then 32 suites after the Q1 batch
+(3 more). All commits on branch `angerman/2.35-eval-profiling-v2`.
+
+## P0.A-1 — kGates + REAL lint — DONE (`1f99afa30`)
+Landed FIRST and ALONE per the binding rule. Full `--brute` 29/29 ALL GREEN.
+- **Confirmed §1.4**: the comment claiming `lint-cache-coherence.sh` enforced the
+  kGates↔codegen-gate sync was fictional (it only checked schema Rules 1/2).
+- Added **Rule 3** to `lint-cache-coherence.sh`: a FULL-TREE invariant (not
+  diff-scoped) — parse `kGates[]` from primops.cc, scan every `getenv("NIX_V3_*")`
+  in emit.cc/opt_*.cc/cli/lower_v3.hh/ir.cc, fail unless each is in `kGates[]` OR
+  an explicit non-codegen allowlist (`EMIT_BYTECODE`, `EMIT_BYTECODE_OUT`,
+  `DBG_STRICTNESS_VERBOSE`). Overridable paths + `CACHE_LINT_RULE3_ONLY` for the
+  self-test. Failing-first proof captured (flagged 3 gates pre-fix, clean after).
+- **kGates += RAW_FORMALS, NO_NONREC_ATTRS_INIT** (the two §1.4 named) **AND
+  `NIX_V3_OCCUR_DCE_VALIDATE`** — a hole §1.4 MISSED: it runs
+  `deadBindingElimViaOccur` (the NEW DCE) as the kept result instead of the
+  default `deadBindingElim`, so it changes emitted bytecode and belongs in the
+  key. **Correction to §1.4: it named 2 missing gates; there were 3.**
+- New self-test `run-cache-gate-coverage-tests.sh` (5 sub-tests, both directions,
+  self-contained fixtures) registered in `--brute`.
+
+## Q1 batch — Q1.1 + Q1.2 + Q1.3 latent-hardening — DONE (`0ed1eaa1c`)
+Three force-path writeback fixes. Full `--brute` **32/32 ALL GREEN**; independent
+adversarial review **NOT REFUTED** on all three (confirmed Q1.1 withStack is a
+scanned root so the index store needs no barrier; Q1.2 mirrors valueEqual's
+already-shipped interior-ListVec cellWrite pattern; Q1.3 memoization preserved;
+one benign Phase-E-only nuance already tracked in §1.9). **Key finding: all three
+are LATENT (not reproducible-today) fixes** —
+real code-level asymmetries with their sibling barriers, but masked under current
+gating. Verified empirically (0 audit flags pre-fix on constructed repros) —
+consistent with the review's own §1.7 "safe today ONLY via the exitDepth==0 gate +
+C-stack pin" classification. They become live under S2.1 safepoint work and are
+landed now as trial preconditions.
+- **Q1.1 (vm.cc withLookup)**: `w = forceValue(vm, w)` wrote through a `Value &`
+  into `vm.withStack` across a re-entrant force that can realloc the vector.
+  **Reachable-UAF PROVEN via instrumentation probe**: a chained-`with` fixture
+  (>64 live with-scopes forcing a realloc) fires the realloc-while-holding-`w`
+  window **8×** (`buf 0x…e00→0x…000 cap 64→256 i=0`) — a use-after-free WRITE to
+  the freed buffer. Not observable in results (the dangling write+read are
+  self-consistent) nor under macOS libgmalloc (doesn't guard this std::vector);
+  the probe is the definitive proof. Fix: force into a local, memoize **by index**
+  (`vm.withStack[i] = forced`), lookup through the local. Guardrail test
+  `run-withlookup-dangling-tests.sh`.
+- **Q1.2 (vm.cc valueLess)**: list-compare writeback missing the `cellWrite`
+  barrier valueEqual (@~1086) and primSort already have. Latent (forced inner
+  values bypass to tenured once the outer list has tenured under nursery
+  pressure → rarely a real nursery→tenured edge today). Fix mirrors valueEqual.
+  Guardrail `run-valueless-barrier-tests.sh`.
+- **Q1.3 (primops.cc replaceStrings)**: **CORRECTION to §1.3** — its claimed
+  reachable missed-root is NOT reachable: (1) `builtins.tryEval` does NOT catch
+  the replaceStrings type error — verified in **v3 AND the tree-walker** (both
+  throw "expected a string…" to top level), so the "list survives under tryEval"
+  premise is false; (2) happy-path forced elements are STRINGS (tenured) → no
+  nursery edge (40 000-element from-list under 1 MB-nursery audit = 0 flags pre-
+  and post-fix). The fix stands as (a) a real premature-argument-mutation cleanup
+  (force→check→store, never mutate a caller-visible arg with a value it rejects)
+  plus (b) a defensive barrier consistent with sibling sites. Guardrail
+  `run-replacestrings-barrier-tests.sh` (valid + type-error arms).
+
+**Method note for future latent-barrier fixes**: the nursery AUDIT trips only when
+the forced value is *already* a nursery cell being stored into a *tenured*
+container (primSort's bulk-copy of early-built literal nested lists is the
+canonical trip). Force-then-writeback sites (valueLess, replaceStrings) rarely
+create that edge under current gating because late forces bypass to tenured — so
+their tests are correctness+exercise guardrails, not pre-fix-tripping repros, and
+that is expected, not a test defect.
