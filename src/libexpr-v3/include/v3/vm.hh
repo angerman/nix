@@ -99,6 +99,18 @@ struct CallFrame
     /// progress); reset to 0 once all deep args are WHNF.  In-class
     /// default keeps every `CallFrame{...}` aggregate init at 0.
     uint32_t  deepForceCursor = 0;          // 4
+    /// NIX_V3_ENV_CAPTURE (Track E v1): the frame's "definition environment" —
+    /// the shared heap Env holding this frame's ESCAPING locals (allocated lazily
+    /// by OP_MAKE_ENV; parent = the Env this frame captured at entry).  null when
+    /// the frame neither creates nor inherits an env-chain.  OP_GET_ENV(depth,idx)
+    /// walks `parent` depth times from here; OP_SET_ENV(idx) writes here.  At
+    /// frame entry a callee/forced-thunk with `usesDefEnv` installs its stored
+    /// Env (Closure::upvalEnv / thunk ENV_SHARED tail) here.  GC-CRITICAL: the
+    /// scavenger + auditor walk vm.frames directly (gc.cc), and mark/evac walk
+    /// via walkAllV3Roots → RootVisitor::visitEnv (precise_root); this field is
+    /// walked in BOTH.  Default-off ⇒ null on every frame ⇒ inert until W2
+    /// emission turns it on.
+    Env *     defEnv = nullptr;             // 8
 };
 
 /// Per-EvalState VM state.

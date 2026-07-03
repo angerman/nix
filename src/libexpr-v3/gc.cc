@@ -891,6 +891,10 @@ void Scavenger::run()
             if (f.thunk)
                 f.thunk = fwdThunk(f.thunk);
             if (f.forceWriteTarget) visitValue(*f.forceWriteTarget);
+            // NIX_V3_ENV_CAPTURE (W2): gray the frame's defEnv (see the main
+            // frame-walk below); null until W2 emission.
+            if (f.defEnv && walked.insert(f.defEnv).second)
+                graylist.push_back({f.defEnv, GK_ENV});
         }
     }
 
@@ -948,6 +952,13 @@ void Scavenger::run()
             }
             visitValue(*f.forceWriteTarget);
         }
+        // NIX_V3_ENV_CAPTURE (W2): the frame's defEnv is a TENURED Env holding
+        // this frame's escaping locals.  Gray it (GK_ENV) so walkEnv forwards its
+        // nursery payloads AND its parent chain (P0.A-4); the Env never moves.
+        // null until W2 emission ⇒ inert.  GC-CRITICAL: a non-null defEnv reached
+        // only via the frame register would otherwise be a missed root.
+        if (f.defEnv && walked.insert(f.defEnv).second)
+            graylist.push_back({f.defEnv, GK_ENV});
     }
 
     // (bridge-table roots retired — TW_VALUE_ERADICATION F4, 2026-06-02;
@@ -1473,6 +1484,9 @@ void postScavengeAudit(const Nursery & n, const VMState & vm)
             // cell; the contents may carry nursery payloads.
             if (f.forceWriteTarget)
                 a.visitValue(*f.forceWriteTarget, "frame.forceWriteTarget");
+            // NIX_V3_ENV_CAPTURE (W2): audit the frame's defEnv (+ parent chain
+            // via the auditor's visitEnv, P0.A-4).  null until W2 emission.
+            if (f.defEnv) a.visitEnv(f.defEnv, "frame.defEnv");
         }
     };
     walkVm("currentVm", &vm);

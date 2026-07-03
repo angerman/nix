@@ -280,6 +280,28 @@ public:
             ++statsPairs_;
         } else enqueueNurseryCell(p, KPair);
     }
+    /// NIX_V3_ENV_CAPTURE (W2): a frame's defEnv root (walkAllV3Roots).  MARK
+    /// the Env cell (else sweep frees a live Env whose only root is the frame
+    /// register) + mark its lines + walk its values (visitValue enqueues nested
+    /// cells) + recurse the parent chain — mirroring walkClosure's upvalEnv
+    /// walk (P0.A-4).  Deduped via tryMark / nurseryVisited_.  ⚠ shares the
+    /// W2-precondition early-break caveat with the walkClosure/evac Env-walks
+    /// (documented at those sites): close before real chains exist.  null until
+    /// W2 emission ⇒ inert.
+    void visitEnv(Env * & e) override
+    {
+        for (Env * cur = e; cur; cur = cur->parent) {
+            const bool fresh = marker_.tryMark(cur)
+                || (nursery_ && nursery_->contains(cur)
+                    && nurseryVisited_.insert(cur).second);
+            if (!fresh) break;
+            if (arenaSetForSlot_)
+                arenaSetForSlot_->markLinesForCell(
+                    cur, sizeof(Env) + sizeof(Value) * cur->nValues);
+            for (uint16_t i = 0; i < cur->nValues; ++i)
+                visitValue(cur->values[i]);
+        }
+    }
     void visitSlot(Value * & p) override
     {
         if (!p) return;
@@ -1239,6 +1261,17 @@ public:
     void visitBindings(Bindings  * & p) override { visitCell(reinterpret_cast<void *&>(p), CellType::Bindings); }
     void visitList    (ListVec   * & p) override { visitCell(reinterpret_cast<void *&>(p), CellType::List); }
     void visitPair    (ValuePair * & p) override { visitCell(reinterpret_cast<void *&>(p), CellType::Pair); }
+
+    /// NIX_V3_ENV_CAPTURE (W2): rewrite the frame defEnv's value ptrs + parent
+    /// chain.  The Env cell is NON-moving (CellType::Env never relocates), so no
+    /// forward of the Env itself — only its values[].  walked_ dedups (a shared
+    /// Env reached via both a closure upvalEnv and a frame defEnv is rewritten
+    /// once).  null until W2 emission ⇒ inert; evac itself unrevived (M-3).
+    void visitEnv(Env * & e) override
+    {
+        for (Env * cur = e; cur && walked_.insert(cur).second; cur = cur->parent)
+            for (uint16_t i = 0; i < cur->nValues; ++i) visitValue(cur->values[i]);
+    }
 
     void visitSlot(Value * & p) override
     {
