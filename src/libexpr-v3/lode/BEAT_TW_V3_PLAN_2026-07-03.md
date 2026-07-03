@@ -676,7 +676,19 @@ stale-binary gotcha; ALWAYS rebuild v3-smoke on an AllocStats change).
 5. GATE: byte-id ladder gate-on/off (hello→git→firefox→python3) FIRST (design-b
    lesson), then brute both settings + adversarial review of the GC/emit changes.
 
-#### W2a — frame-Env root-walking GC scaffold — DONE (`a431e5f4c`, no-op, brute 32/32)
+#### W2a — frame-Env root-walking GC scaffold — DONE (`a431e5f4c`, no-op, brute 32/32, adversarial NOT REFUTED)
+Adversarial review (2026-07-04) verified root-walk COMPLETENESS: all four
+frame-root paths covered (scavenger main gc.cc:906 + nested :888 via GK_ENV;
+auditor :1489 via visitEnv over primary+secondary VMStates; mark+evac via
+walkAllV3Roots→walkOneVMState :94 for primary AND secondary), GK_ENV drains
+through walkEnv (iterative parent chain), the no-dedup default visitEnv is
+cycle-safe (parent chains provably acyclic — allocEnv inits parent=null,
+OP_MAKE_ENV only ever points parent at an OLDER enclosing frame), MarkVisitor
+marks the Env cell (else UAF), EvacVisitor shares the one walked_ set. No-op
+claim airtight (defEnv only ever `=nullptr`; handlers are W0 traps).
+NOTE (pre-existing, not worsened): the dormant NIX_V3_FIBER_BRIDGE yielded-fiber
+conservative scan does not precisely walk a yielded VMState's frames — same
+exposure as the existing closure/thunk frame fields; latent, gated off.
 Landed the GC/root-walk HALF of W2 as a validated no-op (P0.A-4 pattern):
 CallFrame.defEnv + `RootVisitor::visitEnv` (default walks values+parent;
 MarkVisitor overrides to mark the Env cell; EvacVisitor overrides with walked_
