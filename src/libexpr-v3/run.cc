@@ -517,6 +517,25 @@ RootResult runRootExprModule(nix::EvalState & state, ir::Module module)
                 (unsigned long long)a.fwdCapturesEmitted,
                 (unsigned long long)a.totalCapturesEmitted, fwdShare);
         }
+        // W1 escape-analysis (NIX_V3_ENV_CAPTURE=dump/1) — IR-level env-routable
+        // capture split.  Only populated when the gate is on (else all zero).
+        if (a.envTotalCaptures > 0) {
+            double escP = 100.0 * (double)a.envEscapingCaptures   / (double)a.envTotalCaptures;
+            double fwdP = 100.0 * (double)a.envForwardingCaptures / (double)a.envTotalCaptures;
+            double othP = 100.0 * (double)a.envOtherCaptures      / (double)a.envTotalCaptures;
+            std::fprintf(stderr,
+                "v3 W1 escape-analysis (env-routable capture split, IR-level):\n"
+                "  total child captures=%llu: escaping(F-local, depth0)=%llu (%.1f%%)"
+                " forwarding(F-freeVar, depth+1)=%llu (%.1f%%) other=%llu (%.1f%%)\n"
+                "  env-routable = escaping+forwarding = %.1f%%  [forwarding should"
+                " ≈ Phase-1 C3; the emit-side TEMP-slot/with-target ineligibility"
+                " is applied at W2 for the precise counter-4]\n",
+                (unsigned long long)a.envTotalCaptures,
+                (unsigned long long)a.envEscapingCaptures, escP,
+                (unsigned long long)a.envForwardingCaptures, fwdP,
+                (unsigned long long)a.envOtherCaptures, othP,
+                escP + fwdP);
+        }
         // #702: BYTES per allocation category.  The count counters
         // above are partly bumped at primop call sites and miss
         // Alloc::* invocations from vm.cc dispatch; the byte

@@ -706,6 +706,19 @@ struct AllocStats
     uint64_t fwdCapturesEmitted   = 0;   // capture-GETs resolving to an upvalue
     uint64_t totalCapturesEmitted = 0;   // all capture-GETs (local + upvalue)
 
+    /// W1 escape-analysis (NIX_V3_ENV_CAPTURE=dump; ir.cc computeFreeVars tail).
+    /// IR-level classification of every child MkThunk/Lambda capture fv within
+    /// its creating Function F: ESCAPING (fv ∈ F's own-bound locals ⇒ env-routable
+    /// at depth 0 via F's frame Env), FORWARDING (fv ∈ F.freeVars ⇒ env-routable
+    /// at depth+1 — the transitive re-copy the chain kills; should ≈ Phase-1 C3),
+    /// or OTHER.  Gate-on only (analysis, no codegen change).  Sizes v1's
+    /// env-routable fraction; the emit-side ineligibility (TEMP defer-slots,
+    /// with-targets) is applied at W2 for the precise counter-4.
+    uint64_t envTotalCaptures      = 0;
+    uint64_t envEscapingCaptures   = 0;
+    uint64_t envForwardingCaptures = 0;
+    uint64_t envOtherCaptures      = 0;
+
     /// #495: how many OP_CALL invocations dispatched to the v3-native
     /// `lib.fix` intrinsic (instead of running its bytecode body).
     /// Mirrors selectorLambdaCalls -- confirms that lower.cc's

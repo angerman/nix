@@ -17,11 +17,14 @@
 /// SPDX-License-Identifier: Apache-2.0
 
 #include "v3/ir.hh"
+#include "v3/alloc.hh"   // W1 escape-analysis dump counters (V3_STATS_BUMP)
 
 #include <algorithm>
 #include <cassert>
+#include <cstdlib>
 #include <stdexcept>
 #include <unordered_set>
+#include <vector>
 
 namespace nix::v3::ir {
 
@@ -306,6 +309,81 @@ void collectBlockRefs(const Module & m, BlockId bid,
 } // namespace
 
 // ---------------------------------------------------------------------------
+// W1 escape-analysis stats (NIX_V3_ENV_CAPTURE=dump) — see alloc.hh env*Captures.
+// For each Function F, classify every child MkThunk/Lambda capture fv:
+//   ESCAPING   fv ∈ F's own-bound locals (block-binding vars + params) — the
+//              env-pointer model routes these through F's frame Env at depth 0.
+//   FORWARDING fv ∈ F.freeVars — F re-captured its own upvalue for the child;
+//              the transitive re-copy the env chain eliminates (depth+1).
+//   OTHER      neither (not expected at the IR level; a diagnostic bucket).
+// Analysis only — no codegen change (byte-identity trivial).  Reuses
+// computeFreeVars's funcOfBlock reachability; must run AFTER convergence.
+// ---------------------------------------------------------------------------
+static void collectEnvCaptureStats(const Module & m)
+{
+    const size_t nFuncs = m.functions.size();
+    const FuncId kNoFunc = static_cast<FuncId>(nFuncs);
+    // funcOfBlock[bid] = owning function (reachability from entryBlock via
+    // sub-blocks; nested-function entryBlocks are separate ⇒ not crossed).
+    std::vector<FuncId> funcOfBlock(m.blocks.size(), kNoFunc);
+    {
+        std::vector<BlockId> stack;
+        for (size_t fid = 0; fid < nFuncs; ++fid) {
+            if (m.functions[fid].entryBlock == kInvalidBlock) continue;
+            stack.push_back(m.functions[fid].entryBlock);
+            while (!stack.empty()) {
+                BlockId bid = stack.back(); stack.pop_back();
+                if (bid == kInvalidBlock || bid >= m.blocks.size()) continue;
+                if (funcOfBlock[bid] != kNoFunc) continue;
+                funcOfBlock[bid] = static_cast<FuncId>(fid);
+                std::vector<BlockId> subs;
+                for (auto & bd : m.blocks[bid].bindings)
+                    collectExprSubBlocks(bd.expr, subs);
+                for (auto sub : subs) stack.push_back(sub);
+            }
+        }
+    }
+    // Pass 1: per-function own-bound local set = block-binding vars + params.
+    std::vector<std::unordered_set<VarId>> ownLocals(nFuncs);
+    for (size_t fid = 0; fid < nFuncs; ++fid) {
+        const Function & f = m.functions[fid];
+        if (f.paramVar != kInvalid) ownLocals[fid].insert(f.paramVar);
+        for (VarId ep : f.extraParams) ownLocals[fid].insert(ep);
+    }
+    for (size_t bid = 1; bid < m.blocks.size(); ++bid) {
+        FuncId owner = funcOfBlock[bid];
+        if (owner == kNoFunc) continue;
+        for (const auto & bd : m.blocks[bid].bindings)
+            ownLocals[owner].insert(bd.var);
+    }
+    // Pass 2: classify each child MkThunk/Lambda capture against its owner F.
+    for (size_t bid = 1; bid < m.blocks.size(); ++bid) {
+        FuncId owner = funcOfBlock[bid];
+        if (owner == kNoFunc) continue;
+        const auto & ownSet  = ownLocals[owner];
+        const auto & ownFree = m.functions[owner].freeVars;  // sorted (computeOne)
+        for (const auto & bd : m.blocks[bid].bindings) {
+            std::visit([&](const auto & e) {
+                using T = std::decay_t<decltype(e)>;
+                if constexpr (std::is_same_v<T, Lambda> ||
+                              std::is_same_v<T, MkThunk>) {
+                    for (VarId fv : e.freeVars) {
+                        V3_STATS_BUMP(envTotalCaptures, 1);
+                        if (ownSet.count(fv))
+                            V3_STATS_BUMP(envEscapingCaptures, 1);
+                        else if (std::binary_search(ownFree.begin(),
+                                                    ownFree.end(), fv))
+                            V3_STATS_BUMP(envForwardingCaptures, 1);
+                        else
+                            V3_STATS_BUMP(envOtherCaptures, 1);
+                    }
+                }
+            }, bd.expr);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Public: computeFreeVars
 // ---------------------------------------------------------------------------
 
@@ -493,6 +571,17 @@ void computeFreeVars(Module & m)
             "v3 computeFreeVars: free-var fixed-point did not converge "
             "within 16 iterations; pathological mutual recursion likely.  "
             "Aborting compilation rather than emitting wrong upvalue lists.");
+
+    // W1 (NIX_V3_ENV_CAPTURE=dump/1): escape-analysis eligibility stats.  Runs
+    // AFTER convergence (node freeVars are final).  Analysis + counter bumps
+    // only — NO codegen change (byte-identity is trivial).  Gate-on only, so
+    // default builds pay a single predicted-false branch here.
+    static const bool s_envCaptureStats = [] {
+        const char * e = std::getenv("NIX_V3_ENV_CAPTURE");
+        return e && e[0] && e[0] != '0';
+    }();
+    if (__builtin_expect(s_envCaptureStats, 0))
+        collectEnvCaptureStats(m);
 }
 
 } // namespace nix::v3::ir
