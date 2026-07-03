@@ -55,6 +55,41 @@ coarse-grained; `importCacheResultCount()`), thunk in-run memoization (Evaluated
 state).  The gap: persist/share forced results ACROSS eval roots + invocations at
 sub-expression granularity, keyed on the stable CU+offset+captured-env.
 
+### CEILING MEASURED (2026-07-04) — STRONG GREENLIGHT
+Deterministic insns (host-independent, cache-off, firefox.drvPath), the spike's
+disciplined first step (measure before the big build):
+- firefox once (shared `p`):              36,864,730 insns
+- firefox 2× via shared `p`:              36,864,738  (+8 → the 2nd is FREE; thunk
+                                            memoization already shares within a root)
+- firefox 2× via SEPARATE imports:        72,999,412  (≈2× → ZERO reuse across
+                                            eval-roots / invocations)
+⇒ An applied-import result cache converts the 2×-separate case (73 M, what happens
+today across roots/invocations) into the shared case (37 M): eval #2…N → ~0.  Over
+a workload that evals N derivations from the same nixpkgs, this collapses N× the
+shared-infrastructure (stdenv/lib/…) re-evaluation to 1×.  **This is TW-impossible**
+(no stable keys) and is precisely the moat.
+RSS profile (favorable): for repeated eval of the same/overlapping exprs the cache
+holds ONE forced graph (≈ what a single eval allocates anyway) and reuses it →
+steady-state RSS ≈ baseline, inside the ≤1.3× SHIP gate.  Growth only across
+DISTINCT (import,args) pairs → bound with the ImportCache LRU already present.
+
+### BUILD DESIGN (the applied-import result cache)
+Memoize `(import f) args → forced result`, keyed on (f content-hash [ImportCache
+already has mtime/size], args content-hash).  Restrict to SOUND cases: callee is a
+cached-import top-level function (pure by construction — nixpkgs is `args: <pure
+attrset>`) + args is a content-addressable attrset.  Hook at OP_CALL when the
+callee closure originates from a cached ImportCache function (same closure pointer
+returned for repeated `import <nixpkgs>`); GC-root the cached results (ImportCache
+roots are already walked); reuse the ImportCache LRU for bounding.  Two variants:
+- **In-memory (spike first)**: within a process / daemon.  Measures the CPU win +
+  RSS cost of retaining forced results WITHOUT the hard serialization.  Kill/ship
+  here before investing in persistence.
+- **Persistent (if in-memory ships)**: serialize forced Values across invocations
+  (LINKING_DESIGN content-addressed cells) — the big program.
+⚠ CORRECTNESS-CRITICAL (unsound memoization = silently wrong evals — worse than a
+crash).  Build with fresh focus + the full byte-id ladder + brute both settings;
+do NOT rush (the env-capture lesson).
+
 ### PRE-COMMITTED thresholds (write BEFORE measuring — binding rule)
 Spike: build a minimal content-addressed result cache for the hottest memoizable
 class (e.g. deep-forced derivation-arg attrsets / imported-module results), measure
