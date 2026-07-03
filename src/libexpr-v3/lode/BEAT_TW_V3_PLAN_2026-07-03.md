@@ -696,6 +696,25 @@ dedup) + all four frame-root-walk sites (scavenger main+nested, auditor,
 walkAllV3Roots for mark+evac).  So W2b's emission has the moving-GC integration
 in place + independently adversarial-reviewed.  defEnv null today ⇒ inert.
 
+#### W2b-prep — LambdaDescriptor metadata + serialize — DONE (`d7b17a614`, no-op, brute 32/32)
+`usesDefEnv` + `envSlotCount` on LambdaDescriptor + serialize (schema 17→18);
+unset ⇒ byte-identical + brute-green (cache round-trip suites confirm the
+schema-18 round-trip).  Two W2b-runtime design findings from the build (record —
+the plan's "reuse upvalEnv" note is incomplete):
+- **upvalEnv repurposing**: P0.C retired interning ⇒ `Closure::upvalEnv` is always
+  null and free to become the captured defEnv.  BUT `closureUpvalue()` branches
+  `upvalEnv ? upvalEnv->values[i] : upvalues[i]` — once upvalEnv=defEnv it would
+  misread the residual-flat FAM.  W2b-runtime must first make closureUpvalue read
+  the FAM unconditionally (no-op today, upvalEnv null).
+- **walkClosure XOR→both**: with a HYBRID closure (upvalEnv=defEnv AND a residual
+  flat FAM), walkClosure/mark/evac (currently walk upvalEnv XOR the FAM) must walk
+  BOTH — the defEnv as an Env (gray/mark/rewrite, already done for upvalEnv) AND
+  the nUpvalues residual FAM.  Today XOR is a no-op (upvalEnv null → walks FAM);
+  the both-walk must land before the emit sets upvalEnv=defEnv.
+These, the handlers, MAKE/frame-entry install, the escape-analysis emit, and the
+marker/evac precondition are the interdependent, GC-critical, exercised-together
+core — the multi-day fresh-focus remainder.
+
 #### W2b — emission + runtime (the atomic, intricate remainder) — spec refined
 With W2a done, W2b = descriptor + runtime handlers + MAKE/frame-entry + the
 escape-analysis EMIT, all validated TOGETHER (byte-id ladder + brute + the
