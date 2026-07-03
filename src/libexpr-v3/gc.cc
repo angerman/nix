@@ -726,7 +726,7 @@ void Scavenger::walkThunk(Thunk * t)
         }
         if (ListVec * w = thunkCapturedWiths(t))  // FP-2b: tail slot, was suspended.capturedWiths
             thunkSetCapturedWiths(t, fwdList(w));
-        if (Env * te = thunkUpvalEnv(t)) {
+        if (Env * te = thunkTailEnv(t)) {
             // env-sharing: upvalues live in the shared tenured Env (tail[0]); gray
             // it so walkEnv forwards its nursery payloads (the Env never moves).
             if (walked.insert(te).second) graylist.push_back({te, GK_ENV});
@@ -782,7 +782,7 @@ void Scavenger::walkThunk(Thunk * t)
         // Fix: identical to the Suspended case.
         if (ListVec * w = thunkCapturedWiths(t))  // FP-2b: tail slot, was suspended.capturedWiths
             thunkSetCapturedWiths(t, fwdList(w));
-        if (Env * te = thunkUpvalEnv(t)) {
+        if (Env * te = thunkTailEnv(t)) {
             // env-sharing: mirror the Suspended case (Blackhole shares the layout).
             if (walked.insert(te).second) graylist.push_back({te, GK_ENV});
         } else {
@@ -1321,7 +1321,7 @@ struct Auditor {
             walkCUAttrSelectCache(thunkCU(t));  // FP-2a: was t->suspended.cu
             if (ListVec * w = thunkCapturedWiths(t))  // FP-2b: tail slot
                 check(w, "Thunk.suspended.capturedWiths", site);
-            if (Env * te = thunkUpvalEnv(t))
+            if (Env * te = thunkTailEnv(t))
                 visitEnv(te, "Thunk.suspended.upvalEnv");  // env-sharing
             else
                 for (uint16_t i = 0; i < t->nUpvalues; ++i)
@@ -1348,7 +1348,7 @@ struct Auditor {
             if (ListVec * w = thunkCapturedWiths(t))  // FP-2b: tail slot
                 check(w,
                       "Thunk.Blackhole.suspended.capturedWiths", site);
-            if (Env * te = thunkUpvalEnv(t))
+            if (Env * te = thunkTailEnv(t))
                 visitEnv(te, "Thunk.Blackhole.upvalEnv");  // env-sharing
             else
                 for (uint16_t i = 0; i < t->nUpvalues; ++i)

@@ -5828,20 +5828,32 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 if (e) return e[0] != '0';
                 return true;
             }();
+            const LambdaDescriptor & thunkDesc = cu->lambdas[funcIdx];
             Thunk * t;
             Env * thunkEnv = nullptr;
-            if (__builtin_expect(s_envSharingThunk && nUp > 0, 0))
-                thunkEnv = maybeInternUpvalueEnvFromStack(vm, nUp);
-            if (__builtin_expect(thunkEnv != nullptr, 0)) {
-                t = Alloc::allocThunkSuspendedShared(nUp, willHaveWiths);
-                *reinterpret_cast<Env **>(&t->tail[0]) = thunkEnv;  // Env* @ tail[0]
+            if (__builtin_expect(thunkDesc.usesDefEnv, 0)) {
+                // NIX_V3_ENV_CAPTURE (W2b): the thunk body reads env-routed locals
+                // — capture the maker frame's defEnv as ONE pointer (tail[0]).
+                // nUp is 0 (emit routes ALL freeVars through the env chain, none
+                // flat), so the upvalue-fill below is skipped.  Mutually exclusive
+                // with env-sharing.  Inert until the emitter sets usesDefEnv.
+                t = Alloc::allocThunkCapture(willHaveWiths);
+                thunkSetCapturedDefEnv(
+                    t, vm.frames.empty() ? nullptr : vm.frames.back().defEnv);
             } else {
-                t = Alloc::allocThunkSuspended(nUp, willHaveWiths);
+                if (__builtin_expect(s_envSharingThunk && nUp > 0, 0))
+                    thunkEnv = maybeInternUpvalueEnvFromStack(vm, nUp);
+                if (__builtin_expect(thunkEnv != nullptr, 0)) {
+                    t = Alloc::allocThunkSuspendedShared(nUp, willHaveWiths);
+                    *reinterpret_cast<Env **>(&t->tail[0]) = thunkEnv;  // Env* @ tail[0]
+                } else {
+                    t = Alloc::allocThunkSuspended(nUp, willHaveWiths);
+                }
             }
             // The "descriptor" we use is the LambdaDescriptor for the
             // referenced function (treated as 0-arg for thunks).
             // Reuse the LambdaDescriptor pointer through suspended.desc.
-            t->suspended.desc = &cu->lambdas[funcIdx];
+            t->suspended.desc = &thunkDesc;
             // #135 (M4/C1) thunk-body categorization RCA lived here:
             // NIX_V3_THUNK_BODY_STATS measured that only 0.7% of v3's thunks are the
             // trivial alias/const forms TW's maybeThunk avoids (99.3% are real
@@ -5975,7 +5987,10 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // env-sharing: upvalues go into the shared Env, not the inline tail
             // (tail[0] holds the Env*).  Stack order is identical (upvalues on
             // top, withs below), so the withs-pop logic below is unaffected.
-            if (!thunkEnv) {
+            // env-capture thunks have NO inline upvalue slots (tail[0]=defEnv);
+            // nUp is 0 by construction, but guard explicitly so a stray nUp>0
+            // can never write OOB into the 1-2 slot capture tail.
+            if (!thunkEnv && !thunkCapturesDefEnv(t)) {
                 for (uint16_t i = nUp; i > 0; --i) t->tail[i - 1] = pop(vm);
             }
             if (__builtin_expect(g_dbgUpvalDup, 0) && nUp > 0 && !thunkEnv)
@@ -9389,6 +9404,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 .stackBaseOffset = static_cast<uint32_t>(newBase),
                 .withStackBase = newWithBase,
                 .flags = CFF_THUNK_RETURN,
+                // W2b env-capture: install the thunk's captured defEnv (null unless
+                // THUNK_ENV_CAPTURE ⇒ inert until emit).
+                .defEnv = thunkCapturedDefEnv(t),
             });
             pushCapturedWiths(vm, thunkWiths);
             cu = thunkCu;
@@ -14969,6 +14987,8 @@ Value forceValue(VMState & vm, Value v)
             .stackBaseOffset = static_cast<uint32_t>(newBase),
             .withStackBase = newWithBase,
             .flags = CFF_THUNK_RETURN,
+            // W2b env-capture: install the thunk's captured defEnv (inert until emit).
+            .defEnv = thunkCapturedDefEnv(t),
         });
         pushCapturedWiths(vm, thunkWiths);
 
