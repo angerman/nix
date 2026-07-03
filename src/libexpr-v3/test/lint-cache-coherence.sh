@@ -61,6 +61,124 @@ CLOSURE_HH="$ROOT/src/libexpr-v3/include/v3/closure.hh"
 SERIALIZE_CC="$ROOT/src/libexpr-v3/serialize.cc"
 SERIALIZE_HH="$ROOT/src/libexpr-v3/include/v3/serialize.hh"
 
+# ----------------------------------------------------------------------
+# Rule 3: every codegen-affecting env gate is in the disk-cache
+#         fingerprint (kGates[])
+# ----------------------------------------------------------------------
+# The CU disk-cache key keys only on (path, content, schema); the
+# `codegenGateFingerprint()` in primops.cc mixes the *values* of a
+# canonical list of env gates (kGates[]) into the key so that a CU
+# compiled under e.g. NIX_V3_RAW_FORMALS=1 is namespaced away from a
+# default-codegen CU.  DEFECT_REVIEW_2026-07-03 §1.4 found that this
+# list had silently drifted out of sync with the actual getenv() reads
+# in the codegen files (NIX_V3_RAW_FORMALS + NIX_V3_NO_NONREC_ATTRS_INIT
+# both emit different opcodes but were absent from kGates), and that the
+# comment claiming `lint-cache-coherence.sh` enforced the sync was
+# fictional — the lint only checked Rules 1/2.  This rule closes that:
+# every `getenv("NIX_V3_*")` in a codegen file MUST be either in
+# kGates[] OR in the explicit non-codegen allowlist below.  A CU whose
+# bytecode depends on a gate not in kGates would be loaded under the
+# wrong key on any warm run after a toggled run — the exact silent
+# wrong-codegen failure the fingerprint exists to prevent.
+#
+# This is a FULL-TREE invariant (not diff-scoped): it re-verifies the
+# whole codegen surface on every run, so a hole cannot slip through a
+# commit that doesn't touch primops.cc.
+#
+# Paths are overridable (CACHE_LINT_PRIMOPS / CACHE_LINT_CODEGEN_DIR)
+# so the self-test (run-cache-gate-coverage-tests.sh) can drive it with
+# synthetic fixtures.  CACHE_LINT_RULE3_ONLY=1 runs ONLY this rule
+# (skipping the git/diff-based Rules 1/2), for the self-test.
+PRIMOPS_CC="${CACHE_LINT_PRIMOPS:-$ROOT/src/libexpr-v3/primops.cc}"
+CODEGEN_DIR="${CACHE_LINT_CODEGEN_DIR:-$ROOT/src/libexpr-v3}"
+
+# Non-codegen gates that legitimately live in the codegen files: pure
+# diagnostics/dumps that leave the emitted opcode stream bit-identical,
+# so they need not namespace the disk-cache key.  Every entry is a
+# deliberate assertion "this gate does NOT change codegen"; a NEW gate
+# added to a codegen file must go to kGates[] OR here (with a reason),
+# never neither.
+rule3_allowlist=(
+  "NIX_V3_EMIT_BYTECODE"          # dump: disassemble CU to stderr/file
+  "NIX_V3_EMIT_BYTECODE_OUT"      # dump: output-path for the above
+  "NIX_V3_DBG_STRICTNESS_VERBOSE" # dump: per-Function strictArgs report
+)
+
+# run_rule3 PRIMOPS CODEGEN_DIR -> prints violations; returns 0 clean,
+# 1 violation(s), 2 preflight error.
+run_rule3() {
+  local primops="$1"; local cgdir="$2"
+  if [[ ! -f "$primops" ]]; then
+    echo "lint-cache-coherence Rule 3: missing $primops" >&2
+    return 2
+  fi
+  # Extract the kGates[] array body, then the "NIX_V3_*" string tokens.
+  local kgates
+  kgates="$(awk '
+      /kGates\[\][[:space:]]*=[[:space:]]*\{/ { f=1 }
+      f { print }
+      f && /\};/ { exit }
+    ' "$primops" \
+    | grep -oE '"NIX_V3_[A-Z0-9_]+"' | tr -d '"' | sort -u)"
+  if [[ -z "$kgates" ]]; then
+    echo "lint-cache-coherence Rule 3: could not parse kGates[] from $primops" >&2
+    return 2
+  fi
+  # Collect the codegen files (missing ones are simply skipped — the
+  # fixture dir only has a subset).
+  local files=() f
+  for f in "$cgdir/emit.cc" "$cgdir/ir.cc" "$cgdir"/opt_*.cc \
+           "$cgdir/cli/lower_v3.hh" "$cgdir/lower_v3.hh"; do
+    [[ -f "$f" ]] && files+=("$f")
+  done
+  if [[ ${#files[@]} -eq 0 ]]; then
+    echo "lint-cache-coherence Rule 3: no codegen files under $cgdir" >&2
+    return 2
+  fi
+  # Every gate READ in a codegen file.
+  local found
+  found="$(grep -rhoE 'getenv\("NIX_V3_[A-Z0-9_]+"\)' "${files[@]}" 2>/dev/null \
+           | grep -oE 'NIX_V3_[A-Z0-9_]+' | sort -u)"
+  local miss=0 gate a ok
+  while IFS= read -r gate; do
+    [[ -z "$gate" ]] && continue
+    if grep -qxF "$gate" <<<"$kgates"; then continue; fi
+    ok=0
+    for a in "${rule3_allowlist[@]}"; do
+      [[ "$a" == "$gate" ]] && { ok=1; break; }
+    done
+    [[ $ok -eq 1 ]] && continue
+    if [[ $miss -eq 0 ]]; then
+      echo "lint-cache-coherence FAIL (Rule 3):" >&2
+      echo "  codegen env gate(s) missing from kGates[] in primops.cc" >&2
+      echo "  (and not in the non-codegen allowlist):" >&2
+    fi
+    # Show where it is read, for the fix.
+    local where
+    where="$(grep -rnE "getenv\\(\"$gate\"\\)" "${files[@]}" 2>/dev/null | head -1)"
+    echo "    $gate    read at: ${where:-<unknown>}" >&2
+    miss=$((miss+1))
+  done <<<"$found"
+  if [[ $miss -gt 0 ]]; then
+    cat >&2 <<EOF
+  Fix: if the gate changes emitted bytecode, add it to kGates[] in
+  primops.cc (codegenGateFingerprint()).  If it is a pure dump/diagnostic
+  that leaves codegen bit-identical, add it to rule3_allowlist in
+  this lint with a one-line justification.  See DEFECT_REVIEW §1.4.
+EOF
+    return 1
+  fi
+  return 0
+}
+
+# Self-test entry point: run only Rule 3 and exit.
+if [[ -n "${CACHE_LINT_RULE3_ONLY:-}" ]]; then
+  run_rule3 "$PRIMOPS_CC" "$CODEGEN_DIR"
+  rc=$?
+  [[ $rc -eq 0 ]] && echo "lint-cache-coherence Rule 3: OK"
+  exit $rc
+fi
+
 # Preflight: every relevant file must exist.
 for f in "$CLOSURE_HH" "$SERIALIZE_CC" "$SERIALIZE_HH"; do
   if [[ ! -f "$f" ]]; then
@@ -254,6 +372,16 @@ if [[ -n "$deser_diff" ]]; then
     echo "$deser_diff" | head -5 | sed 's/^/    /' >&2
   fi
 fi
+
+# ----------------------------------------------------------------------
+# Rule 3: codegen gate ⇒ present in kGates[] (full-tree invariant)
+# ----------------------------------------------------------------------
+run_rule3 "$PRIMOPS_CC" "$CODEGEN_DIR"
+case $? in
+  0) : ;;
+  1) violations=$((violations+1)) ;;
+  2) echo "lint-cache-coherence: Rule 3 preflight failed" >&2; exit 2 ;;
+esac
 
 # ----------------------------------------------------------------------
 # Summary

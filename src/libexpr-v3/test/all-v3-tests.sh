@@ -177,6 +177,7 @@ if [[ "$mode" == "core" || "$mode" == "full" || "$mode" == "brute" ]]; then
   SUITES+=( "lint-no-inline-getenv|cached env-var lint|$TEST_DIR/lint-no-inline-getenv.sh" )
   SUITES+=( "lint-no-direct-tw-include|FFI consolidation: no new direct TW #includes|$TEST_DIR/lint-no-direct-tw-include.sh" )
   SUITES+=( "lint-cache-coherence|#814/#815 schema-bump operating rules|$TEST_DIR/lint-cache-coherence.sh" )
+  SUITES+=( "cache-gate-coverage|Rule 3: every codegen env gate is in kGates[] fingerprint (§1.4)|$TEST_DIR/run-cache-gate-coverage-tests.sh" )
   SUITES+=( "lint-serialize-symbolid-coverage|CR2 serialize.cc collect/remap symmetry (AR24)|$TEST_DIR/lint-serialize-symbolid-coverage.sh" )
 fi
 
