@@ -589,14 +589,19 @@ inline uint32_t shareAfter(uint16_t nUp) noexcept
     }();
     if (s_override) return s_override;
 
-    // A shared Env wins only when the same capture tuple is reused.  The first
-    // default-on implementation allocated an Env for every nUp>0 thunk/closure;
-    // on python3.drvPath that added ~9.9 MB of Envs while most captures had
-    // only one or two upvalues.  Make sharing pay its way: small captures stay
-    // inline by default so they do not even touch the intern table; wider
-    // repeated tuples share from the second observation.
-    if (nUp <= 8) return UINT32_MAX;
-    return 2;
+    // P0.C (BEAT_TW_V3_PLAN §3.1, 2026-07-03): RETIRED — env-share interning is
+    // a structural no-op that never earned its keep, so the DEFAULT never
+    // interns (always UINT32_MAX ⇒ maybeInternFromStack returns nullptr ⇒ inline
+    // FAM).  FALSIFIER (Rule 0): the heuristic only interned nUp>8 capture tuples
+    // reused ≥2×, but the Phase-1 nUp histogram measured avg nUp 1.88–2.10 across
+    // hello/firefox/git/M5 (and firefox `envs=0.1 MB` of 677 MB RSS) — i.e. it
+    // shared ~nothing while adding a dead 8 B upvalEnv branch on the #1 opcode
+    // family + a call per creation.  DEV: the mechanism stays testable via
+    // NIX_V3_ENV_SHARE_AFTER=N (the s_override above) for any future A/B.  KEEP
+    // the plumbing (Env / upvalEnv / closureUpvalue / walkEnv / ENV_SHARED) — the
+    // capture-model trial (NIX_V3_ENV_CAPTURE, Track E) reuses it via OP_MAKE_ENV,
+    // NOT via this intern table.  Retire the whole path at the W6 Gate C verdict.
+    return UINT32_MAX;
 }
 
 template <typename Stack>
