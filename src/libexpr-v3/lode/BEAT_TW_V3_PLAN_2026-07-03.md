@@ -775,6 +775,52 @@ minimal slice), since gate-on codegen only works when emit+handlers+GC agree:
 - **Minimal validatable slice**: `let x=1+2; f=_: x; in f 0` → 3 gate-on==gate-off,
   then broaden + byte-id ladder (hello→git→firefox→python3) + brute both settings.
 
+#### W2b-runtime EMIT — BUILT + PARTIALLY VALIDATED (2026-07-04). STATUS:
+The full emit is implemented + landed (analysis passes + emitVarRef OP_GET_ENV
+routing + escaping-local OP_SET_ENV binding-store + prologue OP_MAKE_ENV +
+escaping-param copy + descriptor usesDefEnv/envSlotCount/residual-nUpvalues +
+Lambda/MkThunk residual-push gating).  KEY BUGS FOUND + FIXED during bring-up:
+1. **Lambda-lift singleton cache** (vm.cc:5417): a nUp==0 closure was interned as
+   a context-free singleton + REUSED across calls — but env-capture closures are
+   nUp==0 yet capture a per-call defEnv.  Fixed: exclude `usesDefEnv` closures from
+   the singleton lift (they take the per-instantiation path that sets capturedDefEnv).
+2. **Hybrid, not no-residual**: my "every freeVar env-routes" simplification was
+   WRONG — recVars (let-rec / rec-attrset / formals-with-sibling-defaults, which
+   lower to `ir::LetRec`) are captured via the rec-attrset machinery (OP_ATTRS_REC_
+   INIT/SET + OP_GET_UPVALUE_REC_BINDING[_SLOT]), NOT plain upvalues.  Env-routing
+   them corrupts that machinery.  Fix: exclude recVars (m.recVarIds +
+   recVarToSlotVar + every LetRec entry/hiddenEntry outerUpvalues + hiddenVar) from
+   E — they stay RESIDUAL flat upvalues.  So it IS the plan's hybrid.
+VALIDATED gate-on==gate-off (hand-tests): pure-lambda capture, 3-level depth chain,
+letrec recursion (fib), self-rec, multi-capture, formals (WITH sibling-default
+`{a?1,b?a+1}`), rec-attrsets, currying/PAP, higher-order (map/foldl'/mapAttrs/
+genList), nested-let, inherit, functionArgs, ellipsis.  GATE-OFF: byte-id
+(hello==golden) + full --brute 32/32 (NO regression — every emit hook is
+g_envCapture-gated).  GATE-ON --brute: broad PASS (lang 143, property, drv-parity,
+fetcher, readdir, chain-bindings) with **2 REMAINING GAPS**, both in the rec-binding
+integration:
+  (a) **iterative-force app-spine** (deep nested application) — rc=1.
+  (b) **brute-audit list-primop-barriers** (7/17 sub-cases exit=1) + nixpkgs `lib`
+      aborts with `OP_GET_UPVALUE_REC_BINDING_SLOT: upvalue index out of range`.
+Both point at the SAME root: a function that READS a rec-binding via
+RecBindingSlotRef (OP_GET_UPVALUE_REC_BINDING[_SLOT], which uses the recVar's flat
+upvalue index) while ALSO env-routing OTHER freeVars — the env-routed vars are
+removed from the flat upvalue push list, and although emitOne push + fc.upvalue map
+both skip env-routed in freeVars order (so they SHOULD agree), the LetRec ENTRY
+emit (emitOne(LetRec)) has its OWN outerUp+recVar push (recVar = "implicit upvalue
+0") that does NOT go through the residual-aware emitOne(MkThunk) path → index
+disagreement.  **NEXT SESSION**: make the LetRec entry-thunk push residual-aware
+(align emitOne(LetRec)'s per-entry push + the entry FUNCTION's fc.upvalue), OR (the
+robust coarse fix) mark every LetRec-entry funcId + every RecBindingSlotRef-reading
+funcId as `forceFlat` (usesDefEnv=false, push all freeVars, no env-routing) so the
+rec machinery keeps its flat layout — but handle the knock-on (a forceFlat function
+with its own escaping locals still needs createEnv for its children).  Also confirm
+whether list-primop-barriers is a true GC missed-root (BRUTE hit) vs a divergence
+(run the sub-test with V3_DBG_NURSERY_AUDIT).  The env-capture MECHANISM is PROVEN
+VIABLE in the moving-GC VM (the core research question) — the remainder is
+rec-binding-emit integration, not a viability question.  Gate C (perf) needs
+nixpkgs to fully eval gate-on ⇒ blocked on the rec-binding integration.
+
 #### W2 CODE-LEVEL DESIGN (worked out 2026-07-04; turnkey — build in the working
 tree, validate byte-id + brute, commit only when GREEN; it is ATOMIC — emission +
 runtime + GC must land together to be byte-id-validatable, so build it all then

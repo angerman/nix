@@ -5414,7 +5414,15 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // process.  Single-threaded VM — no atomics needed.
             static const bool s_noLift =
                 std::getenv("NIX_V3_NO_LAMBDA_LIFT") != nullptr;
-            if (__builtin_expect(nUp == 0 && nWiths == 0 && !s_noLift, 0)) {
+            // NIX_V3_ENV_CAPTURE (W2b): an env-capture closure is emitted with
+            // nUp==0 but is NOT context-free — it captures the maker frame's
+            // defEnv, which differs per instantiation.  The singleton-lift cache
+            // (one shared closure reused across calls) would (1) never set
+            // capturedDefEnv and (2) alias distinct defEnvs.  Exclude it so it
+            // takes the regular per-instantiation path below (which sets
+            // capturedDefEnv).  usesDefEnv is false when the gate is off.
+            if (__builtin_expect(nUp == 0 && nWiths == 0 && !s_noLift
+                                 && !cu->lambdas[funcIdx].usesDefEnv, 0)) {
                 const LambdaDescriptor & desc = cu->lambdas[funcIdx];
                 if (desc.cachedSingletonClosure) {
                     Value v;
