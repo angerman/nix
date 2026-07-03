@@ -173,7 +173,12 @@ namespace nix::v3::serialize {
 /// `secondArgIdentityLambda` for the arity-2 `name: value: value`
 /// peephole used by mapAttrs/callClosure2.  Cache-loaded CUs must not
 /// silently lose the flag and fall back to per-entry App3 allocation.
-constexpr uint32_t kSchemaVersion = 17;
+///
+/// 18 (2026-07-04): LambdaDescriptor serialises `usesDefEnv` + `envSlotCount`
+/// (NIX_V3_ENV_CAPTURE Track E W2b).  Eval-affecting: they drive the frame-entry
+/// defEnv install + OP_MAKE_ENV allocation size, so a cache-loaded CU must not
+/// silently lose them.  false/0 for CUs compiled without the feature.
+constexpr uint32_t kSchemaVersion = 18;
 
 /// 8-byte magic prefix at the start of every serialized blob.
 /// Includes a discriminator so format mismatches are detected early.

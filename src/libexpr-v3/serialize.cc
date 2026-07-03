@@ -830,6 +830,11 @@ std::string serializeCU(const CompilationUnit & cu)
         w.u8(0);  // _pad
         // Schema 5 (#530): per-descriptor with-target count.
         w.u32(l.nWithTargets);
+        // Schema 18 (NIX_V3_ENV_CAPTURE W2b): eval-affecting env-capture metadata
+        // (drives frame-entry defEnv install + OP_MAKE_ENV size).  false/0 for a
+        // CU compiled without the feature.
+        w.u8(l.usesDefEnv ? 1 : 0);
+        w.u32(l.envSlotCount);
         w.u32(static_cast<uint32_t>(l.formals.size()));
         for (auto & f : l.formals) {
             w.u32(f.name);
@@ -1042,6 +1047,9 @@ CompilationUnit deserializeCU(std::string_view blob)
             r.u8();  // _pad
             // Schema 5 (#530): per-descriptor with-target count.
             l.nWithTargets  = static_cast<uint16_t>(r.u32());
+            // Schema 18 (NIX_V3_ENV_CAPTURE W2b): env-capture metadata.
+            l.usesDefEnv    = (r.u8() != 0);
+            l.envSlotCount  = static_cast<uint16_t>(r.u32());
             uint32_t nFormals = r.u32();
             l.formals.reserve(nFormals);
             for (uint32_t j = 0; j < nFormals; ++j) {

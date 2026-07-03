@@ -342,6 +342,17 @@ struct LambdaDescriptor
     /// the upvalue block.
     uint16_t nWithTargets = 0;
 
+    /// NIX_V3_ENV_CAPTURE (Track E v1 W2b): when `usesDefEnv`, a called
+    /// closure / forced thunk installs its captured Env (Closure::upvalEnv /
+    /// the ENV_SHARED thunk tail) as the frame's `defEnv` register at entry, and
+    /// the body reads its escaping locals + ancestor captures via
+    /// OP_GET_ENV(depth,idx).  `envSlotCount` is the size of the frame Env this
+    /// function allocates via OP_MAKE_ENV (0 if it creates none — a pure reader).
+    /// Both default false/0 ⇒ a function compiled without the feature installs
+    /// no defEnv and emits no env-opcodes (byte-identical to the flat path).
+    bool     usesDefEnv   = false;
+    uint16_t envSlotCount = 0;
+
     /// Formal parameters (`{a, b ? def}: body`).  Each entry is
     /// (name SymbolId, hasDefault, posHandle).  posHandle is an index
     /// into the global posSnapshotPool; 0 means unknown.  Used by
