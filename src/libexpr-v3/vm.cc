@@ -15412,6 +15412,10 @@ Value callClosure(VMState & vm, Value fun, Value arg)
                 .stackBaseOffset = static_cast<uint32_t>(newBase),
                 .withStackBase = newWithBase,
                 .flags = 0,
+                // W2b env-capture: install captured defEnv (this PAP-saturation
+                // entry was a MISSED frame-push site — a usesDefEnv closure entered
+                // here left frame.defEnv null, breaking descendants' parent chain).
+                .defEnv = papBase->desc->usesDefEnv ? papBase->capturedDefEnv : nullptr,
             });
             pushCapturedWiths(vm, papBase->capturedWiths);
             return dispatchLoop(vm, exitDepth);

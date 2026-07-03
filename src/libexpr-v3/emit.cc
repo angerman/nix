@@ -264,6 +264,16 @@ struct Emitter
                     // A nested function: record lexical parent; do NOT descend
                     // (its blocks belong to e.funcIdx, not F).
                     if (e.funcIdx < lexParent_.size()) lexParent_[e.funcIdx] = f;
+                } else if constexpr (std::is_same_v<T, ir::LetRec>) {
+                    // LetRec entries + hidden entries are nested functions
+                    // (entry.thunkBody) lexically inside F.  Their lexParent MUST
+                    // be recorded here (they are NOT ir::Lambda/MkThunk binding
+                    // exprs), else depth() from inside them walks to kNoParent and
+                    // an outer env-routed capture is read at the wrong depth.
+                    for (const auto & en : e.entries)
+                        if (en.thunkBody < lexParent_.size()) lexParent_[en.thunkBody] = f;
+                    for (const auto & he : e.hiddenEntries)
+                        if (he.thunkBody < lexParent_.size()) lexParent_[he.thunkBody] = f;
                 }
             }, bd.expr);
             for (auto sb : subs) walkOwnBlocks(f, sb, visited, own);
@@ -1440,6 +1450,22 @@ struct Emitter
         // explicitly to commit any pending bindings to slots before
         // we read from the slot.
         flushAllDeferred();
+        // NIX_V3_ENV_CAPTURE (W2b): an env-routed var lives in the frame Env, not a
+        // slot/upvalue — its slot is assigned but NEVER written (the value went to
+        // OP_SET_ENV).  The force superinstruction path is SEPARATE from emitVarRef,
+        // so it MUST env-route too, else OP_GET_LOCAL_FORCE reads the stale slot
+        // (the groupBy `prev = acc.${key} or []` bug: prev is forced → wrong value).
+        // Read via OP_GET_ENV then a plain OP_FORCE (no fused GET_ENV_FORCE opcode).
+        if (__builtin_expect(g_envCapture, 0)) {
+            auto oit = varOwner_.find(e.thunk);
+            if (oit != varOwner_.end() && isEscapingLocal(oit->second, e.thunk)) {
+                const uint32_t depth =
+                    (oit->second == ctx->fid) ? 0u : envDepth(ctx->fid, e.thunk);
+                emitGetEnv(depth, envSlotOf_[oit->second].at(e.thunk));
+                emitForceFromIR(e.srcLine);
+                return;
+            }
+        }
         if (auto it = ctx->slot.find(e.thunk); it != ctx->slot.end()) {
             emitGetLocalForceFromIR(it->second, e.srcLine);
             return;
@@ -2395,6 +2421,19 @@ struct Emitter
                 && !capturedFreeVars_.count(bd.var)
                 && occ.lookup(bd.var).kind == ir::OccKind::OnceLinear)
                 constRemat_[bd.var] = &bd.expr;
+            else if (__builtin_expect(g_envCapture, 0)
+                     && isEscapingLocal(fc.fid, bd.var))
+                // NIX_V3_ENV_CAPTURE (W2b): an escaping let-binding lives in the
+                // frame Env (its store is OP_SET_ENV, reads are OP_GET_ENV), so it
+                // gets NO stack slot.  This is the SYSTEMATIC fix for read-path
+                // bypasses: every slot-based fast path (Force superinstruction,
+                // AttrSelect-from-slot, register-If cond, tail-result R_MOVE, …)
+                // does `ctx->slot.find(v)` — with no slot entry they all MISS and
+                // fall through to the env-routed emitVarRef/Force path.  (Params
+                // keep their slot: the arg lands there + is copied to the Env in
+                // the prologue, and the slot retains the value, so slot-reads of an
+                // escaping PARAM are still correct.)
+                ;
             else
                 (void)getOrAssignSlot(fc, bd.var);
             std::vector<ir::BlockId> subs;
