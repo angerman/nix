@@ -5483,6 +5483,15 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             c->desc = &cu->lambdas[funcIdx];
             c->cu   = cu;
             c->nUpvalues = nUp;
+            // NIX_V3_ENV_CAPTURE (W2b): a closure whose function reads env-routed
+            // locals (its own escaping locals or an ancestor's) captures the maker
+            // frame's current defEnv as a SINGLE pointer (vs the flat per-upvalue
+            // FAM copy).  usesDefEnv is false on every descriptor until the emitter
+            // emits env-capture ⇒ capturedDefEnv stays null (allocClosure init) ⇒
+            // inert by default.  Independent of the upvalEnv/shareUpvalues path
+            // (env-capture emits nUp=0, so shareUpvalues never fires here).
+            if (__builtin_expect(c->desc->usesDefEnv, 0))
+                c->capturedDefEnv = vm.frames.back().defEnv;
             // Pop upvalues first (they sit on TOP of stack), then pop
             // the with-target block beneath.  Build capturedWiths
             // outermost-first by filling reverse into the ListVec.
@@ -6453,6 +6462,10 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                         .stackBaseOffset = static_cast<uint32_t>(newBase),
                         .withStackBase = newWithBase,
                         .flags = 0,
+                        // NIX_V3_ENV_CAPTURE (W2b): install the captured defEnv so the
+                        // body's OP_GET_ENV walks the right chain.  null unless the
+                        // descriptor usesDefEnv (⇒ inert until emit).
+                        .defEnv = papBase->desc->usesDefEnv ? papBase->capturedDefEnv : nullptr,
                     });
                     pushCapturedWiths(vm, papBase->capturedWiths);
                     ip = d->codeOffset;
@@ -7298,6 +7311,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 .stackBaseOffset = static_cast<uint32_t>(newBase),
                 .withStackBase = newWithBase,
                 .flags = 0,
+                // NIX_V3_ENV_CAPTURE (W2b): install captured defEnv (inert until emit).
+                .defEnv = callee->desc->usesDefEnv ? callee->capturedDefEnv : nullptr,
             });
             pushCapturedWiths(vm, callee->capturedWiths);
 
@@ -7497,6 +7512,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     cur.cu = baseCu;
                     cur.closure = tcBase;
                     cur.ip = d->codeOffset;
+                    // W2b env-capture: retarget defEnv to the new callee (frame reuse
+                    // means the OLD frame's defEnv must not leak into the body).
+                    cur.defEnv = tcBase->desc->usesDefEnv ? tcBase->capturedDefEnv : nullptr;
                     if (vm.withStack.size() > cur.withStackBase)
                         vm.withStack.resize(cur.withStackBase);
                     cur.withStackBase = static_cast<uint32_t>(vm.withStack.size());
@@ -7818,6 +7836,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // re-entry frame, the thunk should still be set when
             // we eventually OP_RETURN.
             cur.ip = tcDesc->codeOffset;
+            // W2b env-capture: retarget defEnv to the tail-callee (frame reuse; the
+            // old frame's defEnv/thunk-defEnv must not leak into the callee body).
+            cur.defEnv = tcCallee->desc->usesDefEnv ? tcCallee->capturedDefEnv : nullptr;
             // stackBaseOffset is unchanged: we reuse the same
             // operand-stack window.
             //
@@ -7889,6 +7910,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     .stackBaseOffset = static_cast<uint32_t>(newBase),
                     .withStackBase = newWithBase,
                     .flags = 0,
+                    .defEnv = c->desc->usesDefEnv ? c->capturedDefEnv : nullptr,  // W2b env-capture (inert until emit)
                 });
                 pushCapturedWiths(vm, c->capturedWiths);
                 ip = d->codeOffset;
@@ -7951,6 +7973,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 cur.cu = baseCu;
                 cur.closure = c;
                 cur.ip = d->codeOffset;
+                // W2b env-capture: retarget defEnv to the tail-callee (frame reuse).
+                cur.defEnv = c->desc->usesDefEnv ? c->capturedDefEnv : nullptr;
                 if (vm.withStack.size() > cur.withStackBase)
                     vm.withStack.resize(cur.withStackBase);
                 cur.withStackBase = static_cast<uint32_t>(vm.withStack.size());
@@ -15103,6 +15127,7 @@ static bool callClosureNExact(
         .stackBaseOffset = static_cast<uint32_t>(newBase),
         .withStackBase = newWithBase,
         .flags = 0,
+        .defEnv = c->desc->usesDefEnv ? c->capturedDefEnv : nullptr,  // W2b env-capture (inert until emit)
     });
     pushCapturedWiths(vm, c->capturedWiths);
 
@@ -15181,6 +15206,7 @@ Value callClosure2(VMState & vm, Value fun, Value arg1, Value arg2)
                 .stackBaseOffset = static_cast<uint32_t>(newBase),
                 .withStackBase = newWithBase,
                 .flags = 0,
+                .defEnv = c->desc->usesDefEnv ? c->capturedDefEnv : nullptr,  // W2b env-capture (inert until emit)
             });
             pushCapturedWiths(vm, c->capturedWiths);
             // Stage 2: callClosure2's only callers (primFoldl/primFoldlMap)
@@ -15592,6 +15618,7 @@ Value callClosure(VMState & vm, Value fun, Value arg)
         .stackBaseOffset = static_cast<uint32_t>(newBase),
         .withStackBase = newWithBase,
         .flags = 0,
+        .defEnv = callee->desc->usesDefEnv ? callee->capturedDefEnv : nullptr,  // W2b env-capture (inert until emit)
     });
     pushCapturedWiths(vm, callee->capturedWiths);
 
