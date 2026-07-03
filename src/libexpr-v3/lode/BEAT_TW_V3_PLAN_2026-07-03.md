@@ -649,10 +649,39 @@ node. Reuse both.
   (mirror `rawFormalEligible`@ir.hh:515) + the emit-side slot-eligibility (SSA
   proof / TEMP-slot exclusion) + OP_MAKE_ENV/SET_ENV/GET_ENV emission.
 
-**Session end-state (2026-07-03):** HEAD after W0 = `f3acf9d14` (+ handback docs).
-9 commits, each full-`--brute`-gated (32 suites; the recurring 31/32 is the
-let-chain-5000 15s-timeout flake on this shared host at load avg ~21, verified
-3.73s CPU/5.5s wall + passing standalone — NOT a regression), every GC-critical
-commit independently adversarial-reviewed (all NOT REFUTED). Gate A = GO is the
-plan's first decision gate, resolved with reliable data. W1→W6 is the prepped
-multi-week remainder; W1 (above) is the next increment.
+### W1 — escape-analysis dump-mode — DONE (`e4d286166`)
+`collectEnvCaptureStats(Module&)` in ir.cc (gate=dump/1, at computeFreeVars tail;
+analysis-only ⇒ byte-identical). MEASURED on firefox.drvPath: total child
+captures 92731 → escaping 37.9% / forwarding 62.1% / other **0.0%** ⇒ **100%
+env-routable at the IR level**. Forwarding 62.1% CROSS-CHECKS Phase-1 C3 (64.14%)
+— two independent measurements agree, validating the analysis. Projection
+refinement: v1's ceiling is bounded by EMIT-side eligibility (W2), NOT IR
+routability (100%) — the model applies to the full capture population. Full
+`--brute` 32/32 (v3-smoke rebuilt: AllocStats layout changed — the recurring
+stale-binary gotcha; ALWAYS rebuild v3-smoke on an AllocStats change).
+
+### W2 — emission + runtime (NEXT; the risky core) — spec
+1. **FIRST close the W2 PRECONDITION** (task #8: marker/evac Env-parent
+   early-break hole) — it goes live the moment emission populates `parent`.
+2. `Function` += `usesDefEnv` bit + `envSlotCount` + escaping-local→Env-idx map
+   (mirror `rawFormalEligible`/`formalSym`@ir.hh:515); serialize (schema bump).
+3. Emit-side eligibility = W1's escaping set MINUS emitter TEMP defer-slots
+   (§5.3-2 single-assignment) MINUS with-targets (stay flat in v1). Lazy
+   OP_MAKE_ENV before first escaping store; OP_SET_ENV on the binding store;
+   child eligible captures → OP_GET_ENV(depth,idx), residual → flat FAM (hybrid).
+4. Runtime handlers reuse `Closure::upvalEnv` + the ENV_SHARED thunk tail (P0.C
+   keeps this plumbing); frame-entry installs the stored Env as defEnv register;
+   OP_SET_ENV writeback uses `cellWrite` (tenured Env ← nursery payload; PhD-6).
+   Audit all 3 fakeClo fill sites (vm.cc:~13330).
+5. GATE: byte-id ladder gate-on/off (hello→git→firefox→python3) FIRST (design-b
+   lesson), then brute both settings + adversarial review of the GC/emit changes.
+
+**Session end-state (2026-07-03):** HEAD = `e4d286166`. 12 commits, each
+full-`--brute`-gated (32 suites; recurring 31/32 = the let-chain-5000 15s-timeout
+flake on this shared host at load avg ~21, verified 3.73s CPU/5.5s wall + passing
+standalone — NOT a regression; and the AllocStats-change stale-v3-smoke gotcha,
+fixed by rebuild each time). Every GC-critical commit independently
+adversarial-reviewed (all NOT REFUTED). Delivered: Gate A = GO (plan's first
+decision gate, reliable data) + Phase-0 prereqs + W0 (opcode foundation) + W1
+(escape analysis, validated vs C3). W2→W6 is the multi-week remainder; W2
+(emission, above) is the risky core — close the precondition first.
