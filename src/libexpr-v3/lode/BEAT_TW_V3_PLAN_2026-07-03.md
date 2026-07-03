@@ -676,6 +676,54 @@ stale-binary gotcha; ALWAYS rebuild v3-smoke on an AllocStats change).
 5. GATE: byte-id ladder gate-on/off (hello→git→firefox→python3) FIRST (design-b
    lesson), then brute both settings + adversarial review of the GC/emit changes.
 
+#### W2 CODE-LEVEL DESIGN (worked out 2026-07-04; turnkey — build in the working
+tree, validate byte-id + brute, commit only when GREEN; it is ATOMIC — emission +
+runtime + GC must land together to be byte-id-validatable, so build it all then
+validate; ~3-5 focused days):
+- **CallFrame** (vm.hh:66) += `Env * defEnv = nullptr;` (+8 B). **GC-CRITICAL**:
+  the scavenger + mark walk `vm.frames` DIRECTLY as roots (vm.hh:118 note) — so
+  add `defEnv` to the frame-root walk (visit/forward it) in gc.cc + mark_sweep.cc
+  + auditor, ELSE a non-null defEnv is a missed root. (This is the runtime
+  counterpart of P0.A-4's Env::parent walk; do it the same way.)
+- **allocEnv(n)** (alloc.hh:2998) returns a TENURED Env, parent=null, nValues=n,
+  values[] UNINITIALIZED → OP_MAKE_ENV MUST stamp the n slots (Uninitialized tag,
+  not leave them — value.hh maps all-zero to Float 0.0; a mid-fill GC would
+  misread them). Check the Value uninitialized-stamp helper.
+- **Handlers** (replace the W0 trap-stubs; `cur` = current frame ref):
+  - OP_MAKE_ENV: `Env* e=allocEnv(n); e->parent=cur.defEnv; stamp e->values[0..n);
+    cur.defEnv=e; envPostConstructBarrier(e);` (lazy — emit before the first
+    escaping store, so non-creating executions pay nothing).
+  - OP_SET_ENV(idx): `cellWrite(&cur.defEnv->values[idx], pop(vm), nullptr);`
+    (PhD-6: tenured Env ← possibly-nursery payload).
+  - OP_GET_ENV(idx; +1 trailer=depth): `Env* e=cur.defEnv; for depth: e=e->parent;
+    push(e->values[idx]);` (depth==0 fast case first).
+- **MAKE_CLOSURE/THUNK** (vm.cc:5384/5779): when `desc->usesDefEnv`, store
+  `cur.defEnv` into the closure's `upvalEnv` / the thunk ENV_SHARED tail — REUSE
+  the `shareUpvalues` branch (vm.cc:5500 `c->upvalEnv = closureEnv`) that P0.C
+  freed up; the child's flat nUp is only the RESIDUAL (hybrid). Then GC already
+  walks upvalEnv (P0.A-4 + existing env-sharing walkers).
+- **Frame entry** (OP_CALL / thunk-force new-frame setup): `newFrame.defEnv =
+  desc->usesDefEnv ? closure->upvalEnv : nullptr;`. Audit the 3 fakeClo fill
+  sites (vm.cc:~13330) to propagate it.
+- **LambdaDescriptor** (closure.hh) += `bool usesDefEnv; uint16_t envSlotCount;`
+  → serialize schema bump (lint Rule 1) + the 4 serialize walkers already handle
+  OP_GET_ENV's trailer (W0). Emit reads these off ir::Function (like
+  rawFormalEligible).
+- **Emit** (emit.cc + a lower phase): the escape analysis (extend W1's
+  collectEnvCaptureStats into a per-Function eligible set: E(F) MINUS emitter
+  TEMP defer-slots MINUS with-targets, with slot→envIdx assignment) drives:
+  add `FuncCtx.envSlot` (VarId→envIdx); in emitVarRef, an escaping-eligible
+  local → OP_GET_ENV(0,idx), an env-routed ancestor upvalue → OP_GET_ENV(depth,
+  idx); the escaping local's binding store → OP_SET_ENV(idx) (after OP_MAKE_ENV,
+  emitted lazily at entry); a child capturing an escaping/forwarded local routes
+  via defEnv (usesDefEnv) instead of pushing it flat; residual stays flat FAM.
+- **W2 PRECONDITION FIRST** (task #8): close the marker/evac Env-parent
+  early-break hole — it goes live the moment defEnv/parent chains materialize.
+- **Minimal validatable slice** to prove the mechanism end-to-end before
+  broadening: `let x = 1+2; f = _: x; in f 0` — x escapes into f; gate-on must
+  emit OP_MAKE_ENV/SET_ENV + f-captures-defEnv + f-body OP_GET_ENV(0,0), and
+  eval to 3 == gate-off. Then broaden eligibility + byte-id ladder + brute.
+
 ### P0.B (partial) + P0.C — DONE
 - **P0.B item 1 (`6758acdac`)**: deleted the completed TEMP P2.1-a formals sizing
   probe (per-call formals walk + 2 V3_STATS bumps at both OP_CALL + OP_TAIL_CALL
