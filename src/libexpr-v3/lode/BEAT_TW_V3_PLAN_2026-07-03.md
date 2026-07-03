@@ -676,6 +676,39 @@ stale-binary gotcha; ALWAYS rebuild v3-smoke on an AllocStats change).
 5. GATE: byte-id ladder gate-on/off (hello→git→firefox→python3) FIRST (design-b
    lesson), then brute both settings + adversarial review of the GC/emit changes.
 
+#### W2a — frame-Env root-walking GC scaffold — DONE (`a431e5f4c`, no-op, brute 32/32)
+Landed the GC/root-walk HALF of W2 as a validated no-op (P0.A-4 pattern):
+CallFrame.defEnv + `RootVisitor::visitEnv` (default walks values+parent;
+MarkVisitor overrides to mark the Env cell; EvacVisitor overrides with walked_
+dedup) + all four frame-root-walk sites (scavenger main+nested, auditor,
+walkAllV3Roots for mark+evac).  So W2b's emission has the moving-GC integration
+in place + independently adversarial-reviewed.  defEnv null today ⇒ inert.
+
+#### W2b — emission + runtime (the atomic, intricate remainder) — spec refined
+With W2a done, W2b = descriptor + runtime handlers + MAKE/frame-entry + the
+escape-analysis EMIT, all validated TOGETHER (byte-id ladder + brute + the
+minimal slice), since gate-on codegen only works when emit+handlers+GC agree:
+- **LambdaDescriptor** (closure.hh:324) += `bool usesDefEnv; uint16_t envSlotCount;`
+  → serialize + `kSchemaVersion` 17→18 (lint Rule 1).
+- **Handlers** (replace W0 trap-stubs; use `vm.frames.back().defEnv` for mutable
+  access — frames is stable within a handler; stamp new Env slots with
+  `mkUninitialized()`; OP_SET_ENV uses `cellWrite`).
+- **MAKE_CLOSURE/THUNK** (vm.cc:5384/5779) usesDefEnv → store `frames.back().defEnv`
+  into upvalEnv (reuse the shareUpvalues branch P0.C freed) + **frame-entry**
+  install (`newFrame.defEnv = desc->usesDefEnv ? closure->upvalEnv : nullptr`) at
+  every call/force path + the 3 fakeClo sites.
+- **EMIT** (the hard part): extend W1's escape analysis to the per-Function
+  eligible set (E(F) MINUS emitter TEMP defer-slots MINUS with-targets) + envIdx
+  assignment + usesDefEnv; FuncCtx.envSlot; emitVarRef routes escaping locals →
+  OP_GET_ENV(0,idx), env-routed ancestor upvalues → OP_GET_ENV(depth,idx);
+  escaping-local store → OP_SET_ENV (after a lazy OP_MAKE_ENV); child capture of
+  an escaping/forwarded local → route via defEnv (usesDefEnv), residual flat.
+- **W2-PRECONDITION** (task #8): close the marker/evac/visitEnv early-break hole
+  (now applies to visitEnv too) WITH W2b, validated by live chains under
+  V3_DBG_ENV_CAPTURE_AUDIT.
+- **Minimal validatable slice**: `let x=1+2; f=_: x; in f 0` → 3 gate-on==gate-off,
+  then broaden + byte-id ladder (hello→git→firefox→python3) + brute both settings.
+
 #### W2 CODE-LEVEL DESIGN (worked out 2026-07-04; turnkey — build in the working
 tree, validate byte-id + brute, commit only when GREEN; it is ATOMIC — emission +
 runtime + GC must land together to be byte-id-validatable, so build it all then
