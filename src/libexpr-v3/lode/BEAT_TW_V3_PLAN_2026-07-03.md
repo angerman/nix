@@ -725,11 +725,30 @@ the plan's "reuse upvalEnv" note is incomplete):
 
 These, the handlers, MAKE/frame-entry install, the escape-analysis emit, and the
 marker/evac precondition are the interdependent, GC-critical, exercised-together
-core — the multi-day fresh-focus remainder.  Four build-attempt findings
-(RootVisitor::visitEnv, closureUpvalue→FAM, walkClosure XOR→both, upvalEnv
-entanglement) confirm this is NOT fragmentable into safe unexercised slices
-beyond W2b-prep; the runtime repurposing + emit must land + byte-id-validate
-together.
+core — the multi-day fresh-focus remainder.
+
+#### W2b-runtime DESIGN DECISION (chosen 2026-07-04 after tracing all layers):
+**Use a SEPARATE `Closure::capturedDefEnv` field (+8 B), NOT upvalEnv reuse.**
+Rationale (six build-attempt findings): reusing upvalEnv would force
+closureUpvalue→FAM (breaking the retained NIX_V3_ENV_SHARE_AFTER A/B override,
+which can still set upvalEnv to an upvalue-Env), a walkClosure XOR→both change,
+and interacts with the ~10 accessor callers + intrinsics + ENV_SHARED.  A
+separate field avoids ALL of that: closureUpvalue/closureUpvaluePtr UNCHANGED,
+no override conflict, no XOR→both.  It is the exact W2a pattern applied to
+Closure — add the field, init it null at every alloc, GC-walk it ALONGSIDE
+upvalEnv in walkClosure/mark/evac/auditor (gray/mark/rewrite as a tenured Env),
+update allocClosure/closureAllocatedSize sizing (mind the `_pad`).  +8 B/closure
+is a defined v1 cost (v2 reclaims it by fully retiring interning + reusing
+upvalEnv once the override is dropped).  Then: real handlers; MAKE_CLOSURE/THUNK
+usesDefEnv → `c->capturedDefEnv = frame.defEnv`; frame-entry → `newFrame.defEnv =
+desc->usesDefEnv ? closure->capturedDefEnv : nullptr`; the escape-analysis EMIT
+(FuncCtx.envSlot depth/idx, emitVarRef→GET_ENV, store→SET_ENV, child→
+capturedDefEnv, hybrid residual FAM); close the marker/evac precondition.
+Validate the minimal slice `let x=1+2; f=_: x; in f 0` → 3 gate-on==off, then the
+byte-id ladder + brute → Gate B.  This design is directed + lower-risk, but the
+runtime (field+GC+handlers+MAKE+frame-entry) is unexercisable without the emit,
+and the emit is intricate — so runtime+emit land + byte-id-validate TOGETHER
+(multi-day, fresh focus).
 
 #### W2b — emission + runtime (the atomic, intricate remainder) — spec refined
 With W2a done, W2b = descriptor + runtime handlers + MAKE/frame-entry + the
