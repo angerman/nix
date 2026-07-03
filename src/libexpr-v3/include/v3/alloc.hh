@@ -678,6 +678,34 @@ struct AllocStats
     uint64_t formalsRawBindable    = 0;  // no-default formals, arg = plain Bindings
     uint64_t formalsDeferredComplex = 0; // no-default formals, arg = mapAttrs/chain
 
+    /// Phase-1 capture-model counters (BEAT_TW_V3_PLAN_2026-07-03 §3; Gate A).
+    /// DETERMINISTIC + host-independent; RUN CACHE-OFF — the emit-side counters
+    /// accumulate during compilation, so a warm (CU-hit) run zeroes them.
+    /// Counter 1 (capture-op share): captureOpsExecuted = Σ(nUp+nWiths) over
+    ///   EXECUTED MAKE_THUNK/MAKE_CLOSURE = the number of dispatched capture-GET
+    ///   pushes that actually ran (each MAKE is preceded by exactly nUp+nWiths
+    ///   GETs).  Share = captureOpsExecuted / total executed ops (NIX_VM_OPCOUNTS
+    ///   histogram total).  Gate A: BUILD v1 if share ≥ 8%; CLOSE if < 4%.
+    uint64_t captureOpsExecuted  = 0;
+    uint64_t makeThunkExecuted   = 0;
+    uint64_t makeClosureExecuted = 0;
+    /// Counter 2 (nUp histogram): distribution of nUp at executed MAKEs (buckets
+    ///   0,1,2,3,4,5+).  The Env model wins BYTES when nUp ≥ 2 (Env 24 B vs
+    ///   inline 8 B/upval); loses when a lone thunk captures 1 var.
+    uint64_t nUpHist[6] = {0, 0, 0, 0, 0, 0};
+    uint64_t nWithsAtMakeTotal = 0;      // Σ nWiths over executed MAKEs
+    /// Counter 3 (forwarding-capture share): capture-GETs emitted INSIDE the
+    ///   Lambda/MkThunk capture loops that resolve to an UPVALUE of the creating
+    ///   frame (pure forwarding — the transitive re-copy the Env chain kills) vs
+    ///   all capture-GETs.  Emit-time static.  Gate A GO branch uses ≥ 30% of
+    ///   captures (with Counter-2 sibling density ≥ 1.5).  captureGetsEmitted /
+    ///   (captureGetsEmitted+bodyGetsEmitted) is the emit-time capture-op share
+    ///   (cross-check on Counter 1).
+    uint64_t captureGetsEmitted   = 0;   // GET_LOCAL/UPVALUE emitted in capture loops
+    uint64_t bodyGetsEmitted      = 0;   // GET_LOCAL/UPVALUE emitted elsewhere
+    uint64_t fwdCapturesEmitted   = 0;   // capture-GETs resolving to an upvalue
+    uint64_t totalCapturesEmitted = 0;   // all capture-GETs (local + upvalue)
+
     /// #495: how many OP_CALL invocations dispatched to the v3-native
     /// `lib.fix` intrinsic (instead of running its bytecode body).
     /// Mirrors selectorLambdaCalls -- confirms that lower.cc's

@@ -19,6 +19,7 @@
 /// Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>, Input Output Group.
 /// SPDX-License-Identifier: Apache-2.0
 
+#include "v3/alloc.hh"   // Phase-1 capture-model emit-time counters (V3_STATS_BUMP)
 #include "v3/bytecode.hh"
 #include "v3/disasm.hh"
 #include "v3/ir.hh"
@@ -85,6 +86,12 @@ struct Emitter
 {
     const ir::Module & m;
     CompilationUnit unit;
+
+    /// Phase-1 capture-model instrumentation (BEAT_TW_V3_PLAN §3, Counter 3).
+    /// Set true while emitting the capture (lexicalWiths+freeVars) sequence of a
+    /// Lambda/MkThunk, so emitVarRef can classify each emitted GET as a capture
+    /// (and whether it forwards an upvalue) vs a body read.  Emit-time only.
+    bool emittingCaptures_ = false;
 
     /// #542 — module-wide occurrence info, computed once per compile.
     /// Drives the per-binding "defer SET vs emit SET" decision: only
@@ -370,14 +377,29 @@ struct Emitter
         // here instead of GET_LOCAL.  A LIT pushes exactly one value (like a
         // GET), so the post-flush stack discipline is unchanged.
         if (auto cit = constRemat_.find(v); cit != constRemat_.end()) {
+            // A const-remat'd capture emits a LIT (no dispatched GET), but it is
+            // still a capture (counted for Counter-3's denominator).
+            if (__builtin_expect(emittingCaptures_, 0))
+                V3_STATS_BUMP(totalCapturesEmitted, 1);
             emitExpr(*cit->second);
             return;
         }
         if (auto it = ctx->slot.find(v); it != ctx->slot.end()) {
+            if (__builtin_expect(emittingCaptures_, 0)) {
+                V3_STATS_BUMP(totalCapturesEmitted, 1);
+                V3_STATS_BUMP(captureGetsEmitted, 1);
+            } else V3_STATS_BUMP(bodyGetsEmitted, 1);
             emitGetLocal(it->second);   // Step-2 fusion: records SET;GET candidates
             return;
         }
         if (auto uit = ctx->upvalue.find(v); uit != ctx->upvalue.end()) {
+            // A capture that resolves to an UPVALUE of the creating frame is pure
+            // forwarding — the transitive re-copy the env-pointer chain kills.
+            if (__builtin_expect(emittingCaptures_, 0)) {
+                V3_STATS_BUMP(totalCapturesEmitted, 1);
+                V3_STATS_BUMP(captureGetsEmitted, 1);
+                V3_STATS_BUMP(fwdCapturesEmitted, 1);
+            } else V3_STATS_BUMP(bodyGetsEmitted, 1);
             unit.code.push_back(encode(OP_GET_UPVALUE, uit->second));
             return;
         }
@@ -1088,8 +1110,10 @@ struct Emitter
         // they sit BELOW the upvalue block on the value stack.
         // OP_MAKE_CLOSURE pops nUpvalues then nWithTargets in that
         // order (top-down).
+        emittingCaptures_ = true;
         for (auto wv : e.lexicalWiths) emitVarRef(wv);
         for (auto fv : e.freeVars) emitVarRef(fv);
+        emittingCaptures_ = false;
         unit.code.push_back(encode(OP_MAKE_CLOSURE, e.funcIdx));
         unit.code.push_back(static_cast<uint32_t>(e.freeVars.size()));
         unit.code.push_back(static_cast<uint32_t>(e.lexicalWiths.size()));
@@ -1103,8 +1127,10 @@ struct Emitter
     void emitOne(const ir::MkThunk & e)
     {
         // Same push order as ir::Lambda — see comment there.
+        emittingCaptures_ = true;
         for (auto wv : e.lexicalWiths) emitVarRef(wv);
         for (auto fv : e.freeVars) emitVarRef(fv);
+        emittingCaptures_ = false;
         // P2.1-a (NIX_V3_RAW_FORMALS, default-off): prefix a no-default demoted
         // formal wrapper's MkThunk with OP_RAW_FORMAL(formalSym), so the runtime
         // raw-binds the formal (plain arg) instead of allocating the wrapper.

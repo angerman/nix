@@ -479,6 +479,44 @@ RootResult runRootExprModule(nix::EvalState & state, ir::Module module)
                 (unsigned long long)a.formalsDeferredComplex,
                 (unsigned long long)tot);
         }
+        // Phase-1 capture-model counters (BEAT_TW_V3_PLAN_2026-07-03 §3; Gate A).
+        // DETERMINISTIC; run CACHE-OFF (emit-side counters zero on a warm CU hit).
+        // The runtime capture-op share needs the total executed-op count, which is
+        // the NIX_VM_OPCOUNTS histogram total — rerun with NIX_VM_OPCOUNTS=1.
+        {
+            uint64_t totalOps = 0;
+            for (size_t i = 0; i < 256; ++i) totalOps += a.opcodeCounts[i];
+            uint64_t makes = a.makeThunkExecuted + a.makeClosureExecuted;
+            double capShareOps = totalOps
+                ? 100.0 * (double)a.captureOpsExecuted / (double)totalOps : 0.0;
+            double avgCapPerMake = makes
+                ? (double)a.captureOpsExecuted / (double)makes : 0.0;
+            uint64_t emitGets = a.captureGetsEmitted + a.bodyGetsEmitted;
+            double capShareEmit = emitGets
+                ? 100.0 * (double)a.captureGetsEmitted / (double)emitGets : 0.0;
+            double fwdShare = a.totalCapturesEmitted
+                ? 100.0 * (double)a.fwdCapturesEmitted / (double)a.totalCapturesEmitted : 0.0;
+            std::fprintf(stderr,
+                "v3 PHASE1 capture-model (Gate A inputs):\n"
+                "  C1 capture-op share (RUNTIME): captureOps=%llu / totalOps=%llu = %s%.2f%%"
+                "  [GATE A: BUILD >=8%%, CLOSE <4%%]\n"
+                "  C1 emit-time cross-check: captureGets=%llu / (capture+body=%llu) = %.2f%%\n"
+                "  C2 nUp-at-MAKE histogram: [0]=%llu [1]=%llu [2]=%llu [3]=%llu [4]=%llu [5+]=%llu\n"
+                "  C2 avg captures/MAKE=%.2f  (makes=%llu: thunk=%llu clo=%llu; withsTotal=%llu)\n"
+                "  C3 forwarding-capture share (emit): fwd=%llu / totalCaptures=%llu = %.2f%%"
+                "  [GATE A GO-branch: >=30%% & sibling-density>=1.5]\n",
+                (unsigned long long)a.captureOpsExecuted, (unsigned long long)totalOps,
+                (totalOps ? "" : "N/A(need NIX_VM_OPCOUNTS=1) "), capShareOps,
+                (unsigned long long)a.captureGetsEmitted, (unsigned long long)emitGets, capShareEmit,
+                (unsigned long long)a.nUpHist[0], (unsigned long long)a.nUpHist[1],
+                (unsigned long long)a.nUpHist[2], (unsigned long long)a.nUpHist[3],
+                (unsigned long long)a.nUpHist[4], (unsigned long long)a.nUpHist[5],
+                avgCapPerMake, (unsigned long long)makes,
+                (unsigned long long)a.makeThunkExecuted, (unsigned long long)a.makeClosureExecuted,
+                (unsigned long long)a.nWithsAtMakeTotal,
+                (unsigned long long)a.fwdCapturesEmitted,
+                (unsigned long long)a.totalCapturesEmitted, fwdShare);
+        }
         // #702: BYTES per allocation category.  The count counters
         // above are partly bumped at primop call sites and miss
         // Alloc::* invocations from vm.cc dispatch; the byte

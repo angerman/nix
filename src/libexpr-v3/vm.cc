@@ -5388,6 +5388,12 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // of with-target Values pushed BELOW the upvalue block on
             // the value stack.
             uint16_t nWiths = static_cast<uint16_t>(cu->code[ip++]);
+            // Phase-1 capture-model Counter 1/2 (BEAT_TW_V3_PLAN §3): this MAKE was
+            // preceded by exactly nUp+nWiths dispatched capture-GET pushes.
+            V3_STATS_BUMP(makeClosureExecuted, 1);
+            V3_STATS_BUMP(captureOpsExecuted, (uint64_t)nUp + nWiths);
+            V3_STATS_BUMP(nWithsAtMakeTotal, nWiths);
+            V3_STATS_BUMP(nUpHist[nUp < 6 ? nUp : 5], 1);
 
             // IR Phase D (2026-05-18): closure-free lambda lifting.
             // When nUp==0 && nWiths==0, the descriptor's body has no
@@ -5783,6 +5789,12 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // protocol.  Second data word is the with-target count;
             // the with-targets sit BELOW the upvalues on the stack.
             uint16_t nWiths = static_cast<uint16_t>(cu->code[ip++]);
+            // Phase-1 capture-model Counter 1/2 (BEAT_TW_V3_PLAN §3): this MAKE was
+            // preceded by exactly nUp+nWiths dispatched capture-GET pushes.
+            V3_STATS_BUMP(makeThunkExecuted, 1);
+            V3_STATS_BUMP(captureOpsExecuted, (uint64_t)nUp + nWiths);
+            V3_STATS_BUMP(nWithsAtMakeTotal, nWiths);
+            V3_STATS_BUMP(nUpHist[nUp < 6 ? nUp : 5], 1);
             // FP-2b: predict whether this thunk will capture a non-null with-list
             // and reserve the trailing tail slot iff so.  This EXACTLY matches
             // the capturedWiths logic below: nWiths>0 => an explicit lexical with;
