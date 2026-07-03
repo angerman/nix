@@ -620,3 +620,39 @@ darwin-4 baseline): P0.B quick CPU wins, P0.C (retire env-share intern heuristic
 — **the Phase-1 nUp histogram is its falsifier: avg nUp 1.88–2.10 ⇒ the nUp>8
 intern threshold ~never fires, confirming §3.1**), Q1.6 rooting backlog, Q1.8
 GcRoot-at-scavenge assert.
+
+### W1 implementation spec (turnkey — all machinery located this session)
+The escape analysis is the DUAL of `computeFreeVars(Module&)` in `ir.cc:312`,
+which already: (a) builds `funcOfBlock[bid]` via per-function reachability from
+`Function::entryBlock` (crossing sub-blocks via `collectExprSubBlocks`, NOT
+crossing into nested-function entryBlocks); (b) after convergence, PROPAGATES
+each function's `freeVars` onto the ir::Lambda/MkThunk **node**'s `freeVars`
+field (`ir.cc:441-453`) — so a child's captures are readable directly off the
+node. Reuse both.
+- **E(F)** (per Function F): iterate F's blocks (`funcOfBlock[bid]==fid`), for
+  each binding that is a `Lambda`/`MkThunk` read `e.freeVars` (the child's
+  captures); classify each fv:
+  - fv ∈ F's-own-bound set (block-binding `.var`s of F + `paramVar` +
+    `extraParams`) → **escaping** (env-routable at depth 0 via F's frame Env);
+  - fv ∈ `F.freeVars` → **forwarding** (env-routable at depth+1 via parent Env —
+    this is the transitive re-copy the chain kills; should ≈ Phase-1 C3 54–65%);
+  - (at the IR level ~all captures are one of these ⇒ ~100% env-routable; the
+    real v1 INELIGIBILITY is EMIT-side — emitter TEMP defer-slots (§5.3-2) +
+    with-targets stay flat — so counter-4 precision needs the emit-side slot
+    map, computed at W2, per the plan's "Gate A numbers come from W1 if Phase 1
+    used estimates").
+- **W1 dump** (`NIX_V3_ENV_CAPTURE=dump`, analysis+stderr only, NO codegen ⇒
+  byte-id trivial): report escaping/forwarding/total capture split per workload;
+  cross-check forwarding ≈ Phase-1 C3.  Add `computeEnvCaptureStats(const
+  Module&)` in ir.cc called after computeFreeVars; wire the report into the
+  NIX_VM_STATS dump.  Then W2 adds `usesDefEnv`/`envSlotCount` to `Function`
+  (mirror `rawFormalEligible`@ir.hh:515) + the emit-side slot-eligibility (SSA
+  proof / TEMP-slot exclusion) + OP_MAKE_ENV/SET_ENV/GET_ENV emission.
+
+**Session end-state (2026-07-03):** HEAD after W0 = `f3acf9d14` (+ handback docs).
+9 commits, each full-`--brute`-gated (32 suites; the recurring 31/32 is the
+let-chain-5000 15s-timeout flake on this shared host at load avg ~21, verified
+3.73s CPU/5.5s wall + passing standalone — NOT a regression), every GC-critical
+commit independently adversarial-reviewed (all NOT REFUTED). Gate A = GO is the
+plan's first decision gate, resolved with reliable data. W1→W6 is the prepped
+multi-week remainder; W1 (above) is the next increment.
