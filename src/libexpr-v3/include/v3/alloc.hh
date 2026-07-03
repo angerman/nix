@@ -2996,28 +2996,29 @@ struct Alloc
     }
 
     /// NIX_V3_ENV_CAPTURE (W2b): a suspended thunk whose body reads env-routed
-    /// locals.  Identical tail LAYOUT to allocThunkSuspendedShared (tail[0]=Env*,
-    /// withs@tail[1]) but flagged THUNK_ENV_CAPTURE and nUpvalues=0 (all captures
-    /// route through the defEnv chain, none flat).  tail[0] holds the captured
-    /// PARENT defEnv (the maker frame's defEnv); the caller fills it via
+    /// locals AND may capture residual flat upvalues (recVars etc.).  HYBRID tail:
+    /// [nUpvalues FAM upvalues] + [captured defEnv @ tail[nUpvalues]] + [withs @
+    /// tail[nUpvalues+1] iff reserveWithsSlot].  The FAM upvalues are filled by the
+    /// MAKE_THUNK pop loop (as for a normal thunk); the caller fills the defEnv via
     /// thunkSetCapturedDefEnv immediately after alloc.
-    static Thunk * allocThunkCapture(bool reserveWithsSlot = false,
+    static Thunk * allocThunkCapture(uint16_t nUpvalues,
+                                     bool reserveWithsSlot = false,
                                      const char * file = __builtin_FILE(),
                                      uint32_t     line = __builtin_LINE()) noexcept
     {
         const size_t bytes = sizeof(Thunk)
-            + sizeof(Value) * (1 + (reserveWithsSlot ? 1 : 0));
+            + sizeof(Value) * (nUpvalues + 1 + (reserveWithsSlot ? 1 : 0));
         V3_STATS_BUMP(bytesThunks, bytes);
         auto * t = static_cast<Thunk *>(nurseryOrArena(bytes, CellType::Thunk));
         t->state = ThunkState::Suspended;
         t->hasWithsSlot = static_cast<uint8_t>(
             THUNK_ENV_CAPTURE | (reserveWithsSlot ? THUNK_WITHS_SLOT : 0));
-        t->nUpvalues = 0;
+        t->nUpvalues = nUpvalues;
         t->forces = 0;
         t->cell = nullptr;
-        *reinterpret_cast<Env **>(&t->tail[0]) = nullptr;  // defEnv slot; caller fills
-        if (reserveWithsSlot) thunkSetCapturedWiths(t, nullptr);  // tail[1]
-        thunkAllocSiteRecord(t, file, line, 0);
+        thunkSetCapturedDefEnv(t, nullptr);            // tail[nUpvalues]; caller fills
+        if (reserveWithsSlot) thunkSetCapturedWiths(t, nullptr);  // tail[nUpvalues+1]
+        thunkAllocSiteRecord(t, file, line, nUpvalues);
         return t;
     }
 

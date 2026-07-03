@@ -5840,12 +5840,13 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             Thunk * t;
             Env * thunkEnv = nullptr;
             if (__builtin_expect(thunkDesc.usesDefEnv, 0)) {
-                // NIX_V3_ENV_CAPTURE (W2b): the thunk body reads env-routed locals
-                // — capture the maker frame's defEnv as ONE pointer (tail[0]).
-                // nUp is 0 (emit routes ALL freeVars through the env chain, none
-                // flat), so the upvalue-fill below is skipped.  Mutually exclusive
-                // with env-sharing.  Inert until the emitter sets usesDefEnv.
-                t = Alloc::allocThunkCapture(willHaveWiths);
+                // NIX_V3_ENV_CAPTURE (W2b, HYBRID): the thunk body reads env-routed
+                // locals AND may keep residual flat upvalues (recVars etc.).
+                // Allocate the FAM for nUp residual upvalues + a defEnv slot at
+                // tail[nUp]; capture the maker frame's defEnv there.  The FAM is
+                // filled by the pop loop below (as for a normal thunk).  Mutually
+                // exclusive with env-sharing.  Inert until the emitter sets usesDefEnv.
+                t = Alloc::allocThunkCapture(nUp, willHaveWiths);
                 thunkSetCapturedDefEnv(
                     t, vm.frames.empty() ? nullptr : vm.frames.back().defEnv);
             } else {
@@ -5995,10 +5996,11 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // env-sharing: upvalues go into the shared Env, not the inline tail
             // (tail[0] holds the Env*).  Stack order is identical (upvalues on
             // top, withs below), so the withs-pop logic below is unaffected.
-            // env-capture thunks have NO inline upvalue slots (tail[0]=defEnv);
-            // nUp is 0 by construction, but guard explicitly so a stray nUp>0
-            // can never write OOB into the 1-2 slot capture tail.
-            if (!thunkEnv && !thunkCapturesDefEnv(t)) {
+            // Fill the inline FAM upvalues (tail[0..nUp)).  env-shared thunks skip
+            // this (their upvalues live in the shared Env at tail[0]); env-capture
+            // (HYBRID) thunks DO fill the FAM — their defEnv is a separate slot at
+            // tail[nUp], not colliding with tail[0..nUp).
+            if (!thunkEnv) {
                 for (uint16_t i = nUp; i > 0; --i) t->tail[i - 1] = pop(vm);
             }
             if (__builtin_expect(g_dbgUpvalDup, 0) && nUp > 0 && !thunkEnv)

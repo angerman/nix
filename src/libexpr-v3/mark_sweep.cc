@@ -743,11 +743,11 @@ private:
             walkCuIC(thunkCU(t));  // MIDEVAL_GC: IC-pinned Bindings (mirror scavenger)
             if (ListVec * w = thunkCapturedWiths(t))  // FP-2b: tail slot
                 visitList(w);
-            if (Env * te = thunkTailEnv(t)) {
+            if (Env * te = thunkUpvalEnv(t)) {
                 // env-sharing: upvalues live in the shared, tenured Env (tail[0]).
-                // P0.A-4 (§1.9): mark te AND its parent chain (NIX_V3_ENV_CAPTURE).
-                // MIDEVAL_GC: also traverse a nursery-resident Env.  Stop at the
-                // first already-marked Env (first-visit-wins ⇒ dedup + cycle-safe).
+                // P0.A-4 (§1.9): mark te AND its parent chain.  MIDEVAL_GC: also
+                // traverse a nursery-resident Env.  Stop at the first already-marked
+                // Env (first-visit-wins ⇒ dedup + cycle-safe).
                 for (Env * e = te; e; e = e->parent) {
                     const bool fresh = marker_.tryMark(e)
                         || (nursery_ && nursery_->contains(e)
@@ -762,6 +762,19 @@ private:
             } else {
                 for (uint16_t i = 0; i < t->nUpvalues; ++i)
                     visitValue(t->tail[i]);
+                // env-capture (HYBRID): FAM marked above; ALSO mark the captured
+                // defEnv (tail[nUpvalues]) + its parent chain, same loop.
+                for (Env * e = thunkCapturedDefEnv(t); e; e = e->parent) {
+                    const bool fresh = marker_.tryMark(e)
+                        || (nursery_ && nursery_->contains(e)
+                            && nurseryVisited_.insert(e).second);
+                    if (!fresh) break;
+                    if (arenaSetForSlot_)
+                        arenaSetForSlot_->markLinesForCell(
+                            e, sizeof(Env) + sizeof(Value) * e->nValues);
+                    for (uint16_t i = 0; i < e->nValues; ++i)
+                        visitValue(e->values[i]);
+                }
             }
             break;
         case ThunkState::Evaluated:
@@ -1626,11 +1639,15 @@ private:
                 // deduped via walked_ (interning shares one Env across referrers).
                 // P0.A-4 (§1.9): also the Env::parent chain (NIX_V3_ENV_CAPTURE);
                 // walked_ dedups + stops at an already-evacuated Env.
-                if (Env * te = thunkTailEnv(t)) {
+                if (Env * te = thunkUpvalEnv(t)) {
                     for (Env * e = te; e && walked_.insert(e).second; e = e->parent)
                         for (uint16_t i = 0; i < e->nValues; ++i) visitValue(e->values[i]);
                 } else {
                     for (uint16_t i = 0; i < t->nUpvalues; ++i) visitValue(t->tail[i]);
+                    // env-capture (HYBRID): also rewrite the captured defEnv
+                    // (tail[nUpvalues]) + parent chain, deduped via walked_.
+                    for (Env * e = thunkCapturedDefEnv(t); e && walked_.insert(e).second; e = e->parent)
+                        for (uint16_t i = 0; i < e->nValues; ++i) visitValue(e->values[i]);
                 }
                 break;
             case ThunkState::Evaluated: visitValue(t->evaluated); break;
@@ -2130,14 +2147,21 @@ static void runEvacuation(VMState & vm, Arena & arena,
                         case ThunkState::Blackhole:
                         case ThunkState::Native:
                             if (ListVec * w = thunkCapturedWiths(t); w && inFreeable(reinterpret_cast<uintptr_t>(w))) note("Thunk.capturedWiths", cs);  // FP-2b: tail slot
-                            if (Env * te = thunkTailEnv(t)) {
+                            if (Env * te = thunkUpvalEnv(t)) {
                                 // env-sharing: upvalues live in the shared Env.
                                 if (inFreeable(reinterpret_cast<uintptr_t>(te))) note("Thunk.upvalEnv", cs);
                                 for (uint16_t i = 0; i < te->nValues; ++i)
                                     if (refCand(te->values[i])) { note("Thunk.upvalEnv.value", cs); break; }
-                            } else
-                            for (uint16_t i = 0; i < t->nUpvalues; ++i)
-                                if (refCand(t->tail[i])) { note("Thunk.tail", cs); break; }
+                            } else {
+                                for (uint16_t i = 0; i < t->nUpvalues; ++i)
+                                    if (refCand(t->tail[i])) { note("Thunk.tail", cs); break; }
+                                // env-capture (HYBRID): also note the captured defEnv (tail[nUpvalues]).
+                                if (Env * de = thunkCapturedDefEnv(t)) {
+                                    if (inFreeable(reinterpret_cast<uintptr_t>(de))) note("Thunk.capturedDefEnv", cs);
+                                    for (uint16_t i = 0; i < de->nValues; ++i)
+                                        if (refCand(de->values[i])) { note("Thunk.capturedDefEnv.value", cs); break; }
+                                }
+                            }
                             break;
                         case ThunkState::Evaluated:
                             if (refCand(t->evaluated)) note("Thunk.evaluated", cs);

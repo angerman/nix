@@ -264,12 +264,13 @@ enum : uint8_t {
     THUNK_WITHS_SLOT = 1,
     THUNK_ENV_SHARED = 2,
     // NIX_V3_ENV_CAPTURE (W2b): mutually exclusive with THUNK_ENV_SHARED.  The
-    // thunk body reads env-routed locals; tail[0] holds the captured PARENT
-    // defEnv (this thunk's OWN escaping locals, if any, are created at force time
-    // by OP_MAKE_ENV, NOT stored here).  nUpvalues==0 (emit routes ALL freeVars
-    // through the env chain, none flat), so the tail is identical in LAYOUT to
-    // ENV_SHARED — tail[0]=Env*, withs relocate to tail[1] — and the GC walks
-    // tail[0]+its parent chain identically (see thunkTailEnv).
+    // thunk body reads env-routed locals via the captured PARENT defEnv.  HYBRID
+    // layout: the thunk STILL has its residual flat upvalues in the normal FAM
+    // (tail[0..nUpvalues), read via frameUpvalue unchanged — a usesDefEnv function
+    // can ALSO capture recVars/other residual vars flat), and the captured defEnv
+    // sits in ONE extra slot AFTER them at tail[nUpvalues]; withs (if any) relocate
+    // to tail[nUpvalues+1].  (This differs from ENV_SHARED, where tail[0] IS the
+    // Env and nUpvalues is logical.)  GC walks the FAM upvalues AND the defEnv.
     THUNK_ENV_CAPTURE = 4,
 };
 [[gnu::always_inline]] inline bool thunkHasWithsSlot(const Thunk * t) noexcept
@@ -287,27 +288,17 @@ enum : uint8_t {
         ? *reinterpret_cast<Env * const *>(&t->tail[0])
         : nullptr;
 }
-/// NIX_V3_ENV_CAPTURE: the captured PARENT defEnv (tail[0]), or null.
+/// NIX_V3_ENV_CAPTURE: the captured PARENT defEnv, or null.  HYBRID layout — the
+/// defEnv sits AFTER the residual flat upvalues, at tail[nUpvalues] (not tail[0]).
 [[gnu::always_inline]] inline Env * thunkCapturedDefEnv(const Thunk * t) noexcept
 {
     return thunkCapturesDefEnv(t)
-        ? *reinterpret_cast<Env * const *>(&t->tail[0])
+        ? *reinterpret_cast<Env * const *>(&t->tail[t->nUpvalues])
         : nullptr;
 }
 [[gnu::always_inline]] inline void thunkSetCapturedDefEnv(Thunk * t, Env * e) noexcept
 {
-    *reinterpret_cast<Env **>(&t->tail[0]) = e;
-}
-/// GC-unified accessor: the Env living at tail[0] whether it is a shared upvalue
-/// Env (ENV_SHARED) or a captured parent defEnv (ENV_CAPTURE).  BOTH are walked
-/// identically by every GC walker (mark/gray/rewrite the Env + its parent chain
-/// + values), so the walkers use this instead of thunkUpvalEnv.  null on the
-/// default inline-FAM path (⇒ walkers fall through to the nUpvalues FAM walk).
-[[gnu::always_inline]] inline Env * thunkTailEnv(const Thunk * t) noexcept
-{
-    return (thunkEnvShared(t) || thunkCapturesDefEnv(t))
-        ? *reinterpret_cast<Env * const *>(&t->tail[0])
-        : nullptr;
+    *reinterpret_cast<Env **>(&t->tail[t->nUpvalues]) = e;
 }
 
 // FP-2b SINGLE SOURCE OF TRUTH for a thunk's scanned/copied byte size.  EVERY GC
@@ -322,12 +313,16 @@ enum : uint8_t {
     switch (t->state) {
     case ThunkState::Suspended:
     case ThunkState::Blackhole:
-        // env-sharing / env-capture: tail is [Env* @ 0] + [withs @ 1 iff WITHS_SLOT]
-        // — a fixed 1-or-2 slots regardless of the logical nUpvalues (env-shared:
-        // upvalues live in the Env; env-capture: nUpvalues==0, tail[0]=defEnv).
-        if (thunkEnvShared(t) || thunkCapturesDefEnv(t))
+        // env-sharing: tail is [Env* @ 0] + [withs @ 1 iff WITHS_SLOT] — fixed
+        // 1-or-2 slots (upvalues live in the Env).
+        if (thunkEnvShared(t))
             return sizeof(Thunk)
                  + sizeof(Value) * (1 + (thunkHasWithsSlot(t) ? 1 : 0));
+        // env-capture (HYBRID): [nUpvalues FAM upvalues] + [defEnv @ nUpvalues] +
+        // [withs @ nUpvalues+1 iff WITHS_SLOT].
+        if (thunkCapturesDefEnv(t))
+            return sizeof(Thunk)
+                 + sizeof(Value) * (t->nUpvalues + 1 + (thunkHasWithsSlot(t) ? 1 : 0));
         return sizeof(Thunk) + sizeof(Value) * t->nUpvalues
              + (thunkHasWithsSlot(t) ? sizeof(Value) : 0);
     case ThunkState::Native:
@@ -358,12 +353,16 @@ enum : uint8_t {
     // Env*); the default inline-tail path keeps it at tail[nUpvalues].  (env-
     // capture has nUpvalues==0, so tail[nUpvalues] would COLLIDE with tail[0]'s
     // defEnv — the relocation is mandatory, not just an optimization.)
-    const std::size_t idx = (thunkEnvShared(t) || thunkCapturesDefEnv(t)) ? 1 : t->nUpvalues;
+    const std::size_t idx = thunkEnvShared(t)      ? 1
+                          : thunkCapturesDefEnv(t) ? std::size_t(t->nUpvalues) + 1
+                                                   : t->nUpvalues;
     return *reinterpret_cast<ListVec * const *>(&t->tail[idx]);
 }
 [[gnu::always_inline]] inline void thunkSetCapturedWiths(Thunk * t, ListVec * w) noexcept
 {
-    const std::size_t idx = (thunkEnvShared(t) || thunkCapturesDefEnv(t)) ? 1 : t->nUpvalues;
+    const std::size_t idx = thunkEnvShared(t)      ? 1
+                          : thunkCapturesDefEnv(t) ? std::size_t(t->nUpvalues) + 1
+                                                   : t->nUpvalues;
     *reinterpret_cast<ListVec **>(&t->tail[idx]) = w;
 }
 

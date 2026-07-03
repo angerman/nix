@@ -726,7 +726,7 @@ void Scavenger::walkThunk(Thunk * t)
         }
         if (ListVec * w = thunkCapturedWiths(t))  // FP-2b: tail slot, was suspended.capturedWiths
             thunkSetCapturedWiths(t, fwdList(w));
-        if (Env * te = thunkTailEnv(t)) {
+        if (Env * te = thunkUpvalEnv(t)) {
             // env-sharing: upvalues live in the shared tenured Env (tail[0]); gray
             // it so walkEnv forwards its nursery payloads (the Env never moves).
             if (walked.insert(te).second) graylist.push_back({te, GK_ENV});
@@ -734,6 +734,10 @@ void Scavenger::walkThunk(Thunk * t)
             for (uint16_t i = 0; i < t->nUpvalues; ++i) {
                 visitValue(t->tail[i]);
             }
+            // env-capture (HYBRID): FAM walked above; ALSO gray the captured defEnv
+            // at tail[nUpvalues] (a separate tenured Env + parent chain via GK_ENV).
+            if (Env * de = thunkCapturedDefEnv(t))
+                if (walked.insert(de).second) graylist.push_back({de, GK_ENV});
         }
         break;
     case ThunkState::Evaluated:
@@ -782,13 +786,16 @@ void Scavenger::walkThunk(Thunk * t)
         // Fix: identical to the Suspended case.
         if (ListVec * w = thunkCapturedWiths(t))  // FP-2b: tail slot, was suspended.capturedWiths
             thunkSetCapturedWiths(t, fwdList(w));
-        if (Env * te = thunkTailEnv(t)) {
+        if (Env * te = thunkUpvalEnv(t)) {
             // env-sharing: mirror the Suspended case (Blackhole shares the layout).
             if (walked.insert(te).second) graylist.push_back({te, GK_ENV});
         } else {
             for (uint16_t i = 0; i < t->nUpvalues; ++i) {
                 visitValue(t->tail[i]);
             }
+            // env-capture (HYBRID): also gray the captured defEnv (tail[nUpvalues]).
+            if (Env * de = thunkCapturedDefEnv(t))
+                if (walked.insert(de).second) graylist.push_back({de, GK_ENV});
         }
         break;
     }
@@ -1321,11 +1328,14 @@ struct Auditor {
             walkCUAttrSelectCache(thunkCU(t));  // FP-2a: was t->suspended.cu
             if (ListVec * w = thunkCapturedWiths(t))  // FP-2b: tail slot
                 check(w, "Thunk.suspended.capturedWiths", site);
-            if (Env * te = thunkTailEnv(t))
+            if (Env * te = thunkUpvalEnv(t))
                 visitEnv(te, "Thunk.suspended.upvalEnv");  // env-sharing
-            else
+            else {
                 for (uint16_t i = 0; i < t->nUpvalues; ++i)
                     visitValue(t->tail[i], "Thunk.suspended.tail[]");
+                if (Env * de = thunkCapturedDefEnv(t))       // env-capture (HYBRID)
+                    visitEnv(de, "Thunk.suspended.capturedDefEnv");
+            }
             break;
         case ThunkState::Native:
             // N7 (audit Round 2): Suspended and Native have DIFFERENT
@@ -1348,11 +1358,14 @@ struct Auditor {
             if (ListVec * w = thunkCapturedWiths(t))  // FP-2b: tail slot
                 check(w,
                       "Thunk.Blackhole.suspended.capturedWiths", site);
-            if (Env * te = thunkTailEnv(t))
+            if (Env * te = thunkUpvalEnv(t))
                 visitEnv(te, "Thunk.Blackhole.upvalEnv");  // env-sharing
-            else
+            else {
                 for (uint16_t i = 0; i < t->nUpvalues; ++i)
                     visitValue(t->tail[i], "Thunk.Blackhole.tail[]");
+                if (Env * de = thunkCapturedDefEnv(t))       // env-capture (HYBRID)
+                    visitEnv(de, "Thunk.Blackhole.capturedDefEnv");
+            }
             break;
         }
     }
