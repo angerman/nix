@@ -573,3 +573,50 @@ bindings pass trivially; emitter TEMP-slots fail).
     **1.5%** AND RSS flat.
 
 Next: build+brute+commit the counter instrumentation, then Track E v1 W0→W6.
+
+## Track E v1 — W0 (opcode/gate/serialize foundation) — DONE (`f3acf9d14`)
+Validated NO-OP foundation for the capture model:
+- Opcodes OP_MAKE_ENV=0xE0, OP_SET_ENV=0xE1, OP_GET_ENV=0xE2 (plain-int operands,
+  no SymbolId → no P3.3 remap footgun; OP_GET_ENV carries idx in operand + 1
+  trailer word = depth).
+- opcodeTableFingerprint += the 3 (auto-invalidates old CUs). All FOUR
+  code-stream serialize walkers + disasm learn OP_GET_ENV's 1-word trailer.
+- vm.cc dispatch stubs TRAP (reached = emitter/gate bug; nothing emits until W2).
+- `NIX_V3_ENV_CAPTURE` gate (emit.cc `g_envCapture`, default-off, constraint-#4
+  retirement comment) + added to kGates — **the P0.A-1 Rule-3 lint now ENFORCES
+  this** (verified it flags the gate if absent from kGates).
+- Validation: gate-off vs gate-ON hello.drvPath BYTE-IDENTICAL; zero env-opcodes
+  emitted (no-op confirmed); full --brute 31/32 (sole failure = the
+  let-chain-5000 fixed-15s-`timeout -s KILL` flake on this shared host at load
+  avg 21 — measured 3.73s CPU/5.5s wall, correct result; NOT a W0 slowdown, W0
+  adds no eval-time work; brute-audit + let-rec-publish both pass standalone +
+  in the clean re-run).
+
+## Track E v1 — W1..W6 roadmap (prepped; the multi-week remainder)
+Prep done this session (structures located for a fast start):
+- **W1 (escape analysis §5.3 + dump-mode)**: IR structs in `include/v3/ir.hh` —
+  `Lambda`@100 / `MkThunk`@135 (freeVars + lexicalWiths), `Function`@473 (mirror
+  the `rawFormalEligible`/`formalSym`@515 metadata pattern for the new
+  `usesDefEnv`/`envSlotCount` + escaping-local→Env-index map). Dump-mode
+  (`NIX_V3_ENV_CAPTURE=dump`) reports counter-4 eligibility (single-assignment
+  escaping locals) per workload — refines the projection; NO codegen change, so
+  byte-id is trivial and the brute is a formality.
+- **W2 (emission + runtime)**: MUST first close the W2 PRECONDITION (marker/evac
+  Env-parent early-break hole — task #8). Then OP_MAKE_ENV lazy-emit + OP_SET_ENV
+  + child OP_GET_ENV; runtime handlers reusing Closure::upvalEnv + the ENV_SHARED
+  thunk tail (P0.C keeps this plumbing). fakeClo audit (3 sites, vm.cc:~13330).
+- **W3**: GC integration tests (synthetic Env chains + V3_DBG_ENV_CAPTURE_AUDIT —
+  this is where the P0.A-4 walkers get their LIVE validation) + fakeClo +
+  deserialize round-trip.
+- **W4**: byte-id ladder gate-on/off (hello→git→firefox→python3) + Gate B (brute
+  both settings).
+- **W5**: darwin-4 A/B (cache-off + warm; firefox+M5+git; the P0.4 baseline row
+  needs P0.B/P0.C landed first) + re-measure the Phase-1 counters for realized-
+  vs-projected attribution.
+- **W6**: Gate C verdict vs projection P (SHIP≥3%/KILL<1.5% + v2 ≥15%CPU/20%RSS).
+
+Remaining Phase-0 hygiene (non-v1-blocking for W0/W1; needed before the W5
+darwin-4 baseline): P0.B quick CPU wins, P0.C (retire env-share intern heuristic
+— **the Phase-1 nUp histogram is its falsifier: avg nUp 1.88–2.10 ⇒ the nUp>8
+intern threshold ~never fires, confirming §3.1**), Q1.6 rooting backlog, Q1.8
+GcRoot-at-scavenge assert.
