@@ -676,7 +676,27 @@ stale-binary gotcha; ALWAYS rebuild v3-smoke on an AllocStats change).
 5. GATE: byte-id ladder gate-on/off (hello→git→firefox→python3) FIRST (design-b
    lesson), then brute both settings + adversarial review of the GC/emit changes.
 
-**Session end-state (2026-07-03):** HEAD = `e4d286166`. 12 commits, each
+### P0.B (partial) + P0.C — DONE
+- **P0.B item 1 (`6758acdac`)**: deleted the completed TEMP P2.1-a formals sizing
+  probe (per-call formals walk + 2 V3_STATS bumps at both OP_CALL + OP_TAIL_CALL
+  sites) + its counters + dump — instrumentation-creep off the OP_CALL hot path
+  the trial edits (DEFECT_REVIEW §2.5). Byte-identical; brute 32/32. (Remaining
+  P0.B — attrsUsed O(1) extra-arg check, OP_CALL_N Slot→Closure hop, groupBy→C,
+  path-coerce — are CPU micro-opts, deferred: likely noise at firefox scale per
+  the beat-TW campaign, and needed only before the W5 darwin-4 baseline.)
+- **P0.C (`2dbb71da1`)**: RETIRED the env-share intern heuristic (Rule-0
+  falsification — the Phase-1 nUp histogram is the falsifier: avg 1.88–2.10 ⇒
+  nUp>8 threshold ~never fires; firefox envs=0.1 MB ⇒ shared ~nothing).
+  `shareAfter`→UINT32_MAX (default never interns); KEPT the plumbing (Env/
+  upvalEnv/closureUpvalue/walkEnv/ENV_SHARED) that W2 reuses + the
+  NIX_V3_ENV_SHARE_AFTER A/B override. Gives the trial a clean single-mechanism
+  baseline. Byte-id ladder hello/git/firefox IDENTICAL; brute 32/32.
+
+**Remaining Phase-0 (non-v1-blocking; before the W5 darwin-4 baseline):** the 4
+P0.B CPU micro-opts, Q1.6 rooting backlog (mechanical), Q1.8 GcRoot-at-scavenge
+assert (needs empirical false-fire check).
+
+**Session end-state (2026-07-03):** HEAD = `2dbb71da1`. 16 commits, each
 full-`--brute`-gated (32 suites; recurring 31/32 = the let-chain-5000 15s-timeout
 flake on this shared host at load avg ~21, verified 3.73s CPU/5.5s wall + passing
 standalone — NOT a regression; and the AllocStats-change stale-v3-smoke gotcha,
