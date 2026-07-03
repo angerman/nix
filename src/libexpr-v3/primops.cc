@@ -2523,9 +2523,19 @@ void primReplaceStrings(EvalState & state, Value * args, Value & out)
     // doesn't hold: tree-walker IS lazy on `to`.  Eager-force here
     // would break eval-okay-replacestrings (regressed and reverted).
     for (uint32_t j = 0; j < froms->size; ++j) {
-        froms->elems[j] = forceValue(*state.vm, froms->elems[j]);
-        if (!froms->elems[j].isString())
+        // Q1.3 (DEFECT_REVIEW_2026-07-03 §1.3): force into a LOCAL, type-check,
+        // THEN a barriered store.  The old raw `elems[j] = forceValue(...)`
+        // wrote a possibly-nursery WHNF into the (tenured) `froms` list BEFORE
+        // the type check; when an element forced to a non-string nursery value
+        // the store landed and then typeError threw — under builtins.tryEval the
+        // caller-visible list survived holding an unbarriered nursery pointer
+        // that the next exitDepth==0 scavenge invalidates (PhD-6 missed root).
+        // Force-into-local also gives the barrier the happy path doesn't need
+        // but the error path does.
+        Value f = forceValue(*state.vm, froms->elems[j]);
+        if (!f.isString())
             typeError("replaceStrings", "list of strings");
+        cellWrite(&froms->elems[j], f, nullptr);
     }
     // Match Nix's tree-walker behaviour for replaceStrings:
     //  - At each position, scan `from` left-to-right, take first match.

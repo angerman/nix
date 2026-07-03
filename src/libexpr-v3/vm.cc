@@ -1295,12 +1295,25 @@ inline bool valueLess(VMState & vm, const Value & a, const Value & b)
         for (uint32_t i = 0; i < n; ++i) {
             Value & ai = a.asList()->elems[i];
             Value & bi = b.asList()->elems[i];
+            // Q1.2 (DEFECT_REVIEW_2026-07-03 §1.2): barrier the memoizing
+            // writeback.  elems[] is (possibly tenured) ListVec storage and the
+            // forced WHNF can be a nursery Closure/ListVec; a raw `ai = forced`
+            // is the unbarriered tenured→nursery edge the scavenger misses —
+            // the confirmed class-3 missed root valueEqual (@~1086) and primSort
+            // were already fixed for.  This comparison writeback (its own older
+            // comment says "mirrors the primElem fix") mirrored the memoization
+            // but NOT the barrier.  Reachable via </<=/>/>= over lists of
+            // unforced thunks (list-of-list compares, lib sort paths).
             if (ai.tag() == Tag::Thunk || ai.isAppLike()
-                || ai.tag() == Tag::Slot)
-                ai = forceValue(vm, ai);
+                || ai.tag() == Tag::Slot) {
+                Value fa = forceValue(vm, ai);
+                cellWrite(&ai, fa, nullptr);
+            }
             if (bi.tag() == Tag::Thunk || bi.isAppLike()
-                || bi.tag() == Tag::Slot)
-                bi = forceValue(vm, bi);
+                || bi.tag() == Tag::Slot) {
+                Value fb = forceValue(vm, bi);
+                cellWrite(&bi, fb, nullptr);
+            }
             if (valueLess(vm, ai, bi)) return true;
             if (valueLess(vm, bi, ai)) return false;
         }
@@ -2452,8 +2465,24 @@ inline Value withLookup(VMState & vm, SymbolId name)
             // shape: the partial Bindings already has the entries we
             // need; only the OUTER thunk is mid-blackhole.
             // (#458 with-stack Bridge attr-lookup retired; TW_VALUE_ERADICATION F4, 2026-06-02.)
+            //
+            // Q1.1 (DEFECT_REVIEW_2026-07-03 §1.1): `w` is a REFERENCE into
+            // vm.withStack, a std::vector reserved to only 64 entries
+            // (vm.cc/ffi.cc reserve(64)).  forceValue re-enters the dispatch
+            // loop, whose body can OP_WITH_PUSH or call with-capturing closures
+            // that push_back onto vm.withStack and REALLOCATE it — leaving `w`
+            // dangling.  The old memoizing `w = forceValue(...)` then wrote 8
+            // bytes into freed heap and the following isAttrs()/lookup() read
+            // through the dangling reference (a latent default-path UAF; deep
+            // nixpkgs eval nests >64 with-scopes routinely, and it is a
+            // candidate for the intermittent brute-audit flake class).  Fix:
+            // force into a LOCAL, memoize BY INDEX (indices survive realloc),
+            // and lookup through the local — never touch the reference after
+            // the force.  (The Slot branch above already copies into `derefed`
+            // and is safe.)
+            Value forced;
             try {
-                w = forceValue(vm, w);
+                forced = forceValue(vm, w);
             } catch (const BlackholeError &) {
                 // Delayed-with corner case: the with-stack entry
                 // references something that's still being forced from
@@ -2462,6 +2491,11 @@ inline Value withLookup(VMState & vm, SymbolId name)
                 anyBlackholed = true;
                 continue;
             }
+            vm.withStack[i] = forced;   // memoize by index (was: w = forceValue(...))
+            if (!forced.isAttrs()) continue;
+            if (auto * v = forced.asAttrs()->lookup(name))
+                return autoCallArity0(vm, *v);
+            continue;
         }
         if (!w.isAttrs()) continue;
         if (auto * v = w.asAttrs()->lookup(name))
