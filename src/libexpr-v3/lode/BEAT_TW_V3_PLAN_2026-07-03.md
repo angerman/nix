@@ -508,3 +508,68 @@ canonical trip). Force-then-writeback sites (valueLess, replaceStrings) rarely
 create that edge under current gating because late forces bypass to tenured — so
 their tests are correctness+exercise guardrails, not pre-fix-tripping repros, and
 that is expected, not a test defect.
+
+## P0.A-4 — Env::parent walkers — DONE (`373ee07a5`)
+All four GC walkers (scavenger walkEnv, mark-sweep marker+evac, auditor visitEnv)
+now walk `Env::parent`; envPostConstructBarrier added at the intern site. NO-OP
+today (nothing sets `parent`); full `--brute` 32/32. Adversarial review: scavenger
+/auditor/barrier NOT REFUTED; surfaced a real LATENT marker/evac early-break
+invariant hole (an Env can be mark-set WITHOUT a precise values-walk via the
+interior Tag::Slot→Env conservative-mark path; gen-major byte-scan doesn't de-box;
+evac walkFields(Env) is a no-op) → **W2 PRECONDITION** documented at both loop
+sites + tracked. Inert today (parent null; NIX_V3_EVAC unrevived); scavenger is
+immune. Must close before NIX_V3_ENV_CAPTURE populates `parent`.
+
+## Phase 1 — counters + Gate A — DONE. **GATE A VERDICT: GO (BUILD v1).**
+Counters wired (uncommitted at time of verdict; alloc.hh AllocStats +
+vm.cc OP_MAKE_THUNK/CLOSURE + emit.cc capture loops + run.cc dump). Measured
+LOCALLY (deterministic + host-independent per §3, so laptop numbers are
+authoritative for Gate A), cache-off (`NIX_V3_NO_DISK_CACHE=1 NIX_VM_STATS=1
+NIX_VM_OPCOUNTS=1`), all four workloads, byte-correct results:
+
+| Workload | C1 capture-op share (RUNTIME) | C2 avg cap/MAKE | C2 nUp≥2 share | C3 fwd-capture (emit) |
+|---|---|---|---|---|
+| hello.drvPath   | 16.86% (1.29M/7.62M)  | 1.94 | ~50% | 64.91% |
+| firefox.drvPath | 18.11% (6.68M/36.86M) | 2.10 | ~52% | 64.14% |
+| git.drvPath     | 16.57% (2.09M/12.60M) | 1.97 | ~52% | 64.69% |
+| M5 cardano.name | 17.88% (11.0M/61.55M) | 1.88 | ~54% | 53.76% |
+
+**Gate A (pre-committed):** BUILD if (C1 ≥ 8%) OR (C3 ≥ 30% AND sibling-density
+≥ 1.5); CLOSE if (C1 < 4% AND C3 < 15%). → **Every workload satisfies BOTH the
+primary (C1 = 16.6–18.1% ≫ 8%) AND the secondary (C3 = 54–65% ≫ 30% with
+sibling-density 1.88–2.10 ≥ 1.5) conditions.** This is a clear GO, not a
+"between" case; no downgrade of Gate C expectations. The DEFECT_REVIEW §2.1
+estimate ("capture pushes plausibly 10–16% of ALL ops") is CONFIRMED at the high
+end (16.6–18.1%), and the forwarding-waste hypothesis (§2.1: "much of the
+GET_UPVALUE share is capture-forwarding, not body reads") is confirmed strong:
+53–65% of captures are pure upvalue-forwarding (the transitive re-copy the env
+chain eliminates entirely).
+
+**PRE-COMMITTED PROJECTION P (recorded BEFORE building v1, per §3; firefox is the
+Gate C comparand):** v1 is per-function-opt-in / hybrid, so it captures only the
+env-routable eligible slice (§5.3 single-assignment escaping locals; with-targets
+stay flat in v1, so the withsTotal portion — 463 576 of firefox's 6.68M
+capture-ops — is NOT eligible; nUp portion = 6.21M). Eligibility fraction is
+counter-4 (single-assignment), estimated at Phase 1 and refined at W1 dump-mode;
+conservative estimate ~50% of nUp capture-ops env-routable in v1 (single-assignment
+bindings pass trivially; emitter TEMP-slots fail).
+  - **Predicted CPU win P_cpu (firefox, v1 eligible slice) ≈ 5% (range 3–7%).**
+    Formula (§3): dispatch term = capture-op-share(18.1%) × eligible-frac(~0.5) ×
+    dispatch-cost-per-trivial-op(~0.5, trivial stack ops are dispatch-dominated)
+    ≈ ~4.5%; + alloc term = per-capture FAM-copy elimination × ALLOC-share(20%)
+    ≈ ~1%. ⇒ **P_cpu ≈ 5%.**
+  - **Predicted RSS win P_rss (v1) ≈ ~0 to small (single-digit MB).** Per §5.8:
+    Envs are tenured + arena never reclaims, so v1's RSS win is only fewer/smaller
+    thunk tails (nUp≥2 objects, ~1.64M on firefox, drop from nUp×8B inline to one
+    8B env-pointer, minus amortized shared-Env overhead). Judge RSS by the
+    deterministic byte counters, NOT peak — peak follows at v2 scale.
+  - **Full-coverage (v2) model:** extends eligibility + migrates the with-chain
+    (killing capturedWiths, ~26% of firefox thunks per FP-2b + withsTotal 463K) +
+    rec-slot + Env nursery-eligibility → projects **≥15% CPU or ≥20% RSS** (the v2
+    SHIP gate). The 18% capture-op + 64% forwarding ceiling makes this plausible.
+  - **Gate C thresholds derived from P (pre-committed):** SHIP if realized CPU
+    ≥ max(3%, 0.6·P_cpu)=**3%** on firefox or M5 cache-off AND RSS not worse by
+    >1% AND v2 model ≥15%CPU/≥20%RSS. KILL if realized < max(1.5%, 0.3·P_cpu)=
+    **1.5%** AND RSS flat.
+
+Next: build+brute+commit the counter instrumentation, then Track E v1 W0→W6.
