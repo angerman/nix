@@ -796,12 +796,15 @@ letrec recursion (fib), self-rec, multi-capture, formals (WITH sibling-default
 `{a?1,b?a+1}`), rec-attrsets, currying/PAP, higher-order (map/foldl'/mapAttrs/
 genList), nested-let, inherit, functionArgs, ellipsis.  GATE-OFF: byte-id
 (hello==golden) + full --brute 32/32 (NO regression — every emit hook is
-g_envCapture-gated).  GATE-ON --brute: broad PASS (lang 143, property, drv-parity,
-fetcher, readdir, chain-bindings) with **2 REMAINING GAPS**, both in the rec-binding
-integration:
-  (a) **iterative-force app-spine** (deep nested application) — rc=1.
-  (b) **brute-audit list-primop-barriers** (7/17 sub-cases exit=1) + nixpkgs `lib`
+g_envCapture-gated).  GATE-ON --brute: **28/32** (broad PASS incl. lang 143, property, drv-parity,
+fetcher, readdir, chain-bindings) with **4 FAIL suites** — ALL the same rec-binding
+integration root (the earlier commit 73e4e35d5 body says "2 gaps"; the full run
+shows 4 suites — CORRECTED HERE):
+  (a) **iterative-force** app-spine (deep nested application) — rc=1.
+  (b) **brute-audit** list-primop-barriers (7/17 sub-cases exit=1) + nixpkgs `lib`
       aborts with `OP_GET_UPVALUE_REC_BINDING_SLOT: upvalue index out of range`.
+  (c) **583-tag-app-cache** (mapAttrs-style App/App3 capture).
+  (d) **apply-overrides-1.7** (__overrides rec-attrset override chain).
 Both point at the SAME root: a function that READS a rec-binding via
 RecBindingSlotRef (OP_GET_UPVALUE_REC_BINDING[_SLOT], which uses the recVar's flat
 upvalue index) while ALSO env-routing OTHER freeVars — the env-routed vars are
