@@ -13072,6 +13072,19 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             break;
         }
 
+        case OP_MAKE_ENV:
+        case OP_SET_ENV:
+        case OP_GET_ENV: {
+            // NIX_V3_ENV_CAPTURE (Track E v1) — W0 STUBS.  The opcodes are
+            // defined, fingerprinted, serialized (OP_GET_ENV's 1-word depth
+            // trailer is declared in all four serialize walkers + disasm), and
+            // disassembled, but NO emitter emits them yet — emission + the real
+            // handlers land at W2.  Trap loudly if the opcode stream ever reaches
+            // here: a reached stub means an emitter/gate bug, never valid input.
+            throw std::runtime_error(
+                "v3 env-capture opcode reached the dispatch loop before W2 "
+                "emission exists (OP_MAKE_ENV/OP_SET_ENV/OP_GET_ENV are W0 stubs)");
+        }
         case OP_HALT: {
             // Defensive: chase Tag::Thunk/App/Slot before exiting so the
             // caller never receives an unforced value if a future bytecode

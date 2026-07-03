@@ -229,7 +229,8 @@ collectReferencedSymbols(const CompilationUnit & cu)
                 if (ip + 2 * i < code.size()) bump(code[ip + 2 * i]);
             }
             ip += 2 * n;
-        } else if (op == OP_CALL_PRIMOP || op == OP_R_BRANCH_FALSE || op == OP_R_CALL || op == OP_R_STR_CONCAT2) {
+        } else if (op == OP_CALL_PRIMOP || op == OP_R_BRANCH_FALSE || op == OP_R_CALL || op == OP_R_STR_CONCAT2
+                   || op == OP_GET_ENV) {  // +OP_GET_ENV: 1 trailer word = depth (plain int, no remap)
             ++ip;  // primop-index follow-up
         } else if (op == OP_R_PRIMOP2) {
             ip += 2;  // reg-VM: dst + (descA<<16|descB); no SymbolId operand
@@ -328,7 +329,8 @@ collectReferencedPositions(const CompilationUnit & cu)
                     bump(code[ip + 2 * i + 1]);
             }
             ip += 2 * n;
-        } else if (op == OP_CALL_PRIMOP || op == OP_R_BRANCH_FALSE || op == OP_R_CALL || op == OP_R_STR_CONCAT2) {
+        } else if (op == OP_CALL_PRIMOP || op == OP_R_BRANCH_FALSE || op == OP_R_CALL || op == OP_R_STR_CONCAT2
+                   || op == OP_GET_ENV) {  // +OP_GET_ENV: 1 trailer word = depth (plain int, no remap)
             ++ip;
         } else if (op == OP_R_PRIMOP2) {
             ip += 2;  // reg-VM: dst + descAB
@@ -450,6 +452,12 @@ uint64_t opcodeTableFingerprint()
             {"OP_TAIL",            OP_TAIL},
             {"OP_LENGTH",          OP_LENGTH},
             {"OP_ELEM_AT",         OP_ELEM_AT},
+            // Env-pointer capture (NIX_V3_ENV_CAPTURE, W0 stubs).  Listing them
+            // here changes the opcode-table fingerprint, so any on-disk CU built
+            // before this opcode set is automatically rejected (schema-safe).
+            {"OP_MAKE_ENV",        OP_MAKE_ENV},
+            {"OP_SET_ENV",         OP_SET_ENV},
+            {"OP_GET_ENV",         OP_GET_ENV},
             {"OP_HALT",            OP_HALT},
         };
         uint64_t h = 0xcbf29ce484222325ULL;  // FNV offset basis
@@ -627,7 +635,8 @@ void remapSymbolsInBytecode(CompilationUnit & cu,
                 if (--p.setsRemaining == 0) pending.pop_back();
             }
             // No trailing data.
-        } else if (op == OP_CALL_PRIMOP || op == OP_R_BRANCH_FALSE || op == OP_R_CALL || op == OP_R_STR_CONCAT2) {
+        } else if (op == OP_CALL_PRIMOP || op == OP_R_BRANCH_FALSE || op == OP_R_CALL || op == OP_R_STR_CONCAT2
+                   || op == OP_GET_ENV) {  // +OP_GET_ENV: 1 trailer word = depth (plain int, no remap)
             ip++;  // primop-index follow-up
         } else if (op == OP_R_PRIMOP2) {
             ip += 2;  // reg-VM: dst + (descA<<16|descB); no SymbolId operand
@@ -699,7 +708,8 @@ void remapPositionsInBytecode(CompilationUnit & cu,
                         remapPos(code[ip + 2 * i + 1]);
             }
             ip += 2 * n;
-        } else if (op == OP_CALL_PRIMOP || op == OP_R_BRANCH_FALSE || op == OP_R_CALL || op == OP_R_STR_CONCAT2) {
+        } else if (op == OP_CALL_PRIMOP || op == OP_R_BRANCH_FALSE || op == OP_R_CALL || op == OP_R_STR_CONCAT2
+                   || op == OP_GET_ENV) {  // +OP_GET_ENV: 1 trailer word = depth (plain int, no remap)
             ++ip;
         } else if (op == OP_R_PRIMOP2) {
             ip += 2;  // reg-VM: dst + descAB

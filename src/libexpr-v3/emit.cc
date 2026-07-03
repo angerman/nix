@@ -82,6 +82,23 @@ const char * internEmitSiteString(const char * label)
     return pool.back().c_str();
 }
 
+// NIX_V3_ENV_CAPTURE (Track E v1, BEAT_TW_V3_PLAN_2026-07-03 §5) — the
+// env-pointer capture model, default-OFF.  When on (W2+), a function whose
+// locals escape into inner MkThunk/Lambda allocates one shared frame Env
+// (OP_MAKE_ENV) holding its escaping locals; children capture a single pointer
+// to it and read via OP_GET_ENV(depth, idx) instead of flat per-object FAM
+// copies.  In kGates (primops.cc) so the disk-cache key namespaces gate-on CUs
+// away from default-codegen CUs (Rule-3 lint enforces the kGates membership).
+// RETIREMENT CRITERION: retire (flip default-on and delete this gate, or delete
+// the whole path) at the W6 Gate C resolution (2026-Q3) — SHIP → default-on;
+// KILL → delete, preserving the branch point in git per the P3.1 precedent.
+// W0: the read exists + is in kGates; emission arrives at W2 (the branch below
+// is an intentional no-op stub until then).
+static const bool g_envCapture = [] {
+    const char * e = std::getenv("NIX_V3_ENV_CAPTURE");
+    return e && e[0] && e[0] != '0';   // "dump" also enables (W1 dump-mode)
+}();
+
 struct Emitter
 {
     const ir::Module & m;
@@ -1110,6 +1127,12 @@ struct Emitter
         // they sit BELOW the upvalue block on the value stack.
         // OP_MAKE_CLOSURE pops nUpvalues then nWithTargets in that
         // order (top-down).
+        // NIX_V3_ENV_CAPTURE hook (W2): when g_envCapture is on, run the §5.3
+        // escape analysis and emit OP_MAKE_ENV + route eligible escaping-local
+        // captures through the frame Env (OP_SET_ENV / child OP_GET_ENV) instead
+        // of the flat per-capture FAM below.  W0: the gate is read + reserved in
+        // kGates; emission lands at W2, so this is an intentional no-op today.
+        if (__builtin_expect(g_envCapture, 0)) { /* W2: env-capture emission */ }
         emittingCaptures_ = true;
         for (auto wv : e.lexicalWiths) emitVarRef(wv);
         for (auto fv : e.freeVars) emitVarRef(fv);

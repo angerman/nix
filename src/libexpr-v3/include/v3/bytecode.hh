@@ -498,6 +498,20 @@ enum Op : uint8_t
     OP_LENGTH         = 0xD2,  // also handles strings (matches primLength)
     OP_ELEM_AT        = 0xD3,
 
+    // ---- Env-pointer capture (NIX_V3_ENV_CAPTURE, Track E v1; default-off) ----
+    // TW-style shared-environment capture (BEAT_TW_V3_PLAN_2026-07-03 §5): a frame
+    // whose locals are captured by inner objects allocates ONE heap Env holding
+    // exactly its ESCAPING locals; inner MkThunk/Lambda capture a single pointer
+    // to that Env (parent-linked, mirroring lexical nesting) instead of copying
+    // each free var into a per-object FAM.  Reads become OP_GET_ENV(depth, idx).
+    // Operands are PLAIN ints (slot indices / chain depths), NEVER SymbolIds, so
+    // they need no cross-process remap — avoids the P3.3 serialize footgun by
+    // construction.  STUBS as of W0 (defined + serialized + disassembled, but no
+    // emitter emits them yet); the runtime handlers trap until W2 wires emission.
+    OP_MAKE_ENV       = 0xE0,  // operand = envSlotCount; alloc frame Env (parent = current defEnv)
+    OP_SET_ENV        = 0xE1,  // operand = idx; store stack-top into the frame Env's slot idx
+    OP_GET_ENV        = 0xE2,  // operand = idx; + 1 trailer word = depth (walk parent `depth` times)
+
     OP_HALT           = 0xFF,
 };
 

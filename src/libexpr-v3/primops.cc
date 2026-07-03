@@ -6745,7 +6745,8 @@ static const std::string & codegenGateFingerprint()
         // Sorted canonical list of codegen-affecting gates (see header).
         static const char * const kGates[] = {
             "NIX_V3_DBG_OPT_STRICT", "NIX_V3_DBG_STRICTNESS",
-            "NIX_V3_DBG_STRICT_CALL_UNTHUNK", "NIX_V3_NO_APP_SPINE_FOLD",
+            "NIX_V3_DBG_STRICT_CALL_UNTHUNK", "NIX_V3_ENV_CAPTURE",
+            "NIX_V3_NO_APP_SPINE_FOLD",
             "NIX_V3_NO_BETA_REDUCE", "NIX_V3_NO_CALL_N", "NIX_V3_NO_CONST_REMAT",
             "NIX_V3_NO_CROSS_FN_STRICTNESS", "NIX_V3_NO_DAG_DEMOTE",
             "NIX_V3_NO_DEFER", "NIX_V3_NO_DETHUNK_STRICT",
