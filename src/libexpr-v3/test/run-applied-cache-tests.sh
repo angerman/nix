@@ -22,6 +22,15 @@
 #       from serializeOne's acceptance (the tax would silently return).
 #   T7  SHADOW mode (#16a): would-HITs re-evaluate (insns must NOT collapse)
 #       and lockstep-compare — result correct, shadowCompares>0, mismatch=0.
+#   T9  register-call HIT writeback (miscompile fixed 2026-07-04): a HIT reached
+#       via OP_R_CALL must route the cached value into the armed dst register,
+#       not just push the stack — else `(import f) {a=1;} + (import f) {a=1;}`
+#       returns a float half-sum.  Guards the shipped-cache correctness fix.
+#   T8  const-eager literal keys (#17): a NESTED-literal arg (`{ config = {
+#       allowUnfree = true; }; }`) and a const-LIST arg (`{ xs = [ 1 2 ]; }`)
+#       must be hashable — pre-#17 the inner value was a MkThunk (Suspended →
+#       unhashable) so the firefox/allowUnfree daemon scenario missed the
+#       cache.  Repeated nested-literal application must collapse like T3.
 # All correctness cases assert cache-ON == cache-OFF == expected literal.
 #
 # Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>,
@@ -119,6 +128,33 @@ if [[ "$sres" == "3998000" ]] \
 else
     fail=$((fail+1)); echo "FAIL T7-shadow: res=$sres insns=${s_insns:-?} off=${i_off:-?} $sline"
 fi
+
+# T9 — register-call HIT writeback (miscompile fixed 2026-07-04): a cache HIT
+# reached via OP_R_CALL (register-addressed call) arms CFF_FORCE_WB=dst; the HIT
+# must route the cached value into regs[dst], not just push the stack.  The bug:
+# `(import f) {a=1;} + (import f) {a=1;}` — the second app is an R_CALL HIT
+# feeding OP_R_STR_CONCAT2; the un-routed HIT left dst uninitialised (float 0.0),
+# so `+` returned a FLOAT half-sum (2001000.0 instead of int 4002000).  Assert
+# BOTH the correct sum AND integer type (the float was the tell).  Failing-first:
+# reproduces on the shipped cache (flat args hashable since #16); NOT #17-specific.
+FLAT="import $FIX/heavy.nix { a = 1; }"
+check T9-rcall-hit-plus "($FLAT) + ($FLAT)" '4002000'
+check T9-rcall-hit-type "builtins.typeOf (($FLAT) + ($FLAT))" '"int"'
+check T9-rcall-let-form "let imp = import $FIX/heavy.nix; in (imp { a = 1; }) + (imp { a = 1; })" '4002000'
+check T9-rcall-triple "($FLAT) + ($FLAT) + ($FLAT)" '6003000'
+
+# T8 — const-eager literal keys (#17): a NESTED-literal arg must be hashable
+# and collapse on repeat; a const-LIST arg must be hashable too.  Failing-
+# first: pre-#17 the inner attrset/list was a MkThunk → uncacheable → ON==OFF.
+E8="(import $FIX/heavy.nix { config = { allowUnfree = true; }; }) + (builtins.seq 1 (import $FIX/heavy.nix { config = { allowUnfree = true; }; }))"
+check T8-nested-correct "$E8" '4002000'
+i8_off=$(insns 0 "$E8"); i8_on=$(insns 1 "$E8")
+if [[ -n "$i8_off" && -n "$i8_on" ]] && (( i8_on * 100 < i8_off * 75 )); then
+    pass=$((pass+1)); echo "PASS T8-nested-collapse (off=$i8_off on=$i8_on)"
+else
+    fail=$((fail+1)); echo "FAIL T8-nested-collapse: off=${i8_off:-?} on=${i8_on:-?} (need on < 0.75*off)"
+fi
+check T8-list-arg-correct "import $FIX/heavy.nix { xs = [ 1 2 ]; }" '2001000'
 
 echo "applied-cache: $pass passed, $fail failed"
 [[ $fail -eq 0 ]]

@@ -183,7 +183,17 @@ namespace nix::v3::serialize {
 /// retirement commit).  The schema-18 `usesDefEnv`/`envSlotCount` descriptor
 /// fields and the OP_MAKE_ENV/OP_SET_ENV/OP_GET_ENV opcodes (0xE0-0xE2) are
 /// removed from the wire format; opcode values retired, not reused.
-constexpr uint32_t kSchemaVersion = 19;
+///
+/// 20 (2026-07-04): LEVER-1 step 2b const-eager literal lowering
+/// (NIX_V3_NO_CONST_EAGER opt-out).  Nested constant Attrs/List attr-values,
+/// list-elements, and call-args now lower EAGERLY (inline ir::AttrSet/
+/// ListExpr) instead of a MkThunk wrapper, so the emitted bytecode for the
+/// same source differs.  A cache-loaded pre-20 CU carries the old lazy shape
+/// (still a VALID, value-identical program, but misses the eager win and
+/// would trip the byte-compare verify path); the bump forces recompile so old
+/// lazy and new eager CUs never share a key.  The kGates fingerprint
+/// separately namespaces an A/B `NIX_V3_NO_CONST_EAGER=1` run.
+constexpr uint32_t kSchemaVersion = 20;
 
 /// 8-byte magic prefix at the start of every serialized blob.
 /// Includes a discriminator so format mismatches are detected early.

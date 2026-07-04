@@ -7022,7 +7022,24 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     Value cached;
                     bool hit = appliedCacheLookup(memoKey, cached);
                     if (hit && !appliedCacheShadowMode()) {
+                        // The result must land where THIS call site expects it.
+                        // A register-addressed caller (OP_R_CALL) reaches
+                        // op_call_dispatch having armed CFF_FORCE_WB=dst on the
+                        // caller frame (vm.cc OP_R_CALL) so the callee's
+                        // OP_RETURN routes the result into regs[dst] — NOT the
+                        // stack top.  The cache HIT bypasses that OP_RETURN, so
+                        // it must honour the armed writeback itself: push then
+                        // applyForceWriteback (exactly OP_STR_CONCAT's fast-path
+                        // idiom).  If CFF_FORCE_WB is armed it pops `cached` and
+                        // writes regs[dst]; if not (a plain stack-return OP_CALL)
+                        // it is a no-op and `cached` stays on the stack.  BUG
+                        // fixed 2026-07-04: the bare `push;break` left the dst
+                        // register uninitialised (read as float 0.0), so
+                        // `(import f) {a=1;} + (import f) {a=1;}` (second app =
+                        // R_CALL HIT feeding OP_R_STR_CONCAT2) returned a float
+                        // half-sum.  Regression: run-applied-cache-tests T9.
                         push(vm, cached);
+                        applyForceWriteback(vm);
                         break;
                     }
                     // MISS → arm insert; shadow-HIT → arm compare-not-insert

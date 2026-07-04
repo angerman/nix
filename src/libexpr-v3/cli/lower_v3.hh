@@ -760,9 +760,70 @@ struct LowererV3 {
         m.functions[fid].nWithTargets = static_cast<uint16_t>(lws.size());
         return addBinding(ir::MkThunk{fid, /*freeVars*/ {}, std::move(lws)});
     }
+    /// LEVER-1 step 2b (task #17): a RECURSIVELY-constant literal — a value
+    /// whose entire subtree is const-eager, so building it eagerly (no thunk)
+    /// is side-effect-free AND leaves the result fully WHNF.  Superset of
+    /// isTrivialForValue: adds non-recursive plain Attrs and Lists whose every
+    /// child is itself const-eager.  WHY: the applied-import cache
+    /// (NIX_V3_APPLIED_CACHE) keys on canonicalHash(arg), which is WHNF-only;
+    /// a nested literal like `import <nixpkgs> { config.allowUnfree = true; }`
+    /// otherwise wraps `config`'s value in a MkThunk (Suspended → unhashable),
+    /// so the whole daemon-workload firefox/allowUnfree scenario missed the
+    /// cache.  Making a const subtree eager is byte-identical (same value,
+    /// no throw/divergence/free-var/order effect is reachable — the allowed
+    /// node set excludes Call/Select/If/etc.), exactly the argument the
+    /// non-recursive OP_ATTRS_INIT demotion already relies on; here it extends
+    /// one level deeper for const children.  Depth-capped (fallback = thunk,
+    /// still correct).  EXCLUDES rec attrsets (self-ref needs the rec slot),
+    /// dynamic/`${}` keys (need forcing), and inherit/inherit-from (resolve via
+    /// outer/with scope — not self-contained).
+    bool isConstEagerLiteral(const nix::v3::ast::Node * n, int depth) const
+    {
+        namespace a = nix::v3::ast;
+        if (depth > 200) return false;           // pathological nesting → thunk
+        switch (n->kind) {
+        case a::Kind::Int: case a::Kind::Float: case a::Kind::String:
+        case a::Kind::Path: case a::Kind::Lambda:
+            return true;
+        case a::Kind::Var:
+            return !resolvesViaWith(static_cast<const a::Var *>(n)->name);
+        case a::Kind::List: {
+            auto * l = static_cast<const a::List *>(n);
+            for (auto * el : l->elems)
+                if (!isConstEagerLiteral(el, depth + 1)) return false;
+            return true;
+        }
+        case a::Kind::Attrs: {
+            auto * at = static_cast<const a::Attrs *>(n);
+            if (at->recursive) return false;               // self-ref machinery
+            if (!at->dynamicAttrs.empty()) return false;   // ${} keys force
+            if (!at->inheritFromExprs.empty()) return false;
+            for (auto & d : at->attrs) {
+                // Only Plain entries carry a self-contained value; inherit /
+                // inherit-from resolve against an outer scope.
+                if (d.kind != a::Attrs::AttrKind::Plain) return false;
+                if (!d.value || !isConstEagerLiteral(d.value, depth + 1))
+                    return false;
+            }
+            return true;
+        }
+        default: return false;
+        }
+    }
+
     ir::VarId thunkifyForAttr(const nix::v3::ast::Node * e)
     {
-        return isTrivialForValue(e) ? lowerExpr(e) : thunkify(e);
+        // LEVER-1 step 2b gate: NIX_V3_NO_CONST_EAGER=1 restores the leaf-only
+        // predicate (A/B bisect + emergency mitigation).  In kGates (the disk-
+        // cache codegen fingerprint) so a flipped gate can't collide with a
+        // default-lowered CU.  Retirement: drop the opt-out (hard-true) after a
+        // full darwin-4 nixpkgs byte-equality sweep, mirroring NONREC_ATTRS_INIT.
+        static const bool s_constEager =
+            std::getenv("NIX_V3_NO_CONST_EAGER") == nullptr;
+        const bool eager = s_constEager
+            ? isConstEagerLiteral(e, 0)
+            : isTrivialForValue(e);
+        return eager ? lowerExpr(e) : thunkify(e);
     }
 
     /// Thunk whose body is built by `bodyBuilder()` (returns the body
