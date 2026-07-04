@@ -106,6 +106,67 @@ REMAINING WORK (both sides multi-day):
 - Thunk env-sharing (the forceValue target): the analogous rework on Thunk + the
   fakeClo force path — the higher-payoff, harder half.
 
+## CLOSURE functional layer SHIPPED (increment-2b, 2026-06-19, commit 9ada0703e)
+
+Done + validated + committed. Gated NIX_V3_ENV_SHARING (default-off). Full
+moving-GC integration: GK_ENV + walkEnv (gc.cc), DirtyKind::Env +
+envPostConstructBarrier + env-aware closurePostConstructBarrier (barrier.hh),
+mark+evac+auditor (mark_sweep.cc), all readers routed (vm.cc). hello.drvPath
+byte-id TW==off==on (envs=0.99MB → path fires); lang 143/143 + parity 20/20;
+--brute 21/22 ZERO missed-root hits (sole fail = stale firefox golden, NOT us).
+**HONEST: NOT a perf win yet** — bring-up builds 1 fresh Env/closure AND keeps
+allocClosure(nUp) (FAM poisoned to Uninitialized so brute-scan stays clean) →
+MORE memory. The real win = the FOLLOW-UP: (a) Env INTERNING (hash-cons
+upvalue-tuples; multiple closures share one Env — MUST add shared-Env evac
+dedup, see below) + (b) allocClosure(0) (drop the FAM, keep nUpvalues as the
+logical count) → then darwin-4 CPU/arena grade.
+
+## THUNK HALF — design constraints discovered (2026-06-19, before impl)
+
+The thunk half is the actual forceValue lever, and it REUSES the Env infra
+(GK_ENV/walkEnv/DirtyKind::Env already built): the fakeClo IS a Closure, so the
+per-force win is simply `fakeClo->upvalEnv = t->upvalEnv` (share, no per-force
+tail[]-copy) instead of vm.cc:8241/13799's `for i: fakeClo->upvalues[i]=t->tail[i]`.
+BUT two hard constraints make it harder than the closure half:
+
+1. **The 24B Thunk header is SACRED.** FP-2 (8cd42314d) shrank it 40→24B for
+   −285 MB on M5 — the campaign's biggest realized memory win. A new
+   `Thunk::upvalEnv` field (+8 B/thunk, even gate-off) would partially UNDO that.
+   ∴ the Env reference must live in the `tail[]` FAM (like FP-2b relocated
+   capturedWiths to a tail slot via thunkScanSize()) or be otherwise
+   gate-conditional — NOT a new always-present header field. This needs careful
+   tail-layout design (tail = upvalues[0..nUp) + optional withs slot + now
+   optionally an Env ref), updating thunkScanSize()/fwdThunk/walkThunk/mark.
+
+2. **fakeClo + thunk SHARE the Env** → the shared-Env evac double-visit problem
+   (deferred for closures because bring-up is 1-Env-1-closure) becomes
+   MANDATORY. When `fakeClo->upvalEnv = t->upvalEnv`, BOTH the thunk and the
+   fakeClo reference one Env; the major-GC evac inline-visit (mark_sweep.cc
+   Closure case: `for i visitValue(e->values[i])`) would double-forward. FIX:
+   make the major evac walk a shared Env via mark-bit dedup (enqueue the Env on
+   a worklist keyed by its mark bit, OR mark-guard the inline visit), not the
+   current unconditional inline visit. The minor scavenge already dedups (walked
+   set in walkClosure). This same dedup is the prerequisite for closure-side
+   INTERNING, so do it once for both.
+
+Staging suggestion for the thunk half (each byte-id + --brute, gated):
+  (T-a) shared-Env evac dedup (mark_sweep) — enables sharing for BOTH closures
+        (interning) and thunks; validate closures still byte-id/--brute clean.
+  (T-b) Thunk tail-layout: add a gate-conditional Env ref in tail[] +
+        thunkScanSize()/fwdThunk/walkThunk/mark-evac updates (header stays 24B).
+  (T-c) MAKE_THUNK builds the Env (gated); thunk upvalue readers routed.
+  (T-d) fakeClo force path shares it: `fakeClo->upvalEnv = t->upvalEnv` (the
+        forceValue win — no per-force copy); darwin-4 CPU/arena grade.
+
+## JIT (goal item 3) — months-long subsystem, design+spike not single-turn
+
+Per reference_v3_vs_tw_structural_2026-06-19: JIT of hot lib.* bodies is the
+only raw-CPU lever (the 4.5× gap is the interpreter machinery), but it's a
+multi-month subsystem: native codegen + register allocation + calling
+convention + GC safepoints + a byte-identity bail path. The right first step is
+a feasibility/design doc + a tiny spike (JIT one trivial hot body, measure), NOT
+a single-session implementation. See PERF_STRATEGY_2026-05-17 §Stage-12.
+
 ## Byte-identity strategy
 
 A captured value is the same whether read from an inline FAM or a shared Env at
