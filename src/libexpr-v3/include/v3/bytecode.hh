@@ -598,6 +598,15 @@ StringConstPoolStats stringConstantPoolStats() noexcept;
 
 struct CompilationUnit
 {
+    /// LEVER-1 applied-import cache (NIX_V3_APPLIED_CACHE, lode/NEXT_LEVERS
+    /// _2026-07-04.md): true iff this CU was inserted into importCache().cus —
+    /// i.e. it is the compiled body of an `import`ed file.  The OP_CALL memo
+    /// hook keys on "callee closure's CU is an import CU" and needs an O(1)
+    /// discriminator (an importCache().cus deque scan per call would sink the
+    /// hot path).  In-memory only, NOT serialized (deserializeCU leaves it
+    /// false; the insertion site sets it).
+    bool fromImportCU = false;
+
     /// Flat instruction stream.
     std::vector<Instruction> code;
 

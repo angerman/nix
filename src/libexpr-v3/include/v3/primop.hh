@@ -104,6 +104,13 @@ namespace nix::v3 {
 /// after scavenge.
 void walkImportCacheRoots(const std::function<void(Value &)> & visit);
 
+/// LEVER-1 applied-import cache PROBE (NIX_V3_APPLIED_CACHE=probe): print the
+/// cumulative would-cache counters.  Self-gates on probe mode + non-zero
+/// counts; called from run.cc at end-of-root-eval (the atexit variant loses
+/// its output in the `nix` binary — stderr/logger torn down before atexit).
+/// Defined in vm.cc next to the probe.  Retires with the probe.
+void dumpAppliedCacheProbeStats() noexcept;
+
 /// Memory-bucket accounting (2026-06-04): size the "CU cache".
 ///   * `importCacheBytecodeBytes` — libc-malloc'd CompilationUnit
 ///     bytecode bytes (NOT in the arena; invisible to the arena mark).

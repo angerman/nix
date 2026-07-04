@@ -7290,6 +7290,7 @@ void primImport(EvalState & state, Value * args, Value & out)
             try {
                 auto tDes = impStamp();
                 cache.cus.push_back(serialize::deserializeCU(*blob));
+                cache.cus.back().fromImportCU = true;  // LEVER-1 memo-hook discriminator
                 impBumpNs(importTimingTotals().deserializeNs, tDes);
 
                 // #815 RCA: V3_DBG_DESERIALIZE_VERIFY=path forks a side
@@ -7920,6 +7921,7 @@ skipDiskCacheLookup:
         }
         auto tCompile = impStamp();
         cache.cus.push_back(compile(module));
+        cache.cus.back().fromImportCU = true;  // LEVER-1 memo-hook discriminator
         impBumpNs(importTimingTotals().compileNs, tCompile);
         // #772 spike: survey bytecode dedup ratio (zero-cost when
         // NIX_V3_DEDUP_SURVEY is unset).  Captures the LOWER BOUND
@@ -7954,6 +7956,17 @@ skipDiskCacheLookup:
     auto tRun = impStamp();
     out = run(cache.cus.back());
     impBumpNs(importTimingTotals().runNs, tRun);
+    // LEVER-1 probe diagnostic (TEMP; retire with the probe): show what the
+    // import returned — the applied-cache hook keys on out.closure->cu->
+    // fromImportCU, so a mismatch here explains a silent probe.
+    static const bool s_dbgApplied = std::getenv("V3_DBG_APPLIED") != nullptr;
+    if (__builtin_expect(s_dbgApplied, 0)) {
+        const Closure * dc = out.isClosure() ? out.asClosure() : nullptr;
+        std::fprintf(stderr,
+            "V3_DBG_APPLIED primImport(fresh): path=%s tag=%d cloCu=%p flag=%d\n",
+            path.c_str(), (int)out.tag(), dc ? (const void *)dc->cu : nullptr,
+            (dc && dc->cu) ? (int)dc->cu->fromImportCU : -1);
+    }
     // #741 Phase 4b (2026-05-23): force-deep the imported result
     // BEFORE persisting to in-memory + disk cache.  Imported `rec {
     // ... }` attrsets produce Bindings whose entries are Tag::Thunk
@@ -8741,6 +8754,7 @@ void primScopedImport(EvalState & state, Value * args, Value & out)
     nix::v3::ir::computeFreeVars(module);
     auto & cache = importCache();
     cache.cus.push_back(compile(module));
+    cache.cus.back().fromImportCU = true;  // LEVER-1 memo-hook discriminator
     Value fn = run(cache.cus.back());
 
     // Apply the lambda to the scope value.

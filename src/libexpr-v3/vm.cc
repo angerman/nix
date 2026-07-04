@@ -38,6 +38,9 @@
 // v3/ffi.hh shims; `nix::evalTrace::*` (hot guards) is re-exported INLINE by
 // ffi.hh as a Layer-0 util, so the dispatch loop stays zero-cost.
 #include "v3/ffi.hh"
+#include "v3/value_serialize.hh"  // LEVER-1 applied-cache probe: canonicalHash
+#include "v3/gc_root.hh"          // LEVER-1 applied-cache probe: root arg across forceDeep
+#include "v3/print.hh"            // LEVER-1 applied-cache probe: forceDeep
 
 #include <algorithm>
 #include <atomic>
@@ -3845,6 +3848,181 @@ frameDesc(const Closure * closure, const CallFrame & frame) noexcept
     return closure ? closure->desc : nullptr;
 }
 
+// ---------------------------------------------------------------------------
+// LEVER-1 applied-import cache — PROBE instrumentation (NIX_V3_APPLIED_CACHE=
+// probe; lode/NEXT_LEVERS_2026-07-04.md Part B step 1).  Rule-0 falsifier run
+// BEFORE building the cache: counts would-cache OP_CALL applications (callee =
+// import-CU closure with formals, plain single-arg path) and how many DISTINCT
+// (CU, argsHash) keys they collapse to.  wouldHit = the in-process hit ceiling.
+// Pure observation — no insert, no reuse, no forcing (canonicalHash chases only
+// already-Evaluated indirections and throws on Suspended → counted unhashable).
+// RETIREMENT CRITERION: this probe is replaced by the real cache's stats at
+// spike step 2+, or deleted with the probe-verdict handback if the spike KILLs.
+namespace {
+struct AppliedCacheProbeStats {
+    uint64_t eligibleCalls  = 0;  // import-CU callee, plain single-arg path
+    uint64_t noFormals      = 0;  // of those: callee WITHOUT formals (diagnostic)
+    uint64_t bySite[3]      = {0, 0, 0};  // 0=OP_CALL 1=OP_TAIL_CALL 2=callClosure
+    uint64_t hashedCalls    = 0;  // args canonically hashable (deep-forced)
+    uint64_t unhashableArgs = 0;  // hash/force threw (fn args, throw, etc.)
+    uint64_t wouldHit       = 0;  // key seen before = the cache's hit ceiling
+    std::unordered_set<std::string> keys;   // distinct (CU*, argsHash)
+};
+AppliedCacheProbeStats & appliedCacheProbeStats()
+{
+    static auto * s = [] {
+        auto * p = new AppliedCacheProbeStats();
+        // Belt-and-braces: atexit dump (works in v3-eval) AND the run.cc
+        // end-of-root-eval dump (works in the `nix` binary, where atexit
+        // output is lost).  Both print the same cumulative counters.
+        std::atexit([] {
+            const auto & st = appliedCacheProbeStats();
+            if (st.eligibleCalls == 0) return;
+            std::fprintf(stderr,
+                "v3 APPLIED-CACHE PROBE: eligible=%llu (call=%llu tail=%llu cc=%llu "
+                "noFormals=%llu) hashed=%llu unhashable=%llu distinctKeys=%zu wouldHit=%llu\n",
+                (unsigned long long)st.eligibleCalls,
+                (unsigned long long)st.bySite[0],
+                (unsigned long long)st.bySite[1],
+                (unsigned long long)st.bySite[2],
+                (unsigned long long)st.noFormals,
+                (unsigned long long)st.hashedCalls,
+                (unsigned long long)st.unhashableArgs,
+                st.keys.size(),
+                (unsigned long long)st.wouldHit);
+        });
+        return p;
+    }();
+    return *s;
+}
+/// BOUNDED force+serialize for the memo key (probe form).  The first probe
+/// iteration used forceDeep + canonicalHash — it EXPLODED on nixpkgs (>>120 s):
+/// nixpkgs-internal import-CU applications (booter.nix, stage fns) take
+/// pkgs-sized lazy args, and deep-forcing them evaluates enormous graphs.  So
+/// the key computation MUST be budget-capped: walk the args, forcing as we go,
+/// appending a process-stable byte encoding; BAIL (uncacheable) on budget
+/// exhaustion or a non-data tag (closure/PAP/primop — e.g. overlays).  Small
+/// top-level config attrsets (`import <nixpkgs> { config... }`) fit easily in
+/// the budget; pkgs-sized args bail after kAppliedKeyBudget nodes of work —
+/// bounded perturbation.  Encoding is per-process stable (not canonical): the
+/// probe only measures within-process hit rates.  GC discipline: every Value
+/// held across the re-entrant forceValue is GcRoot'd (Rule 1).
+constexpr int kAppliedKeyBudget = 512;
+bool appliedProbeBoundedKey(VMState & vm, const Value & v0, std::string & out, int & budget)
+{
+    if (--budget < 0) return false;
+    Value local = v0;
+    GcRoot r(local);
+    local = forceValue(vm, local);   // may scavenge; local is rooted+rewritten
+    switch (local.tag()) {
+    case Tag::Int: {
+        int64_t i = local.asInt();
+        out.push_back('i'); out.append(reinterpret_cast<const char *>(&i), 8);
+        return true;
+    }
+    case Tag::Float: {
+        double d = local.asFloat();
+        out.push_back('f'); out.append(reinterpret_cast<const char *>(&d), 8);
+        return true;
+    }
+    case Tag::Bool:  out.push_back(local.asInt() ? 'T' : 'F'); return true;  // vTrue/vFalse: asInt()=0|1
+    case Tag::Null:  out.push_back('n'); return true;
+    case Tag::String: {
+        // NOTE: string CONTEXT is ignored here (probe-only; per-process
+        // discrimination not canonical).  The real cache must include it.
+        const char * s = local.asString();
+        uint32_t n = s ? (uint32_t)std::strlen(s) : 0;
+        out.push_back('s'); out.append(reinterpret_cast<const char *>(&n), 4);
+        if (s) out.append(s, n);
+        return true;
+    }
+    case Tag::Path: {
+        const char * s = local.asString();
+        uint32_t n = s ? (uint32_t)std::strlen(s) : 0;
+        out.push_back('p'); out.append(reinterpret_cast<const char *>(&n), 4);
+        if (s) out.append(s, n);
+        return true;
+    }
+    case Tag::List: {
+        ListVec * l = local.asList();
+        uint32_t n = l ? l->size : 0;
+        out.push_back('['); out.append(reinterpret_cast<const char *>(&n), 4);
+        for (uint32_t i = 0; i < n; ++i) {
+            // Re-read through the rooted local each iteration: the recursive
+            // call can scavenge and relocate the list.
+            if (!appliedProbeBoundedKey(vm, local.asList()->elems[i], out, budget))
+                return false;
+        }
+        return true;
+    }
+    case Tag::Attrs: {
+        Bindings * b = local.asAttrs();
+        uint32_t n = b ? b->size : 0;
+        out.push_back('{'); out.append(reinterpret_cast<const char *>(&n), 4);
+        const auto & symTab = ir::globalSymbolTable();
+        for (uint32_t i = 0; i < n; ++i) {
+            Bindings * bb = local.asAttrs();   // re-read (relocation-safe)
+            const uint32_t sym = bb->entries[i].name;
+            if (sym >= symTab.size()) return false;   // defensive: unknown symbol
+            const std::string & nm = symTab[sym];
+            uint32_t sn = (uint32_t)nm.size();
+            out.append(reinterpret_cast<const char *>(&sn), 4);
+            out += nm;
+            if (!appliedProbeBoundedKey(vm, local.asAttrs()->entries[i].value, out, budget))
+                return false;
+        }
+        return true;
+    }
+    case Tag::Uninitialized:
+    case Tag::Closure:
+    case Tag::Thunk:
+    case Tag::PrimOp:
+    case Tag::PrimOpApp:
+    case Tag::App:
+    case Tag::App3:
+    case Tag::Slot:
+    case Tag::External:
+    case Tag::Blackhole:
+    default:
+        return false;   // closure / PAP / primop / external / … ⇒ uncacheable
+    }
+}
+
+void appliedCacheProbeObserve(VMState & vm, const Closure * callee, const Value & arg,
+                              int site, bool hasFormals) noexcept
+{
+    auto & st = appliedCacheProbeStats();
+    st.eligibleCalls++;
+    if (site >= 0 && site < 3) st.bySite[site]++;
+    if (!hasFormals) { st.noFormals++; return; }  // formals-only cacheable (v1 rule)
+    // NIX_V3_APPLIED_CACHE=count → eligibility counters ONLY, no key
+    // computation.  The bounded-forcing key (probe mode) perturbs real evals
+    // (every callPackage is an eligible import-CU application; forcing even a
+    // bounded prefix of its args cascades — observed NixOS-module warnings in
+    // a hello eval).  count-mode quantifies the flood non-invasively.
+    static const bool s_countOnly = [] {
+        const char * e = std::getenv("NIX_V3_APPLIED_CACHE");
+        return e && std::strcmp(e, "count") == 0;
+    }();
+    if (s_countOnly) return;
+    std::string k;
+    k.reserve(160);
+    char pbuf[2 * sizeof(void *) + 4];
+    std::snprintf(pbuf, sizeof pbuf, "%p:", (const void *)callee->cu);
+    k += pbuf;
+    int budget = kAppliedKeyBudget;
+    bool ok = false;
+    try {
+        ok = appliedProbeBoundedKey(vm, arg, k, budget);
+    } catch (...) {
+        ok = false;   // eval throw during bounded forcing ⇒ uncacheable
+    }
+    if (!ok) { st.unhashableArgs++; return; }
+    st.hashedCalls++;
+    if (!st.keys.insert(std::move(k)).second) st.wouldHit++;
+}
+} // namespace
+
 Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
 {
     // Stage 2 (LIST_ITERATION_FIX_PLAN_2026-06-08): per-element callback
@@ -6558,6 +6736,19 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             const Closure * callee = fun.asClosure();
             const LambdaDescriptor * desc = callee->desc;
 
+            // LEVER-1 applied-import cache PROBE (NIX_V3_APPLIED_CACHE=probe):
+            // observe would-cache applications on the plain single-arg closure
+            // path (PrimOp/PAP/__functor branches diverted above).  See the
+            // AppliedCacheProbeStats block before dispatchLoop for the design +
+            // retirement criterion.  Zero cost when unset (static bool).
+            static const bool s_appliedCacheProbe = [] {
+                const char * e = std::getenv("NIX_V3_APPLIED_CACHE");
+                return e && (std::strcmp(e, "probe") == 0 || std::strcmp(e, "count") == 0);
+            }();
+            if (__builtin_expect(s_appliedCacheProbe, 0)
+                && callee->cu && callee->cu->fromImportCU)
+                appliedCacheProbeObserve(vm, callee, arg, 0, desc->hasFormals);
+
             // #495 follow-on bisect: log OP_CALL post-force for
             // platform-named closures.  Used to trace the wrong-arg
             // capture in the broader-thunkify upvalue bug.  Also derefs
@@ -7864,6 +8055,21 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // W2b env-capture: retarget defEnv to the tail-callee (frame reuse; the
             // old frame's defEnv/thunk-defEnv must not leak into the callee body).
             cur.defEnv = tcCallee->desc->usesDefEnv ? tcCallee->capturedDefEnv : nullptr;
+            // LEVER-1 applied-import cache PROBE: the `(import f) args` application
+            // reaches OP_TAIL_CALL when the App is in tail position (the common
+            // DIRECT_EVAL shape) — observe here too.  NOTE for the real cache:
+            // tail-call frame reuse = the CFF_MEMO_RETURN capture would be lost on
+            // this path (fail-safe miss, per the soundness review §4) — the probe
+            // counts eligibility regardless so we know the opportunity size.
+            {
+                static const bool s_probeTC = [] {
+                    const char * e = std::getenv("NIX_V3_APPLIED_CACHE");
+                    return e && (std::strcmp(e, "probe") == 0 || std::strcmp(e, "count") == 0);
+                }();
+                if (__builtin_expect(s_probeTC, 0)
+                    && tcCallee->cu && tcCallee->cu->fromImportCU)
+                    appliedCacheProbeObserve(vm, tcCallee, arg, 1, tcDesc->hasFormals);
+            }
             // stackBaseOffset is unchanged: we reuse the same
             // operand-stack window.
             //
@@ -15256,6 +15462,34 @@ Value callClosure2(VMState & vm, Value fun, Value arg1, Value arg2)
     return callClosure(vm, step1, arg2);
 }
 
+// LEVER-1 applied-import cache PROBE — cumulative-counter dump, called from
+// run.cc at end-of-root-eval (see the primop.hh declaration for why not
+// atexit).  Monotonic — the LAST line printed in a process is authoritative.
+// Defined HERE (external-linkage region; the probe helpers above dispatchLoop
+// live in an anonymous namespace, which is fine — same-TU access).
+void dumpAppliedCacheProbeStats() noexcept
+{
+    static const bool s_probe = [] {
+        const char * e = std::getenv("NIX_V3_APPLIED_CACHE");
+        return e && (std::strcmp(e, "probe") == 0 || std::strcmp(e, "count") == 0);
+    }();
+    if (!s_probe) return;
+    const auto & st = appliedCacheProbeStats();
+    if (st.eligibleCalls == 0) return;
+    std::fprintf(stderr,
+        "v3 APPLIED-CACHE PROBE: eligible=%llu (call=%llu tail=%llu cc=%llu "
+        "noFormals=%llu) hashed=%llu unhashable=%llu distinctKeys=%zu wouldHit=%llu\n",
+        (unsigned long long)st.eligibleCalls,
+        (unsigned long long)st.bySite[0],
+        (unsigned long long)st.bySite[1],
+        (unsigned long long)st.bySite[2],
+        (unsigned long long)st.noFormals,
+        (unsigned long long)st.hashedCalls,
+        (unsigned long long)st.unhashableArgs,
+        st.keys.size(),
+        (unsigned long long)st.wouldHit);
+}
+
 Value callClosure(VMState & vm, Value fun, Value arg)
 {
     // Mirror tree-walker's `callFunction`: callable values must be in
@@ -15463,6 +15697,19 @@ Value callClosure(VMState & vm, Value fun, Value arg)
 
     const Closure * callee = fun.asClosure();
     const LambdaDescriptor * desc = callee->desc;
+
+    // LEVER-1 applied-import cache PROBE (NIX_V3_APPLIED_CACHE=probe): the
+    // let-bound `(import f) args` shape becomes a lazy Tag::App value whose
+    // force lands HERE (callClosure), not in dispatch-loop OP_CALL — this is
+    // the path the minimal repro proved (2026-07-04).  Same observation as the
+    // OP_CALL hook; see AppliedCacheProbeStats for design + retirement.
+    static const bool s_appliedCacheProbeCC = [] {
+        const char * e = std::getenv("NIX_V3_APPLIED_CACHE");
+        return e && (std::strcmp(e, "probe") == 0 || std::strcmp(e, "count") == 0);
+    }();
+    if (__builtin_expect(s_appliedCacheProbeCC, 0)
+        && callee->cu && callee->cu->fromImportCU)
+        appliedCacheProbeObserve(vm, callee, arg, 2, desc->hasFormals);
 
     // #495: native fix-point intrinsic -- mirrored from OP_CALL.
     // callClosure is the entry point primops + bridges use; the

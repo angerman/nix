@@ -393,6 +393,12 @@ RootResult runRootExprModule(nix::EvalState & state, ir::Module module)
     // unconditional and runs exactly once.
     flushPeriodicLiveTraceCsv();
 
+    // LEVER-1 applied-import cache PROBE: self-gated (NIX_V3_APPLIED_CACHE=
+    // probe + non-zero counters), unconditional here for the same reason as
+    // flushPeriodicLiveTraceCsv above — the atexit variant loses its output in
+    // the `nix` binary.  Cumulative; the LAST line per process is authoritative.
+    dumpAppliedCacheProbeStats();
+
     // NIX_VM_STATS=1: dump alloc counters at completion.  Lets us
     // attribute alloc explosions to thunks vs closures vs Bindings
     // vs lists.

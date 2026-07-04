@@ -155,3 +155,37 @@ KEY READINGS:
   numbers still pending (needs the current instrumentation flags re-run).
 - IFD/store portions (M5/simplex) are store-bound — not eval-cache-addressable
   (already store-cached); the eval-CPU column is the cache's addressable target.
+
+## Part B step 1 — PROBE VERDICT (2026-07-04): BUILD, with emitter-assisted constant-args keys
+The Rule-0 probe (NIX_V3_APPLIED_CACHE=probe|count, in-tree) killed the NAIVE
+runtime-hashed design and redirected to a better one.  Findings:
+1. **Application paths**: `(import f) args` reaches the VM via THREE routes —
+   dispatch-loop OP_CALL (op_call_dispatch/have_fun; R_CALL feeds it),
+   OP_TAIL_CALL (frame retarget; the DIRECT_EVAL top-level shape), and
+   callClosure (App-spine force; the let-bound shape).  A memo hook must cover
+   all three (probe does, site-tagged).  Import side verified: `import
+   <nixpkgs>` returns the impure.nix closure with cu->fromImportCU=1.
+2. **Runtime forced-key hashing is DEAD**: forceDeep+canonicalHash exploded
+   (hello >>120 s — booter.nix/stage args are pkgs-sized); even a 512-node
+   BOUNDED force perturbs broadly (NixOS-module deprecation warnings appeared
+   in a hello eval — every callPackage is an eligible application and forcing
+   its args cascades).
+3. **The flood, quantified** (hello 1×, count-mode, non-invasive): eligible
+   import-CU applications = 95,717 (OP_CALL 28,354 / tail 19,457 / callClosure
+   47,906); 92% (88,359) are formals-LESS lib-function applications; the
+   formals-bearing callPackage-class flood ≈ 7,358/eval.  A per-call runtime
+   key attempt is untenable at that rate.
+4. **v1 DESIGN PIVOT (the build)**: EMITTER-ASSISTED CONSTANT-ARGS KEYS — the
+   emitter statically marks applications whose arg expression is a
+   compile-time-CONSTANT attrset (literal leaves only; the `import <nixpkgs>
+   { config.allowUnfree = true; }` shape) and emits the canonical args-key AS A
+   CONSTANT.  Runtime memo hook fires ONLY on marked sites: zero forcing, zero
+   per-call hashing, and the 7.4K computed-args flood is excluded
+   STRUCTURALLY.  Top-level repeats (the user's workload) are exactly literal-
+   config applications → the 73M→37M ceiling is delivered by hitting 1-2
+   applications per eval root.  (callPackage-level memoization — computed args
+   — remains v2+ territory via the persistent store's content keys.)
+5. Probe stays in-tree as the measurement instrument (NIX_V3_APPLIED_CACHE=
+   probe|count, default-off, retirement: replaced by the real cache stats).
+zsh gotcha re-learned the hard way: `env $P cmd` does NOT word-split in zsh →
+use explicit assignments (several "silent" probe runs were TW evals).
