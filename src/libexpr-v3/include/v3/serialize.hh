@@ -178,7 +178,12 @@ namespace nix::v3::serialize {
 /// (NIX_V3_ENV_CAPTURE Track E W2b).  Eval-affecting: they drive the frame-entry
 /// defEnv install + OP_MAKE_ENV allocation size, so a cache-loaded CU must not
 /// silently lose them.  false/0 for CUs compiled without the feature.
-constexpr uint32_t kSchemaVersion = 18;
+///
+/// 19 (2026-07-04): env-pointer capture DELETED (Gate C KILL — see the
+/// retirement commit).  The schema-18 `usesDefEnv`/`envSlotCount` descriptor
+/// fields and the OP_MAKE_ENV/OP_SET_ENV/OP_GET_ENV opcodes (0xE0-0xE2) are
+/// removed from the wire format; opcode values retired, not reused.
+constexpr uint32_t kSchemaVersion = 19;
 
 /// 8-byte magic prefix at the start of every serialized blob.
 /// Includes a discriminator so format mismatches are detected early.

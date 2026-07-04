@@ -697,19 +697,6 @@ struct AllocStats
     uint64_t fwdCapturesEmitted   = 0;   // capture-GETs resolving to an upvalue
     uint64_t totalCapturesEmitted = 0;   // all capture-GETs (local + upvalue)
 
-    /// W1 escape-analysis (NIX_V3_ENV_CAPTURE=dump; ir.cc computeFreeVars tail).
-    /// IR-level classification of every child MkThunk/Lambda capture fv within
-    /// its creating Function F: ESCAPING (fv ∈ F's own-bound locals ⇒ env-routable
-    /// at depth 0 via F's frame Env), FORWARDING (fv ∈ F.freeVars ⇒ env-routable
-    /// at depth+1 — the transitive re-copy the chain kills; should ≈ Phase-1 C3),
-    /// or OTHER.  Gate-on only (analysis, no codegen change).  Sizes v1's
-    /// env-routable fraction; the emit-side ineligibility (TEMP defer-slots,
-    /// with-targets) is applied at W2 for the precise counter-4.
-    uint64_t envTotalCaptures      = 0;
-    uint64_t envEscapingCaptures   = 0;
-    uint64_t envForwardingCaptures = 0;
-    uint64_t envOtherCaptures      = 0;
-
     /// #495: how many OP_CALL invocations dispatched to the v3-native
     /// `lib.fix` intrinsic (instead of running its bytecode body).
     /// Mirrors selectorLambdaCalls -- confirms that lower.cc's
@@ -2877,7 +2864,6 @@ struct Alloc
         c->capturedWiths = nullptr;
         c->cu = nullptr;
         c->upvalEnv = nullptr;   // env-sharing: inline-FAM path until a gate builds an Env
-        c->capturedDefEnv = nullptr;  // NIX_V3_ENV_CAPTURE (W2b): set by MAKE if usesDefEnv
         closureAllocSiteRecord(c, file, line, nUpvalues);
         return c;
     }
@@ -2920,7 +2906,6 @@ struct Alloc
         c->capturedWiths = nullptr;
         c->cu = nullptr;
         c->upvalEnv = nullptr;   // env-sharing: inline-FAM path until a gate builds an Env
-        c->capturedDefEnv = nullptr;  // NIX_V3_ENV_CAPTURE (W2b): set by MAKE if usesDefEnv
         closureAllocSiteRecord(c, file, line, nUpvalues);
         return c;
     }
@@ -2991,33 +2976,6 @@ struct Alloc
         t->cell = nullptr;
         *reinterpret_cast<Env **>(&t->tail[0]) = nullptr;  // Env* slot; caller fills
         if (reserveWithsSlot) thunkSetCapturedWiths(t, nullptr);  // tail[1]
-        thunkAllocSiteRecord(t, file, line, nUpvalues);
-        return t;
-    }
-
-    /// NIX_V3_ENV_CAPTURE (W2b): a suspended thunk whose body reads env-routed
-    /// locals AND may capture residual flat upvalues (recVars etc.).  HYBRID tail:
-    /// [nUpvalues FAM upvalues] + [captured defEnv @ tail[nUpvalues]] + [withs @
-    /// tail[nUpvalues+1] iff reserveWithsSlot].  The FAM upvalues are filled by the
-    /// MAKE_THUNK pop loop (as for a normal thunk); the caller fills the defEnv via
-    /// thunkSetCapturedDefEnv immediately after alloc.
-    static Thunk * allocThunkCapture(uint16_t nUpvalues,
-                                     bool reserveWithsSlot = false,
-                                     const char * file = __builtin_FILE(),
-                                     uint32_t     line = __builtin_LINE()) noexcept
-    {
-        const size_t bytes = sizeof(Thunk)
-            + sizeof(Value) * (nUpvalues + 1 + (reserveWithsSlot ? 1 : 0));
-        V3_STATS_BUMP(bytesThunks, bytes);
-        auto * t = static_cast<Thunk *>(nurseryOrArena(bytes, CellType::Thunk));
-        t->state = ThunkState::Suspended;
-        t->hasWithsSlot = static_cast<uint8_t>(
-            THUNK_ENV_CAPTURE | (reserveWithsSlot ? THUNK_WITHS_SLOT : 0));
-        t->nUpvalues = nUpvalues;
-        t->forces = 0;
-        t->cell = nullptr;
-        thunkSetCapturedDefEnv(t, nullptr);            // tail[nUpvalues]; caller fills
-        if (reserveWithsSlot) thunkSetCapturedWiths(t, nullptr);  // tail[nUpvalues+1]
         thunkAllocSiteRecord(t, file, line, nUpvalues);
         return t;
     }
@@ -3399,7 +3357,6 @@ inline Closure * Alloc::allocFakeClo(uint16_t nUpvalues) noexcept
             // stale Env into a non-env-shared reuse (closureUpvalue reads it →
             // wrong value/UAF).  Callers that share set it again after.
             c->upvalEnv = nullptr;
-            c->capturedDefEnv = nullptr;  // NIX_V3_ENV_CAPTURE (W2b): reset on recycle too
             return c;
         }
     }
@@ -3414,7 +3371,6 @@ inline Closure * Alloc::allocFakeClo(uint16_t nUpvalues) noexcept
     c->capturedWiths = nullptr;
     c->cu = nullptr;
     c->upvalEnv = nullptr;   // env-sharing: inline-FAM path (fakeClos never share an Env)
-    c->capturedDefEnv = nullptr;  // NIX_V3_ENV_CAPTURE (W2b)
     return c;
 }
 

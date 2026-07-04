@@ -82,23 +82,6 @@ const char * internEmitSiteString(const char * label)
     return pool.back().c_str();
 }
 
-// NIX_V3_ENV_CAPTURE (Track E v1, BEAT_TW_V3_PLAN_2026-07-03 §5) — the
-// env-pointer capture model, default-OFF.  When on (W2+), a function whose
-// locals escape into inner MkThunk/Lambda allocates one shared frame Env
-// (OP_MAKE_ENV) holding its escaping locals; children capture a single pointer
-// to it and read via OP_GET_ENV(depth, idx) instead of flat per-object FAM
-// copies.  In kGates (primops.cc) so the disk-cache key namespaces gate-on CUs
-// away from default-codegen CUs (Rule-3 lint enforces the kGates membership).
-// RETIREMENT CRITERION: retire (flip default-on and delete this gate, or delete
-// the whole path) at the W6 Gate C resolution (2026-Q3) — SHIP → default-on;
-// KILL → delete, preserving the branch point in git per the P3.1 precedent.
-// W0: the read exists + is in kGates; emission arrives at W2 (the branch below
-// is an intentional no-op stub until then).
-static const bool g_envCapture = [] {
-    const char * e = std::getenv("NIX_V3_ENV_CAPTURE");
-    return e && e[0] && e[0] != '0';   // "dump" also enables (W1 dump-mode)
-}();
-
 struct Emitter
 {
     const ir::Module & m;
@@ -208,187 +191,6 @@ struct Emitter
         for (const auto & fn : m.functions)
             for (ir::VarId fv : fn.freeVars)
                 capturedFreeVars_.insert(fv);
-    }
-
-    // ---- NIX_V3_ENV_CAPTURE (W2b) module-level escape analysis -------------
-    // Only meaningful when g_envCapture; built once by computeEnvCapture()
-    // before the emitFunction loop.  See the design in BEAT_TW_V3_PLAN §W2b:
-    // every free var is an escaping local of its owner, so ALL captures route
-    // through the frame-Env chain (no residual flat FAM).  A function F:
-    //   - owns the vars bound in its block-tree (params + let bindings);
-    //   - E(F) = the subset of F's own locals captured by any nested function
-    //     (= ownLocals(F) ∩ capturedFreeVars_) — these live in F's frame Env;
-    //   - createsEnv(F) = E(F) non-empty → emits OP_MAKE_ENV, gets an env slot
-    //     per escaping local;
-    //   - usesDefEnv(F) = createsEnv(F) OR F reads any ancestor's env-routed
-    //     local (⇔ F.freeVars non-empty, since all freeVars are env-routed) —
-    //     installs the captured parent defEnv at entry.
-    std::vector<std::unordered_map<ir::VarId, uint16_t>> envSlotOf_; // [fid] var→envIdx
-    std::vector<uint16_t> envSlotCount_;      // [fid] size of F's frame Env
-    std::vector<uint8_t>  createsEnv_;        // [fid] bool
-    std::vector<uint8_t>  usesDefEnv_;        // [fid] bool
-    // "no lexical parent" sentinel: FuncId 0 is the VALID root function, so
-    // ir::kInvalid (=0) cannot double as "none" here — use the max value.
-    static constexpr ir::FuncId kNoParent = ~ir::FuncId(0);
-    std::vector<ir::FuncId> lexParent_;       // [fid] enclosing function (kNoParent=root)
-    std::unordered_map<ir::VarId, ir::FuncId> varOwner_;  // var→owning function
-    bool envCaptureBuilt_ = false;
-
-    /// Walk F's own block-tree (entryBlock + If/With/Assert/And/Or/Impl
-    /// sub-blocks), NOT descending into nested Lambda/MkThunk bodies (they are
-    /// separate FuncIds).  Records ownLocals (via varOwner_) and, for every
-    /// nested Lambda/MkThunk node, lexParent_[child]=F.  Mirrors the boundary
-    /// preassignSlotsInBlock respects.
-    void walkOwnBlocks(ir::FuncId f, ir::BlockId bid,
-                       std::unordered_set<ir::BlockId> & visited,
-                       std::unordered_set<ir::VarId> & own)
-    {
-        if (bid == ir::kInvalidBlock || !visited.insert(bid).second) return;
-        const ir::Block & b = m.blocks[bid];
-        for (const auto & bd : b.bindings) {
-            if (bd.var != ir::kInvalid) { own.insert(bd.var); varOwner_[bd.var] = f; }
-            std::vector<ir::BlockId> subs;
-            std::visit([&](auto const & e) {
-                using T = std::decay_t<decltype(e)>;
-                if constexpr (std::is_same_v<T, ir::If>) {
-                    subs.push_back(e.thenBlock); subs.push_back(e.elseBlock);
-                } else if constexpr (std::is_same_v<T, ir::With> ||
-                                     std::is_same_v<T, ir::Assert>) {
-                    subs.push_back(e.bodyBlock);
-                } else if constexpr (std::is_same_v<T, ir::And> ||
-                                     std::is_same_v<T, ir::Or>  ||
-                                     std::is_same_v<T, ir::Impl>) {
-                    subs.push_back(e.rhsBlock);
-                } else if constexpr (std::is_same_v<T, ir::Lambda> ||
-                                     std::is_same_v<T, ir::MkThunk>) {
-                    // A nested function: record lexical parent; do NOT descend
-                    // (its blocks belong to e.funcIdx, not F).
-                    if (e.funcIdx < lexParent_.size()) lexParent_[e.funcIdx] = f;
-                } else if constexpr (std::is_same_v<T, ir::LetRec>) {
-                    // LetRec entries + hidden entries are nested functions
-                    // (entry.thunkBody) lexically inside F.  Their lexParent MUST
-                    // be recorded here (they are NOT ir::Lambda/MkThunk binding
-                    // exprs), else depth() from inside them walks to kNoParent and
-                    // an outer env-routed capture is read at the wrong depth.
-                    for (const auto & en : e.entries)
-                        if (en.thunkBody < lexParent_.size()) lexParent_[en.thunkBody] = f;
-                    for (const auto & he : e.hiddenEntries)
-                        if (he.thunkBody < lexParent_.size()) lexParent_[he.thunkBody] = f;
-                }
-            }, bd.expr);
-            for (auto sb : subs) walkOwnBlocks(f, sb, visited, own);
-        }
-    }
-
-    void computeEnvCapture()
-    {
-        if (envCaptureBuilt_) return;
-        envCaptureBuilt_ = true;
-        ensureCapturedFreeVars();
-        const size_t NF = m.functions.size();
-        envSlotOf_.assign(NF, {});
-        envSlotCount_.assign(NF, 0);
-        createsEnv_.assign(NF, 0);
-        usesDefEnv_.assign(NF, 0);
-        lexParent_.assign(NF, kNoParent);
-        varOwner_.clear();
-
-        // Pass 1: ownLocals + varOwner + lexParent (params first, then block-tree).
-        std::vector<std::unordered_set<ir::VarId>> own(NF);
-        for (ir::FuncId f = 0; f < NF; ++f) {
-            const ir::Function & fn = m.functions[f];
-            auto addParam = [&](ir::VarId v) {
-                if (v != ir::kInvalid) { own[f].insert(v); varOwner_[v] = f; }
-            };
-            addParam(fn.paramVar);
-            for (ir::VarId ep : fn.extraParams) addParam(ep);
-            std::unordered_set<ir::BlockId> visited;
-            walkOwnBlocks(f, fn.entryBlock, visited, own[f]);
-        }
-        // recVar exclusion: a let-rec / rec-attrset's recVar is captured by its
-        // recursive members and read via the rec-binding mechanism (RecBindingSlot
-        // Ref → OP_GET_UPVALUE_REC_BINDING + OP_ATTRS_REC_INIT/SET), NOT plain
-        // freeVars.  Env-routing it collides with that machinery (OP_ATTRS_REC_SET
-        // sees a corrupted stack).  So recVars stay RESIDUAL (flat upvalues via the
-        // existing path) — the hybrid the plan specified.  Exclude them from E.
-        std::unordered_set<ir::VarId> recVars;
-        for (ir::VarId v : m.recVarIds) recVars.insert(v);
-        for (const auto & kv : m.recVarToSlotVar) { recVars.insert(kv.first); recVars.insert(kv.second); }
-        // Also exclude every var captured by a LetRec/rec-attrset ENTRY via the
-        // rec mechanism (entry.outerUpvalues + hiddenEntry.outerUpvalues +
-        // hiddenVar).  Those entries are thunks the LetRec emit builds with its own
-        // outerUp+rec-attrset publish (OP_ATTRS_REC_INIT/SET); env-routing such a
-        // captured var makes the entry body read OP_GET_ENV while the LetRec pushed
-        // it flat → OP_ATTRS_REC_SET index-out-of-range / wrong reads.  Keep them
-        // flat (residual).  Scan all blocks for LetRec binding exprs.
-        for (const ir::Block & blk : m.blocks)
-            for (const ir::Binding & bd : blk.bindings)
-                if (const auto * lr = std::get_if<ir::LetRec>(&bd.expr)) {
-                    if (lr->recVar != ir::kInvalid) recVars.insert(lr->recVar);
-                    for (const auto & en : lr->entries)
-                        for (ir::VarId ov : en.outerUpvalues) recVars.insert(ov);
-                    for (const auto & he : lr->hiddenEntries) {
-                        recVars.insert(he.hiddenVar);
-                        for (ir::VarId ov : he.outerUpvalues) recVars.insert(ov);
-                    }
-                }
-
-        // Pass 2: E(F) = ownLocals(F) ∩ capturedFreeVars_ (minus recVars) → env slots.
-        for (ir::FuncId f = 0; f < NF; ++f) {
-            std::vector<ir::VarId> esc;
-            for (ir::VarId v : own[f])
-                if (capturedFreeVars_.count(v) && !recVars.count(v)) esc.push_back(v);
-            if (esc.empty()) continue;
-            std::sort(esc.begin(), esc.end());   // deterministic env-slot order
-            createsEnv_[f] = 1;
-            uint16_t idx = 0;
-            for (ir::VarId v : esc) envSlotOf_[f][v] = idx++;
-            envSlotCount_[f] = idx;
-        }
-        // Pass 3: usesDefEnv(F) = createsEnv(F) OR F reads/forwards any ENV-ROUTED
-        // freeVar (a freeVar whose owner env-routes it — residual recVars don't
-        // count; they use the flat upvalue path).
-        for (ir::FuncId f = 0; f < NF; ++f) {
-            bool routesFree = false;
-            for (ir::VarId v : m.functions[f].freeVars)
-                if (isEnvRouted(v)) { routesFree = true; break; }
-            usesDefEnv_[f] = createsEnv_[f] || routesFree;
-        }
-    }
-
-    /// A var is env-routed iff its owning function houses it in a frame Env (it is
-    /// an escaping local there).  recVars are excluded from E, so they are NEVER
-    /// env-routed — they remain flat residual upvalues.  Owner-independent (the
-    /// routing is a property of where the var is BOUND).
-    bool isEnvRouted(ir::VarId v) const
-    {
-        auto it = varOwner_.find(v);
-        return it != varOwner_.end() && isEscapingLocal(it->second, v);
-    }
-
-    /// Is v one of F's OWN locals that escapes into a nested function (⇒ lives
-    /// in F's frame Env, read/written via OP_GET_ENV(0)/OP_SET_ENV).
-    bool isEscapingLocal(ir::FuncId f, ir::VarId v) const
-    {
-        return f < envSlotOf_.size() && envSlotOf_[f].count(v) != 0;
-    }
-
-    /// Env-chain depth from a reference in function `refFn` to the frame Env
-    /// that owns v: count env-creating functions in the lexical chain strictly
-    /// before v's owner.  0 = v is in refFn's own env (own escaping local) or in
-    /// the directly-installed captured defEnv (pass-through through non-env-
-    /// creating intermediates).  Precondition: v is env-routed (owner creates env).
-    uint32_t envDepth(ir::FuncId refFn, ir::VarId v) const
-    {
-        auto oit = varOwner_.find(v);
-        ir::FuncId owner = (oit != varOwner_.end()) ? oit->second : kNoParent;
-        uint32_t depth = 0;
-        ir::FuncId walk = refFn;
-        while (walk != owner && walk != kNoParent) {
-            if (walk < createsEnv_.size() && createsEnv_[walk]) ++depth;
-            walk = (walk < lexParent_.size()) ? lexParent_[walk] : kNoParent;
-        }
-        return depth;
     }
 
     /// #548c (2026-05-10): set by emitBlock when emitting the
@@ -553,14 +355,6 @@ struct Emitter
         unit.code.push_back(encode(OP_GET_LOCAL, slot));
     }
 
-    /// NIX_V3_ENV_CAPTURE (W2b): read env slot `idx` `depth` frames up the defEnv
-    /// chain.  operand=idx (instruction word), depth=1-word trailer.
-    void emitGetEnv(uint32_t depth, uint16_t idx)
-    {
-        unit.code.push_back(encode(OP_GET_ENV, idx));
-        unit.code.push_back(depth);
-    }
-
     void emitVarRef(ir::VarId v)
     {
         // #542 deferring discipline: emitVarRef ALWAYS flushes any
@@ -589,25 +383,6 @@ struct Emitter
                 V3_STATS_BUMP(totalCapturesEmitted, 1);
             emitExpr(*cit->second);
             return;
-        }
-        // NIX_V3_ENV_CAPTURE (W2b): route env-routed vars through the frame-Env
-        // chain instead of the flat slot/upvalue paths.  A var is env-routed iff
-        // it is an escaping local of its owning function (own or ancestor); every
-        // freeVar qualifies (it escaped its owner to reach here).  Own escaping
-        // local → depth 0; ancestor's → depth = env-creating frames in between.
-        // Non-escaping own locals fall through to the OP_GET_LOCAL path below.
-        if (__builtin_expect(g_envCapture, 0)) {
-            auto oit = varOwner_.find(v);
-            if (oit != varOwner_.end()) {
-                const ir::FuncId owner = oit->second;
-                if (isEscapingLocal(owner, v)) {
-                    const uint32_t depth =
-                        (owner == ctx->fid) ? 0u : envDepth(ctx->fid, v);
-                    emitGetEnv(depth, envSlotOf_[owner].at(v));
-                    return;
-                }
-                // owner==fid but non-escaping → local slot path (fall through).
-            }
         }
         if (auto it = ctx->slot.find(v); it != ctx->slot.end()) {
             if (__builtin_expect(emittingCaptures_, 0)) {
@@ -1135,23 +910,6 @@ struct Emitter
             // they never collide with the spine head/inner logic.)
             if (constRemat_.count(bd.var)) continue;
 
-            // NIX_V3_ENV_CAPTURE (W2b): an escaping local lives in the frame Env,
-            // not a stack slot.  Compute its value (general emitExpr — one value
-            // on the stack) and OP_SET_ENV it, bypassing the slot/defer/register-
-            // If/tail-scratch optimizations (correctness-first for v1; these are
-            // captured, hence never OnceLinear, so no defer win is lost).  If the
-            // binding is also the block tail, re-read (OP_GET_ENV 0) so its value
-            // is on the operand stack for the terminal return.
-            if (__builtin_expect(g_envCapture, 0)
-                && isEscapingLocal(ctx->fid, bd.var)) {
-                flushAllDeferred();
-                emitExpr(bd.expr);
-                const uint16_t ei = envSlotOf_[ctx->fid].at(bd.var);
-                unit.code.push_back(encode(OP_SET_ENV, ei));
-                if (isTail) emitGetEnv(0, ei);
-                continue;
-            }
-
             // Register VM Phase 1 + 5: a binary primop with slot/const
             // operands and a slot result → one 3-address OP_R_PRIMOP2 (no
             // stack traffic; writes slot v).  For the TAIL binding, follow
@@ -1352,18 +1110,10 @@ struct Emitter
         // they sit BELOW the upvalue block on the value stack.
         // OP_MAKE_CLOSURE pops nUpvalues then nWithTargets in that
         // order (top-down).
-        // NIX_V3_ENV_CAPTURE (W2b, hybrid): env-routed freeVars are read via the
-        // captured defEnv chain (OP_GET_ENV) — do NOT push them.  Push only the
-        // RESIDUAL freeVars (recVars + anything not env-routed) as flat upvalues,
-        // in freeVars order (matching the callee's upvalue-index order).  nUp =
-        // residual count.  The runtime OP_MAKE_CLOSURE sets capturedDefEnv from the
-        // maker frame's defEnv when the callee usesDefEnv.  Non-env-capture callees
-        // have no env-routed freeVar ⇒ push all (unchanged).
         emittingCaptures_ = true;
         for (auto wv : e.lexicalWiths) emitVarRef(wv);
         uint32_t nUp = 0;
         for (auto fv : e.freeVars) {
-            if (__builtin_expect(g_envCapture, 0) && isEnvRouted(fv)) continue;
             emitVarRef(fv); ++nUp;
         }
         emittingCaptures_ = false;
@@ -1379,16 +1129,11 @@ struct Emitter
     }
     void emitOne(const ir::MkThunk & e)
     {
-        // Same push order as ir::Lambda — see comment there.  NIX_V3_ENV_CAPTURE
-        // (W2b, hybrid): push only RESIDUAL freeVars (env-routed ones come via the
-        // defEnv chain); nUp = residual count.
-        const bool childEnv = g_envCapture && e.funcIdx < usesDefEnv_.size()
-                              && usesDefEnv_[e.funcIdx];
+        // Same push order as ir::Lambda — see comment there.
         emittingCaptures_ = true;
         for (auto wv : e.lexicalWiths) emitVarRef(wv);
         uint32_t nUp = 0;
         for (auto fv : e.freeVars) {
-            if (__builtin_expect(g_envCapture, 0) && isEnvRouted(fv)) continue;
             emitVarRef(fv); ++nUp;
         }
         emittingCaptures_ = false;
@@ -1402,7 +1147,6 @@ struct Emitter
         static const bool s_rawFormals =
             std::getenv("NIX_V3_RAW_FORMALS") != nullptr;
         if (__builtin_expect(s_rawFormals, 0)
-            && !childEnv
             && e.funcIdx < m.functions.size()
             && m.functions[e.funcIdx].rawFormalEligible
             && e.freeVars.size() == 1) {
@@ -1450,22 +1194,6 @@ struct Emitter
         // explicitly to commit any pending bindings to slots before
         // we read from the slot.
         flushAllDeferred();
-        // NIX_V3_ENV_CAPTURE (W2b): an env-routed var lives in the frame Env, not a
-        // slot/upvalue — its slot is assigned but NEVER written (the value went to
-        // OP_SET_ENV).  The force superinstruction path is SEPARATE from emitVarRef,
-        // so it MUST env-route too, else OP_GET_LOCAL_FORCE reads the stale slot
-        // (the groupBy `prev = acc.${key} or []` bug: prev is forced → wrong value).
-        // Read via OP_GET_ENV then a plain OP_FORCE (no fused GET_ENV_FORCE opcode).
-        if (__builtin_expect(g_envCapture, 0)) {
-            auto oit = varOwner_.find(e.thunk);
-            if (oit != varOwner_.end() && isEscapingLocal(oit->second, e.thunk)) {
-                const uint32_t depth =
-                    (oit->second == ctx->fid) ? 0u : envDepth(ctx->fid, e.thunk);
-                emitGetEnv(depth, envSlotOf_[oit->second].at(e.thunk));
-                emitForceFromIR(e.srcLine);
-                return;
-            }
-        }
         if (auto it = ctx->slot.find(e.thunk); it != ctx->slot.end()) {
             emitGetLocalForceFromIR(it->second, e.srcLine);
             return;
@@ -2421,19 +2149,6 @@ struct Emitter
                 && !capturedFreeVars_.count(bd.var)
                 && occ.lookup(bd.var).kind == ir::OccKind::OnceLinear)
                 constRemat_[bd.var] = &bd.expr;
-            else if (__builtin_expect(g_envCapture, 0)
-                     && isEscapingLocal(fc.fid, bd.var))
-                // NIX_V3_ENV_CAPTURE (W2b): an escaping let-binding lives in the
-                // frame Env (its store is OP_SET_ENV, reads are OP_GET_ENV), so it
-                // gets NO stack slot.  This is the SYSTEMATIC fix for read-path
-                // bypasses: every slot-based fast path (Force superinstruction,
-                // AttrSelect-from-slot, register-If cond, tail-result R_MOVE, …)
-                // does `ctx->slot.find(v)` — with no slot entry they all MISS and
-                // fall through to the env-routed emitVarRef/Force path.  (Params
-                // keep their slot: the arg lands there + is copied to the Env in
-                // the prologue, and the slot retains the value, so slot-reads of an
-                // escaping PARAM are still correct.)
-                ;
             else
                 (void)getOrAssignSlot(fc, bd.var);
             std::vector<ir::BlockId> subs;
@@ -2589,19 +2304,12 @@ struct Emitter
         // OP_CALL_N writes the N args into these slots before entering.
         for (ir::VarId ep : f.extraParams)
             (void)getOrAssignSlot(fc, ep);
-        // Upvalue order = freeVars.  NIX_V3_ENV_CAPTURE (W2b, hybrid): env-routed
-        // freeVars are read via OP_GET_ENV(depth) from the defEnv chain, NOT as
-        // flat upvalues, so they get NO upvalue index and are NOT pushed by the
-        // maker (see emitOne(Lambda/MkThunk)).  RESIDUAL freeVars (recVars +
-        // anything not env-routed) keep the flat upvalue path.  The index order
-        // here MUST match the maker's residual push order (both skip env-routed in
-        // freeVars order).
+        // Upvalue order = freeVars; the index order here MUST match the
+        // maker's push order in emitOne(Lambda/MkThunk).
         {
             uint16_t ui = 0;
-            for (ir::VarId fv : f.freeVars) {
-                if (g_envCapture && isEnvRouted(fv)) continue;
+            for (ir::VarId fv : f.freeVars)
                 fc.upvalue[fv] = ui++;
-            }
         }
         // #498: trace freeVars for body emit of "res" with 4 freeVars.
         if (std::getenv("V3_DBG_RES_FREEVARS")
@@ -2634,27 +2342,6 @@ struct Emitter
         getLocalPositions_.clear();
         jumpInsnPositions_.clear();
         jumpTargetPositions_.clear();
-
-        // NIX_V3_ENV_CAPTURE (W2b): prologue.  If this function houses escaping
-        // locals in a frame Env, allocate it up front (parent = the defEnv the
-        // frame-entry installed) so every body reference to an env slot is valid,
-        // and copy escaping PARAMS from their entry stack slots into the Env
-        // (params arrive on the operand stack at call entry; escaping let-bindings
-        // are OP_SET_ENV'd at their binding site instead).
-        if (__builtin_expect(g_envCapture, 0) && createsEnv_[fid]) {
-            unit.code.push_back(encode(OP_MAKE_ENV, envSlotCount_[fid]));
-            auto copyParam = [&](ir::VarId pv) {
-                if (pv == ir::kInvalid) return;
-                auto eit = envSlotOf_[fid].find(pv);
-                if (eit == envSlotOf_[fid].end()) return;   // param does not escape
-                auto sit = fc.slot.find(pv);
-                if (sit == fc.slot.end()) return;           // no entry slot (unreferenced)
-                unit.code.push_back(encode(OP_GET_LOCAL, sit->second));
-                unit.code.push_back(encode(OP_SET_ENV, eit->second));
-            };
-            if (f.argName != ir::kInvalidSymbol || f.hasFormals) copyParam(f.paramVar);
-            for (ir::VarId ep : f.extraParams) copyParam(ep);
-        }
 
         if (f.entryBlock != ir::kInvalidBlock)
             emitBlock(f.entryBlock);
@@ -2774,23 +2461,10 @@ struct Emitter
 
         if (unit.lambdas.size() <= fid)         unit.lambdas.resize(fid + 1);
         if (unit.lambdaCodeOffsets.size() <= fid) unit.lambdaCodeOffsets.resize(fid + 1);
-        // NIX_V3_ENV_CAPTURE (W2b, hybrid): an env-capture function captures only
-        // its RESIDUAL freeVars (recVars etc.) as flat upvalues; env-routed
-        // freeVars come via the defEnv chain.  nUpvalues must be the residual count
-        // — consistent with the OP_MAKE_CLOSURE/THUNK nUp the maker emits + the
-        // callee's upvalue-index count (else GET_UPVALUE / the TW-bridge disagree).
-        const bool fnEnvCapture =
-            g_envCapture && fid < usesDefEnv_.size() && usesDefEnv_[fid];
-        uint16_t residualUpvalues = static_cast<uint16_t>(f.freeVars.size());
-        if (__builtin_expect(g_envCapture, 0)) {
-            residualUpvalues = 0;
-            for (ir::VarId fv : f.freeVars)
-                if (!isEnvRouted(fv)) ++residualUpvalues;
-        }
         unit.lambdas[fid] = LambdaDescriptor{
             .codeOffset     = codeStart,
             .prologueOffset = codeStart,
-            .nUpvalues      = residualUpvalues,
+            .nUpvalues      = static_cast<uint16_t>(f.freeVars.size()),
             .nLocals        = fc.nLocals,
             .arity          = static_cast<uint8_t>((f.argName != ir::kInvalidSymbol ? 1 : (f.hasFormals ? 1 : 0)) + f.extraParams.size()),
             .hasFormals     = static_cast<uint8_t>(f.hasFormals ? 1 : 0),
@@ -2800,14 +2474,6 @@ struct Emitter
             // this to consume the with-target block before the
             // upvalue block at OP_MAKE_CLOSURE / OP_MAKE_THUNK.
             .nWithTargets   = f.nWithTargets,
-            // NIX_V3_ENV_CAPTURE (W2b): install the captured defEnv at entry when
-            // this function reads/forwards env-routed locals; allocate a frame Env
-            // of envSlotCount slots when it houses escaping locals of its own.
-            // Both 0/false when the gate is off (analysis not run).
-            .usesDefEnv     = g_envCapture && fid < usesDefEnv_.size()
-                                  ? (usesDefEnv_[fid] != 0) : false,
-            .envSlotCount   = (g_envCapture && fid < envSlotCount_.size())
-                                  ? envSlotCount_[fid] : uint16_t(0),
             .formals        = {},
             .name           = f.name,
             .contextualName = f.contextualName,
@@ -3055,11 +2721,6 @@ struct Emitter
         // hello.drvPath's 269 import compiles (~270 MB of compile-
         // time alloc churn).  Keep the field for ABI compatibility
         // with any code that constructs a CU outside emit.
-
-        // NIX_V3_ENV_CAPTURE (W2b): run the module-level escape analysis once,
-        // before any function is emitted (emitVarRef/prologue/descriptor all read
-        // its per-function results).  No-op / not called when the gate is off.
-        if (g_envCapture) computeEnvCapture();
 
         // Emit inner functions first so their descriptors and code are
         // available before the top-level (which references them via

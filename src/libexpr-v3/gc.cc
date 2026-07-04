@@ -669,13 +669,6 @@ void Scavenger::walkClosure(Closure * c)
             visitValue(c->upvalues[i]);
         }
     }
-    // NIX_V3_ENV_CAPTURE (W2b): also gray the captured frame Env (a SEPARATE
-    // field from upvalEnv — env-capture closures keep upvalEnv=null so the FAM
-    // branch above walks their residual flat upvalues; capturedDefEnv holds the
-    // shared frame Env, walked as a tenured Env + parent chain like upvalEnv).
-    // null until W2b emission ⇒ inert.
-    if (c->capturedDefEnv && walked.insert(c->capturedDefEnv).second)
-        graylist.push_back({c->capturedDefEnv, GK_ENV});
     // #738 Phase E v0.2 post-walk barrier — see walkList.
     if (n.isPhaseEActive()) closurePostConstructBarrier(c);
 }
@@ -694,9 +687,8 @@ void Scavenger::walkEnv(Env * e)
     // TENURED (allocEnv → threadArena) and never moves, so gray the parent via
     // GK_ENV (deduped by `walked`); the graylist drains it back through walkEnv,
     // so an arbitrary-depth chain is handled iteratively (no C recursion).  This
-    // is a benign no-op today (no allocEnv caller sets `parent`), added BEFORE
-    // NIX_V3_ENV_CAPTURE (Track E) materializes Env chains so no walker silently
-    // drops the chain the day it exists.
+    // is a benign no-op today (no allocEnv caller sets `parent`), kept so no
+    // walker silently drops the chain the day a producer materializes one.
     if (e->parent && walked.insert(e->parent).second)
         graylist.push_back({e->parent, GK_ENV});
     if (n.isPhaseEActive()) envPostConstructBarrier(e);
@@ -734,10 +726,6 @@ void Scavenger::walkThunk(Thunk * t)
             for (uint16_t i = 0; i < t->nUpvalues; ++i) {
                 visitValue(t->tail[i]);
             }
-            // env-capture (HYBRID): FAM walked above; ALSO gray the captured defEnv
-            // at tail[nUpvalues] (a separate tenured Env + parent chain via GK_ENV).
-            if (Env * de = thunkCapturedDefEnv(t))
-                if (walked.insert(de).second) graylist.push_back({de, GK_ENV});
         }
         break;
     case ThunkState::Evaluated:
@@ -793,9 +781,6 @@ void Scavenger::walkThunk(Thunk * t)
             for (uint16_t i = 0; i < t->nUpvalues; ++i) {
                 visitValue(t->tail[i]);
             }
-            // env-capture (HYBRID): also gray the captured defEnv (tail[nUpvalues]).
-            if (Env * de = thunkCapturedDefEnv(t))
-                if (walked.insert(de).second) graylist.push_back({de, GK_ENV});
         }
         break;
     }
@@ -905,8 +890,8 @@ void Scavenger::run()
             if (f.thunk)
                 f.thunk = fwdThunk(f.thunk);
             if (f.forceWriteTarget) visitValue(*f.forceWriteTarget);
-            // NIX_V3_ENV_CAPTURE (W2): gray the frame's defEnv (see the main
-            // frame-walk below); null until W2 emission.
+            // Gray the frame's defEnv (see the main frame-walk below);
+            // always null today (env-capture deleted) — kept null-safe.
             if (f.defEnv && walked.insert(f.defEnv).second)
                 graylist.push_back({f.defEnv, GK_ENV});
         }
@@ -966,11 +951,13 @@ void Scavenger::run()
             }
             visitValue(*f.forceWriteTarget);
         }
-        // NIX_V3_ENV_CAPTURE (W2): the frame's defEnv is a TENURED Env holding
-        // this frame's escaping locals.  Gray it (GK_ENV) so walkEnv forwards its
-        // nursery payloads AND its parent chain (P0.A-4); the Env never moves.
-        // null until W2 emission ⇒ inert.  GC-CRITICAL: a non-null defEnv reached
-        // only via the frame register would otherwise be a missed root.
+        // The frame's defEnv would be a TENURED Env holding escaping locals.
+        // Gray it (GK_ENV) so walkEnv forwards its nursery payloads AND its
+        // parent chain (P0.A-4); the Env never moves.  ALWAYS NULL today (the
+        // env-capture experiment that populated it was deleted 2026-07-04);
+        // kept as null-safe scaffolding.  GC-CRITICAL if ever repopulated: a
+        // non-null defEnv reached only via the frame register would otherwise
+        // be a missed root.
         if (f.defEnv && walked.insert(f.defEnv).second)
             graylist.push_back({f.defEnv, GK_ENV});
     }
@@ -1294,10 +1281,6 @@ struct Auditor {
         else
             for (uint16_t i = 0; i < c->nUpvalues; ++i)
                 visitValue(c->upvalues[i], "Closure.upvalues[]");
-        // NIX_V3_ENV_CAPTURE (W2b): audit the captured frame Env (separate field;
-        // env-capture closures keep upvalEnv=null → FAM audited above).
-        if (c->capturedDefEnv)
-            visitEnv(c->capturedDefEnv, "Closure.capturedDefEnv");
     }
 
     void visitEnv(const Env * e, const char * site)
@@ -1307,8 +1290,8 @@ struct Auditor {
         if (!visited.insert(e).second) return;
         for (uint16_t i = 0; i < e->nValues; ++i)
             visitValue(e->values[i], "Env.values[]");
-        // P0.A-4 (§1.9): walk the Env::parent chain (populated by
-        // NIX_V3_ENV_CAPTURE).  `visited` dedups, so this recursion is cycle-safe.
+        // P0.A-4 (§1.9): walk the Env::parent chain.  `visited` dedups, so
+        // this recursion is cycle-safe.
         if (e->parent) visitEnv(e->parent, "Env.parent");
     }
 
@@ -1334,8 +1317,6 @@ struct Auditor {
             else {
                 for (uint16_t i = 0; i < t->nUpvalues; ++i)
                     visitValue(t->tail[i], "Thunk.suspended.tail[]");
-                if (Env * de = thunkCapturedDefEnv(t))       // env-capture (HYBRID)
-                    visitEnv(de, "Thunk.suspended.capturedDefEnv");
             }
             break;
         case ThunkState::Native:
@@ -1364,8 +1345,6 @@ struct Auditor {
             else {
                 for (uint16_t i = 0; i < t->nUpvalues; ++i)
                     visitValue(t->tail[i], "Thunk.Blackhole.tail[]");
-                if (Env * de = thunkCapturedDefEnv(t))       // env-capture (HYBRID)
-                    visitEnv(de, "Thunk.Blackhole.capturedDefEnv");
             }
             break;
         }
@@ -1509,8 +1488,9 @@ void postScavengeAudit(const Nursery & n, const VMState & vm)
             // cell; the contents may carry nursery payloads.
             if (f.forceWriteTarget)
                 a.visitValue(*f.forceWriteTarget, "frame.forceWriteTarget");
-            // NIX_V3_ENV_CAPTURE (W2): audit the frame's defEnv (+ parent chain
-            // via the auditor's visitEnv, P0.A-4).  null until W2 emission.
+            // Audit the frame's defEnv (+ parent chain via the auditor's
+            // visitEnv, P0.A-4).  Always null today (env-capture deleted);
+            // kept null-safe.
             if (f.defEnv) a.visitEnv(f.defEnv, "frame.defEnv");
         }
     };

@@ -130,9 +130,6 @@ const char * opName(Op op)
     case OP_TAIL:              return "OP_TAIL";
     case OP_LENGTH:            return "OP_LENGTH";
     case OP_ELEM_AT:           return "OP_ELEM_AT";
-    case OP_MAKE_ENV:          return "OP_MAKE_ENV";
-    case OP_SET_ENV:           return "OP_SET_ENV";
-    case OP_GET_ENV:           return "OP_GET_ENV";
     case OP_HALT:              return "OP_HALT";
     default:                   return nullptr;
     }
@@ -153,9 +150,6 @@ static uint32_t opExtraWords(Op op, uint32_t operand,
     case OP_MAKE_CLOSURE:
     case OP_MAKE_THUNK:
         return 2;                       // nUpvalues + nWithTargets (#530)
-    case OP_GET_ENV:
-        return 1;                       // NIX_V3_ENV_CAPTURE: parent-chain depth
-                                        // (OP_MAKE_ENV / OP_SET_ENV: no trailer)
     case OP_ATTRS_INIT:
         return 2 * operand;             // n (name, pos) pairs
     case OP_ATTRS_INIT_DYN: {
@@ -387,15 +381,6 @@ uint32_t disassembleOne(std::FILE * out,
             if (!fn.empty()) std::fprintf(out, "   ; func \"%s\"", fn.c_str());
             else             std::fprintf(out, "   ; func %u", operand);
         }
-        break;
-    case OP_MAKE_ENV:
-        std::fprintf(out, "   ; envSlots=%u", operand);
-        break;
-    case OP_SET_ENV:
-        std::fprintf(out, "   ; env[%u] = pop", operand);
-        break;
-    case OP_GET_ENV:
-        std::fprintf(out, "   ; push env(depth=%u)[%u]", dataAt(0), operand);
         break;
     case OP_ATTRS_SELECT:
     case OP_ATTRS_SELECT_DYN:

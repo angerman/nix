@@ -601,9 +601,9 @@ inline uint32_t shareAfter(uint16_t nUp) noexcept
     // shared ~nothing while adding a dead 8 B upvalEnv branch on the #1 opcode
     // family + a call per creation.  DEV: the mechanism stays testable via
     // NIX_V3_ENV_SHARE_AFTER=N (the s_override above) for any future A/B.  KEEP
-    // the plumbing (Env / upvalEnv / closureUpvalue / walkEnv / ENV_SHARED) — the
-    // capture-model trial (NIX_V3_ENV_CAPTURE, Track E) reuses it via OP_MAKE_ENV,
-    // NOT via this intern table.  Retire the whole path at the W6 Gate C verdict.
+    // the plumbing (Env / upvalEnv / closureUpvalue / walkEnv / ENV_SHARED).
+    // (The env-pointer-capture trial that also reused this plumbing was KILLed
+    // at Gate C 2026-07-04 and deleted; branch 8eebbe25b preserves it.)
     return UINT32_MAX;
 }
 
@@ -672,8 +672,8 @@ Env * maybeInternFromStack(VMState & vm, uint16_t nUp)
         // its values[] copy nursery cells off the value stack; register it as a
         // barriered root source at creation.  Previously covered only
         // TRANSITIVELY via each consumer's closure/thunk post-construct scan —
-        // one new consumer (e.g. NIX_V3_ENV_CAPTURE's frame Env) away from a
-        // missed root.  One line closes it.
+        // one new frame-Env consumer away from a missed root.  One line
+        // closes it.
         envPostConstructBarrier(env);
         vm.valueStack.resize(base);
         seed->env = env;
@@ -5862,15 +5862,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // process.  Single-threaded VM — no atomics needed.
             static const bool s_noLift =
                 std::getenv("NIX_V3_NO_LAMBDA_LIFT") != nullptr;
-            // NIX_V3_ENV_CAPTURE (W2b): an env-capture closure is emitted with
-            // nUp==0 but is NOT context-free — it captures the maker frame's
-            // defEnv, which differs per instantiation.  The singleton-lift cache
-            // (one shared closure reused across calls) would (1) never set
-            // capturedDefEnv and (2) alias distinct defEnvs.  Exclude it so it
-            // takes the regular per-instantiation path below (which sets
-            // capturedDefEnv).  usesDefEnv is false when the gate is off.
-            if (__builtin_expect(nUp == 0 && nWiths == 0 && !s_noLift
-                                 && !cu->lambdas[funcIdx].usesDefEnv, 0)) {
+            if (__builtin_expect(nUp == 0 && nWiths == 0 && !s_noLift, 0)) {
                 const LambdaDescriptor & desc = cu->lambdas[funcIdx];
                 if (desc.cachedSingletonClosure) {
                     Value v;
@@ -5939,15 +5931,6 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             c->desc = &cu->lambdas[funcIdx];
             c->cu   = cu;
             c->nUpvalues = nUp;
-            // NIX_V3_ENV_CAPTURE (W2b): a closure whose function reads env-routed
-            // locals (its own escaping locals or an ancestor's) captures the maker
-            // frame's current defEnv as a SINGLE pointer (vs the flat per-upvalue
-            // FAM copy).  usesDefEnv is false on every descriptor until the emitter
-            // emits env-capture ⇒ capturedDefEnv stays null (allocClosure init) ⇒
-            // inert by default.  Independent of the upvalEnv/shareUpvalues path
-            // (env-capture emits nUp=0, so shareUpvalues never fires here).
-            if (__builtin_expect(c->desc->usesDefEnv, 0))
-                c->capturedDefEnv = vm.frames.back().defEnv;
             // Pop upvalues first (they sit on TOP of stack), then pop
             // the with-target block beneath.  Build capturedWiths
             // outermost-first by filling reverse into the ListVec.
@@ -6287,17 +6270,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             const LambdaDescriptor & thunkDesc = cu->lambdas[funcIdx];
             Thunk * t;
             Env * thunkEnv = nullptr;
-            if (__builtin_expect(thunkDesc.usesDefEnv, 0)) {
-                // NIX_V3_ENV_CAPTURE (W2b, HYBRID): the thunk body reads env-routed
-                // locals AND may keep residual flat upvalues (recVars etc.).
-                // Allocate the FAM for nUp residual upvalues + a defEnv slot at
-                // tail[nUp]; capture the maker frame's defEnv there.  The FAM is
-                // filled by the pop loop below (as for a normal thunk).  Mutually
-                // exclusive with env-sharing.  Inert until the emitter sets usesDefEnv.
-                t = Alloc::allocThunkCapture(nUp, willHaveWiths);
-                thunkSetCapturedDefEnv(
-                    t, vm.frames.empty() ? nullptr : vm.frames.back().defEnv);
-            } else {
+            {
                 if (__builtin_expect(s_envSharingThunk && nUp > 0, 0))
                     thunkEnv = maybeInternUpvalueEnvFromStack(vm, nUp);
                 if (__builtin_expect(thunkEnv != nullptr, 0)) {
@@ -6445,9 +6418,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // (tail[0] holds the Env*).  Stack order is identical (upvalues on
             // top, withs below), so the withs-pop logic below is unaffected.
             // Fill the inline FAM upvalues (tail[0..nUp)).  env-shared thunks skip
-            // this (their upvalues live in the shared Env at tail[0]); env-capture
-            // (HYBRID) thunks DO fill the FAM — their defEnv is a separate slot at
-            // tail[nUp], not colliding with tail[0..nUp).
+            // this (their upvalues live in the shared Env at tail[0]).
             if (!thunkEnv) {
                 for (uint16_t i = nUp; i > 0; --i) t->tail[i - 1] = pop(vm);
             }
@@ -6938,10 +6909,6 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                         .stackBaseOffset = static_cast<uint32_t>(newBase),
                         .withStackBase = newWithBase,
                         .flags = 0,
-                        // NIX_V3_ENV_CAPTURE (W2b): install the captured defEnv so the
-                        // body's OP_GET_ENV walks the right chain.  null unless the
-                        // descriptor usesDefEnv (⇒ inert until emit).
-                        .defEnv = papBase->desc->usesDefEnv ? papBase->capturedDefEnv : nullptr,
                     });
                     pushCapturedWiths(vm, papBase->capturedWiths);
                     ip = d->codeOffset;
@@ -7846,8 +7813,6 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 .stackBaseOffset = static_cast<uint32_t>(newBase),
                 .withStackBase = newWithBase,
                 .flags = 0,
-                // NIX_V3_ENV_CAPTURE (W2b): install captured defEnv (inert until emit).
-                .defEnv = callee->desc->usesDefEnv ? callee->capturedDefEnv : nullptr,
                 // LEVER-1 applied cache: consume the memo arm — this callee
                 // frame's OP_RETURN inserts its result under the pending key.
                 .memoKeyIdx = (vm.memoArmCallee == callee) ? vm.memoArmPending : 0,
@@ -8052,9 +8017,6 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     cur.cu = baseCu;
                     cur.closure = tcBase;
                     cur.ip = d->codeOffset;
-                    // W2b env-capture: retarget defEnv to the new callee (frame reuse
-                    // means the OLD frame's defEnv must not leak into the body).
-                    cur.defEnv = tcBase->desc->usesDefEnv ? tcBase->capturedDefEnv : nullptr;
                     // LEVER-1: memoKeyIdx is PRESERVED across tail retargets — the reused
                     // frame's eventual OP_RETURN value IS the original application's
                     // result (the tail chain's final value).  Clearing it here LOST the
@@ -8381,9 +8343,6 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // re-entry frame, the thunk should still be set when
             // we eventually OP_RETURN.
             cur.ip = tcDesc->codeOffset;
-            // W2b env-capture: retarget defEnv to the tail-callee (frame reuse; the
-            // old frame's defEnv/thunk-defEnv must not leak into the callee body).
-            cur.defEnv = tcCallee->desc->usesDefEnv ? tcCallee->capturedDefEnv : nullptr;
             // LEVER-1: memoKeyIdx PRESERVED (tail chain's final value = the armed
             // application's result); see the retarget above.
             // LEVER-1 applied-import cache PROBE: the `(import f) args` application
@@ -8472,7 +8431,6 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     .stackBaseOffset = static_cast<uint32_t>(newBase),
                     .withStackBase = newWithBase,
                     .flags = 0,
-                    .defEnv = c->desc->usesDefEnv ? c->capturedDefEnv : nullptr,  // W2b env-capture (inert until emit)
                 });
                 pushCapturedWiths(vm, c->capturedWiths);
                 ip = d->codeOffset;
@@ -8535,8 +8493,6 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 cur.cu = baseCu;
                 cur.closure = c;
                 cur.ip = d->codeOffset;
-                // W2b env-capture: retarget defEnv to the tail-callee (frame reuse).
-                cur.defEnv = c->desc->usesDefEnv ? c->capturedDefEnv : nullptr;
                 // LEVER-1: memoKeyIdx PRESERVED across tail retarget (see above).
                 if (vm.withStack.size() > cur.withStackBase)
                     vm.withStack.resize(cur.withStackBase);
@@ -9970,9 +9926,6 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 .stackBaseOffset = static_cast<uint32_t>(newBase),
                 .withStackBase = newWithBase,
                 .flags = CFF_THUNK_RETURN,
-                // W2b env-capture: install the thunk's captured defEnv (null unless
-                // THUNK_ENV_CAPTURE ⇒ inert until emit).
-                .defEnv = thunkCapturedDefEnv(t),
             });
             pushCapturedWiths(vm, thunkWiths);
             cu = thunkCu;
@@ -13674,58 +13627,6 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             break;
         }
 
-        case OP_MAKE_ENV: {
-            // NIX_V3_ENV_CAPTURE (Track E v1 W2b): allocate this frame's shared
-            // "definition environment" holding its ESCAPING locals.  parent = the
-            // Env captured at entry (defEnv, installed by the call/force path from
-            // the closure's capturedDefEnv).  allocEnv leaves values[] RAW, so
-            // stamp every slot Uninitialized before publishing — a GC that fires
-            // mid-fill must not read a zero word as Float 0.0 (value.hh maps
-            // all-zero → Float).  Publish into the frame register, then run the
-            // Phase-D post-construct barrier (the Env is tenured; its slots will
-            // hold possibly-nursery payloads written by OP_SET_ENV).  operand =
-            // envSlotCount.  Unreachable until the emitter emits it (gate + emit).
-            CallFrame & cur = vm.frames.back();
-            const uint16_t n = static_cast<uint16_t>(operand);
-            Env * e = Alloc::allocEnv(n);
-            e->parent = cur.defEnv;
-            for (uint16_t i = 0; i < n; ++i) e->values[i].mkUninitialized();
-            cur.defEnv = e;
-            envPostConstructBarrier(e);
-            break;
-        }
-        case OP_SET_ENV: {
-            // Store stack-top into the frame Env's slot `idx` (operand).  cellWrite
-            // = the PhD-6 intergenerational barrier: the Env is tenured and the
-            // popped payload may be nursery-resident, so the write must be tracked
-            // (standalone-cell registry; cellContainer=nullptr — an Env is not a
-            // Bindings).  A null defEnv here is an emit bug (SET before MAKE), never
-            // valid input — trap rather than segfault during bring-up.
-            CallFrame & cur = vm.frames.back();
-            if (__builtin_expect(!cur.defEnv, 0))
-                throw std::runtime_error("v3 OP_SET_ENV: no frame defEnv (emit bug)");
-            const uint16_t idx = static_cast<uint16_t>(operand);
-            cellWrite(&cur.defEnv->values[idx], pop(vm), nullptr);
-            break;
-        }
-        case OP_GET_ENV: {
-            // Walk `depth` parents from the frame's defEnv and push slot `idx`.
-            // operand = idx; the following code word = depth (depth==0 = this
-            // frame's own env, the common case).  A null defEnv / short parent
-            // chain is an emit/depth bug, never valid input.
-            const uint16_t idx = static_cast<uint16_t>(operand);
-            const uint32_t depth = static_cast<uint32_t>(cu->code[ip++]);  // 1-word trailer
-            Env * e = vm.frames.back().defEnv;
-            for (uint32_t d = 0; d < depth; ++d) {
-                if (__builtin_expect(!e, 0))
-                    throw std::runtime_error("v3 OP_GET_ENV: parent chain too short (emit bug)");
-                e = e->parent;
-            }
-            if (__builtin_expect(!e, 0))
-                throw std::runtime_error("v3 OP_GET_ENV: null defEnv (emit bug)");
-            push(vm, e->values[idx]);
-            break;
-        }
         case OP_HALT: {
             // Defensive: chase Tag::Thunk/App/Slot before exiting so the
             // caller never receives an unforced value if a future bytecode
@@ -15553,8 +15454,6 @@ Value forceValue(VMState & vm, Value v)
             .stackBaseOffset = static_cast<uint32_t>(newBase),
             .withStackBase = newWithBase,
             .flags = CFF_THUNK_RETURN,
-            // W2b env-capture: install the thunk's captured defEnv (inert until emit).
-            .defEnv = thunkCapturedDefEnv(t),
         });
         pushCapturedWiths(vm, thunkWiths);
 
@@ -15713,7 +15612,6 @@ static bool callClosureNExact(
         .stackBaseOffset = static_cast<uint32_t>(newBase),
         .withStackBase = newWithBase,
         .flags = 0,
-        .defEnv = c->desc->usesDefEnv ? c->capturedDefEnv : nullptr,  // W2b env-capture (inert until emit)
     });
     pushCapturedWiths(vm, c->capturedWiths);
 
@@ -15792,7 +15690,6 @@ Value callClosure2(VMState & vm, Value fun, Value arg1, Value arg2)
                 .stackBaseOffset = static_cast<uint32_t>(newBase),
                 .withStackBase = newWithBase,
                 .flags = 0,
-                .defEnv = c->desc->usesDefEnv ? c->capturedDefEnv : nullptr,  // W2b env-capture (inert until emit)
             });
             pushCapturedWiths(vm, c->capturedWiths);
             // Stage 2: callClosure2's only callers (primFoldl/primFoldlMap)
@@ -16041,10 +15938,6 @@ Value callClosure(VMState & vm, Value fun, Value arg)
                 .stackBaseOffset = static_cast<uint32_t>(newBase),
                 .withStackBase = newWithBase,
                 .flags = 0,
-                // W2b env-capture: install captured defEnv (this PAP-saturation
-                // entry was a MISSED frame-push site — a usesDefEnv closure entered
-                // here left frame.defEnv null, breaking descendants' parent chain).
-                .defEnv = papBase->desc->usesDefEnv ? papBase->capturedDefEnv : nullptr,
             });
             pushCapturedWiths(vm, papBase->capturedWiths);
             return dispatchLoop(vm, exitDepth);
@@ -16298,7 +16191,6 @@ Value callClosure(VMState & vm, Value fun, Value arg)
         .stackBaseOffset = static_cast<uint32_t>(newBase),
         .withStackBase = newWithBase,
         .flags = 0,
-        .defEnv = callee->desc->usesDefEnv ? callee->capturedDefEnv : nullptr,  // W2b env-capture (inert until emit)
         // LEVER-1 applied cache: consume the memo arm (set by the hook above on
         // a miss); this frame's OP_RETURN inserts under the pending key.
         .memoKeyIdx = (vm.memoArmCallee == callee) ? vm.memoArmPending : 0,

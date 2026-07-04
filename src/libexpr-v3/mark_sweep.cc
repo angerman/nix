@@ -280,14 +280,15 @@ public:
             ++statsPairs_;
         } else enqueueNurseryCell(p, KPair);
     }
-    /// NIX_V3_ENV_CAPTURE (W2): a frame's defEnv root (walkAllV3Roots).  MARK
-    /// the Env cell (else sweep frees a live Env whose only root is the frame
-    /// register) + mark its lines + walk its values (visitValue enqueues nested
-    /// cells) + recurse the parent chain — mirroring walkClosure's upvalEnv
-    /// walk (P0.A-4).  Deduped via tryMark / nurseryVisited_.  ⚠ shares the
-    /// W2-precondition early-break caveat with the walkClosure/evac Env-walks
-    /// (documented at those sites): close before real chains exist.  null until
-    /// W2 emission ⇒ inert.
+    /// A frame's defEnv root (walkAllV3Roots).  MARK the Env cell (else sweep
+    /// frees a live Env whose only root is the frame register) + mark its lines
+    /// + walk its values (visitValue enqueues nested cells) + recurse the parent
+    /// chain — mirroring walkClosure's upvalEnv walk (P0.A-4).  Deduped via
+    /// tryMark / nurseryVisited_.  ⚠ shares the W2-precondition early-break
+    /// caveat with the walkClosure/evac Env-walks (documented at those sites):
+    /// close before real chains exist.  CallFrame::defEnv is ALWAYS NULL today
+    /// (the env-capture experiment that populated it was deleted 2026-07-04);
+    /// the walker is kept as null-safe scaffolding for env-sharing futures.
     void visitEnv(Env * & e) override
     {
         for (Env * cur = e; cur; cur = cur->parent) {
@@ -656,7 +657,7 @@ private:
         // (non-moving) Env rather than the inline FAM.  Mark the Env's lines and
         // visit its values precisely; the inline FAM is unused when upvalEnv is set.
         if (c->upvalEnv) {
-            // P0.A-4 (§1.9): mark the Env AND its parent chain (NIX_V3_ENV_CAPTURE).
+            // P0.A-4 (§1.9): mark the Env AND its parent chain.
             // MIDEVAL_GC: also traverse a nursery-resident Env (tryMark fails for
             // non-arena cells); dedup via the nursery set.  Stop at the first
             // already-marked Env — its parents were walked with it on a prior
@@ -669,11 +670,13 @@ private:
             // Tag::Slot→Env conservative-mark path (visitSlot → CellType::Env
             // markConservative), and the gen-major byte-scan does NOT de-box
             // (gated on g_midEvalGcEnabled).  So once real Env chains exist
-            // (NIX_V3_ENV_CAPTURE), a `break` here could skip an ancestor Env's
-            // boxed values[] → missed tenured root.  INERT today (parent always
-            // null; the loop runs exactly once).  Before NIX_V3_ENV_CAPTURE lands,
-            // close it: track precise-Env-walk in a separate set (don't reuse the
-            // mark bit), or forbid interior-Slot owner-marking of Env cells.  The
+            // (any future Env-chain producer; the env-capture experiment that
+            // motivated this was deleted 2026-07-04), a `break` here could skip
+            // an ancestor Env's boxed values[] → missed tenured root.  INERT
+            // today (parent always null; the loop runs exactly once).  Before
+            // real chains land, close it: track precise-Env-walk in a separate
+            // set (don't reuse the mark bit), or forbid interior-Slot
+            // owner-marking of Env cells.  The
             // SCAVENGER (production generational collector) is immune — it grays
             // each parent as an independent GK_ENV item, no early-break.
             for (Env * e = c->upvalEnv; e; e = e->parent) {
@@ -690,22 +693,6 @@ private:
         } else {
             for (uint16_t i = 0; i < c->nUpvalues; ++i)
                 visitValue(c->upvalues[i]);
-        }
-        // NIX_V3_ENV_CAPTURE (W2b): the captured frame Env is a SEPARATE field
-        // (env-capture closures keep upvalEnv=null → their residual FAM was
-        // walked above).  Mark it + its parent chain exactly as upvalEnv above;
-        // the SAME W2 PRECONDITION on the early-break applies (task #8 — close
-        // before emit populates parent chains).  null until W2b emission ⇒ inert.
-        for (Env * e = c->capturedDefEnv; e; e = e->parent) {
-            const bool fresh = marker_.tryMark(e)
-                || (nursery_ && nursery_->contains(e)
-                    && nurseryVisited_.insert(e).second);
-            if (!fresh) break;
-            if (arenaSetForSlot_)
-                arenaSetForSlot_->markLinesForCell(
-                    e, sizeof(Env) + sizeof(Value) * e->nValues);
-            for (uint16_t i = 0; i < e->nValues; ++i)
-                visitValue(e->values[i]);
         }
     }
     void walkThunk(Thunk * t) noexcept
@@ -762,19 +749,6 @@ private:
             } else {
                 for (uint16_t i = 0; i < t->nUpvalues; ++i)
                     visitValue(t->tail[i]);
-                // env-capture (HYBRID): FAM marked above; ALSO mark the captured
-                // defEnv (tail[nUpvalues]) + its parent chain, same loop.
-                for (Env * e = thunkCapturedDefEnv(t); e; e = e->parent) {
-                    const bool fresh = marker_.tryMark(e)
-                        || (nursery_ && nursery_->contains(e)
-                            && nurseryVisited_.insert(e).second);
-                    if (!fresh) break;
-                    if (arenaSetForSlot_)
-                        arenaSetForSlot_->markLinesForCell(
-                            e, sizeof(Env) + sizeof(Value) * e->nValues);
-                    for (uint16_t i = 0; i < e->nValues; ++i)
-                        visitValue(e->values[i]);
-                }
             }
             break;
         case ThunkState::Evaluated:
@@ -1291,11 +1265,12 @@ public:
     void visitList    (ListVec   * & p) override { visitCell(reinterpret_cast<void *&>(p), CellType::List); }
     void visitPair    (ValuePair * & p) override { visitCell(reinterpret_cast<void *&>(p), CellType::Pair); }
 
-    /// NIX_V3_ENV_CAPTURE (W2): rewrite the frame defEnv's value ptrs + parent
-    /// chain.  The Env cell is NON-moving (CellType::Env never relocates), so no
-    /// forward of the Env itself — only its values[].  walked_ dedups (a shared
-    /// Env reached via both a closure upvalEnv and a frame defEnv is rewritten
-    /// once).  null until W2 emission ⇒ inert; evac itself unrevived (M-3).
+    /// Rewrite the frame defEnv's value ptrs + parent chain.  The Env cell is
+    /// NON-moving (CellType::Env never relocates), so no forward of the Env
+    /// itself — only its values[].  walked_ dedups (a shared Env reached via
+    /// both a closure upvalEnv and a frame defEnv is rewritten once).
+    /// CallFrame::defEnv is always null today (env-capture deleted 2026-07-04);
+    /// kept null-safe.  Evac itself unrevived (M-3).
     void visitEnv(Env * & e) override
     {
         for (Env * cur = e; cur && walked_.insert(cur).second; cur = cur->parent)
@@ -1596,7 +1571,7 @@ private:
             // once per pass (else a shared Env is content-walked once per referrer).
             if (c->upvalEnv) {
                 // P0.A-4 (§1.9): rewrite value ptrs of the Env AND its parent
-                // chain (NIX_V3_ENV_CAPTURE).  walked_ dedups + stops at an
+                // chain.  walked_ dedups + stops at an
                 // already-evacuated Env (its chain was rewritten with it).
                 // ⚠ W2 PRECONDITION (same class as the marker loop above): the
                 // interior Tag::Slot→Env path inserts an Env into walked_ while
@@ -1610,12 +1585,6 @@ private:
             } else {
                 for (uint16_t i = 0; i < c->nUpvalues; ++i) visitValue(c->upvalues[i]);
             }
-            // NIX_V3_ENV_CAPTURE (W2b): rewrite the captured frame Env's value
-            // pointers (separate field; env-capture closures keep upvalEnv=null →
-            // residual FAM rewritten above).  Same walked_ dedup + W2 PRECONDITION
-            // on the early-stop as upvalEnv (task #8).  null until emit ⇒ inert.
-            for (Env * e = c->capturedDefEnv; e && walked_.insert(e).second; e = e->parent)
-                for (uint16_t i = 0; i < e->nValues; ++i) visitValue(e->values[i]);
             break;
         }
         case CellType::Thunk: {
@@ -1637,17 +1606,13 @@ private:
                 if (ListVec * w = thunkCapturedWiths(t)) visitList(w);  // FP-2b: tail slot
                 // env-sharing: rewrite the shared (non-moving) Env's value ptrs,
                 // deduped via walked_ (interning shares one Env across referrers).
-                // P0.A-4 (§1.9): also the Env::parent chain (NIX_V3_ENV_CAPTURE);
+                // P0.A-4 (§1.9): also the Env::parent chain;
                 // walked_ dedups + stops at an already-evacuated Env.
                 if (Env * te = thunkUpvalEnv(t)) {
                     for (Env * e = te; e && walked_.insert(e).second; e = e->parent)
                         for (uint16_t i = 0; i < e->nValues; ++i) visitValue(e->values[i]);
                 } else {
                     for (uint16_t i = 0; i < t->nUpvalues; ++i) visitValue(t->tail[i]);
-                    // env-capture (HYBRID): also rewrite the captured defEnv
-                    // (tail[nUpvalues]) + parent chain, deduped via walked_.
-                    for (Env * e = thunkCapturedDefEnv(t); e && walked_.insert(e).second; e = e->parent)
-                        for (uint16_t i = 0; i < e->nValues; ++i) visitValue(e->values[i]);
                 }
                 break;
             case ThunkState::Evaluated: visitValue(t->evaluated); break;
@@ -2131,12 +2096,6 @@ static void runEvacuation(VMState & vm, Arena & arena,
                         } else
                         for (uint16_t i = 0; i < c->nUpvalues; ++i)
                             if (refCand(c->upvalues[i])) { note("Closure.upvalue", cs); break; }
-                        // NIX_V3_ENV_CAPTURE (W2b): captured frame Env (separate field).
-                        if (c->capturedDefEnv) {
-                            if (inFreeable(reinterpret_cast<uintptr_t>(c->capturedDefEnv))) note("Closure.capturedDefEnv", cs);
-                            for (uint16_t i = 0; i < c->capturedDefEnv->nValues; ++i)
-                                if (refCand(c->capturedDefEnv->values[i])) { note("Closure.capturedDefEnv.value", cs); break; }
-                        }
                         break; }
                     case CellType::Thunk: {
                         auto * t = reinterpret_cast<const Thunk *>(cs);
@@ -2155,12 +2114,6 @@ static void runEvacuation(VMState & vm, Arena & arena,
                             } else {
                                 for (uint16_t i = 0; i < t->nUpvalues; ++i)
                                     if (refCand(t->tail[i])) { note("Thunk.tail", cs); break; }
-                                // env-capture (HYBRID): also note the captured defEnv (tail[nUpvalues]).
-                                if (Env * de = thunkCapturedDefEnv(t)) {
-                                    if (inFreeable(reinterpret_cast<uintptr_t>(de))) note("Thunk.capturedDefEnv", cs);
-                                    for (uint16_t i = 0; i < de->nValues; ++i)
-                                        if (refCand(de->values[i])) { note("Thunk.capturedDefEnv.value", cs); break; }
-                                }
                             }
                             break;
                         case ThunkState::Evaluated:

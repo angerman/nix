@@ -77,19 +77,6 @@ struct Closure
     /// `upvalEnv->values[n]` when set, else `upvalues[n]`. The inline-FAM path
     /// remains available via NIX_V3_NO_ENV_SHARING / NIX_V3_ENV_SHARING=0.
     Env *                    upvalEnv;
-    /// NIX_V3_ENV_CAPTURE (Track E v1 W2b): when this closure's function
-    /// `usesDefEnv`, the shared frame Env it captured at MAKE time (= the maker
-    /// frame's defEnv).  Installed as the callee frame's `defEnv` register at
-    /// entry; the body reads escaping locals + ancestor captures via
-    /// OP_GET_ENV(depth,idx).  Kept SEPARATE from upvalEnv (not a repurpose) so
-    /// closureUpvalue()/GET_UPVALUE keep reading the residual-flat FAM unchanged
-    /// and the NIX_V3_ENV_SHARE_AFTER override is unaffected (W2b design
-    /// decision, plan handback).  null unless env-capture is emitted for the
-    /// function ⇒ inert until W2b emission.  GC: walked as a tenured Env
-    /// alongside upvalEnv in walkClosure/mark/evac/auditor.  Explicitly
-    /// initialized (null) at every closure-alloc site (raw arena alloc runs no
-    /// ctor), mirroring upvalEnv.
-    Env *                    capturedDefEnv;
     uint16_t                 nUpvalues;
     uint16_t                 _pad;
     Value                    upvalues[]; // FAM (unused when upvalEnv != null)
@@ -263,42 +250,21 @@ static_assert(sizeof(Thunk) == 24,
 enum : uint8_t {
     THUNK_WITHS_SLOT = 1,
     THUNK_ENV_SHARED = 2,
-    // NIX_V3_ENV_CAPTURE (W2b): mutually exclusive with THUNK_ENV_SHARED.  The
-    // thunk body reads env-routed locals via the captured PARENT defEnv.  HYBRID
-    // layout: the thunk STILL has its residual flat upvalues in the normal FAM
-    // (tail[0..nUpvalues), read via frameUpvalue unchanged — a usesDefEnv function
-    // can ALSO capture recVars/other residual vars flat), and the captured defEnv
-    // sits in ONE extra slot AFTER them at tail[nUpvalues]; withs (if any) relocate
-    // to tail[nUpvalues+1].  (This differs from ENV_SHARED, where tail[0] IS the
-    // Env and nUpvalues is logical.)  GC walks the FAM upvalues AND the defEnv.
-    THUNK_ENV_CAPTURE = 4,
+    // (bit 4 was THUNK_ENV_CAPTURE — the env-pointer-capture experiment,
+    // KILLed at Gate C 2026-07-04 and deleted.  Retired, not reusable while
+    // pre-deletion arenas could be replayed; safe to reuse after a schema
+    // bump — 19 already gates the disk cache.)
 };
 [[gnu::always_inline]] inline bool thunkHasWithsSlot(const Thunk * t) noexcept
 { return (t->hasWithsSlot & THUNK_WITHS_SLOT) != 0; }
 [[gnu::always_inline]] inline bool thunkEnvShared(const Thunk * t) noexcept
 { return (t->hasWithsSlot & THUNK_ENV_SHARED) != 0; }
-[[gnu::always_inline]] inline bool thunkCapturesDefEnv(const Thunk * t) noexcept
-{ return (t->hasWithsSlot & THUNK_ENV_CAPTURE) != 0; }
 /// Shared upvalue Env (env-sharing), or null on the default inline-tail path.
-/// NOTE: returns null for env-CAPTURE thunks (their tail[0] is a defEnv, not an
-/// upvalue Env) — the fakeClo force path relies on this distinction.
 [[gnu::always_inline]] inline Env * thunkUpvalEnv(const Thunk * t) noexcept
 {
     return thunkEnvShared(t)
         ? *reinterpret_cast<Env * const *>(&t->tail[0])
         : nullptr;
-}
-/// NIX_V3_ENV_CAPTURE: the captured PARENT defEnv, or null.  HYBRID layout — the
-/// defEnv sits AFTER the residual flat upvalues, at tail[nUpvalues] (not tail[0]).
-[[gnu::always_inline]] inline Env * thunkCapturedDefEnv(const Thunk * t) noexcept
-{
-    return thunkCapturesDefEnv(t)
-        ? *reinterpret_cast<Env * const *>(&t->tail[t->nUpvalues])
-        : nullptr;
-}
-[[gnu::always_inline]] inline void thunkSetCapturedDefEnv(Thunk * t, Env * e) noexcept
-{
-    *reinterpret_cast<Env **>(&t->tail[t->nUpvalues]) = e;
 }
 
 // FP-2b SINGLE SOURCE OF TRUTH for a thunk's scanned/copied byte size.  EVERY GC
@@ -318,11 +284,6 @@ enum : uint8_t {
         if (thunkEnvShared(t))
             return sizeof(Thunk)
                  + sizeof(Value) * (1 + (thunkHasWithsSlot(t) ? 1 : 0));
-        // env-capture (HYBRID): [nUpvalues FAM upvalues] + [defEnv @ nUpvalues] +
-        // [withs @ nUpvalues+1 iff WITHS_SLOT].
-        if (thunkCapturesDefEnv(t))
-            return sizeof(Thunk)
-                 + sizeof(Value) * (t->nUpvalues + 1 + (thunkHasWithsSlot(t) ? 1 : 0));
         return sizeof(Thunk) + sizeof(Value) * t->nUpvalues
              + (thunkHasWithsSlot(t) ? sizeof(Value) : 0);
     case ThunkState::Native:
@@ -349,20 +310,14 @@ enum : uint8_t {
         || !(t->state == ThunkState::Suspended
              || t->state == ThunkState::Blackhole))
         return nullptr;
-    // env-sharing/env-capture relocate the withs slot to tail[1] (tail[0] is the
-    // Env*); the default inline-tail path keeps it at tail[nUpvalues].  (env-
-    // capture has nUpvalues==0, so tail[nUpvalues] would COLLIDE with tail[0]'s
-    // defEnv — the relocation is mandatory, not just an optimization.)
-    const std::size_t idx = thunkEnvShared(t)      ? 1
-                          : thunkCapturesDefEnv(t) ? std::size_t(t->nUpvalues) + 1
-                                                   : t->nUpvalues;
+    // env-sharing relocates the withs slot to tail[1] (tail[0] is the Env*);
+    // the default inline-tail path keeps it at tail[nUpvalues].
+    const std::size_t idx = thunkEnvShared(t) ? 1 : t->nUpvalues;
     return *reinterpret_cast<ListVec * const *>(&t->tail[idx]);
 }
 [[gnu::always_inline]] inline void thunkSetCapturedWiths(Thunk * t, ListVec * w) noexcept
 {
-    const std::size_t idx = thunkEnvShared(t)      ? 1
-                          : thunkCapturesDefEnv(t) ? std::size_t(t->nUpvalues) + 1
-                                                   : t->nUpvalues;
+    const std::size_t idx = thunkEnvShared(t) ? 1 : t->nUpvalues;
     *reinterpret_cast<ListVec **>(&t->tail[idx]) = w;
 }
 
@@ -390,17 +345,6 @@ struct LambdaDescriptor
     /// block on the stack — pushed first by the maker frame), then
     /// the upvalue block.
     uint16_t nWithTargets = 0;
-
-    /// NIX_V3_ENV_CAPTURE (Track E v1 W2b): when `usesDefEnv`, a called
-    /// closure / forced thunk installs its captured Env (Closure::upvalEnv /
-    /// the ENV_SHARED thunk tail) as the frame's `defEnv` register at entry, and
-    /// the body reads its escaping locals + ancestor captures via
-    /// OP_GET_ENV(depth,idx).  `envSlotCount` is the size of the frame Env this
-    /// function allocates via OP_MAKE_ENV (0 if it creates none — a pure reader).
-    /// Both default false/0 ⇒ a function compiled without the feature installs
-    /// no defEnv and emits no env-opcodes (byte-identical to the flat path).
-    bool     usesDefEnv   = false;
-    uint16_t envSlotCount = 0;
 
     /// Formal parameters (`{a, b ? def}: body`).  Each entry is
     /// (name SymbolId, hasDefault, posHandle).  posHandle is an index

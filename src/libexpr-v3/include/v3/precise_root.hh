@@ -120,7 +120,7 @@ struct RootVisitor
     virtual void visitString   (const char * & s) noexcept { (void)s; }
     virtual void visitPath     (const char * & s) noexcept { (void)s; }
 
-    /// NIX_V3_ENV_CAPTURE (Track E W2): a shared frame `Env *` root — the
+    /// A shared frame `Env *` root — the
     /// CallFrame::defEnv holding a frame's escaping locals, reachable ONLY via
     /// the frame register until a child captures it, so it must be walked as a
     /// distinct root class (the upvalEnv walkers do NOT cover it).  DEFAULT: walk
