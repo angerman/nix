@@ -4131,9 +4131,27 @@ bool appliedCacheTryKey(const Closure * callee, const Value & arg, std::string &
 /// the exit bar (0 mismatches on hello/firefox/HNE) has been recorded.
 bool appliedCacheOn() noexcept
 {
+    // DEFAULT-ON (#1.2, 2026-07-05): the applied-import result cache is now
+    // active unless explicitly disabled.  Gate the win into production after
+    // the #1.0 overhead gate (single-eval Δcpu ≤0.3%, RSS flat across LRU caps)
+    // + #1.1 impurity/taint lock (T10/T11) + a full nixpkgs byte-eq sweep.
+    // Retirement of the OPT-OUT: drop it (hard-true) once the cache has soaked
+    // in production; retirement of the whole gate is not planned (it stays as
+    // the emergency kill).  POLARITY (careful — probe/count are measurement-
+    // only and must NOT enable the real cache):
+    //   unset          → ON   (production default)
+    //   "0" / "off"    → OFF  (opt-out / A-B baseline / emergency kill)
+    //   "probe"/"count"→ OFF  (measurement modes; the probe hooks run separately)
+    //   "shadow"       → ON   (compare-not-reuse; appliedCacheShadowMode gates it)
+    //   "1" / other    → ON   (back-compat with the pre-flip explicit enable)
     static const bool v = [] {
         const char * e = std::getenv("NIX_V3_APPLIED_CACHE");
-        return e && (std::strcmp(e, "1") == 0 || std::strcmp(e, "shadow") == 0);
+        if (!e) return true;                              // default ON
+        if (std::strcmp(e, "0") == 0 || std::strcmp(e, "off") == 0)
+            return false;                                 // explicit opt-out
+        if (std::strcmp(e, "probe") == 0 || std::strcmp(e, "count") == 0)
+            return false;                                 // measurement-only
+        return true;                                      // "1"/"shadow"/other → ON
     }();
     return v;
 }

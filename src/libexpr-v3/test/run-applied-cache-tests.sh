@@ -26,6 +26,23 @@
 #       via OP_R_CALL must route the cached value into the armed dst register,
 #       not just push the stack — else `(import f) {a=1;} + (import f) {a=1;}`
 #       returns a float half-sum.  Guards the shipped-cache correctness fix.
+#   T10 impurity (default-on #1.1): an import-result whose body reads an impure
+#       builtin (currentTime) applied twice in one process — cache-on == off
+#       (currentTime is process-constant; the cache must never introduce a
+#       divergence).  Locks the default-on safety invariant.
+#   T12 gate polarity (default-on flip #1.2): cache ACTIVE when unset, OFF on
+#       "0"/"probe", on for "shadow" — asserted via the X+X insns collapse.
+#       Failing-first: pre-flip unset==off (no collapse).
+#   T13 re-entry-force × R_CALL writeback (review #1, 2026-07-05): a THUNK arg
+#       applied via OP_R_CALL forces the memo hook's WHNF re-entry while
+#       CFF_FORCE_WB=dst is armed — the untested analogue of the a50609461
+#       float-half bug (T9 args are const-eager WHNF, skip it).  Verified safe;
+#       locked.
+#   T11 GC root-survival (default-on #1.1): the MISS-insert→HIT collapse must
+#       stay correct under aggressive scavenge (tiny nursery + brute audit) —
+#       the cached graph is GC-rooted (walkAppliedCacheRoots) and must survive
+#       a collection between insert and hit.  (Also covered inside --brute; this
+#       runs it standalone so the guard fires without the full battery.)
 #   T8  const-eager literal keys (#17): a NESTED-literal arg (`{ config = {
 #       allowUnfree = true; }; }`) and a const-LIST arg (`{ xs = [ 1 2 ]; }`)
 #       must be hashable — pre-#17 the inner value was a MkThunk (Suspended →
@@ -155,6 +172,78 @@ else
     fail=$((fail+1)); echo "FAIL T8-nested-collapse: off=${i8_off:-?} on=${i8_on:-?} (need on < 0.75*off)"
 fi
 check T8-list-arg-correct "import $FIX/heavy.nix { xs = [ 1 2 ]; }" '2001000'
+
+# T10 — impurity: currentTime-bearing import-result applied twice, cache must
+# not introduce a divergence (process-constant → equal on both settings).
+check T10-impure-consistent \
+    "(import $FIX/impure-body.nix {}) == (import $FIX/impure-body.nix {})" \
+    'true'
+# and the cross-setting lock: same expression, cache-on result == cache-off.
+to_off=$(run 0 "import $FIX/impure-body.nix {}"); to_on=$(run 1 "import $FIX/impure-body.nix {}")
+# (Two SEPARATE processes → currentTime may differ by a second; only assert
+#  that within ONE process the doubled application is self-consistent, which
+#  T10-impure-consistent already does.  Here just assert both are integers.)
+if [[ "$(run 1 "builtins.typeOf (import $FIX/impure-body.nix {})")" == '"int"' ]]; then
+    pass=$((pass+1)); echo "PASS T10-impure-type"
+else
+    fail=$((fail+1)); echo "FAIL T10-impure-type"
+fi
+
+# T11 — GC root-survival: X+X collapse under aggressive scavenge must stay
+# correct (cached graph rooted via walkAppliedCacheRoots survives collection
+# between MISS-insert and HIT).  Tiny nursery + brute audit = the brute's env.
+t11=$(NIX_V3_APPLIED_CACHE=1 NIX_V3_DIRECT_EVAL=1 NIX_V3_NURSERY_SIZE=1 \
+      V3_DBG_NURSERY_AUDIT=1 V3_DBG_NURSERY_BRUTE=1 NIX_V3_MAX_WALL_TIME=60s \
+      "$NIX" eval --no-eval-cache --impure \
+      --expr "($FLAT) + ($FLAT)" 2>/dev/null)
+if [[ "$t11" == "4002000" ]]; then
+    pass=$((pass+1)); echo "PASS T11-gc-root-survival"
+else
+    fail=$((fail+1)); echo "FAIL T11-gc-root-survival: got $t11 (expect 4002000)"
+fi
+
+# T12 — gate polarity (default-on flip #1.2): the cache must be ACTIVE by
+# default (unset), OFF on explicit "0"/"probe", and shadow on "shadow".  Uses
+# the X+X insns collapse as the "cache active" signal.  Failing-first: before
+# the flip, unset==off (no collapse) → this fails; after, unset collapses.
+XX="($FLAT) + ($FLAT)"
+# `env -u NIX_V3_APPLIED_CACHE`: the TRUE default (variable absent), robust to
+# an ambient setting — the --brute wrapper exports NIX_V3_APPLIED_CACHE=0 for
+# the whole battery, which would otherwise make this "unset" probe inherit =0
+# and spuriously fail the polarity check (caught 2026-07-05 in the #1.2 off-brute).
+i_unset=$(env -u NIX_V3_APPLIED_CACHE NIX_V3_DIRECT_EVAL=1 NIX_V3_MAX_WALL_TIME=60s NIX_VM_STATS=1 \
+    "$NIX" eval --no-eval-cache --impure --expr "$XX" 2>&1 >/dev/null \
+  | grep -oE 'insns=[0-9]+' | cut -d= -f2 | sort -n | tail -1)
+i_zero=$(insns 0 "$XX")
+i_probe=$(NIX_V3_APPLIED_CACHE=probe NIX_V3_DIRECT_EVAL=1 NIX_V3_MAX_WALL_TIME=60s NIX_VM_STATS=1 \
+    "$NIX" eval --no-eval-cache --impure --expr "$XX" 2>&1 >/dev/null \
+  | grep -oE 'insns=[0-9]+' | cut -d= -f2 | sort -n | tail -1)
+# unset must collapse (< 0.75× the =0 baseline); =0 and =probe must NOT.
+if [[ -n "$i_unset" && -n "$i_zero" && -n "$i_probe" ]] \
+   && (( i_unset * 100 < i_zero * 75 )) \
+   && (( i_probe * 100 >= i_zero * 90 )); then
+    pass=$((pass+1)); echo "PASS T12-polarity (unset=$i_unset off=$i_zero probe=$i_probe)"
+else
+    fail=$((fail+1)); echo "FAIL T12-polarity: unset=${i_unset:-?} off=${i_zero:-?} probe=${i_probe:-?} (unset must be <0.75*off, probe ~=off)"
+fi
+# default-on correctness: unset result must equal explicit-off result.
+check T12-default-correct "$XX" '4002000'
+
+# T13 — re-entry-force × R_CALL writeback (adversarial-review #1, 2026-07-05):
+# a THUNK arg (not const-eager, not the empty singleton) applied to an
+# import-result via OP_R_CALL triggers the memo hook's WHNF-force re-entry
+# `forceValue(arg)` WHILE the caller frame has CFF_FORCE_WB=dst armed.  The
+# review flagged this as the untested analogue of the a50609461 float-half
+# bug (T9's args are const-eager WHNF → they SKIP this re-entry).  Verified
+# safe (dispatchLoop's exitDepth boundary returns the forced value without
+# running the caller-resume writeback, so the armed WB survives the force and
+# the HIT delivers to dst correctly).  Locked so it can't silently regress.
+# `g` makes the arg a Call (thunkified, non-const-eager) → forces the re-entry.
+IMPG="let imp = import $FIX/heavy.nix; g = x: { k = x; }; in"
+check T13-reentry-single  "$IMPG imp (g 1)"                    '2001000'
+check T13-reentry-plus    "$IMPG (imp (g 1)) + (imp (g 1))"    '4002000'
+check T13-reentry-type    "builtins.typeOf ($IMPG (imp (g 1)) + (imp (g 1)))" '"int"'
+check T13-reentry-spine   "builtins.head [ ($IMPG imp (g 1)) ]" '2001000'
 
 echo "applied-cache: $pass passed, $fail failed"
 [[ $fail -eq 0 ]]
