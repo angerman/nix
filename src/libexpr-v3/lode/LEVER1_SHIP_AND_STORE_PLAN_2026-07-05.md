@@ -108,7 +108,34 @@ round-trips wrong is dead on arrival regardless of speed).
   covers the in-process/daemon case for free. Document + stop; a defended KILL
   is the deliverable (mirrors BiBOP/env-capture).**
 
-### 2.3 — (only on GO) phased store build per RESULT_STORE_DESIGN
+### 2.X — VERDICT: KILL (2026-07-05, defended by measurement)
+Rule 0 sharpening: the 2.0 pre-falsifier (bench/lever1-store-prefalsifier.sh)
+measured T_run/T_leaf=0.27 — a SAVINGS-CEILING proxy, not the real T_hit.
+Rather than build the multi-day thunk-serialize spike on a proxy, measured the
+REAL cross-process T_hit via #741's EXISTING persistent drv-result disk cache
+(NIX_V3_DRV_HASH_CACHE_DISK — the closest working analogue of the store), which
+serializes+reloads forced drv results (value_serialize + SQLite):
+  T_eval(cold, warm-CU)=0.600s ; T_hit(warm x-proc, #741 disk @ 100% hit)=0.600s
+  → **T_hit/T_eval = 1.00 ≫ 0.20 gate → KILL.**
+Even at 100% hit rate (691 drv-hash + 496 eval-result disk hits), the persistent
+cache delivers ZERO wall-clock speedup: reload/relink of a cached result costs
+as much as recomputing it, because hello.drvPath's cost is import+run+force
+(0.44s of 0.60s per 2.0), NOT the derivationStrict call the cache short-circuits.
+A general thunk-graph store faces the same wall (reload ≈ re-eval).
+CONCLUSION: a persistent RESULT store is NOT worth building.  The realizable
+repeated-eval wins are ALREADY captured by (a) the in-memory applied cache
+(default-on, #1 — eval#2 free in-process/daemon) and (b) the CU disk cache
+(parse+lower persisted).  #741's own disk eval-result layer is measured
+no-speedup here — a candidate for retirement, tracked separately.
+NARROW residual (NOT built): persisting FINAL LEAF projections (a drvPath
+STRING) keyed by content would give T_hit≈0 cross-process, but that is thin
+cross-process memoization of the applied cache's leaf results (overlaps #741 +
+the applied cache), value limited to repeated identical `nix eval .#pkg.drvPath`
+across processes — filed as a possible small future item, below the bar now.
+Falsifier method (git-noted): bench/lever1-store-prefalsifier.sh + the #741
+cross-process T_hit measurement (scratchpad p2-real-thit.sh).
+
+### 2.3 — (WOULD-BE only on GO; not reached) phased store build per RESULT_STORE_DESIGN
 Writable LRU segments on aot_cache mmap; key discipline (schema ‖ nixVersion ‖
 gateFingerprint ‖ currentSystem ‖ storePathPin ‖ argsHash); content-hash
 verify-don't-trust; no persistent entry for mutable-working-tree paths or
