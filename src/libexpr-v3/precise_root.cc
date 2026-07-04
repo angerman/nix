@@ -179,6 +179,7 @@ void walkAllV3Roots(VMState & vm, RootVisitor & visitor) noexcept
         std::function<void(Value &)> adapter =
             [&visitor](Value & v) { visitor.visitValue(v); };
         walkImportCacheRoots(adapter);
+        walkAppliedCacheRoots(adapter);  // LEVER-1 applied cache
     }
 
     // -- Global root sources the NURSERY walks but the MAJOR GC did NOT --
@@ -262,6 +263,7 @@ void walkGlobalV3Roots(RootVisitor & visitor) noexcept
         // bucketing visitor; same eval-first reasoning as walkAllV3Roots).
         visitor.enterRootSource(RootSource::CuCache);
         walkImportCacheRoots(adapter);
+        walkAppliedCacheRoots(adapter);  // LEVER-1 applied cache
         // The global root sources the nursery walks — eval infrastructure
         // (parity with walkAllV3Roots; see there for rationale).
         visitor.enterRootSource(RootSource::Eval);

@@ -6710,6 +6710,132 @@ void walkImportCacheRoots(const std::function<void(Value &)> & visit)
     }
 }
 
+// ---------------------------------------------------------------------------
+// LEVER-1 applied-import result cache (NIX_V3_APPLIED_CACHE=1, default-off;
+// lode/NEXT_LEVERS_2026-07-04.md Part B).  Memoizes `(import f) args →
+// result` keyed on (callee CU identity, non-forcing canonical args hash).
+// v1 restrictions (soundness review): callee CU is an import CU + hasFormals
+// + plain single-arg application + args canonically hashable WITHOUT forcing
+// (Suspended/Closure anywhere ⇒ bail — this is also the structural filter
+// that excludes the ~7.4K/eval callPackage-class computed-args flood the
+// probe measured).  The cached Value is the LIVE result graph (no
+// serialization — in-memory tier; the persistent tier is
+// lode/RESULT_STORE_DESIGN_2026-07-04.md).  GC: entries are walked as roots
+// via walkAppliedCacheRoots at the same 3 sites as walkImportCacheRoots.
+// LRU-bounded via NIX_V3_APPLIED_CACHE_MAX_ENTRIES (default 8 — each entry
+// pins a forced-graph-sized retained set).
+// RETIREMENT CRITERION: the spike's pre-committed gates (SHIP eval#2 ≤0.30×
+// eval#1 CPU AND steady RSS ≤1.3× → default-on; KILL >0.60× or >2× RSS →
+// delete).
+namespace {
+struct AppliedCacheEntry {
+    Value    result;
+    uint64_t lastAccessGen = 0;
+};
+struct AppliedCache {
+    std::unordered_map<std::string, AppliedCacheEntry> entries;
+    uint64_t accessCounter = 0;
+    // stats (dumped with the probe counters)
+    uint64_t lookups = 0, hits = 0, inserts = 0, evictions = 0;
+};
+AppliedCache & appliedCache()
+{
+    static AppliedCache c;
+    return c;
+}
+size_t appliedCacheMaxEntries() noexcept
+{
+    static const size_t v = []() -> size_t {
+        if (const char * s = std::getenv("NIX_V3_APPLIED_CACHE_MAX_ENTRIES")) {
+            long n = std::strtol(s, nullptr, 10);
+            if (n > 0) return static_cast<size_t>(n);
+        }
+        return 8;
+    }();
+    return v;
+}
+} // namespace
+
+bool appliedCacheLookup(const std::string & key, Value & out) noexcept
+{
+    auto & c = appliedCache();
+    c.lookups++;
+    auto it = c.entries.find(key);
+    static const bool s_dbg = std::getenv("V3_DBG_APPLIED") != nullptr;  // TEMP
+    if (it == c.entries.end()) {
+        if (__builtin_expect(s_dbg, 0))
+            std::fprintf(stderr, "APPLIED MISS key=%s\n", key.c_str());
+        return false;
+    }
+    it->second.lastAccessGen = ++c.accessCounter;
+    out = it->second.result;
+    c.hits++;
+    if (__builtin_expect(s_dbg, 0))
+        std::fprintf(stderr, "APPLIED HIT  key=%s tag=%d\n", key.c_str(), (int)out.tag());
+    return true;
+}
+
+void appliedCacheInsert(const std::string & key, Value result) noexcept
+{
+    auto & c = appliedCache();
+    // Evict LRU when at capacity (mirrors maybeEvictOldImportEntries, simpler:
+    // single eviction per insert suffices at cap 8).
+    if (c.entries.size() >= appliedCacheMaxEntries()) {
+        auto lru = c.entries.begin();
+        for (auto it = c.entries.begin(); it != c.entries.end(); ++it)
+            if (it->second.lastAccessGen < lru->second.lastAccessGen) lru = it;
+        c.entries.erase(lru);
+        c.evictions++;
+    }
+    auto & e = c.entries[key];
+    e.result = result;
+    e.lastAccessGen = ++c.accessCounter;
+    c.inserts++;
+}
+
+void appliedCacheStatsDump() noexcept
+{
+    const auto & c = appliedCache();
+    if (c.lookups == 0 && c.inserts == 0) return;
+    std::fprintf(stderr,
+        "v3 APPLIED-CACHE: lookups=%llu hits=%llu inserts=%llu evictions=%llu size=%zu\n",
+        (unsigned long long)c.lookups, (unsigned long long)c.hits,
+        (unsigned long long)c.inserts, (unsigned long long)c.evictions,
+        c.entries.size());
+}
+
+void walkAppliedCacheRoots(const std::function<void(Value &)> & visit)
+{
+    auto & c = appliedCache();
+    for (auto & [key, entry] : c.entries) {
+        (void)key;
+        visit(entry.result);
+    }
+}
+
+// Provenance set for the applied-import cache: the LambdaDescriptor pointers
+// of closures RETURNED BY primImport (the import-result closures).  Keying on
+// the desc is only sound for these — exactly ONE closure exists per
+// import-result desc per process (the CU top-level runs once; ImportCache
+// returns the same closure thereafter), so desc ⇒ unique closure ⇒ unique
+// captured state.  Desc pointers live in CU-owned malloc'd vectors — STABLE
+// under the moving GC (closure POINTERS are not: pointer-keying measured 203
+// inserts/139 evictions on a hello eval — relocation churn).
+static std::unordered_set<const LambdaDescriptor *> & appliedImportResultDescs()
+{
+    static std::unordered_set<const LambdaDescriptor *> s;
+    return s;
+}
+void appliedCacheRecordImportResult(const Value & v) noexcept
+{
+    if (v.isClosure() && v.asClosure() && v.asClosure()->desc)
+        appliedImportResultDescs().insert(v.asClosure()->desc);
+}
+bool appliedCacheIsImportResultDesc(const LambdaDescriptor * d) noexcept
+{
+    return d && appliedImportResultDescs().count(d) != 0;
+}
+
 namespace {
 
 /// Stat a path and produce (mtime_ns, size).  Returns (0, -1) on
@@ -6958,6 +7084,7 @@ void primImport(EvalState & state, Value * args, Value & out)
             // Phase 4b LRU (2026-05-30): mark this entry as recently used.
             bumpImportEntry(it->second, cache);
             out = it->second.result;
+            appliedCacheRecordImportResult(out);  // LEVER-1 provenance (idempotent)
             return;
         }
         // Stat differs -- file changed.  Drop entry, re-evaluate.
@@ -7959,13 +8086,20 @@ skipDiskCacheLookup:
     // LEVER-1 probe diagnostic (TEMP; retire with the probe): show what the
     // import returned — the applied-cache hook keys on out.closure->cu->
     // fromImportCU, so a mismatch here explains a silent probe.
+    appliedCacheRecordImportResult(out);  // LEVER-1: provenance for desc-keying
     static const bool s_dbgApplied = std::getenv("V3_DBG_APPLIED") != nullptr;
     if (__builtin_expect(s_dbgApplied, 0)) {
         const Closure * dc = out.isClosure() ? out.asClosure() : nullptr;
         std::fprintf(stderr,
-            "V3_DBG_APPLIED primImport(fresh): path=%s tag=%d cloCu=%p flag=%d\n",
+            "V3_DBG_APPLIED primImport(fresh): path=%s tag=%d cloCu=%p flag=%d "
+            "nUp=%d withs=%p formals=%d arity=%d name=%s\n",
             path.c_str(), (int)out.tag(), dc ? (const void *)dc->cu : nullptr,
-            (dc && dc->cu) ? (int)dc->cu->fromImportCU : -1);
+            (dc && dc->cu) ? (int)dc->cu->fromImportCU : -1,
+            dc ? (int)dc->nUpvalues : -1,
+            dc ? (const void *)dc->capturedWiths : nullptr,
+            (dc && dc->desc) ? (int)dc->desc->hasFormals : -1,
+            (dc && dc->desc) ? (int)dc->desc->arity : -1,
+            (dc && dc->desc && !dc->desc->name.empty()) ? dc->desc->name.c_str() : "<anon>");
     }
     // #741 Phase 4b (2026-05-23): force-deep the imported result
     // BEFORE persisting to in-memory + disk cache.  Imported `rec {
@@ -8756,6 +8890,7 @@ void primScopedImport(EvalState & state, Value * args, Value & out)
     cache.cus.push_back(compile(module));
     cache.cus.back().fromImportCU = true;  // LEVER-1 memo-hook discriminator
     Value fn = run(cache.cus.back());
+    appliedCacheRecordImportResult(fn);  // LEVER-1 provenance
 
     // Apply the lambda to the scope value.
     out = callClosure(*state.vm, fn, scope);

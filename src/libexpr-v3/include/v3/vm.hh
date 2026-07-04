@@ -111,6 +111,14 @@ struct CallFrame
     /// walked in BOTH.  Default-off ⇒ null on every frame ⇒ inert until W2
     /// emission turns it on.
     Env *     defEnv = nullptr;             // 8
+    /// LEVER-1 applied-import cache (NIX_V3_APPLIED_CACHE=1): 1-based index
+    /// into VMState::pendingMemoKeys for a frame whose OP_RETURN value should
+    /// be inserted into the applied cache under that key (the CFF_MEMO_RETURN
+    /// capture pattern, soundness review §4).  0 = no memo capture (default).
+    /// Armed only on cache-MISS applications of import-CU formals closures
+    /// with hashable const args (rare: ~1-5 per eval root).  An exception
+    /// unwinding the frame simply never inserts (throws are never cached).
+    uint32_t  memoKeyIdx = 0;               // 4 (+pad)
 };
 
 /// Per-EvalState VM state.
@@ -140,6 +148,23 @@ struct VMState
     /// recursion (`let f = x: f x; in f 1`) which v3's TCO would
     /// otherwise let run forever in O(1) frame space.
     uint64_t tailCallCount = 0;
+    /// LEVER-1 applied-import cache: keys pending insertion at OP_RETURN,
+    /// referenced 1-based by CallFrame::memoKeyIdx.  Plain byte strings (no GC
+    /// pointers).  Append-only within a root eval (armed rarely); cleared by
+    /// runRootExpr teardown with the VMState itself.
+    std::vector<std::string> pendingMemoKeys;
+    /// Arm scratch: set (1-based pendingMemoKeys index) by the OP_CALL memo
+    /// hook on a MISS, consumed by the frame push at the end of the same
+    /// OP_CALL, cleared at op_call_dispatch entry (so early-exit paths never
+    /// leak a stale arm into the next call).  A VM member rather than a
+    /// case-local because `goto op_call_have_fun` jumps would bypass a local's
+    /// initialization.  `memoArmCallee` binds the arm to its intended callee:
+    /// a push site consumes ONLY when its callee matches, so an intermediate
+    /// nested call between arm and push cannot mis-attribute the key (v1
+    /// residual: a nested push of the SAME closure could — not reachable for
+    /// import-CU top-level lambdas, documented).
+    uint32_t memoArmPending = 0;
+    const Closure * memoArmCallee = nullptr;
 };
 
 /// Bytecode IR → CompilationUnit pipeline.

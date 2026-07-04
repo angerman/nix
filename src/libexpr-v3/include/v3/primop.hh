@@ -111,6 +111,22 @@ void walkImportCacheRoots(const std::function<void(Value &)> & visit);
 /// Defined in vm.cc next to the probe.  Retires with the probe.
 void dumpAppliedCacheProbeStats() noexcept;
 
+/// LEVER-1 applied-import result cache (NIX_V3_APPLIED_CACHE=1; primops.cc,
+/// design in the AppliedCache block there).  Lookup/insert by the memo key
+/// (callee-CU identity + non-forcing canonical args hash).  The stored Value
+/// is the LIVE result graph — GC-rooted via walkAppliedCacheRoots at the SAME
+/// 3 sites as walkImportCacheRoots (gc.cc scavenger + precise_root bucketed +
+/// global walks); a missed site is a moving-GC UAF.
+bool appliedCacheLookup(const std::string & key, Value & out) noexcept;
+void appliedCacheInsert(const std::string & key, Value result) noexcept;
+void appliedCacheStatsDump() noexcept;
+void walkAppliedCacheRoots(const std::function<void(Value &)> & visit);
+/// Provenance: record/check import-RESULT closures (desc-keyed; see the
+/// appliedImportResultDescs block in primops.cc for the soundness argument).
+void appliedCacheRecordImportResult(const Value & v) noexcept;
+struct LambdaDescriptor;  // fwd (full decl in closure.hh)
+bool appliedCacheIsImportResultDesc(const LambdaDescriptor * d) noexcept;
+
 /// Memory-bucket accounting (2026-06-04): size the "CU cache".
 ///   * `importCacheBytecodeBytes` — libc-malloc'd CompilationUnit
 ///     bytecode bytes (NOT in the arena; invisible to the arena mark).

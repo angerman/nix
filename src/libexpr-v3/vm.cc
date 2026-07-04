@@ -3988,6 +3988,65 @@ bool appliedProbeBoundedKey(VMState & vm, const Value & v0, std::string & out, i
     }
 }
 
+/// LEVER-1 applied-import cache — the REAL memo key (NIX_V3_APPLIED_CACHE=1).
+/// NON-FORCING: value_serialize::canonicalHash chases only already-Evaluated
+/// indirections and throws on any Suspended thunk / Closure — which is exactly
+/// the structural filter that rejects the callPackage-class computed-args
+/// flood (~7.4K/eval, probe-measured) in nanoseconds while accepting WHNF
+/// const args (e.g. the vEmptyAttrs `{}` of `import <nixpkgs> {}`).
+/// KEY = callee LambdaDescriptor pointer + canonical args digest.  The DESC
+/// (not the CU!) is the identity: the first acceptance run keyed on the CU
+/// and produced a WRONG drvPath — `fromImportCU` marks EVERY closure defined
+/// in an imported file, and DIFFERENT closures sharing one CU with `{}` args
+/// collided (126 lookups / 85 bogus hits on a hello eval).  With callers
+/// restricted to nUpvalues==0 && capturedWiths==nullptr, the desc is the
+/// COMPLETE behavioral identity (no captured state) ⇒ desc+args is sound.
+/// (In-memory tier; the persistent tier uses content keys.)
+bool appliedCacheTryKey(const Closure * callee, const Value & arg, std::string & out)
+{
+    uint8_t digest[32];
+    try {
+        value_serialize::canonicalHash(arg, digest);
+    } catch (const std::exception & e) {
+        // TEMP diagnostic (retire with spike): which eligible callees fail
+        // hashing + WHY — is the TOP-LEVEL pkgs application among them?
+        static const bool s_dbg = std::getenv("V3_DBG_APPLIED") != nullptr;
+        if (__builtin_expect(s_dbg, 0) && callee->desc)
+            std::fprintf(stderr, "APPLIED tryKey UNHASHABLE desc=%s argTag=%d sz=%d why=%s\n",
+                callee->desc->name.empty() ? "<anon>" : callee->desc->name.c_str(),
+                (int)arg.tag(),
+                arg.isAttrs() && arg.asAttrs() ? (int)arg.asAttrs()->size : -1,
+                e.what());
+        return false;   // unhashable ⇒ uncacheable (never force here)
+    } catch (...) {
+        return false;
+    }
+    static const bool s_dbg = std::getenv("V3_DBG_APPLIED") != nullptr;
+    if (__builtin_expect(s_dbg, 0) && callee->desc)
+        std::fprintf(stderr, "APPLIED tryKey OK desc=%s argTag=%d\n",
+            callee->desc->name.empty() ? "<anon>" : callee->desc->name.c_str(),
+            (int)arg.tag());
+    char pbuf[2 * sizeof(void *) + 4];
+    std::snprintf(pbuf, sizeof pbuf, "%p:", (const void *)callee->desc);
+    out = pbuf;
+    static const char hexd[] = "0123456789abcdef";
+    for (int i = 0; i < 32; ++i) {
+        out += hexd[digest[i] >> 4];
+        out += hexd[digest[i] & 0xF];
+    }
+    return true;
+}
+
+/// Gate for the REAL cache ("1"); probe/count are the measurement modes.
+bool appliedCacheOn() noexcept
+{
+    static const bool v = [] {
+        const char * e = std::getenv("NIX_V3_APPLIED_CACHE");
+        return e && std::strcmp(e, "1") == 0;
+    }();
+    return v;
+}
+
 void appliedCacheProbeObserve(VMState & vm, const Closure * callee, const Value & arg,
                               int site, bool hasFormals) noexcept
 {
@@ -6361,6 +6420,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // subsequent runaway recursion is bounded against the
             // 5000-frame stack guard, not the tail-call counter.
             vm.tailCallCount = 0;
+            // LEVER-1 applied cache: clear any stale arm from an aborted path
+            // (see VMState::memoArmPending docs).
+            vm.memoArmPending = 0;
             Value arg = pop(vm), fun = pop(vm);
             // V3_DBG_FINAL_CALL=1: log Apply of extends's `final:`
             // lambda OR allPackages's `self:` outer lambda — tracing
@@ -6748,6 +6810,48 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             if (__builtin_expect(s_appliedCacheProbe, 0)
                 && callee->cu && callee->cu->fromImportCU)
                 appliedCacheProbeObserve(vm, callee, arg, 0, desc->hasFormals);
+
+            // LEVER-1 applied-import cache (NIX_V3_APPLIED_CACHE=1): memoize
+            // `(import f) args`.  Restrictions per the soundness review: import
+            // CU + formals + arity ≤1 (plain single-arg; PAP/functor diverted
+            // above) + 0 upvalues + no withs (desc = complete identity) +
+            // hashable args.  Args arrive as Suspended thunks here (diagnostic:
+            // desc=args argTag=10 ×30 on hello) — a formals callee forces its
+            // arg anyway, so WHNF-force it FIRST via the safe RE-ENTRY pattern:
+            // rooted force, push fun+arg back, goto op_call_dispatch (second
+            // pass re-derives every pointer fresh — no stale callee/desc after
+            // a scavenge; arg is WHNF so no loop).  HIT: push the cached live
+            // graph, skip the call.  MISS: arm the capture (OP_RETURN inserts;
+            // throw ⇒ no insert).
+            if (__builtin_expect(appliedCacheOn(), 0)
+                && callee->cu && callee->cu->fromImportCU
+                && desc->hasFormals && desc->arity <= 1
+                && callee->capturedWiths == nullptr
+                && appliedCacheIsImportResultDesc(desc)) {
+                {
+                    Tag at = arg.tag();
+                    if (at == Tag::Thunk || at == Tag::App || at == Tag::App3
+                        || at == Tag::Slot) {
+                        GcRoot rf(fun), ra(arg);   // Rule 1: rooted across force
+                        arg = forceValue(vm, arg);
+                        push(vm, fun);
+                        push(vm, arg);
+                        goto op_call_dispatch;     // re-derive everything fresh
+                    }
+                }
+                std::string memoKey;
+                if (appliedCacheTryKey(callee, arg, memoKey)) {
+                    Value cached;
+                    if (appliedCacheLookup(memoKey, cached)) {
+                        push(vm, cached);
+                        break;
+                    }
+                    vm.pendingMemoKeys.push_back(std::move(memoKey));
+                    vm.memoArmPending =
+                        static_cast<uint32_t>(vm.pendingMemoKeys.size());
+                    vm.memoArmCallee = callee;
+                }
+            }
 
             // #495 follow-on bisect: log OP_CALL post-force for
             // platform-named closures.  Used to trace the wrong-arg
@@ -7529,7 +7633,12 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 .flags = 0,
                 // NIX_V3_ENV_CAPTURE (W2b): install captured defEnv (inert until emit).
                 .defEnv = callee->desc->usesDefEnv ? callee->capturedDefEnv : nullptr,
+                // LEVER-1 applied cache: consume the memo arm — this callee
+                // frame's OP_RETURN inserts its result under the pending key.
+                .memoKeyIdx = (vm.memoArmCallee == callee) ? vm.memoArmPending : 0,
             });
+            vm.memoArmPending = 0;
+            vm.memoArmCallee = nullptr;
             pushCapturedWiths(vm, callee->capturedWiths);
 
             ip = desc->codeOffset;
@@ -7731,6 +7840,11 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     // W2b env-capture: retarget defEnv to the new callee (frame reuse
                     // means the OLD frame's defEnv must not leak into the body).
                     cur.defEnv = tcBase->desc->usesDefEnv ? tcBase->capturedDefEnv : nullptr;
+                    // LEVER-1: memoKeyIdx is PRESERVED across tail retargets — the reused
+                    // frame's eventual OP_RETURN value IS the original application's
+                    // result (the tail chain's final value).  Clearing it here LOST the
+                    // capture for `import <nixpkgs> {}` (impure.nix's body tail-calls
+                    // `import ./. {...}`), measured 2026-07-04.
                     if (vm.withStack.size() > cur.withStackBase)
                         vm.withStack.resize(cur.withStackBase);
                     cur.withStackBase = static_cast<uint32_t>(vm.withStack.size());
@@ -8055,6 +8169,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // W2b env-capture: retarget defEnv to the tail-callee (frame reuse; the
             // old frame's defEnv/thunk-defEnv must not leak into the callee body).
             cur.defEnv = tcCallee->desc->usesDefEnv ? tcCallee->capturedDefEnv : nullptr;
+            // LEVER-1: memoKeyIdx PRESERVED (tail chain's final value = the armed
+            // application's result); see the retarget above.
             // LEVER-1 applied-import cache PROBE: the `(import f) args` application
             // reaches OP_TAIL_CALL when the App is in tail position (the common
             // DIRECT_EVAL shape) — observe here too.  NOTE for the real cache:
@@ -8206,6 +8322,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 cur.ip = d->codeOffset;
                 // W2b env-capture: retarget defEnv to the tail-callee (frame reuse).
                 cur.defEnv = c->desc->usesDefEnv ? c->capturedDefEnv : nullptr;
+                // LEVER-1: memoKeyIdx PRESERVED across tail retarget (see above).
                 if (vm.withStack.size() > cur.withStackBase)
                     vm.withStack.resize(cur.withStackBase);
                 cur.withStackBase = static_cast<uint32_t>(vm.withStack.size());
@@ -8258,6 +8375,19 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             Value retVal = (op == OP_R_RETURN)
                 ? vm.valueStack[stackBase + operand]
                 : pop(vm);
+            // LEVER-1 applied-import cache: a memo-armed frame's return value is
+            // the `(import f) args` application result — insert it under the key
+            // armed at OP_CALL/callClosure.  Runs BEFORE frame teardown; a throw
+            // unwinds without OP_RETURN ⇒ never cached.  The cache map is a GC
+            // root (walkAppliedCacheRoots), so storing the live Value is safe.
+            {
+                CallFrame & memoFr = vm.frames.back();
+                if (__builtin_expect(memoFr.memoKeyIdx != 0, 0)) {
+                    appliedCacheInsert(
+                        vm.pendingMemoKeys[memoFr.memoKeyIdx - 1], retVal);
+                    memoFr.memoKeyIdx = 0;
+                }
+            }
             // Phase A5: trace EVERY OP_RETURN whose frame's codeOff
             // matches V3_DBG_RETURN_AT_CODEOFF.  Logs retVal's tag +
             // (for closures) the closure-body codeOff so we can see
@@ -15509,6 +15639,48 @@ Value callClosure(VMState & vm, Value fun, Value arg)
                              || ft == Tag::Slot, 0))
             fun = forceValue(vm, fun);
     }
+    // LEVER-1 applied-import cache (NIX_V3_APPLIED_CACHE=1) — placed HERE,
+    // BEFORE any callee/desc derivation below, because the hook may FORCE the
+    // arg (a scavenge can relocate fun's closure; everything downstream then
+    // derives fresh pointers).  Restrictions per the soundness review + the
+    // desc-key fix: import-CU 0-upvalue no-withs formals closure, arity ≤1.
+    // Args arrive as Suspended thunks even for literal `{}` (diagnostic
+    // 2026-07-04: argTag=10 on ALL eligible calls) — WHNF-force the arg first;
+    // a hasFormals callee performs EXACTLY this force at entry (vm.cc formals
+    // handshake), so it is semantics-preserving, just earlier.  Interior
+    // entries stay lazy: canonicalHash then bails (uncacheable) on any
+    // Suspended entry — `{}` hashes; `{config={...};}` needs the const-eager
+    // emitter step (2b) to hash.
+    if (__builtin_expect(appliedCacheOn(), 0)
+        && fun.isClosure() && fun.asClosure()) {
+        const Closure * c0 = fun.asClosure();
+        const LambdaDescriptor * d0 = c0->desc;
+        if (d0 && c0->cu && c0->cu->fromImportCU
+            && d0->hasFormals && d0->arity <= 1
+            && c0->capturedWiths == nullptr
+            && appliedCacheIsImportResultDesc(d0)) {
+            {
+                Tag at = arg.tag();
+                if (at == Tag::Thunk || at == Tag::App || at == Tag::App3
+                    || at == Tag::Slot) {
+                    // Rule 1: root BOTH values across the re-entrant force.
+                    GcRoot rf(fun), ra(arg);
+                    arg = forceValue(vm, arg);
+                }
+            }
+            // Re-derive post-force (the closure may have been relocated).
+            const Closure * c1 = fun.asClosure();
+            std::string memoKey;
+            if (appliedCacheTryKey(c1, arg, memoKey)) {
+                Value cached;
+                if (appliedCacheLookup(memoKey, cached)) return cached;
+                vm.pendingMemoKeys.push_back(std::move(memoKey));
+                vm.memoArmPending =
+                    static_cast<uint32_t>(vm.pendingMemoKeys.size());
+                vm.memoArmCallee = c1;
+            }
+        }
+    }
     // V3_DBG_CALL_CLOSURE=1 prints every call: closure name + arg
     // shape.  Used to trace the broader-thunkify upvalue bug.
     static const bool s_dbgCallClosure =
@@ -15711,6 +15883,10 @@ Value callClosure(VMState & vm, Value fun, Value arg)
         && callee->cu && callee->cu->fromImportCU)
         appliedCacheProbeObserve(vm, callee, arg, 2, desc->hasFormals);
 
+    // (LEVER-1 memo hook moved ABOVE the callee/desc derivation — the hook
+    //  WHNF-forces the arg, which can relocate the closure; see the block
+    //  after the fun-force fast-path at function entry.)
+
     // #495: native fix-point intrinsic -- mirrored from OP_CALL.
     // callClosure is the entry point primops + bridges use; the
     // intrinsic check must fire here too or recognised lambdas
@@ -15900,7 +16076,12 @@ Value callClosure(VMState & vm, Value fun, Value arg)
         .withStackBase = newWithBase,
         .flags = 0,
         .defEnv = callee->desc->usesDefEnv ? callee->capturedDefEnv : nullptr,  // W2b env-capture (inert until emit)
+        // LEVER-1 applied cache: consume the memo arm (set by the hook above on
+        // a miss); this frame's OP_RETURN inserts under the pending key.
+        .memoKeyIdx = (vm.memoArmCallee == callee) ? vm.memoArmPending : 0,
     });
+    vm.memoArmPending = 0;
+    vm.memoArmCallee = nullptr;
     pushCapturedWiths(vm, callee->capturedWiths);
 
     // 2026-05-17: exception cleanup happens inside dispatchLoop's

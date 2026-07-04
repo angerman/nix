@@ -398,6 +398,7 @@ RootResult runRootExprModule(nix::EvalState & state, ir::Module module)
     // flushPeriodicLiveTraceCsv above — the atexit variant loses its output in
     // the `nix` binary.  Cumulative; the LAST line per process is authoritative.
     dumpAppliedCacheProbeStats();
+    appliedCacheStatsDump();   // LEVER-1 real-cache counters (self-gates on activity)
 
     // NIX_VM_STATS=1: dump alloc counters at completion.  Lets us
     // attribute alloc explosions to thunks vs closures vs Bindings

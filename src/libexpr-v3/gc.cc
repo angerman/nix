@@ -1057,6 +1057,7 @@ void Scavenger::run()
     // repeat builtins.import after scavenge would otherwise return
     // a stale pointer.
     walkImportCacheRoots(rootVisit);
+    walkAppliedCacheRoots(rootVisit);  // LEVER-1 applied cache (same UAF class)
 
     // #705 (2026-05-21): cached call-flake closure.  Set once at
     // first getFlake; closure may be nursery-allocated.
@@ -1541,6 +1542,7 @@ void postScavengeAudit(const Nursery & n, const VMState & vm)
         std::function<void(Value &)> visit =
             [&](Value & v) { a.root = "importCache"; a.visitValue(v, "importCache"); };
         walkImportCacheRoots(visit);
+        walkAppliedCacheRoots(visit);  // LEVER-1 applied cache
     }
 
     // 6. call-flake closure.
