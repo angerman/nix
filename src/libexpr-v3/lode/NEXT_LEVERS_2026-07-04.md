@@ -128,3 +128,30 @@ comes first.  Revisit if LEVER 1 kills.
   a deliberate follow-up, low urgency (gated/harmless).  Its OP_MAKE/GET_ENV +
   defEnv infra is exactly what LEVER-1 key-derivation (captured-env identity) and a
   future JIT would reuse, which argues for keeping it gated a while longer.
+
+## Part A — real-workload measurements (darwin-4, 2026-07-04, sonnet agent run)
+Binary = this session's rsynced build (agent's "commit 3ff650587" reading is the
+documented darwin-4 source-checkout-lags-binary caveat; insns match current HEAD
+to ±3). Raw logs: scratchpad/partA-*.log.
+
+| workload | insns 1× | insns 2×-shared Δ | warm v3 user/RSS | warm TW user/RSS | eval-CPU ratio | RSS ratio |
+|---|---|---|---|---|---|---|
+| firefox | 36,864,727 | +6 | 1.73s / 591MB | 0.73s / 358MB | **2.37×** | 1.65× |
+| HNE | 49,454,133 | −12 | 2.64s / 1182MB | 1.55s / 563MB | **1.70×** | 2.10× |
+| M5 | 225,157,973 | −436 | 6.27s / 2245MB | 3.59s / 982MB | **1.75×** | 2.29× |
+| simplex | 25,370,107 | −297 | 2.62s / 560MB | 2.07s / 339MB | **1.27×** | 1.65× |
+
+KEY READINGS:
+- **Eval-only (user-time) warm gap on the haskell.nix workloads is 1.27–1.75×** —
+  much closer than firefox's 2.37×; simplex is store-I/O dominated (real ≈ 32s
+  BOTH engines; eval CPU is the only differentiator and it's 1.27×).
+- **2×-shared is FREE at every scale** (Δinsns ≤ 0.002%): in-graph thunk
+  memoization already dedups; the applied-import cache's job is exactly to make
+  the ACROSS-ROOT/INVOCATION case equal the shared case (73M→37M on firefox).
+- firefox post-eval: eval working set 0 B, ImportCache-pinned results 13.1 MB,
+  CU bytecode 27 MB — the end-of-eval RETAINED set is small; the cache-entry
+  retained-size measurement must capture the graph AT result time (a cache
+  ROOTS it; post-teardown measurement shows it freed).  Big-workload live-MB
+  numbers still pending (needs the current instrumentation flags re-run).
+- IFD/store portions (M5/simplex) are store-bound — not eval-cache-addressable
+  (already store-cached); the eval-CPU column is the cache's addressable target.
