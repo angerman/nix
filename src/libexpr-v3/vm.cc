@@ -4002,14 +4002,95 @@ bool appliedProbeBoundedKey(VMState & vm, const Value & v0, std::string & out, i
 /// restricted to nUpvalues==0 && capturedWiths==nullptr, the desc is the
 /// COMPLETE behavioral identity (no captured state) ⇒ desc+args is sound.
 /// (In-memory tier; the persistent tier uses content keys.)
+/// Non-throwing structural pre-check: returns true iff canonicalHash(v)
+/// would (very likely) SUCCEED.  Exact mirror of value_serialize's
+/// chaseToWHNF + serializeOne acceptance — Int/Float/Bool/Null/String/Path
+/// leaves, List/Attrs containers, Evaluated-indirection chasing (Thunk/App/
+/// App3/Slot), same depth bound.  WHY (task #16c, gate git-note e156a9874):
+/// ~370 of ~380 tryKey attempts per hello eval are UNHASHABLE, and each
+/// paid a partial serialize (allocation + name-sort per attrs node) plus a
+/// thrown SerializeError — the dominant share of the +60ms (+9.7%) eval#1
+/// cache tax.  The pre-check bails on the first non-WHNF node with zero
+/// allocation and zero exceptions.  Conservative-false only loses a
+/// would-be hit; the try/catch backstop below stays (keyExceptionBail
+/// counts how often the mirror is WRONG — expected 0, regression-tested).
+static bool appliedKeyPrecheck(const Value & vIn, int depth) noexcept
+{
+    if (depth > 10000) return false;  // kMaxSerializeDepth mirror (cycles)
+    const Value * cur = &vIn;
+    for (int hop = 0; hop < 32; ++hop) {  // chaseToWHNF maxHops mirror
+        Tag t = cur->tag();
+        if (t == Tag::Thunk) {
+            Thunk * th = cur->asThunk();
+            if (!th || th->state != ThunkState::Evaluated) return false;
+            cur = &th->evaluated;
+            continue;
+        }
+        if (t == Tag::App || t == Tag::App3) {
+            ValuePair * p = cur->asPair();
+            if (!p || p->evaluated.tag() == Tag::Uninitialized) return false;
+            cur = &p->evaluated;
+            continue;
+        }
+        if (t == Tag::Slot) {
+            if (!cur->asSlot()) return false;
+            cur = cur->asSlot();
+            continue;
+        }
+        // WHNF — accept exactly serializeOne's tag set.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wswitch-enum"
+        switch (t) {
+        case Tag::Int:
+        case Tag::Float:
+        case Tag::Bool:
+        case Tag::Null:
+        case Tag::String:
+        case Tag::Path:
+            return true;
+        case Tag::List: {
+            const ListVec * lv = cur->asList();
+            if (!lv) return true;  // empty list serialises fine
+            for (uint32_t i = 0; i < lv->size; ++i)
+                if (!appliedKeyPrecheck(lv->elems[i], depth + 1)) return false;
+            return true;
+        }
+        case Tag::Attrs: {
+            const Bindings * b = cur->asAttrs();
+            if (!b) return true;
+            bool ok = true;
+            // forEach (not forEachName) to MATCH serializeAttrs — it
+            // realizes MapAttrs lazy entries exactly like serialize would.
+            b->forEach([&](const Bindings::Entry & e) {
+                if (ok && !appliedKeyPrecheck(e.value, depth + 1)) ok = false;
+            });
+            return ok;
+        }
+        default:
+            return false;  // Closure / PrimOp / ... — serialize throws
+        }
+#pragma clang diagnostic pop
+    }
+    return false;  // chase chain exceeded max hops
+}
+
 bool appliedCacheTryKey(const Closure * callee, const Value & arg, std::string & out)
 {
+    if (!appliedKeyPrecheck(arg, 0)) {
+        static const bool s_dbgPre = std::getenv("V3_DBG_APPLIED") != nullptr;
+        if (__builtin_expect(s_dbgPre, 0) && callee->desc)
+            std::fprintf(stderr, "APPLIED tryKey PRECHECK-BAIL desc=%s argTag=%d\n",
+                callee->desc->name.empty() ? "<anon>" : callee->desc->name.c_str(),
+                (int)arg.tag());
+        appliedCacheNoteTryKey(false);
+        return false;   // unhashable ⇒ uncacheable (never force here)
+    }
     uint8_t digest[32];
     try {
         value_serialize::canonicalHash(arg, digest);
     } catch (const std::exception & e) {
-        // TEMP diagnostic (retire with spike): which eligible callees fail
-        // hashing + WHY — is the TOP-LEVEL pkgs application among them?
+        // BACKSTOP (should be dead post-pre-check): counts mirror drift.
+        appliedCacheNoteTryKeyException();
         static const bool s_dbg = std::getenv("V3_DBG_APPLIED") != nullptr;
         if (__builtin_expect(s_dbg, 0) && callee->desc)
             std::fprintf(stderr, "APPLIED tryKey UNHASHABLE desc=%s argTag=%d sz=%d why=%s\n",
@@ -4020,6 +4101,7 @@ bool appliedCacheTryKey(const Closure * callee, const Value & arg, std::string &
         appliedCacheNoteTryKey(false);
         return false;   // unhashable ⇒ uncacheable (never force here)
     } catch (...) {
+        appliedCacheNoteTryKeyException();
         appliedCacheNoteTryKey(false);
         return false;
     }
@@ -4040,14 +4122,140 @@ bool appliedCacheTryKey(const Closure * callee, const Value & arg, std::string &
     return true;
 }
 
-/// Gate for the REAL cache ("1"); probe/count are the measurement modes.
+/// Gate for the REAL cache ("1") or SHADOW validation ("shadow");
+/// probe/count are the measurement modes.  In shadow mode the hooks arm and
+/// insert exactly like "1" but a would-HIT never short-circuits: the
+/// application evaluates normally and OP_RETURN lockstep-compares the fresh
+/// result against the cached entry (appliedShadowCompare).  Retirement:
+/// shadow is the #16a validation instrument — retire (fold into "1") once
+/// the exit bar (0 mismatches on hello/firefox/HNE) has been recorded.
 bool appliedCacheOn() noexcept
 {
     static const bool v = [] {
         const char * e = std::getenv("NIX_V3_APPLIED_CACHE");
-        return e && std::strcmp(e, "1") == 0;
+        return e && (std::strcmp(e, "1") == 0 || std::strcmp(e, "shadow") == 0);
     }();
     return v;
+}
+
+/// True iff NIX_V3_APPLIED_CACHE=shadow (compare-not-reuse).
+bool appliedCacheShadowMode() noexcept
+{
+    static const bool v = [] {
+        const char * e = std::getenv("NIX_V3_APPLIED_CACHE");
+        return e && std::strcmp(e, "shadow") == 0;
+    }();
+    return v;
+}
+
+/// SHADOW lockstep compare (#16a): structural equality of the freshly
+/// computed result vs the cached entry, comparing ONLY nodes that are
+/// already WHNF on BOTH sides — Suspended/unevaluated subtrees are SKIPPED
+/// (never forced; forcing would perturb the eval being validated).  Chases
+/// Evaluated indirections like value_serialize::chaseToWHNF.  Returns false
+/// ONLY on a definite structural mismatch of WHNF-vs-WHNF nodes.
+static bool appliedShadowCompareOne(const Value & aIn, const Value & bIn,
+                                    int depth, uint64_t & compared) noexcept
+{
+    if (depth > 512 || compared > 2'000'000) return true;  // bounded: treat as unknown
+    // chase both sides to WHNF; bail (skip) if either side is not there yet
+    auto chase = [](const Value & vIn) -> const Value * {
+        const Value * cur = &vIn;
+        for (int hop = 0; hop < 32; ++hop) {
+            Tag t = cur->tag();
+            if (t == Tag::Thunk) {
+                Thunk * th = cur->asThunk();
+                if (!th || th->state != ThunkState::Evaluated) return nullptr;
+                cur = &th->evaluated;
+                continue;
+            }
+            if (t == Tag::App || t == Tag::App3) {
+                ValuePair * p = cur->asPair();
+                if (!p || p->evaluated.tag() == Tag::Uninitialized) return nullptr;
+                cur = &p->evaluated;
+                continue;
+            }
+            if (t == Tag::Slot) {
+                if (!cur->asSlot()) return nullptr;
+                cur = cur->asSlot();
+                continue;
+            }
+            return cur;
+        }
+        return nullptr;
+    };
+    const Value * a = chase(aIn);
+    const Value * b = chase(bIn);
+    if (!a || !b) return true;  // one side not WHNF — skip subtree
+    ++compared;
+    Tag ta = a->tag(), tb = b->tag();
+    if (ta != tb) return false;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wswitch-enum"
+    switch (ta) {
+    case Tag::Int:   return a->asInt() == b->asInt();
+    case Tag::Float: return a->floatBits() == b->floatBits();
+    case Tag::Bool:  return a->asInt() == b->asInt();
+    case Tag::Null:  return true;
+    case Tag::String: {
+        const char * sa = a->asString(); const char * sb = b->asString();
+        if (!sa || !sb) return sa == sb;
+        return std::strcmp(sa, sb) == 0;
+    }
+    case Tag::Path: {
+        const char * pa = a->asPath(); const char * pb = b->asPath();
+        if (!pa || !pb) return pa == pb;
+        return std::strcmp(pa, pb) == 0;
+    }
+    case Tag::List: {
+        const ListVec * la = a->asList(); const ListVec * lb = b->asList();
+        uint32_t na = la ? la->size : 0, nb = lb ? lb->size : 0;
+        if (na != nb) return false;
+        for (uint32_t i = 0; i < na; ++i)
+            if (!appliedShadowCompareOne(la->elems[i], lb->elems[i],
+                                         depth + 1, compared)) return false;
+        return true;
+    }
+    case Tag::Attrs: {
+        const Bindings * ba = a->asAttrs(); const Bindings * bb = b->asAttrs();
+        uint32_t na = ba ? ba->countDistinct() : 0;
+        uint32_t nb = bb ? bb->countDistinct() : 0;
+        if (na != nb) return false;
+        if (!ba || !bb) return true;
+        // Same construction path ⇒ same ascending-SymbolId iteration order.
+        bool ok = true;
+        std::vector<Bindings::Entry> ea, eb;
+        ea.reserve(na); eb.reserve(nb);
+        ba->forEach([&](const Bindings::Entry & e) { ea.push_back(e); });
+        bb->forEach([&](const Bindings::Entry & e) { eb.push_back(e); });
+        if (ea.size() != eb.size()) return false;
+        for (size_t i = 0; i < ea.size() && ok; ++i) {
+            if (ea[i].name != eb[i].name) { ok = false; break; }
+            if (!appliedShadowCompareOne(ea[i].value, eb[i].value,
+                                         depth + 1, compared)) ok = false;
+        }
+        return ok;
+    }
+    default:
+        // Closures / functions / external: identity not comparable
+        // structurally without forcing — skip (count as compared).
+        return true;
+    }
+#pragma clang diagnostic pop
+}
+
+/// Entry point used by OP_RETURN in shadow mode.
+void appliedShadowCompare(const std::string & key, const Value & fresh) noexcept
+{
+    Value cached;
+    if (!appliedCacheLookupPeek(key, cached)) return;  // evicted — nothing to compare
+    uint64_t compared = 0;
+    bool ok = appliedShadowCompareOne(fresh, cached, 0, compared);
+    appliedCacheNoteShadowCompare(ok, compared);
+    if (!ok)
+        std::fprintf(stderr,
+            "v3 APPLIED-CACHE SHADOW MISMATCH key=%s (compared=%llu WHNF nodes)\n",
+            key.c_str(), (unsigned long long)compared);
 }
 
 void appliedCacheProbeObserve(VMState & vm, const Closure * callee, const Value & arg,
@@ -6845,11 +7053,15 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 std::string memoKey;
                 if (appliedCacheTryKey(callee, arg, memoKey)) {
                     Value cached;
-                    if (appliedCacheLookup(memoKey, cached)) {
+                    bool hit = appliedCacheLookup(memoKey, cached);
+                    if (hit && !appliedCacheShadowMode()) {
                         push(vm, cached);
                         break;
                     }
+                    // MISS → arm insert; shadow-HIT → arm compare-not-insert
+                    // (#16a: evaluate normally, OP_RETURN lockstep-compares).
                     vm.pendingMemoKeys.push_back(std::move(memoKey));
+                    vm.pendingMemoShadow.push_back(hit ? 1 : 0);
                     vm.memoArmPending =
                         static_cast<uint32_t>(vm.pendingMemoKeys.size());
                     vm.memoArmCallee = callee;
@@ -8386,8 +8598,13 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             {
                 CallFrame & memoFr = vm.frames.back();
                 if (__builtin_expect(memoFr.memoKeyIdx != 0, 0)) {
-                    appliedCacheInsert(
-                        vm.pendingMemoKeys[memoFr.memoKeyIdx - 1], retVal);
+                    const uint32_t mIdx = memoFr.memoKeyIdx - 1;
+                    if (mIdx < vm.pendingMemoShadow.size()
+                        && vm.pendingMemoShadow[mIdx])
+                        // SHADOW (#16a): compare fresh result vs cached entry.
+                        appliedShadowCompare(vm.pendingMemoKeys[mIdx], retVal);
+                    else
+                        appliedCacheInsert(vm.pendingMemoKeys[mIdx], retVal);
                     memoFr.memoKeyIdx = 0;
                 }
             }
@@ -15676,8 +15893,11 @@ Value callClosure(VMState & vm, Value fun, Value arg)
             std::string memoKey;
             if (appliedCacheTryKey(c1, arg, memoKey)) {
                 Value cached;
-                if (appliedCacheLookup(memoKey, cached)) return cached;
+                bool hit = appliedCacheLookup(memoKey, cached);
+                if (hit && !appliedCacheShadowMode()) return cached;
+                // MISS → arm insert; shadow-HIT → arm compare-not-insert.
                 vm.pendingMemoKeys.push_back(std::move(memoKey));
+                vm.pendingMemoShadow.push_back(hit ? 1 : 0);
                 vm.memoArmPending =
                     static_cast<uint32_t>(vm.pendingMemoKeys.size());
                 vm.memoArmCallee = c1;

@@ -153,6 +153,13 @@ struct VMState
     /// pointers).  Append-only within a root eval (armed rarely); cleared by
     /// runRootExpr teardown with the VMState itself.
     std::vector<std::string> pendingMemoKeys;
+    /// SHADOW mode (NIX_V3_APPLIED_CACHE=shadow, task #16a): parallel to
+    /// pendingMemoKeys — 1 marks a would-HIT armed for compare-not-insert.
+    /// At OP_RETURN the freshly computed result is lockstep-compared against
+    /// the cache entry (re-looked-up by key — the entry lives in the ROOTED
+    /// map, so no extra GC rooting is needed here) instead of inserted.
+    /// Plain bytes, no GC pointers.
+    std::vector<uint8_t> pendingMemoShadow;
     /// Arm scratch: set (1-based pendingMemoKeys index) by the OP_CALL memo
     /// hook on a MISS, consumed by the frame push at the end of the same
     /// OP_CALL, cleared at op_call_dispatch entry (so early-exit paths never

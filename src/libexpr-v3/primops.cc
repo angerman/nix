@@ -6743,6 +6743,14 @@ struct AppliedCache {
     // serialization + exception-throw on unhashable args (~95K eligible/eval
     // per the probe).  These quantify that tax.
     uint64_t keyAttempts = 0, keyUnhashable = 0;
+    // Backstop counter (task #16c): canonicalHash threw even though the
+    // structural pre-check said hashable — i.e. the non-throwing mirror in
+    // appliedKeyPrecheck drifted from serializeOne's acceptance.  Expected 0
+    // (regression-tested in run-applied-cache-tests.sh T6).
+    uint64_t keyExceptionBail = 0;
+    // SHADOW mode (#16a): would-HIT applications re-evaluated + lockstep-
+    // compared instead of reused.  Exit bar: shadowMismatch == 0.
+    uint64_t shadowCompares = 0, shadowMismatch = 0, shadowNodes = 0;
 };
 AppliedCache & appliedCache()
 {
@@ -6767,6 +6775,30 @@ void appliedCacheNoteTryKey(bool hashable) noexcept
     auto & c = appliedCache();
     c.keyAttempts++;
     if (!hashable) c.keyUnhashable++;
+}
+
+void appliedCacheNoteTryKeyException() noexcept
+{
+    appliedCache().keyExceptionBail++;
+}
+
+/// Non-mutating lookup for SHADOW compare: no LRU bump, no hit/miss stats
+/// (the shadow HIT was already counted by the arming lookup).
+bool appliedCacheLookupPeek(const std::string & key, Value & out) noexcept
+{
+    auto & c = appliedCache();
+    auto it = c.entries.find(key);
+    if (it == c.entries.end()) return false;
+    out = it->second.result;
+    return true;
+}
+
+void appliedCacheNoteShadowCompare(bool ok, uint64_t comparedNodes) noexcept
+{
+    auto & c = appliedCache();
+    c.shadowCompares++;
+    c.shadowNodes += comparedNodes;
+    if (!ok) c.shadowMismatch++;
 }
 
 bool appliedCacheLookup(const std::string & key, Value & out) noexcept
@@ -6812,11 +6844,23 @@ void appliedCacheStatsDump() noexcept
     if (c.lookups == 0 && c.inserts == 0 && c.keyAttempts == 0) return;
     std::fprintf(stderr,
         "v3 APPLIED-CACHE: lookups=%llu hits=%llu inserts=%llu evictions=%llu "
-        "size=%zu keyAttempts=%llu keyUnhashable=%llu\n",
+        "size=%zu keyAttempts=%llu keyUnhashable=%llu keyExceptionBail=%llu"
+        "%s\n",
         (unsigned long long)c.lookups, (unsigned long long)c.hits,
         (unsigned long long)c.inserts, (unsigned long long)c.evictions,
         c.entries.size(),
-        (unsigned long long)c.keyAttempts, (unsigned long long)c.keyUnhashable);
+        (unsigned long long)c.keyAttempts, (unsigned long long)c.keyUnhashable,
+        (unsigned long long)c.keyExceptionBail,
+        [&]() -> const char * {
+            static char sbuf[128];
+            if (c.shadowCompares == 0) return "";
+            std::snprintf(sbuf, sizeof sbuf,
+                " shadowCompares=%llu shadowMismatch=%llu shadowNodes=%llu",
+                (unsigned long long)c.shadowCompares,
+                (unsigned long long)c.shadowMismatch,
+                (unsigned long long)c.shadowNodes);
+            return sbuf;
+        }());
 }
 
 void walkAppliedCacheRoots(const std::function<void(Value &)> & visit)

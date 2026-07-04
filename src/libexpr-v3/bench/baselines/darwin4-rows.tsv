@@ -184,3 +184,14 @@ attrNames	0.57	NA	NA	NA	yes	off	3ff650587	2026-06-19
 #     churn-reduction opt-in (removes ~24.5K never-forced-waste wrapper allocs on
 #     firefox); retire-eligible if no future default-on alloc-reduction program.
 # ============================================================================
+# ============================================================================
+# 2026-07-04 task #5 refresh @ e156a9874 (post defect-audit + LEVER-1 cache
+# commit; cache DEFAULT-OFF so rows are cache-agnostic).  beat-tw-compare.sh
+# median-of-5 back-to-back, user+sys CPU, peak RSS.  Cold = cache-off
+# methodology; warm = WARM=1 (CU disk cache warm, production steady state).
+# Full block git-noted on e156a9874.  RSS MB in arena_MB column position is
+# PEAK RSS here (not arena) — see the git note for the full table.
+firefox	2.60	0.73	3.56	675	yes	off	e156a9874	2026-07-04
+M5	10.74	3.59	2.99	3011	yes	off	e156a9874	2026-07-04
+firefox	1.74	0.73	2.38	590	yes	warm	e156a9874	2026-07-04
+M5	6.38	3.59	1.78	2245	yes	warm	e156a9874	2026-07-04

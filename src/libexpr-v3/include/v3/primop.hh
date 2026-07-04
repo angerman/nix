@@ -124,6 +124,12 @@ void appliedCacheStatsDump() noexcept;
 /// canonicalHash attempt on an eligible application + how many bailed
 /// unhashable (each bail = a partial serialize walk + a thrown exception).
 void appliedCacheNoteTryKey(bool hashable) noexcept;
+/// Backstop: canonicalHash threw despite the pre-check accepting (mirror
+/// drift).  Expected 0; regression-tested.
+void appliedCacheNoteTryKeyException() noexcept;
+/// SHADOW mode (#16a) support: non-mutating entry peek + compare accounting.
+bool appliedCacheLookupPeek(const std::string & key, Value & out) noexcept;
+void appliedCacheNoteShadowCompare(bool ok, uint64_t comparedNodes) noexcept;
 void walkAppliedCacheRoots(const std::function<void(Value &)> & visit);
 /// Provenance: record/check import-RESULT closures (desc-keyed; see the
 /// appliedImportResultDescs block in primops.cc for the soundness argument).

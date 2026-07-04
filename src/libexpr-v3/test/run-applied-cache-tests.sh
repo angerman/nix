@@ -15,6 +15,13 @@
 #       This is the FAILING-FIRST test: a broken/no-op cache makes ON==OFF.
 #   T4  throws are never cached: insert happens only at OP_RETURN; the second
 #       application of a throwing import-result must re-throw.
+#   T5  unhashable args (a function in the arg set) fall through the
+#       structural pre-check (task #16c) to plain evaluation — correct result.
+#   T6  pre-check mirror exactness: keyExceptionBail must be 0 — canonicalHash
+#       throwing AFTER the pre-check accepted means appliedKeyPrecheck drifted
+#       from serializeOne's acceptance (the tax would silently return).
+#   T7  SHADOW mode (#16a): would-HITs re-evaluate (insns must NOT collapse)
+#       and lockstep-compare — result correct, shadowCompares>0, mismatch=0.
 # All correctness cases assert cache-ON == cache-OFF == expected literal.
 #
 # Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>,
@@ -75,6 +82,42 @@ if [[ -n "$i_off" && -n "$i_on" ]] && (( i_on * 100 < i_off * 75 )); then
     pass=$((pass+1)); echo "PASS T3-collapse (off=$i_off on=$i_on)"
 else
     fail=$((fail+1)); echo "FAIL T3-collapse: off=${i_off:-?} on=${i_on:-?} (need on < 0.75*off)"
+fi
+
+# T5 — unhashable arg (function value): pre-check bails, eval still correct.
+check T5-unhashable-arg \
+    "import $FIX/heavy.nix { f = (x: x); }" \
+    '2001000'
+
+# T6 — pre-check mirror exactness: no canonicalHash exceptions past the
+# pre-check across the whole fixture set (hashable + unhashable shapes).
+# SCALAR root (+): a list root returns WHNF from runRootExpr and the CLI
+# forces elements via bridge re-entry AFTER the stats dump — counters would
+# read 0 (diagnosed 2026-07-04; the dump is not wrong, just pre-render).
+E6="($E3) + (import $FIX/heavy.nix { f = (x: x); }) + (import $FIX/heavy.nix { xs = [ 1 \"a\" { y = 2; } ]; })"
+statline=$(NIX_V3_APPLIED_CACHE=1 NIX_V3_DIRECT_EVAL=1 NIX_V3_MAX_WALL_TIME=60s NIX_VM_STATS=1 \
+    "$NIX" eval --no-eval-cache --impure --expr "$E6" 2>&1 >/dev/null | grep 'APPLIED-CACHE:')
+if echo "$statline" | grep -q 'keyExceptionBail=0'; then
+    pass=$((pass+1)); echo "PASS T6-precheck-exact ($statline)"
+else
+    fail=$((fail+1)); echo "FAIL T6-precheck-exact: $statline"
+fi
+
+# T7 — shadow mode: correct result, compares happen, ZERO mismatches, and
+# NO reuse (insns must stay at the OFF level — shadow never short-circuits).
+sres=$(NIX_V3_APPLIED_CACHE=shadow NIX_V3_DIRECT_EVAL=1 NIX_V3_MAX_WALL_TIME=60s "$NIX" eval --no-eval-cache --impure --expr "$E3" 2>/dev/null)
+sline=$(NIX_V3_APPLIED_CACHE=shadow NIX_V3_DIRECT_EVAL=1 NIX_V3_MAX_WALL_TIME=60s NIX_VM_STATS=1 \
+    "$NIX" eval --no-eval-cache --impure --expr "$E3" 2>&1 >/dev/null | grep 'APPLIED-CACHE:')
+s_insns=$(NIX_V3_APPLIED_CACHE=shadow NIX_V3_DIRECT_EVAL=1 NIX_V3_MAX_WALL_TIME=60s NIX_VM_STATS=1 \
+    "$NIX" eval --no-eval-cache --impure --expr "$E3" 2>&1 >/dev/null \
+  | grep -oE 'insns=[0-9]+' | cut -d= -f2 | sort -n | tail -1)
+if [[ "$sres" == "3998000" ]] \
+   && echo "$sline" | grep -q 'shadowMismatch=0' \
+   && echo "$sline" | grep -qE 'shadowCompares=[1-9]' \
+   && [[ -n "$s_insns" && -n "$i_off" ]] && (( s_insns * 100 > i_off * 90 )); then
+    pass=$((pass+1)); echo "PASS T7-shadow (insns=$s_insns; $sline)"
+else
+    fail=$((fail+1)); echo "FAIL T7-shadow: res=$sres insns=${s_insns:-?} off=${i_off:-?} $sline"
 fi
 
 echo "applied-cache: $pass passed, $fail failed"
