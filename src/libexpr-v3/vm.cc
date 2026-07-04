@@ -4017,10 +4017,13 @@ bool appliedCacheTryKey(const Closure * callee, const Value & arg, std::string &
                 (int)arg.tag(),
                 arg.isAttrs() && arg.asAttrs() ? (int)arg.asAttrs()->size : -1,
                 e.what());
+        appliedCacheNoteTryKey(false);
         return false;   // unhashable ⇒ uncacheable (never force here)
     } catch (...) {
+        appliedCacheNoteTryKey(false);
         return false;
     }
+    appliedCacheNoteTryKey(true);
     static const bool s_dbg = std::getenv("V3_DBG_APPLIED") != nullptr;
     if (__builtin_expect(s_dbg, 0) && callee->desc)
         std::fprintf(stderr, "APPLIED tryKey OK desc=%s argTag=%d\n",

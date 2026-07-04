@@ -120,6 +120,10 @@ void dumpAppliedCacheProbeStats() noexcept;
 bool appliedCacheLookup(const std::string & key, Value & out) noexcept;
 void appliedCacheInsert(const std::string & key, Value result) noexcept;
 void appliedCacheStatsDump() noexcept;
+/// tryKey attempt accounting (GRAY-gate diagnosis 2026-07-04): counts every
+/// canonicalHash attempt on an eligible application + how many bailed
+/// unhashable (each bail = a partial serialize walk + a thrown exception).
+void appliedCacheNoteTryKey(bool hashable) noexcept;
 void walkAppliedCacheRoots(const std::function<void(Value &)> & visit);
 /// Provenance: record/check import-RESULT closures (desc-keyed; see the
 /// appliedImportResultDescs block in primops.cc for the soundness argument).

@@ -6737,6 +6737,12 @@ struct AppliedCache {
     uint64_t accessCounter = 0;
     // stats (dumped with the probe counters)
     uint64_t lookups = 0, hits = 0, inserts = 0, evictions = 0;
+    // tryKey attempt counters (2026-07-04 GRAY-gate diagnosis): the darwin-4
+    // double-eval gate showed cache-ON eval#2 marginal CPU WORSE than OFF
+    // despite insns halving — suspect = per-eligible-application canonicalHash
+    // serialization + exception-throw on unhashable args (~95K eligible/eval
+    // per the probe).  These quantify that tax.
+    uint64_t keyAttempts = 0, keyUnhashable = 0;
 };
 AppliedCache & appliedCache()
 {
@@ -6755,6 +6761,13 @@ size_t appliedCacheMaxEntries() noexcept
     return v;
 }
 } // namespace
+
+void appliedCacheNoteTryKey(bool hashable) noexcept
+{
+    auto & c = appliedCache();
+    c.keyAttempts++;
+    if (!hashable) c.keyUnhashable++;
+}
 
 bool appliedCacheLookup(const std::string & key, Value & out) noexcept
 {
@@ -6796,12 +6809,14 @@ void appliedCacheInsert(const std::string & key, Value result) noexcept
 void appliedCacheStatsDump() noexcept
 {
     const auto & c = appliedCache();
-    if (c.lookups == 0 && c.inserts == 0) return;
+    if (c.lookups == 0 && c.inserts == 0 && c.keyAttempts == 0) return;
     std::fprintf(stderr,
-        "v3 APPLIED-CACHE: lookups=%llu hits=%llu inserts=%llu evictions=%llu size=%zu\n",
+        "v3 APPLIED-CACHE: lookups=%llu hits=%llu inserts=%llu evictions=%llu "
+        "size=%zu keyAttempts=%llu keyUnhashable=%llu\n",
         (unsigned long long)c.lookups, (unsigned long long)c.hits,
         (unsigned long long)c.inserts, (unsigned long long)c.evictions,
-        c.entries.size());
+        c.entries.size(),
+        (unsigned long long)c.keyAttempts, (unsigned long long)c.keyUnhashable);
 }
 
 void walkAppliedCacheRoots(const std::function<void(Value &)> & visit)
@@ -7941,6 +7956,12 @@ void primImport(EvalState & state, Value * args, Value & out)
                 auto tRun = impStamp();
                 out = run(cache.cus.back());
                 impBumpNs(importTimingTotals().runNs, tRun);
+                // LEVER-1 provenance for desc-keying: the disk-HIT path was
+                // the ONE primImport exit missing this record, so in a warm-
+                // disk-cache process the FIRST application of an imported
+                // file was silently ineligible (found via the T3-collapse
+                // regression test: lookups=1 came from the SECOND app).
+                appliedCacheRecordImportResult(out);
                 if (s_impTimingEn) ++importTimingTotals().diskCacheHits;
                 auto [mt, sz] = importStat(path);
                 {

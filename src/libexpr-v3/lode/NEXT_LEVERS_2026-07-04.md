@@ -189,3 +189,41 @@ runtime-hashed design and redirected to a better one.  Findings:
    probe|count, default-off, retirement: replaced by the real cache stats).
 zsh gotcha re-learned the hard way: `env $P cmd` does NOT word-split in zsh →
 use explicit assignments (several "silent" probe runs were TW evals).
+
+## Part B RESULT — v1 cache SHIPPED (gate PASSED both axes) 2026-07-04
+
+Commits: edf869bee (the cache) + follow-up (disk-HIT provenance fix + battery).
+Note vs plan item 4: the emitter-assisted design was NOT needed for v1 — the
+desc+provenance restriction (key only applications of closures RETURNED by
+primImport) already cut the runtime flood from 95,717 eligible to 763 tryKey
+attempts / 747 unhashable-bails per hello double-eval (counter-measured), so
+runtime WHNF-hash keying is viable at that rate.  The emitter-assisted
+constant-args key remains the step-2b play to make NON-empty literal configs
+(`{ config.allowUnfree = true; }`) hashable (interior thunks today).
+
+DARWIN-4 GATE (bench/lever1-gate.sh, N=5 medians, warm CU disk cache,
+hello.drvPath double-eval, fixed binary):
+
+| cell | CPU | RSS |
+|---|---|---|
+| E1 OFF | 0.620s | 290MB |
+| E2 OFF | 0.950s | 348MB |
+| E1 ON  | 0.680s | 290MB |
+| E2 ON  | 0.680s | 290MB |
+
+- eval#2 marginal CPU = 0.000s = **0.00× eval#1** (SHIP bar ≤0.30, KILL >0.60)
+- steady RSS E2-ON/E1-OFF = **1.00×** (SHIP bar ≤1.3, KILL >2)
+- **VERDICT: SHIP** on both pre-committed axes.  Deterministic corroboration:
+  insns eval#2 = +22 (hello E2) / +14 (synthetic fixture).
+- Known cost: +60ms (+9.7%) cache tax on eval#1 (mostly ~370 unhashable
+  canonicalHash bails/eval, each a partial serialize + thrown exception).
+  Acceptable for the eval-many workload (gate default-off); trim with a
+  structural WHNF pre-check before any default-on decision.
+- KILLED en route: the disk-HIT provenance hole (first-import applications
+  silently ineligible in warm-disk-cache processes; hello E2 MASKED it because
+  nixpkgs re-imports itself in-process — found by the failing-first
+  T3-collapse test, test/run-applied-cache-tests.sh).
+
+Remaining LEVER-1 line items: shadow mode validation on nixpkgs workloads;
+const-eager emitter (2b) for literal-config keys (schema bump 18→19); M5/HNE
+double-eval characterization; Part C persistent-store falsifier prototype.
