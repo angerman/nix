@@ -127,13 +127,20 @@ struct Bindings
     /// 2026-05-21 #752: PosIdx32 fits in what used to be Entry's
     /// implicit padding slot (between the 4-byte SymbolId at offset
     /// 0 and the 8-byte-aligned Value at offset 8).  sizeof(Entry)
-    /// is unchanged at 24 B; the side-table-style attrPosTable
-    /// that previously held ~14 M (Bindings*,SymbolId)->PosIdx32
-    /// mappings on hello.drvPath (~ 719 MB of "elsewhere" RSS per
-    /// #751 attribution) is no longer required for entries we
-    /// allocate ourselves — `entry.pos` IS the position.  Default
-    /// 0 means "no position info."
+    /// is 16 B (4B SymbolId + 4B PosIdx32 + 8B NaN-boxed Value); the
+    /// "24 B" in the pre-2026-07 comment reflected the OLD 16B Value
+    /// and is stale — a static_assert below locks the current size
+    /// (GC size accounting multiplies by sizeof(Entry) at several
+    /// sites: alloc.hh:3131/3176/4083/4086).  The side-table-style
+    /// attrPosTable that previously held ~14 M
+    /// (Bindings*,SymbolId)->PosIdx32 mappings on hello.drvPath
+    /// (~ 719 MB of "elsewhere" RSS per #751 attribution) is no
+    /// longer required for entries we allocate ourselves —
+    /// `entry.pos` IS the position.  Default 0 means "no position info."
     struct Entry { SymbolId name; PosIdx32 pos; Value value; };
+    static_assert(sizeof(Entry) == 16,
+        "Bindings::Entry must stay 16B (4B SymbolId + 4B PosIdx32 + 8B Value) "
+        "— GC size accounting depends on it; see the comment above");
     static constexpr PosIdx32 kMapAttrsUnrealizedPosBit = 0x80000000u;
     static constexpr PosIdx32 kPosMask = ~kMapAttrsUnrealizedPosBit;
 

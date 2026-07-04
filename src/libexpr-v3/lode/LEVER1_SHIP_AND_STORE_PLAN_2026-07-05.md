@@ -162,7 +162,19 @@ applications) capture the bulk of M5/HNE reuse?
   keying → KILL #3; document that flake workloads are served by the file-level
   CU disk cache (already exists), not an applied-result cache. Stop.**
 
-### 3.1 — (only if 3.0 ≥30% AND #2 GO) design + build content-key v2
+### 3.X — VERDICT: KILL (2026-07-05, measured)
+3.0 ran on darwin-4 (current default-on binary).  M5/HNE eval#2 collapse under
+the in-memory applied cache = **−1% / −2%** (essentially zero reuse); the
+keyAttempts/keyUnhashable ratio on a single M5 eval = **7594 unhashable /
+7612 attempts = 99.76% UNHASHABLE** (only 18 hashable, 14 hits).  Cause:
+haskell.nix applies nixpkgs with COMPUTED args + overlays (functions), which
+have no canonical hash under ANY key scheme.  Addressable share ≪ the 30%
+gate → **KILL.**  Flake workloads are served by the file-level CU disk cache
+(parse+lower already persisted); an applied-RESULT cache — in-memory (measured
+~0 here) or persistent (#2 KILLed independently) — cannot help them.  No
+content-key v2 to build.
+
+### 3.1 — (NOT reached; #2 KILLed + 3.0 <30%) design + build content-key v2
 Per RESULT_STORE §key-discipline. New failing-first flake regression tests.
 Own byte-id + brute + gate.
 
