@@ -170,15 +170,37 @@ use it); for kind==MapAttrs ONLY the aux moved to a tail slot after entries[size
   (alloc.hh:1473); old 24+16n is 8-past-a-boundary → wasted a granule (→32+16n),
   new 16+16n is aligned → dropping aux removes the field AND the rounding waste.
   MapAttrs (rare) net-zero (old 24+16n == new header16+16n+8 tail).
-- **darwin-4 same-host A/B (M5, default config, N=5):** arena bump high-water
-  1456→1248MB (**−208MB deterministic**); **peak RSS 2160→2105MB = −55MB**
-  (median-of-5, range 45-68MB) ≥ the 30MB SHIP gate; byte-identical
+- **darwin-4 same-host A/B (M5, default config, N=5):** **peak RSS 2160→2105MB
+  = −55MB** (median-of-5, range 45-68MB) ≥ the 30MB SHIP gate; byte-identical
   (cardano-node.name ==); CPU −0.9% (faster, within ≤2%). Full --brute 34/34;
-  adversarial layout review clean. (Arena −208 vs RSS −55: peak RSS is a mid-eval
-  transient dominated by non-arena Boehm/SQLite/flake, so the arena win is only
-  partially captured at the peak moment; the 55MB is robust.)
+  adversarial layout review clean.
+  - NB the periodic-trace "arena −208MB" I first noted was a SAMPLING ARTIFACT
+    (the trace samples every 200MB of alloc, catching the high-water differently
+    per run). The true arena delta ≈ 3.84M bindings × 16B ≈ 61MB, of which
+    ~90% (**55MB**) realizes as peak RSS. This ~0.90 arena→peak-RSS realization
+    (NOT the artifact 0.26) is what calibrated the P1b projection.
 VERDICT: **SHIP** — all three gate criteria met. Unconditional layout change
 (no runtime env gate); MapAttrs tail gated on the kind flag.
+
+### P1b RESULT — cu-drop **SHIPPED** (c9642d27a, 2026-07-06); withs-tail DECLINED
+Removed `Closure::cu`, derived from `desc->cu` via closureCU() — the FP-2a
+per-thunk-cu pattern applied to closures. Header 40B→32B (8B × ~2.2M M5
+closures; env-shared + even-upvalue closures save 16B via granule rounding).
+- **darwin-4 same-session A/B (M5, N=5):** **peak RSS 2106→2087MB = −19MB**
+  (median-of-5, range 13-26MB); byte-identical; CPU +0.1% (noise). Full --brute
+  34/34; adversarial review clean (8 hazards incl. GC missed-root — none).
+- **19MB is in the MARGINAL 15-30MB zone** (below the strict 30MB SHIP gate,
+  above the 15MB KILL floor). SHIPPED anyway: a clean, byte-id, brute-green,
+  zero-CPU-cost, zero-downside reduction — no reason to revert a real win.
+- **withs-tail half DECLINED** (the capturedWiths→FAM-tail FP-2b analogue that
+  would add ~8-13MB toward 30MB): it touches every Closure GC-walk of the tail
+  (missed-root UAF class) + interacts with default-on env-sharing (upvalEnv/FAM
+  layout), disproportionate risk for the marginal extra on a lever P0 classified
+  a ~3-4% sideshow.
+VERDICT: cu-drop **SHIP** (19MB banked); withs-tail declined. Confirms P0's gate:
+representation-shrinking (P1) yielded one clean win (P1a 55MB) + one marginal
+(P1b 19MB) = ~74MB total, but no path to RSS parity — the real lever is P2
+(the ~837MB dead arena).
 
 ### Phase 2 — The GC-rewrite research spike (the ONLY path to real RSS parity)
 DO NOT build; SPIKE + falsify first (the prior GC KILLs demand it). The design
