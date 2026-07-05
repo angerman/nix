@@ -1,0 +1,156 @@
+# Representation-rewrite attack plan — 5-agent investigation + adversarial synthesis (2026-07-05)
+
+Five independent code-grounded investigators fanned out over the "representation
+rewrite" (the multi-quarter path to close v3's ~1.8-2.4× CPU / ~1.6-2.3× RSS
+single-eval gap to the tree-walker). This doc records their findings, the
+CONTRADICTIONS the adversarial review caught between them, the reconciled truth,
+and a concrete phased plan.
+
+## Agents (all read-only, file:line-grounded)
+- A1 v3 byte-audit (per-cell sizeof + reducible fields + live-count recipe)
+- A2 tree-walker study (why TW is lighter/faster, grounded in src/libexpr/)
+- A3 thunk/laziness representation (the 623-659MB arena sink)
+- A4 Bindings/attrset representation (the 347-362MB sink + drv-hash invariant)
+- A5 alloc/GC model + the CPU-vs-RSS cross-check
+
+## CONTRADICTIONS CAUGHT + RECONCILED (the point of the fan-out)
+
+**C1 — "M5 at RSS parity" (A4) vs "M5 2.29× RSS" (A1/A5 + the authoritative
+baseline). REJECTED A4's parity.** A4 cited MEMORY_REPRESENTATION_2026-06-07
+("cardano-node.drvPath 924 vs TW 915MB"). That is a STALE/narrow claim: it
+predates both the 2026-06-27 RSS decomp (M5 arena 1560MB / peak 3121MB, POST-
+Chain, POST-Lever-B) and the 2026-07-04 darwin-4 baseline (M5 warm 2245MB vs TW
+982 = 2.29×, git-noted @ e156a9874). The Chain (−268MB firefox) + NaN-box wins
+are REAL but already BAKED INTO the 2.29× residual — M5 is not at parity.
+Trust the recent authoritative number.
+
+**C2 — "inline the thunk like TW" (A2, its #1 RSS lever) vs "inline-thunk
+FORBIDDEN" (A3). A3 WINS.** A2 (studying TW) correctly found TW's thunk is
+`{Env*,Expr*}` inline in the 16B Value — 0 separate allocation — vs v3's separate
+24B+ heap Thunk (the 659MB M5 sink). But A3 (grounded in v3's constraints)
+proved porting it is BLOCKED: a `Tag::App`/ValuePair-encoded thunk inside a
+tenured `Bindings::Entry` is the PhD-6 missed-root class under the MOVING GC; the
+`cell`-writeback contract (STG-8/#498) + `Tag::Slot` pointer-stability depend on
+the separate cell; and a ValuePair can't hold N upvalues + the desc pointer
+(Tag::App/App3 already cover only the 1-2-arg deferred-application subset).
+**TW's inline-thunk does not port to v3's moving-GC bytecode architecture.**
+
+**C3 — thunk LIVE-vs-DEAD split: A3 "~71MB live / ~588MB dead" vs A1 "~592MB
+live at peak GC" on M5. BOTH mis-attributed; the authoritative number is in
+between and is a MEASUREMENT GAP.** A3 conflated "63% never-forced" with "dead"
+(a never-forced thunk in the result graph is LIVE, just unforced). A1's "592MB
+live" is ~90% of allocated, implausible against the never-forced data. The
+authoritative memory (reference_fresh_numbers_2026-06-27) says the M5 ARENA
+(1560MB) is ~590MB LIVE / ~970MB DEAD *total across all cell types*. So A3 over-
+attributed all dead-arena to thunks; A1's "592MB live thunks" ≈ the total live
+arena, not thunks alone. THE EXACT PER-TYPE LIVE-vs-DEAD SPLIT IS UNMEASURED —
+and it decides whether effort goes to representation (live) or GC (dead). This
+is Phase 0.
+
+## RECONCILED TRUTH (what all five actually establish)
+
+1. **The leaner-cells "rewrite" is MOSTLY ALREADY SHIPPED.** NaN-box 8B Value
+   (Lever B, c690b3f19: Entry 24→16, ValuePair 64→32, ListVec 16→8, ~−30%
+   arena), Chain/overlay Bindings (Lever A, c6cba9e12: firefox −268MB/−29%),
+   thunk 24B floor (three shrinks 56→40→32→24), pair-tax — all DONE. The 2.29×
+   residual is the state AFTER these.
+
+2. **Remaining cell-level wins are REAL but SMALL** (A1, byte-id-safe, not yet
+   shipped): Bindings::aux removal (−16B/Bindings incl. rounding = ~50MB M5) +
+   Closure header diet (drop cu/capturedWiths/upvalEnv per the proven FP-2
+   Thunk pattern, 40→16B = −16..−32B/closure = ~37-74MB M5). Total ~90-130MB ≈
+   **~3-4% of the 3121MB peak.** NOT parity.
+
+3. **The DOMINANT RSS sink is ~970MB DEAD arena — a GC problem, not
+   representation** (A3+A5 converge; authoritative memory confirms). But
+   reclaiming it is PRIOR-KILLED both ways: non-moving sweep can't munmap
+   (blocks are mixed live/dead — blocksFreed=0 every sweep), moving compaction
+   raises peak (Cheney 2×). And it can't run MID-EVAL at all (moving GC can't
+   forward C-stack locals → the exitDepth==0 gate). The nursery underperforms
+   (7-16% hit vs 60-80% design; A5).
+
+4. **The moving GC is the LINCHPIN blocking BOTH #2's ceiling AND the inline-
+   thunk (C2) AND mid-eval reclamation (#3).** A non-moving, mid-eval-capable,
+   page-releasing collector would unblock all three. THIS is the real coupled
+   "representation rewrite": it's a GC rewrite that unblocks representation.
+
+5. **Representation is an RSS lever, NOT a CPU lever** (A5, proven: Value 16→8B
+   gave −18-24% RSS but +1-4% wall). CPU is DISPATCH+semantic = JIT (the
+   register-VM substrate exists). FFI marshalling is already gone (F4).
+
+6. **CU-bytecode "elsewhere" (~207MB M5, 488,998 LambdaDescriptors) has no TW
+   analog** (A2: TW walks a shared parsed Expr AST). WS-B (descriptor diet)
+   ~40-62MB, ~38% diagnostic. Real, separate lever.
+
+## HONEST VERDICT
+- A "representation rewrite" as narrowly framed (leaner cells) is ~90-130MB /
+  ~3-4% RSS (Phase 1) — most of it already shipped. It does NOT reach parity and
+  does NOT help CPU.
+- REAL RSS parity requires reclaiming the ~970MB dead arena, which requires
+  replacing the moving GC with a non-moving, mid-eval, page-releasing collector
+  — the SAME change that would unblock TW-style inline representation. This is a
+  multi-quarter GC+representation program, and the prior campaign's KILLs
+  (non-moving-can't-munmap, moving-2×-peak) mean it needs a genuinely new design
+  with a pre-committed falsifier BEFORE building.
+- CPU parity is a JIT program (orthogonal).
+
+## PHASED PLAN (measure-first, pre-committed gates, Rule 0)
+
+### Phase 0 — MEASURE the live-vs-dead split (resolves C3; ~1 day; darwin-4)
+Run A1's recipe on M5+firefox: `NIX_VM_STATS=1 NIX_V3_LIVE_TRACE=1
+NIX_V3_LIVE_TRACE_PERIODIC=100` + a forced peak major-mark-sweep
+(`NIX_V3_MAJOR_GC_THRESHOLD_MB=<just-under-peak>` → the `closures=N thunks=M
+bindings=K...` line). Produce the exact per-type LIVE bytes at peak and the
+LIVE-vs-DEAD split. GATE the whole program: if arena is mostly LIVE (>70%) →
+representation matters (Phase 1 + the inline-thunk-via-GC-rewrite); if mostly
+DEAD (>60%, as memory suggests) → the lever is GC reclamation (Phase 2), and
+Phase 1 cell-shrinking is a ~3% sideshow. git-note it.
+
+### Phase 1 — Bank the safe representation wins (~90-130MB, low-risk, shippable)
+Only the byte-id-safe, GC-simple ones A1 ranked:
+1. **Bindings::aux removal** (rank 1, ~50MB): header 24→16B, MapAttrs's aux →
+   flag-gated tail slot / side-table. No GC complexity (Bindings tenured), no
+   serialize change (headers runtime-only), drv-hash-agnostic (A4:
+   lexicographicAttrEntries re-sorts by name string). Failing-first test +
+   byte-id ladder + brute. Post-build darwin-4 RSS gate: SHIP ≥30MB.
+2. **Closure header diet** (rank 2, ~37-74MB): apply the PROVEN FP-2 Thunk
+   pattern — drop `cu` (derive from desc->cu), move `capturedWiths`+`upvalEnv`
+   to flag-gated FAM tail. Touches closure alloc + every GC walk of Closure
+   (scavenger/marker/evac/auditor) → adversarial review + full --brute (missed-
+   root class). Post-build RSS gate: SHIP ≥30MB.
+Each: measure-first ceiling on darwin-4, gated, byte-id, brute-green. These are
+the concrete "representation rewrite" deliverables that are actually left.
+
+### Phase 2 — The GC-rewrite research spike (the ONLY path to real RSS parity)
+DO NOT build; SPIKE + falsify first (the prior GC KILLs demand it). The design
+question: a collector that (a) runs MID-EVAL (safepoints or precise stack maps,
+not exitDepth==0), (b) RELEASES pages to the OS (munmap), (c) does NOT raise
+peak (non-moving, or moving-with-a-peak-bound). Candidate: precise-stack-map
+safepoints + segregated-by-lifetime blocks (so whole-block-free becomes
+possible) OR a compacting collector with a peak cap. PRE-COMMITTED FALSIFIER
+(before any build): on M5, a forced mid-eval collection at peak must reclaim
+≥300MB of the ~970MB dead AND lower OS RSS (munmap fires) — measured on a
+prototype. If it can't clear that (as every prior variant failed), KILL and
+declare the ~2× RSS floor final. This spike ALSO unblocks the inline-thunk (C2):
+a non-moving GC removes the PhD-6 constraint, making TW-style inline thunks
+viable — so Phase 2's payoff is BOTH dead-reclamation AND the 659MB inline-thunk
+lever. That coupling is why it's the real program.
+
+### Phase 3 — CPU (orthogonal; JIT on the register-VM substrate)
+Separate from representation. The register VM (shipped, fib stack-free) is the
+IR substrate for a copy-patch/optimizing JIT that removes dispatch + fuses
+semantic ops. Its own plan (NON_JIT_LEVER_MAP + REGISTER_VM_MEASUREMENT verdict:
+JIT ceiling ~1.5-2.2×, needs J3 GC-safepoints — which Phase 2 would also
+provide). Note the coupling: Phase 2's safepoints are a shared prerequisite.
+
+## THE STRATEGIC CALL (for the human)
+Phase 1 is cheap and worth doing (~3-4% RSS, low-risk). But Phase 2 (the GC
+rewrite) is the only path to real RSS parity, it is multi-quarter, and the prior
+campaign KILLED every reclamation variant — so it must be gated behind the Phase
+0 measurement + the Phase 2 falsifier PROTOTYPE before committing. If the Phase
+2 falsifier can't reclaim ≥300MB-to-OS at peak (the prior wall), then ~1.6-2.0×
+RSS is v3's defended structural floor and the honest move is to lean into the
+repeated-eval moat (the caches) rather than chase single-eval parity.
+
+Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>,
+Input Output Group. SPDX-License-Identifier: Apache-2.0.
