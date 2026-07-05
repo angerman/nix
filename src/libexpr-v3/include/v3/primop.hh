@@ -127,6 +127,18 @@ void appliedCacheNoteTryKey(bool hashable) noexcept;
 /// Backstop: canonicalHash threw despite the pre-check accepting (mirror
 /// drift).  Expected 0; regression-tested.
 void appliedCacheNoteTryKeyException() noexcept;
+
+/// Top-level result cache (TOPLEVEL_RESULT_CACHE_2026-07-05) impurity taint.
+/// An eval whose result is NOT a pure function of the cache key
+/// (source ‖ NIX_PATH ‖ currentSystem ‖ schema) must NOT be persisted.
+/// Impure primops (getEnv, currentTime, non-store FS reads, …) bump the taint;
+/// the top-level shadow/active cache checks it before insert/reuse.  Per-eval
+/// (reset at the outermost runRootExprFromString entry).  The shadow's
+/// getEnv-mismatch probe (2026-07-05) proved this is required for soundness.
+void topLevelTaintBump() noexcept;    // an impure primop ran this eval
+void topLevelTaintReset() noexcept;   // outermost eval entry
+bool topLevelTainted() noexcept;      // did an impure primop run?
+
 /// SHADOW mode (#16a) support: non-mutating entry peek + compare accounting.
 bool appliedCacheLookupPeek(const std::string & key, Value & out) noexcept;
 void appliedCacheNoteShadowCompare(bool ok, uint64_t comparedNodes) noexcept;

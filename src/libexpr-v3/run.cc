@@ -318,6 +318,14 @@ RootResult runRootExprModule(nix::EvalState & state, ir::Module module)
     // API refactor (v3ToTreeWalker takes Expr*) or per-bridge-
     // creation-site Scoped guards.  See
     // WEAK_BRIDGE_EVICTION_DESIGN_2026-05-29.md.
+    // Top-level cache: reset the impurity taint HERE — after registerBuiltin
+    // PrimOps (148) + installAllBytecodePrimops (190), which run builtin bodies
+    // that call currentTime and would otherwise contaminate EVERY eval's taint
+    // (even a plain "abc").  Resetting right before the module's run() makes the
+    // taint reflect ONLY this module's evaluation.  Unconditional: nested
+    // installer runRootExprModule calls also reset before their own run(), but
+    // only the OUTERMOST run's taint is read (topLevelCacheShadow, depth==1).
+    topLevelTaintReset();
     try {
         out.value = run(*out.cu);
     } catch (...) {
@@ -1782,7 +1790,7 @@ RootResult runRootExprModule(nix::EvalState & state, ir::Module module)
 // recorded, OR KILLed if mismatch>0 proves the key cannot be made complete.
 namespace {
 struct TopLevelCacheStats {
-    uint64_t evals = 0, serializable = 0, unserializable = 0;
+    uint64_t evals = 0, serializable = 0, unserializable = 0, tainted = 0;
     uint64_t lookups = 0, hits = 0, mismatch = 0, inserts = 0;
 };
 TopLevelCacheStats & topLevelCacheStats() { static TopLevelCacheStats s; return s; }
@@ -1815,6 +1823,10 @@ void topLevelCacheShadow(nix::EvalState & state, const std::string & source,
     }
     // Only serializable-WHNF results are cacheable; value_serialize throws on
     // unforced thunks / closures / functions → natural bypass (counted).
+    // Impurity taint (v2): an eval that touched an impure builtin (getEnv,
+    // currentTime, …) is NOT a pure function of the key → must not be cached.
+    // Checked BEFORE serialize so a tainted eval never inserts/compares.
+    if (topLevelTainted()) { ++st.tainted; return; }
     std::string blob;
     try { value_serialize::serialize(result, blob); }
     catch (const std::exception & e) {
@@ -1870,11 +1882,12 @@ void dumpTopLevelCacheStats() noexcept {
     if (s.evals == 0 || !topLevelCacheOn()) return;
     std::fprintf(stderr,
         "v3 TOPLEVEL-CACHE (shadow): evals=%llu serializable=%llu "
-        "unserializable=%llu lookups=%llu hits=%llu mismatch=%llu inserts=%llu\n",
+        "unserializable=%llu tainted=%llu lookups=%llu hits=%llu mismatch=%llu "
+        "inserts=%llu\n",
         (unsigned long long)s.evals, (unsigned long long)s.serializable,
-        (unsigned long long)s.unserializable, (unsigned long long)s.lookups,
-        (unsigned long long)s.hits, (unsigned long long)s.mismatch,
-        (unsigned long long)s.inserts);
+        (unsigned long long)s.unserializable, (unsigned long long)s.tainted,
+        (unsigned long long)s.lookups, (unsigned long long)s.hits,
+        (unsigned long long)s.mismatch, (unsigned long long)s.inserts);
 }
 } // namespace
 
@@ -1905,6 +1918,8 @@ RootResult runRootExprFromString(nix::EvalState & state, const std::string & sou
     static thread_local int s_rrDepth = 0;
     struct DepthGuard { int & d; ~DepthGuard() { --d; } } _dg{s_rrDepth};
     ++s_rrDepth;
+    // (taint reset happens inside runRootExprModule, right before run() — after
+    // the primop installer, which calls currentTime.  See there.)
     auto rr = runRootExprModule(state, std::move(module));
     // Top-level result cache v1 SHADOW (default-off): measure hit rate +
     // soundness of memoizing this whole eval keyed on (source ‖ NIX_PATH ‖

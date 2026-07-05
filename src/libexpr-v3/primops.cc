@@ -1845,6 +1845,11 @@ void primAny(EvalState & state, Value * args, Value & out)
 
 void primGetEnv(EvalState & state, Value * args, Value & out)
 {
+    // Top-level cache taint: getEnv reads the ambient environment, which is
+    // NOT in the cache key.  Under pureEval it returns "" (deterministic), but
+    // conservatively taint always — the shadow's getEnv-mismatch probe proved
+    // an untainted getEnv serves a stale result across processes.
+    topLevelTaintBump();
     if (!args[0].isString()) typeError("getEnv", "string");
     // #674: TW's prim_getEnv uses forceStringNoCtx; mirror it so
     // contexted strings can't be used as env-var names (would mask
@@ -3906,6 +3911,7 @@ void primCurrentSystem(EvalState & state, Value *, Value & out)
 
 void primCurrentTime(EvalState &, Value *, Value & out)
 {
+    topLevelTaintBump();  // wall clock — not in the top-level cache key
     out.mkInt(static_cast<int64_t>(std::time(nullptr)));
 }
 
@@ -6781,6 +6787,14 @@ void appliedCacheNoteTryKeyException() noexcept
 {
     appliedCache().keyExceptionBail++;
 }
+
+// Top-level result cache impurity taint (TOPLEVEL_RESULT_CACHE_2026-07-05).
+// Thread-local per-eval flag; accessors so impure primops (this TU) bump it and
+// run.cc's top-level cache reads it.  Reset at the outermost eval entry.
+namespace { thread_local bool g_topLevelTaint = false; }
+void topLevelTaintBump() noexcept  { g_topLevelTaint = true; }
+void topLevelTaintReset() noexcept { g_topLevelTaint = false; }
+bool topLevelTainted() noexcept    { return g_topLevelTaint; }
 
 /// Non-mutating lookup for SHADOW compare: no LRU bump, no hit/miss stats
 /// (the shadow HIT was already counted by the arming lookup).

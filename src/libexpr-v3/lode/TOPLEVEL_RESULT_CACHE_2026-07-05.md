@@ -61,6 +61,37 @@ needs tainting empirically (below) before any taint code is written.
 4. **v3 ACTIVE** (skip-on-hit) — only after shadow mismatch==0 with taint on.
    Byte-id ladder cached==fresh==golden; full --brute; cross-process T_hit gate.
 
+## v2 TAINT finding (2026-07-05) — conservative global-taint is SOUND but OVER-REJECTS
+Built a per-eval impurity taint (topLevelTaint{Bump,Reset,Tainted}): getEnv +
+currentTime bump it; the shadow skips insert/compare when tainted; reset right
+before the module's run() (AFTER the primop installer, which itself calls
+currentTime — else EVERY eval, even `"abc"`, is falsely tainted; fixed).
+
+MEASURED after the installer-taint fix:
+- `"abc"` (pure): tainted=0 → caches (hit, mismatch=0).  Correct.
+- `builtins.seq builtins.currentTime "abc"`: tainted=1.  Correct (genuinely
+  calls currentTime), though the RESULT ("abc") is deterministic.
+- **hello.drvPath: tainted=1** — nixpkgs GENUINELY calls `builtins.currentTime`
+  during the eval (in a result-IRRELEVANT branch: v1 shadow proved the drvPath
+  is deterministic, mismatch=0).  So the CONSERVATIVE global taint (taint if an
+  impure primop is CALLED ANYWHERE) OVER-REJECTS the real workloads: nixpkgs
+  pervasively calls currentTime in branches that don't flow into the result.
+
+CONCLUSION: a global "impurity called" flag is sound but useless (rejects the
+very workloads the cache targets).  A sound AND useful top-level cache needs to
+distinguish "impurity called" from "impurity IN THE RESULT" — i.e. PRECISE
+DATA-FLOW taint: propagate an impure-derived bit through Values, and taint only
+when the serialized RESULT carries it.  That is a substantial feature (a taint
+bit on Value / per-thunk provenance).  ALTERNATIVE: empirical-corpus approach —
+ship ACTIVE for results that shadow-validate mismatch==0 across a wide corpus +
+re-validate on nixpkgs bumps, accepting a bounded residual risk (what nix's own
+eval-cache effectively does by keying on the flake lock and trusting purity).
+
+STATUS: v1 shadow + v2 conservative taint are the SOUND FOUNDATION (committed,
+gated-off).  The precise-taint OR empirical-corpus decision is the next careful
+phase (the cache is PROVEN viable — T_hit≈0, hello mismatch=0 — the remaining
+work is the soundness-vs-hit-rate mechanism).
+
 ## Relation to prior work
 - This is the CORRECT-boundary version of what #2 (RESULT_STORE) reached for;
   #2's KILL is RETRACTED (it measured the mis-keyed #741 drv-hash cache).
