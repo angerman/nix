@@ -2905,7 +2905,7 @@ struct Alloc
         c->nUpvalues = nUpvalues;
         c->_pad = 0;
         c->capturedWiths = nullptr;
-        c->cu = nullptr;
+        // P1b: no Closure::cu to init (derived from desc->cu via closureCU).
         c->upvalEnv = nullptr;   // env-sharing: inline-FAM path until a gate builds an Env
         closureAllocSiteRecord(c, file, line, nUpvalues);
         return c;
@@ -2947,7 +2947,7 @@ struct Alloc
         c->nUpvalues = nUpvalues;
         c->_pad = 0;
         c->capturedWiths = nullptr;
-        c->cu = nullptr;
+        // P1b: no Closure::cu to init (derived from desc->cu via closureCU).
         c->upvalEnv = nullptr;   // env-sharing: inline-FAM path until a gate builds an Env
         closureAllocSiteRecord(c, file, line, nUpvalues);
         return c;
@@ -3455,7 +3455,7 @@ inline Closure * Alloc::allocFakeClo(uint16_t nUpvalues) noexcept
     c->nUpvalues = nUpvalues;
     c->_pad = kFakeCloMagic;   // Mark as fakeClo for safe pooling.
     c->capturedWiths = nullptr;
-    c->cu = nullptr;
+    // P1b: no Closure::cu to init (derived from desc->cu via closureCU).
     c->upvalEnv = nullptr;   // env-sharing: inline-FAM path (fakeClos never share an Env)
     return c;
 }

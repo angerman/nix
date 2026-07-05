@@ -8178,8 +8178,8 @@ skipDiskCacheLookup:
         std::fprintf(stderr,
             "V3_DBG_APPLIED primImport(fresh): path=%s tag=%d cloCu=%p flag=%d "
             "nUp=%d withs=%p formals=%d arity=%d name=%s\n",
-            path.c_str(), (int)out.tag(), dc ? (const void *)dc->cu : nullptr,
-            (dc && dc->cu) ? (int)dc->cu->fromImportCU : -1,
+            path.c_str(), (int)out.tag(), dc ? (const void *)closureCU(dc) : nullptr,
+            (dc && closureCU(dc)) ? (int)closureCU(dc)->fromImportCU : -1,
             dc ? (int)dc->nUpvalues : -1,
             dc ? (const void *)dc->capturedWiths : nullptr,
             (dc && dc->desc) ? (int)dc->desc->hasFormals : -1,

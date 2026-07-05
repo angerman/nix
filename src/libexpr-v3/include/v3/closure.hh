@@ -60,11 +60,13 @@ struct CompilationUnit;
 struct Closure
 {
     const LambdaDescriptor * desc;        // shared blueprint
-    /// CompilationUnit owning desc + the bytecode it points into.
-    /// Required for cross-CU calls (e.g., closures returned by
-    /// `builtins.import` from another file).  When null, the dispatch
-    /// loop uses the caller's CU — fine for intra-CU calls.
-    const CompilationUnit *  cu;
+    /// P1b (2026-07-06): the per-closure `const CompilationUnit * cu` field was
+    /// REMOVED — derived from desc->cu via closureCU(c), mirroring FP-2a's
+    /// per-thunk cu removal (thunkCU).  A closure's CU is always its
+    /// descriptor's owning CU (OP_MAKE_CLOSURE sets desc = &cu->lambdas[i], so
+    /// the descriptor LIVES IN that cu's lambdas vector); OP_MAKE_CLOSURE +
+    /// fakeClo set `desc->cu = cu` idempotently (always the authoritative
+    /// value).  Shrinks the header 40B → 32B (8B × every closure — ~2.2M on M5).
     /// Snapshot of the `with`-stack visible at MAKE_CLOSURE.  null when
     /// no enclosing `with` is in scope at definition time.  When the
     /// closure is invoked, the dispatcher re-pushes these onto the
@@ -586,6 +588,17 @@ struct LambdaDescriptor
 [[gnu::always_inline]] inline const CompilationUnit * thunkCU(const Thunk * t) noexcept
 {
     return t->suspended.desc ? t->suspended.desc->cu : nullptr;
+}
+
+/// P1b accessor: a closure's owning CU, derived from its descriptor's
+/// backpointer (LambdaDescriptor::cu).  Replaces the former per-closure
+/// `Closure::cu` field.  Returns nullptr when the closure has no descriptor;
+/// callers that fell back to the executing frame's `cu` when `cu` was null
+/// keep that `?: cu` fallback (closureCU(c) is null iff the old cu was null,
+/// since desc->cu is set to the same authoritative value at closure creation).
+[[gnu::always_inline]] inline const CompilationUnit * closureCU(const Closure * c) noexcept
+{
+    return c->desc ? c->desc->cu : nullptr;
 }
 
 // `struct ThunkDescriptor` removed -- was a placeholder type only ever

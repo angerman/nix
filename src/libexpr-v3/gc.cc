@@ -648,8 +648,9 @@ void Scavenger::walkClosure(Closure * c)
     // byte range so postScavengeBruteScan can filter hits to live
     // (reachable-from-roots) objects only.
     recordLiveTenured(c, closureScanSize(c), CellType::Closure);
-    if (c->cu && walkedCUs.insert(c->cu).second) {
-        for (const auto & ic : c->cu->attrSelectCache) {
+    const CompilationUnit * ccu = closureCU(c);  // P1b: was c->cu
+    if (ccu && walkedCUs.insert(ccu).second) {
+        for (const auto & ic : ccu->attrSelectCache) {
             for (int w = 0; w < CompilationUnit::AttrSelectIC::kWays; ++w) {
                 if (Bindings * b = const_cast<Bindings *>(ic.entries[w].bindings))
                     fwdBindings(b);
@@ -1004,7 +1005,7 @@ void Scavenger::run()
         // refs that may not be in any active frame.
         for (Value & v : vm.valueStack) {
             if (v.tag() == Tag::Closure && v.asClosure())
-                walkOneCU(v.asClosure()->cu);
+                walkOneCU(closureCU(v.asClosure()));  // P1b: was ->cu
             else if (v.tag() == Tag::Thunk && v.asThunk()
                      && (v.asThunk()->state == ThunkState::Suspended
                          || v.asThunk()->state == ThunkState::Blackhole))
@@ -1012,7 +1013,7 @@ void Scavenger::run()
         }
         for (Value & v : vm.withStack) {
             if (v.tag() == Tag::Closure && v.asClosure())
-                walkOneCU(v.asClosure()->cu);
+                walkOneCU(closureCU(v.asClosure()));  // P1b: was ->cu
             else if (v.tag() == Tag::Thunk && v.asThunk()
                      && (v.asThunk()->state == ThunkState::Suspended
                          || v.asThunk()->state == ThunkState::Blackhole))
@@ -1269,7 +1270,7 @@ struct Auditor {
         if (!c) return;
         check(c, "Closure", site);
         if (!visited.insert(c).second) return;
-        walkCUAttrSelectCache(c->cu);
+        walkCUAttrSelectCache(closureCU(c));  // P1b: was c->cu
         if (c->capturedWiths) check(c->capturedWiths, "Closure.capturedWiths", site);
         if (c->capturedWiths) {
             for (uint32_t i = 0; i < c->capturedWiths->size; ++i)

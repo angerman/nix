@@ -652,7 +652,7 @@ private:
         }
         if (c->capturedWiths)
             visitList(c->capturedWiths);
-        walkCuIC(c->cu);  // MIDEVAL_GC: IC-pinned Bindings (mirror scavenger)
+        walkCuIC(closureCU(c));  // P1b: was c->cu. MIDEVAL_GC: IC-pinned Bindings (mirror scavenger)
         // env-sharing (NIX_V3_ENV_SHARING): upvalues live in a shared, tenured
         // (non-moving) Env rather than the inline FAM.  Mark the Env's lines and
         // visit its values precisely; the inline FAM is unused when upvalEnv is set.
@@ -1581,7 +1581,7 @@ private:
         switch (ty) {
         case CellType::Closure: {
             auto * c = static_cast<Closure *>(cell);
-            clearCU(c->cu);  // evac moves IC'd Bindings → invalidate the IC
+            clearCU(closureCU(c));  // P1b: was c->cu. evac moves IC'd Bindings → invalidate the IC
             if (c->capturedWiths) visitList(c->capturedWiths);
             // env-sharing: rewrite the shared Env's value pointers to their
             // forwarded locations.  The Env cell itself is non-moving (CellType::

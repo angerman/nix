@@ -4296,7 +4296,7 @@ void appliedCacheProbeObserve(VMState & vm, const Closure * callee, const Value 
     std::string k;
     k.reserve(160);
     char pbuf[2 * sizeof(void *) + 4];
-    std::snprintf(pbuf, sizeof pbuf, "%p:", (const void *)callee->cu);
+    std::snprintf(pbuf, sizeof pbuf, "%p:", (const void *)closureCU(callee));
     k += pbuf;
     int budget = kAppliedKeyBudget;
     bool ok = false;
@@ -5897,7 +5897,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 Closure * c = Alloc::allocClosureTenured(0);
                 V3_STATS_INC(closuresAllocated);
                 c->desc = &desc;
-                c->cu   = cu;
+                c->desc->cu = cu;   // P1b: authoritative CU on the descriptor (was c->cu)
                 c->nUpvalues = 0;
                 // No upvalues to pop (nUp==0); no withs to pop (nWiths==0).
                 // The body cannot reach any enclosing `with` (lowerer
@@ -5947,7 +5947,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             Closure * c = Alloc::allocClosure(shareUpvalues ? 0 : nUp);
             V3_STATS_INC(closuresAllocated);
             c->desc = &cu->lambdas[funcIdx];
-            c->cu   = cu;
+            c->desc->cu = cu;   // P1b: authoritative CU on the descriptor (was c->cu)
             c->nUpvalues = nUp;
             // Pop upvalues first (they sit on TOP of stack), then pop
             // the with-target block beneath.  Build capturedWiths
@@ -6918,7 +6918,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                         vm.valueStack[newBase + i] = argbuf[i];
                     uint32_t newWithBase =
                         static_cast<uint32_t>(vm.withStack.size());
-                    const CompilationUnit * calleeCu = papBase->cu ? papBase->cu : cu;
+                    const CompilationUnit * pcu = closureCU(papBase);
+                    const CompilationUnit * calleeCu = pcu ? pcu : cu;
                     vm.frames.push_back(CallFrame{
                         .cu = calleeCu,
                         .closure = papBase,
@@ -7004,7 +7005,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 return e && (std::strcmp(e, "probe") == 0 || std::strcmp(e, "count") == 0);
             }();
             if (__builtin_expect(s_appliedCacheProbe, 0)
-                && callee->cu && callee->cu->fromImportCU)
+                && closureCU(callee) && closureCU(callee)->fromImportCU)
                 appliedCacheProbeObserve(vm, callee, arg, 0, desc->hasFormals);
 
             // LEVER-1 applied-import cache (NIX_V3_APPLIED_CACHE=1): memoize
@@ -7020,7 +7021,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // graph, skip the call.  MISS: arm the capture (OP_RETURN inserts;
             // throw ⇒ no insert).
             if (__builtin_expect(appliedCacheOn(), 0)
-                && callee->cu && callee->cu->fromImportCU
+                && closureCU(callee) && closureCU(callee)->fromImportCU
                 && desc->hasFormals && desc->arity <= 1
                 && callee->capturedWiths == nullptr
                 && appliedCacheIsImportResultDesc(desc)) {
@@ -7391,7 +7392,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // when callee->cu differs, switch the dispatch loop to the
             // callee's bytecode/constant pools.  Falls back to the caller's
             // cu when the closure was made before cu-tracking landed.
-            const CompilationUnit * calleeCu = callee->cu ? callee->cu : cu;
+            const CompilationUnit * ccu0 = closureCU(callee);
+            const CompilationUnit * calleeCu = ccu0 ? ccu0 : cu;
 
             // Formals validation: when a lambda has formals and no
             // ellipsis, every key in the param attrset must match a
@@ -7610,7 +7612,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                                             "unexpected='%s' ellipsis=0 "
                                             "passed_attrs=[",
                                             (const void *)desc,
-                                            (const void *)(fun.asClosure() ? fun.asClosure()->cu : nullptr),
+                                            (const void *)(fun.asClosure() ? closureCU(fun.asClosure()) : nullptr),
                                             desc->name.c_str(),
                                             desc->contextualName.c_str(),
                                             ps ? ps->file.c_str() : "?",
@@ -8044,7 +8046,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     for (size_t i = 0; i < nTmp; ++i) argbuf[i] = tmp[nTmp - 1 - i];
                     argbuf[A - 1] = arg;
                     const LambdaDescriptor * d = tcBase->desc;
-                    const CompilationUnit * baseCu = tcBase->cu ? tcBase->cu : cu;
+                    const CompilationUnit * tbcu = closureCU(tcBase);
+                    const CompilationUnit * baseCu = tbcu ? tbcu : cu;
                     vm.valueStack.resize(stackBase + d->nLocals);
                     for (size_t i = 0; i < A; ++i)
                         vm.valueStack[stackBase + i] = argbuf[i];
@@ -8122,7 +8125,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 }
             }
             const LambdaDescriptor * tcDesc = tcCallee->desc;
-            const CompilationUnit * tcCalleeCu = tcCallee->cu ? tcCallee->cu : cu;
+            const CompilationUnit * tccu = closureCU(tcCallee);
+            const CompilationUnit * tcCalleeCu = tccu ? tccu : cu;
 
             // Same formals-argument force as OP_CALL — see WC-38 explanation above.
             if (tcDesc->hasFormals) {
@@ -8392,7 +8396,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     return e && (std::strcmp(e, "probe") == 0 || std::strcmp(e, "count") == 0);
                 }();
                 if (__builtin_expect(s_probeTC, 0)
-                    && tcCallee->cu && tcCallee->cu->fromImportCU)
+                    && closureCU(tcCallee) && closureCU(tcCallee)->fromImportCU)
                     appliedCacheProbeObserve(vm, tcCallee, arg, 1, tcDesc->hasFormals);
             }
             // stackBaseOffset is unchanged: we reuse the same
@@ -8457,7 +8461,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 for (uint32_t i = 0; i < n; ++i)
                     vm.valueStack[newBase + i] = argbuf[i];
                 uint32_t newWithBase = static_cast<uint32_t>(vm.withStack.size());
-                const CompilationUnit * calleeCu = c->cu ? c->cu : cu;
+                const CompilationUnit * ccu1 = closureCU(c);
+                const CompilationUnit * calleeCu = ccu1 ? ccu1 : cu;
                 vm.frames.push_back(CallFrame{
                     .cu = calleeCu,
                     .closure = c,
@@ -8520,7 +8525,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 && fun.asClosure()->desc->arity == n) {
                 const Closure * c = fun.asClosure();
                 const LambdaDescriptor * d = c->desc;
-                const CompilationUnit * baseCu = c->cu ? c->cu : cu;
+                const CompilationUnit * ccu2 = closureCU(c);
+                const CompilationUnit * baseCu = ccu2 ? ccu2 : cu;
                 vm.valueStack.resize(stackBase + d->nLocals);
                 for (uint32_t i = 0; i < n; ++i)
                     vm.valueStack[stackBase + i] = argbuf[i];
@@ -13978,7 +13984,7 @@ inline Value runOnExistingVm(VMState & vm,
         // EXIT_GC_SPIRAL Day 6-8: use pool.
         fakeClo = Alloc::allocFakeClo(static_cast<uint16_t>(nUpvalues));
         fakeClo->desc = &desc;
-        fakeClo->cu   = &cu;
+        fakeClo->desc->cu = &cu;   // P1b: authoritative CU on the descriptor (was fakeClo->cu)
         fakeClo->capturedWiths = capturedWiths;
         fakeClo->nUpvalues = static_cast<uint16_t>(nUpvalues);
         for (uint32_t i = 0; i < nUpvalues; ++i)
@@ -14136,7 +14142,7 @@ Value runFunctionWithUpvalues(const CompilationUnit & cu, uint32_t funcIdx,
 
     Closure * fakeClo = Alloc::allocFakeClo(static_cast<uint16_t>(nUpvalues));
     fakeClo->desc = &desc;
-    fakeClo->cu   = &cu;
+    fakeClo->desc->cu = &cu;   // P1b: authoritative CU on the descriptor (was fakeClo->cu)
     // #416: also publish the captured chain on the closure so any
     // sub-call that re-uses fakeClo (e.g. via tail calls in the body)
     // sees the outer withs through pushCapturedWiths().
@@ -14263,7 +14269,7 @@ Value runLambda(const CompilationUnit & cu, uint32_t funcIdx,
 
     Closure * fakeClo = Alloc::allocFakeClo(static_cast<uint16_t>(nUpvalues));
     fakeClo->desc = &desc;
-    fakeClo->cu   = &cu;
+    fakeClo->desc->cu = &cu;   // P1b: authoritative CU on the descriptor (was fakeClo->cu)
     fakeClo->capturedWiths = capturedWiths;
     fakeClo->nUpvalues = static_cast<uint16_t>(nUpvalues);
     for (uint32_t i = 0; i < nUpvalues; ++i)
@@ -15632,7 +15638,8 @@ static bool callClosureNExact(
         return true;
     }
 
-    const CompilationUnit * ccu = c->cu ? c->cu : vm.frames.back().cu;
+    const CompilationUnit * ccuc0 = closureCU(c);
+    const CompilationUnit * ccu = ccuc0 ? ccuc0 : vm.frames.back().cu;
     size_t exitDepth = vm.frames.size();
     size_t newBase = vm.valueStack.size();
     vm.valueStack.resize(newBase + d->nLocals);
@@ -15710,7 +15717,8 @@ Value callClosure2(VMState & vm, Value fun, Value arg1, Value arg2)
             const LambdaDescriptor * d = c->desc;
             if (__builtin_expect(d->secondArgIdentityLambda, 0))
                 return arg2;
-            const CompilationUnit * ccu = c->cu ? c->cu : vm.frames.back().cu;
+            const CompilationUnit * ccuc = closureCU(c);
+            const CompilationUnit * ccu = ccuc ? ccuc : vm.frames.back().cu;
             size_t exitDepth = vm.frames.size();
             size_t newBase = vm.valueStack.size();
             vm.valueStack.resize(newBase + d->nLocals);
@@ -15807,7 +15815,7 @@ Value callClosure(VMState & vm, Value fun, Value arg)
         && fun.isClosure() && fun.asClosure()) {
         const Closure * c0 = fun.asClosure();
         const LambdaDescriptor * d0 = c0->desc;
-        if (d0 && c0->cu && c0->cu->fromImportCU
+        if (d0 && closureCU(c0) && closureCU(c0)->fromImportCU
             && d0->hasFormals && d0->arity <= 1
             && c0->capturedWiths == nullptr
             && appliedCacheIsImportResultDesc(d0)) {
@@ -15958,7 +15966,7 @@ Value callClosure(VMState & vm, Value fun, Value arg)
             }
             const LambdaDescriptor * d = papBase->desc;
             const CompilationUnit * ccu =
-                papBase->cu ? papBase->cu : vm.frames.back().cu;
+                closureCU(papBase) ? closureCU(papBase) : vm.frames.back().cu;
             size_t exitDepth = vm.frames.size();
             size_t newBase = vm.valueStack.size();
             vm.valueStack.resize(newBase + d->nLocals);
@@ -16031,7 +16039,7 @@ Value callClosure(VMState & vm, Value fun, Value arg)
         return e && (std::strcmp(e, "probe") == 0 || std::strcmp(e, "count") == 0);
     }();
     if (__builtin_expect(s_appliedCacheProbeCC, 0)
-        && callee->cu && callee->cu->fromImportCU)
+        && closureCU(callee) && closureCU(callee)->fromImportCU)
         appliedCacheProbeObserve(vm, callee, arg, 2, desc->hasFormals);
 
     // (LEVER-1 memo hook moved ABOVE the callee/desc derivation — the hook
@@ -16170,7 +16178,8 @@ Value callClosure(VMState & vm, Value fun, Value arg)
 
     // Cross-CU calls (e.g., calling a closure returned from
     // builtins.import): use the closure's own CU when available.
-    const CompilationUnit * cu = callee->cu ? callee->cu : vm.frames.back().cu;
+    const CompilationUnit * ccu3 = closureCU(callee);
+    const CompilationUnit * cu = ccu3 ? ccu3 : vm.frames.back().cu;
 
     // Push a CALL frame for the callee — mirrors OP_CALL.
     size_t exitDepth = vm.frames.size();
