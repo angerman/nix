@@ -1792,6 +1792,7 @@ namespace {
 struct TopLevelCacheStats {
     uint64_t evals = 0, serializable = 0, unserializable = 0, tainted = 0;
     uint64_t lookups = 0, hits = 0, mismatch = 0, inserts = 0;
+    uint64_t activeHits = 0;  // ACTIVE skip-on-hit: whole pipeline skipped
 };
 TopLevelCacheStats & topLevelCacheStats() { static TopLevelCacheStats s; return s; }
 
@@ -1805,6 +1806,43 @@ const char * topLevelCacheMode() {
 bool topLevelCacheOn() {
     const char * m = topLevelCacheMode();
     return m[0] != '\0' && std::strcmp(m, "0") != 0;
+}
+// ACTIVE (skip-on-hit): "1"/"active".  SHADOW (compare-only): "shadow".
+bool topLevelCacheActive() {
+    const char * m = topLevelCacheMode();
+    return std::strcmp(m, "1") == 0 || std::strcmp(m, "active") == 0;
+}
+
+// Shared key: (namespaced ‖ schema ‖ currentSystem ‖ NIX_PATH ‖ basePath ‖
+// source).  Computable WITHOUT parsing/evaluating → an ACTIVE hit skips the
+// whole pipeline.  v1 uses the NIX_PATH ENV STRING (sound only for IMMUTABLE
+// pins — archive URLs / store paths; a mutable channel symlink is a known v1
+// gap → ACTIVE is opt-in and documented for pinned inputs only.  v3-production
+// will resolve NIX_PATH entries to content ids + mix codegenGateFingerprint).
+disk_cache::CacheKey topLevelCacheKey(nix::EvalState & state,
+                                      const std::string & source,
+                                      const std::string & basePath) {
+    std::string keyBytes;
+    keyBytes.reserve(64 + source.size() + basePath.size());
+    // Namespace + CACHE-POLICY VERSION.  BUMP this whenever the key inputs OR
+    // the impurity-taint policy change — else entries written by an older
+    // binary (different soundness rules) are served by a newer one, a
+    // cross-version cache-poisoning silent-wrong-result (found 2026-07-05: a
+    // pre-taint "v1" getEnv entry was served after taint landed).  v2 = taint
+    // on getEnv/currentTime.
+    keyBytes.append("v3-toplevel-v2");
+    keyBytes.push_back('\0');
+    uint32_t schema = disk_cache::kEvalResultSchemaVersion;
+    keyBytes.append(reinterpret_cast<const char *>(&schema), sizeof schema);
+    keyBytes.push_back('\0');
+    try { keyBytes.append(ffi::currentSystem(state)); } catch (...) {}
+    keyBytes.push_back('\0');
+    if (const char * np = std::getenv("NIX_PATH")) keyBytes.append(np);
+    keyBytes.push_back('\0');
+    keyBytes.append(basePath);
+    keyBytes.push_back('\0');
+    keyBytes.append(source);
+    return disk_cache::computeKeyForString(keyBytes);
 }
 
 /// v1 SHADOW: serialize the forced WHNF result, key it on pre-eval inputs,
@@ -1838,26 +1876,7 @@ void topLevelCacheShadow(nix::EvalState & state, const std::string & source,
     }
     catch (...) { ++st.unserializable; return; }
     ++st.serializable;
-    // KEY (v1): namespaced ‖ schema ‖ currentSystem ‖ NIX_PATH ‖ basePath ‖
-    // source.  v3-ACTIVE will additionally resolve NIX_PATH entries to content
-    // ids + mix codegenGateFingerprint + an impurity-taint flag (see the doc);
-    // v1 uses the NIX_PATH env string, sufficient to measure hit+mismatch under
-    // a pinned setup.
-    std::string keyBytes;
-    keyBytes.reserve(64 + source.size() + basePath.size());
-    keyBytes.append("v3-toplevel-v1");
-    keyBytes.push_back('\0');
-    uint32_t schema = disk_cache::kEvalResultSchemaVersion;
-    keyBytes.append(reinterpret_cast<const char *>(&schema), sizeof schema);
-    keyBytes.push_back('\0');
-    try { keyBytes.append(ffi::currentSystem(state)); } catch (...) {}
-    keyBytes.push_back('\0');
-    if (const char * np = std::getenv("NIX_PATH")) keyBytes.append(np);
-    keyBytes.push_back('\0');
-    keyBytes.append(basePath);
-    keyBytes.push_back('\0');
-    keyBytes.append(source);
-    auto key = disk_cache::computeKeyForString(keyBytes);
+    auto key = topLevelCacheKey(state, source, basePath);
     ++st.lookups;
     auto existing = disk_cache::lookupEvalResult(key);
     if (existing) {
@@ -1879,15 +1898,17 @@ void topLevelCacheShadow(nix::EvalState & state, const std::string & source,
 }
 void dumpTopLevelCacheStats() noexcept {
     const auto & s = topLevelCacheStats();
-    if (s.evals == 0 || !topLevelCacheOn()) return;
+    if ((s.evals == 0 && s.activeHits == 0) || !topLevelCacheOn()) return;
     std::fprintf(stderr,
-        "v3 TOPLEVEL-CACHE (shadow): evals=%llu serializable=%llu "
+        "v3 TOPLEVEL-CACHE (%s): evals=%llu serializable=%llu "
         "unserializable=%llu tainted=%llu lookups=%llu hits=%llu mismatch=%llu "
-        "inserts=%llu\n",
+        "inserts=%llu activeHits=%llu\n",
+        topLevelCacheActive() ? "active" : "shadow",
         (unsigned long long)s.evals, (unsigned long long)s.serializable,
         (unsigned long long)s.unserializable, (unsigned long long)s.tainted,
         (unsigned long long)s.lookups, (unsigned long long)s.hits,
-        (unsigned long long)s.mismatch, (unsigned long long)s.inserts);
+        (unsigned long long)s.mismatch, (unsigned long long)s.inserts,
+        (unsigned long long)s.activeHits);
 }
 } // namespace
 
@@ -1896,6 +1917,34 @@ RootResult runRootExprFromString(nix::EvalState & state, const std::string & sou
                                  const nix::SourcePath * originPath)
 {
     registerBuiltinPrimOps();  // before lowering (lower-time findPrimOp)
+    // Re-entry depth: runRootExprModule installs bytecode primops via NESTED
+    // runRootExprFromString calls; the top-level cache acts ONLY on the
+    // outermost (the user's actual expr), never the installer sub-evals.
+    static thread_local int s_rrDepth = 0;
+    struct DepthGuard { int & d; ~DepthGuard() { --d; } } _dg{s_rrDepth};
+    ++s_rrDepth;
+    // Top-level result cache — ACTIVE pre-run lookup (skip-on-hit).  Keyed on
+    // inputs computable BEFORE parsing (source ‖ NIX_PATH ‖ system ‖ schema),
+    // so a hit skips the WHOLE pipeline (parse+lower+run).  SOUND: only
+    // UNTAINTED results were inserted (the taint gates insert, post-run below),
+    // so any cached entry is a pure function of the key → safe to reuse.  The
+    // cached value is a fully-serialized WHNF (deserialize allocates its string
+    // payloads in the arena, independent of a CU), so a minimal CompilationUnit
+    // suffices for the caller's synthetic frame (it only forces the WHNF value,
+    // never runs cu code).  Shadow mode does NOT skip (validates via post-run
+    // compare).  Outermost only.
+    if (s_rrDepth == 1 && topLevelCacheActive()) {
+        auto key = topLevelCacheKey(state, source, basePath);
+        if (auto blob = disk_cache::lookupEvalResult(key)) {
+            try {
+                Value cached = value_serialize::deserialize(*blob);
+                auto & st2 = topLevelCacheStats();
+                ++st2.lookups; ++st2.hits; ++st2.activeHits;
+                dumpTopLevelCacheStats();
+                return RootResult{ std::make_unique<CompilationUnit>(), cached };
+            } catch (...) { /* deserialize failed → fall through to full eval */ }
+        }
+    }
     nix::v3::ast::ParserState st;
     st.basePath = basePath;
     st.homePath = homePath;
@@ -1915,9 +1964,6 @@ RootResult runRootExprFromString(nix::EvalState & state, const std::string & sou
     // their bodies via NESTED runRootExprFromString calls (returning function
     // closures — tag 9, unserializable noise).  Shadow ONLY the OUTERMOST call
     // (the user's actual top-level expr), not the installer sub-evals.
-    static thread_local int s_rrDepth = 0;
-    struct DepthGuard { int & d; ~DepthGuard() { --d; } } _dg{s_rrDepth};
-    ++s_rrDepth;
     // (taint reset happens inside runRootExprModule, right before run() — after
     // the primop installer, which calls currentTime.  See there.)
     auto rr = runRootExprModule(state, std::move(module));

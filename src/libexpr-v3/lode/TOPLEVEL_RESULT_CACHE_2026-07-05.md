@@ -92,6 +92,37 @@ gated-off).  The precise-taint OR empirical-corpus decision is the next careful
 phase (the cache is PROVEN viable — T_hit≈0, hello mismatch=0 — the remaining
 work is the soundness-vs-hit-rate mechanism).
 
+## v3 ACTIVE (skip-on-hit) built + #2 GO verdict (2026-07-05)
+Phase-1 ACTIVE shipped (gate NIX_V3_TOPLEVEL_CACHE=active|1, default-OFF): a
+pre-run lookup at the outermost runRootExprFromString (keyed on inputs known
+BEFORE parse) skips the WHOLE pipeline on a hit, returning the deserialized
+WHNF result on a minimal CU.  SOUND: only UNTAINTED results are inserted
+(post-run, taint-gated), so any cached entry is a pure function of the key.
+
+#2 GO — corrected falsifier (replaces the RETRACTED T_hit/T_eval=1.00, which
+measured #741's mis-keyed drv-hash cache): 12M untainted fold, laptop —
+  T_eval(off) = 4.50s ; T_hit(active, skip) = 0.20s ; **T_hit/T_eval = 0.044**
+  ≪ the 0.20 gate → GO.  The store concept WINS at the right boundary.
+
+SOUNDNESS bug found + fixed (a real silent-wrong-result): a pre-taint "v1" key
+getEnv entry was served after taint landed (cross-version cache poisoning).
+FIX: the key prefix encodes the CACHE-POLICY VERSION (v1→v2 = taint on getEnv/
+currentTime); bump it on any key/taint change.  Regression: TL2/TL3 in
+test/run-toplevel-cache-tests.sh (fresh-cache getEnv-not-stale + currentTime-
+not-frozen).  Verified: fresh cache → getEnv tainted (inserts=0), FOO=bbb→bbb.
+
+PHASE-1 LIMITATIONS (documented; phase-2 work):
+- Taint OVER-REJECTS the nixpkgs workloads (hello/firefox call currentTime in
+  result-irrelevant branches) → .drvPath/.name don't cache yet.  Needs PRECISE
+  data-flow taint (taint only if the impure value reaches the result) — the win
+  set today is untainted evals (pure computation, non-impure-touching derivs).
+- Fixed per-process floor ~0.09-0.20s (startup + registerBuiltinPrimOps) → the
+  net win needs T_eval > ~0.45s.
+- v1 key uses the NIX_PATH ENV STRING (sound for immutable pins; a mutable
+  channel symlink is a gap) → opt-in, pinned-inputs-only.
+So #2 = GO + phase-1 ACTIVE built (default-off), with precise-taint + resolved-
+NIX_PATH-content keying as the phase-2 path to cover the nixpkgs workloads.
+
 ## Relation to prior work
 - This is the CORRECT-boundary version of what #2 (RESULT_STORE) reached for;
   #2's KILL is RETRACTED (it measured the mis-keyed #741 drv-hash cache).
