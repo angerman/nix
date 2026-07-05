@@ -217,6 +217,39 @@ a non-moving GC removes the PhD-6 constraint, making TW-style inline thunks
 viable — so Phase 2's payoff is BOTH dead-reclamation AND the 659MB inline-thunk
 lever. That coupling is why it's the real program.
 
+### P2 RESULT — falsifier **KILL** (2026-07-06, darwin-4, M5 near-peak)
+The falsifier prototype = the existing mid-eval mark-sweep (NIX_V3_MIDEVAL_GC,
+which DOES run mid-eval at peak, unlike the exitDepth==0 default) + whole-block-
+free (the munmap-to-OS mechanism) + a new density/reclaim census (mark_sweep.cc
+"v3 P2-density" / "v3 P2-reclaim-to-OS", NIX_VM_STATS). Forced at threshold
+1300MB so it sweeps near the 1456MB peak.
+
+**MEASURED at the near-peak sweep (blocks=86, deadBytes=805MB, reclaim 55.8%):**
+- **whole-block-free: blocksFreed=0, bytesFreed=0.0MB → 0MB reclaimed TO OS**
+  despite 805MB dead identified. munmap does NOT fire.
+- **block live-density: [<10%=0, 10-25%=0, 25-50%=62, 50-75%=24, 75-100%=0];
+  sparse(<25%)=0.** EVERY block is 25-75% live — the ~805MB dead is UNIFORMLY
+  INTERLEAVED with live cells. Zero fully-dead blocks, zero even-sparse blocks.
+- **evacuation (moving) ceiling = 0MB**: no sparse-block candidates; and moving
+  25-75%-live blocks copies most of their contents = huge churn that RAISES peak
+  (prior BiBOP: freedRSS 16.8MB despite moving 342MB, peak 386→537MB — in the
+  mark_sweep.cc:1562 comment ledger).
+
+**VERDICT: KILL.** Reclaim-to-OS at peak = 0MB ≪ the 300MB GO gate, by the
+maximum possible margin. No collector that doesn't move live cells can munmap
+the dead (it's interleaved), and moving them raises peak (violates the no-peak-
+raise constraint). This is the FRESH-M5 confirmation of the prior GC campaign's
+wall (6 reclamation KILLs). **~1.6-2.0× RSS is v3's DEFENDED STRUCTURAL FLOOR**
+(M5 warm 2.29×; the dead arena is not reclaimable-to-OS at peak). The GC rewrite
+is NOT funded on RSS grounds. Because P2's safepoints ALSO would have unblocked
+the inline-thunk (C2) + JIT-J3 (Phase 3), those remain blocked too.
+
+**STRATEGIC CONSEQUENCE (for the human):** lean into the REPEATED-EVAL MOAT —
+the applied-import cache (LEVER-1, shipped default-on) + top-level result cache
+collapse eval #2..N to ~0, which the tree-walker structurally cannot do. That is
+v3's durable win, not single-eval RSS parity. Representation-shrinking banked
+~74MB (P1a 55 + P1b 19) — real but ~2-3% of peak; the floor stands.
+
 ### Phase 3 — CPU (orthogonal; JIT on the register-VM substrate)
 Separate from representation. The register VM (shipped, fib stack-free) is the
 IR substrate for a copy-patch/optimizing JIT that removes dispatch + fuses

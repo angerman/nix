@@ -2667,6 +2667,33 @@ MajorGcResult runMajorMarkSweep(VMState & vm) noexcept
                 lh[4] + dh[4],
                 double(lh[4] + dh[4]) * 8.0 / 1e6);
         }
+        // P2 falsifier (REPRESENTATION_REWRITE Phase 2): block live-density
+        // distribution at this (near-peak) sweep + whole-block-free / evac
+        // ceilings.  The GO gate is: reclaim >=300MB TO OS at peak.  Two
+        // mechanisms: (a) whole-block-free (non-moving) reclaims only FULLY
+        // dead blocks = blocksFreed*blockSize; (b) evacuation (moving) could
+        // reclaim SPARSE blocks (<25% live) but must copy their live bytes
+        // (churn that raises peak).  densityHist bins blocks by live fraction
+        // [0-10)[10-25)[25-50)[50-75)[75-100]%; sparseBlocks = the <25% ones
+        // (evacuation candidates), sparseLiveBytes = the copy cost. If blocks
+        // cluster 25-75% (dense-scattered), BOTH mechanisms reclaim ~0.
+        {
+            const size_t * dHist = sweep.densityHist;
+            const size_t nblk = sweep.blocksScanned;
+            const double evacCeilingMB =
+                double(nblk ? (dHist[0] + dHist[1]) : 0) * (512.0 / 1024.0);  // sparse blocks * ~512KB
+            std::fprintf(stderr,
+                "v3 P2-density: blocks=%zu bins[<10%%=%zu 10-25=%zu 25-50=%zu "
+                "50-75=%zu 75-100=%zu] sparse(<25%%)=%zu sparseLiveMB=%.1f\n",
+                nblk, dHist[0], dHist[1], dHist[2], dHist[3], dHist[4],
+                sweep.sparseBlocks, double(sweep.sparseLiveBytes)/1e6);
+            std::fprintf(stderr,
+                "v3 P2-reclaim-to-OS: whole-block-free blocksFreed=%zu bytesFreed=%.1fMB "
+                "(evac-ceiling ~%.0fMB sparse-blocks * 512KB, minus %.1fMB copy-churn) "
+                "[GO gate >=300MB]\n",
+                sweep.blocksFreed, double(sweep.bytesFreed)/1e6,
+                evacCeilingMB, double(sweep.sparseLiveBytes)/1e6);
+        }
         // Step 11′ (Immix, 2026-05-29): line-mark bitmap summary.
         // Each block has 131,072 lines of 128 B; a line is "live"
         // if any byte of any marked cell falls in it.  Dead-line
