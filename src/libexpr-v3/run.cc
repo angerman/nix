@@ -134,6 +134,11 @@ bool keepLibAlive()
     return true;
 }
 
+// Forward decl (defined in the anonymous namespace before
+// runRootExprFromString): the top-level result cache v1 shadow stats dump,
+// called from runRootExprModule's end-of-eval stats region below.
+namespace { void dumpTopLevelCacheStats() noexcept; }
+
 RootResult runRootExprModule(nix::EvalState & state, ir::Module module)
 {
     // Idempotent: register the builtin primop table on first call.
@@ -399,6 +404,8 @@ RootResult runRootExprModule(nix::EvalState & state, ir::Module module)
     // the `nix` binary.  Cumulative; the LAST line per process is authoritative.
     dumpAppliedCacheProbeStats();
     appliedCacheStatsDump();   // LEVER-1 real-cache counters (self-gates on activity)
+    // (top-level result cache shadow dumps from runRootExprFromString, AFTER
+    // the outermost eval's shadow — see topLevelCacheShadow call there.)
 
     // NIX_VM_STATS=1: dump alloc counters at completion.  Lets us
     // attribute alloc explosions to thunks vs closures vs Bindings
@@ -1756,6 +1763,121 @@ RootResult runRootExprModule(nix::EvalState & state, ir::Module module)
 // PosTable::Origin (Pos::Origin(sp) / Pos::String / Pos::Stdin) so
 // positions match TW.  canLowerV3 is total for parser-produced ASTs, so
 // the throw is a should-never-fire guard.
+// ---------------------------------------------------------------------------
+// TOP-LEVEL RESULT CACHE — v1 SHADOW (task: "#741 done at the right boundary").
+//
+// #741's caches key on FORCED derivation inputs / drvPath (post-computation),
+// so a hit saves only the ~30-50µs libstore tail — measured 0 speedup even at
+// 100% hit (lode/TOPLEVEL_RESULT_CACHE_2026-07-05.md).  The fix is a HIGHER
+// boundary: memoize the TOP-LEVEL expr's forced WHNF result, keyed on inputs
+// computable BEFORE eval (source ‖ NIX_PATH ‖ currentSystem ‖ schema), so an
+// (eventual) ACTIVE hit skips the WHOLE eval (T_hit/T_eval < 0.002).
+//
+// v1 SHADOW: always run, then COMPARE cached-vs-fresh byte-identically and
+// count mismatches.  ZERO risk (never reuses).  The mismatch rate reveals
+// which impure inputs the key misses (→ what to taint) before ACTIVE ships.
+// Gate NIX_V3_TOPLEVEL_CACHE=shadow (default OFF).  Retirement criterion: this
+// SHADOW instrument is folded into an ACTIVE gate once the exit bar
+// (mismatch==0 across hello/firefox/M5/HNE + measured T_hit/T_eval≤0.20) is
+// recorded, OR KILLed if mismatch>0 proves the key cannot be made complete.
+namespace {
+struct TopLevelCacheStats {
+    uint64_t evals = 0, serializable = 0, unserializable = 0;
+    uint64_t lookups = 0, hits = 0, mismatch = 0, inserts = 0;
+};
+TopLevelCacheStats & topLevelCacheStats() { static TopLevelCacheStats s; return s; }
+
+const char * topLevelCacheMode() {
+    static const char * m = [] {
+        const char * e = std::getenv("NIX_V3_TOPLEVEL_CACHE");
+        return e ? e : "";
+    }();
+    return m;
+}
+bool topLevelCacheOn() {
+    const char * m = topLevelCacheMode();
+    return m[0] != '\0' && std::strcmp(m, "0") != 0;
+}
+
+/// v1 SHADOW: serialize the forced WHNF result, key it on pre-eval inputs,
+/// compare against any cached blob (byte-identical), insert if absent.  Never
+/// returns a cached value (shadow) — pure measurement + soundness probe.
+void topLevelCacheShadow(nix::EvalState & state, const std::string & source,
+                         const std::string & basePath, const Value & result) noexcept
+{
+    if (!topLevelCacheOn()) return;
+    auto & st = topLevelCacheStats();
+    ++st.evals;
+    {
+        static const bool s_dbg = std::getenv("V3_DBG_TOPLEVEL") != nullptr;  // TEMP
+        if (s_dbg) std::fprintf(stderr, "  TOPLEVEL eval#%llu tag=%d source=%.50s\n",
+            (unsigned long long)st.evals, (int)result.tag(), source.c_str());
+    }
+    // Only serializable-WHNF results are cacheable; value_serialize throws on
+    // unforced thunks / closures / functions → natural bypass (counted).
+    std::string blob;
+    try { value_serialize::serialize(result, blob); }
+    catch (const std::exception & e) {
+        ++st.unserializable;
+        static const bool s_dbg = std::getenv("V3_DBG_TOPLEVEL") != nullptr;  // TEMP
+        if (s_dbg) std::fprintf(stderr, "  TOPLEVEL unserializable: tag=%d why=%s\n",
+            (int)result.tag(), e.what());
+        return;
+    }
+    catch (...) { ++st.unserializable; return; }
+    ++st.serializable;
+    // KEY (v1): namespaced ‖ schema ‖ currentSystem ‖ NIX_PATH ‖ basePath ‖
+    // source.  v3-ACTIVE will additionally resolve NIX_PATH entries to content
+    // ids + mix codegenGateFingerprint + an impurity-taint flag (see the doc);
+    // v1 uses the NIX_PATH env string, sufficient to measure hit+mismatch under
+    // a pinned setup.
+    std::string keyBytes;
+    keyBytes.reserve(64 + source.size() + basePath.size());
+    keyBytes.append("v3-toplevel-v1");
+    keyBytes.push_back('\0');
+    uint32_t schema = disk_cache::kEvalResultSchemaVersion;
+    keyBytes.append(reinterpret_cast<const char *>(&schema), sizeof schema);
+    keyBytes.push_back('\0');
+    try { keyBytes.append(ffi::currentSystem(state)); } catch (...) {}
+    keyBytes.push_back('\0');
+    if (const char * np = std::getenv("NIX_PATH")) keyBytes.append(np);
+    keyBytes.push_back('\0');
+    keyBytes.append(basePath);
+    keyBytes.push_back('\0');
+    keyBytes.append(source);
+    auto key = disk_cache::computeKeyForString(keyBytes);
+    ++st.lookups;
+    auto existing = disk_cache::lookupEvalResult(key);
+    if (existing) {
+        ++st.hits;
+        // Byte-compare fresh vs cached (serialize is deterministic — sorted
+        // attrs + sorted string context, per canonicalHash's contract).  A
+        // mismatch means the key MISSES an input the result depends on
+        // (impurity / unpinned search path) — the soundness signal.
+        if (*existing != blob) {
+            ++st.mismatch;
+            std::fprintf(stderr,
+                "v3 TOPLEVEL-CACHE SHADOW MISMATCH: differing result under a "
+                "matching key (source prefix: %.60s)\n", source.c_str());
+        }
+    } else {
+        disk_cache::insertEvalResult(key, blob);
+        ++st.inserts;
+    }
+}
+void dumpTopLevelCacheStats() noexcept {
+    const auto & s = topLevelCacheStats();
+    if (s.evals == 0 || !topLevelCacheOn()) return;
+    std::fprintf(stderr,
+        "v3 TOPLEVEL-CACHE (shadow): evals=%llu serializable=%llu "
+        "unserializable=%llu lookups=%llu hits=%llu mismatch=%llu inserts=%llu\n",
+        (unsigned long long)s.evals, (unsigned long long)s.serializable,
+        (unsigned long long)s.unserializable, (unsigned long long)s.lookups,
+        (unsigned long long)s.hits, (unsigned long long)s.mismatch,
+        (unsigned long long)s.inserts);
+}
+} // namespace
+
 RootResult runRootExprFromString(nix::EvalState & state, const std::string & source,
                                  const std::string & basePath, const std::string & homePath,
                                  const nix::SourcePath * originPath)
@@ -1776,7 +1898,22 @@ RootResult runRootExprFromString(nix::EvalState & state, const std::string & sou
               nix::Pos::String{.source = nix::make_ref<std::string>(source)}, source.size());
     auto module = lowerV3Ast(ffi::symbols(state), st.result, &ffi::positions(state), origin,
                              &twBaseEnvGlobals(state));
-    return runRootExprModule(state, std::move(module));
+    // Re-entry depth: runRootExprModule installs bytecode primops by running
+    // their bodies via NESTED runRootExprFromString calls (returning function
+    // closures — tag 9, unserializable noise).  Shadow ONLY the OUTERMOST call
+    // (the user's actual top-level expr), not the installer sub-evals.
+    static thread_local int s_rrDepth = 0;
+    struct DepthGuard { int & d; ~DepthGuard() { --d; } } _dg{s_rrDepth};
+    ++s_rrDepth;
+    auto rr = runRootExprModule(state, std::move(module));
+    // Top-level result cache v1 SHADOW (default-off): measure hit rate +
+    // soundness of memoizing this whole eval keyed on (source ‖ NIX_PATH ‖
+    // system ‖ schema).  Never reuses; see topLevelCacheShadow.
+    if (s_rrDepth == 1) {
+        topLevelCacheShadow(state, source, basePath, rr.value);
+        dumpTopLevelCacheStats();  // after the main shadow (self-gates)
+    }
+    return rr;
 }
 
 // Synthetic-source overload (no path literals): builds a Pos::String
