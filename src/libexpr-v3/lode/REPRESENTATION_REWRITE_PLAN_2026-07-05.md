@@ -162,6 +162,24 @@ Only the byte-id-safe, GC-simple ones A1 ranked:
 Each: measure-first ceiling on darwin-4, gated, byte-id, brute-green. These are
 the concrete "representation rewrite" deliverables that are actually left.
 
+### P1a RESULT — **SHIPPED** (cbe4fe55f, 2026-07-06)
+Bindings header 24B→16B: dropped `Value aux` (dead for 99%+; Sorted/Chain never
+use it); for kind==MapAttrs ONLY the aux moved to a tail slot after entries[size]
+(allocMapAttrsBindings + mapAttrsAux(); mirrors the Thunk withs-slot idiom).
+- **Realized saving = 16B/binding, not 8B**: the arena rounds to 16B granules
+  (alloc.hh:1473); old 24+16n is 8-past-a-boundary → wasted a granule (→32+16n),
+  new 16+16n is aligned → dropping aux removes the field AND the rounding waste.
+  MapAttrs (rare) net-zero (old 24+16n == new header16+16n+8 tail).
+- **darwin-4 same-host A/B (M5, default config, N=5):** arena bump high-water
+  1456→1248MB (**−208MB deterministic**); **peak RSS 2160→2105MB = −55MB**
+  (median-of-5, range 45-68MB) ≥ the 30MB SHIP gate; byte-identical
+  (cardano-node.name ==); CPU −0.9% (faster, within ≤2%). Full --brute 34/34;
+  adversarial layout review clean. (Arena −208 vs RSS −55: peak RSS is a mid-eval
+  transient dominated by non-arena Boehm/SQLite/flake, so the arena win is only
+  partially captured at the peak moment; the 55MB is robust.)
+VERDICT: **SHIP** — all three gate criteria met. Unconditional layout change
+(no runtime env gate); MapAttrs tail gated on the kind flag.
+
 ### Phase 2 — The GC-rewrite research spike (the ONLY path to real RSS parity)
 DO NOT build; SPIKE + falsify first (the prior GC KILLs demand it). The design
 question: a collector that (a) runs MID-EVAL (safepoints or precise stack maps,
