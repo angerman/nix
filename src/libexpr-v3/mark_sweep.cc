@@ -984,6 +984,15 @@ struct SweepStats {
     // interior/huge/non-bump cells the mover can't directly type.
     size_t cellTypeHist[9] = {0,0,0,0,0,0,0,0,0};
 
+    // P1/P2 sizing (2026-07-06, REPRESENTATION_REWRITE Phase 0): DEAD-cell
+    // tally by CellType, mirroring cellTypeHist but for the swept-dead branch.
+    // cellTypeHist is live-only, so total-tenured(type) = cellTypeHist[t] +
+    // deadCellTypeHist[t].  Pins P1a's ceiling (8B * total-tenured Bindings =
+    // the header-shrink peak-RSS bound) and sizes P2 (per-type reclaimable
+    // dead bytes/count).  Measurement-only; reported under NIX_VM_STATS.
+    size_t deadCellTypeHist[9]  = {0,0,0,0,0,0,0,0,0};
+    size_t deadCellTypeBytes[9] = {0,0,0,0,0,0,0,0,0};
+
     // R2.4b: per regular-block (start, live-byte fraction).  The
     // evacuator filters this to the sparse candidate set.  Populated
     // in sweepOneBlock's density section.
@@ -1071,6 +1080,16 @@ static bool sweepOneBlock(
         } else {
             ++stats.deadCells;
             stats.deadBytes += cellSize;
+            // P1/P2 sizing: tally the DEAD cell by its stamped type (mirror of
+            // the live branch's cellTypeHist unpack).  Measurement-only.
+            {
+                const size_t gran = offset >> 4;
+                const uint8_t ty = static_cast<uint8_t>(
+                    nix::v3::cellTypeUnpack(cellTypeBytes, gran));
+                const size_t ti = ty < 9 ? ty : 0;
+                stats.deadCellTypeHist[ti]++;
+                stats.deadCellTypeBytes[ti] += cellSize;
+            }
             // Phase 3: route dead cell to the per-exact-size free
             // list and clear its cell-start bit.  Subsequent allocs
             // of this size will reuse the freed slot.
@@ -2626,6 +2645,26 @@ MajorGcResult runMajorMarkSweep(VMState & vm) noexcept
                 h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], h[8],
                 (typed + h[0]) > 0 ? 100.0 * double(typed)
                                      / double(typed + h[0]) : 0.0);
+        }
+        // P1/P2 sizing (REPRESENTATION_REWRITE Phase 0): DEAD-cell tally by
+        // type + total-tenured (live+dead) per type.  total-tenured Bindings
+        // * 8B = P1a header-shrink peak-RSS ceiling; per-type dead bytes size
+        // the P2 GC-reclaim lever.  Measurement-only.
+        {
+            const size_t * lh = sweep.cellTypeHist;
+            const size_t * dh = sweep.deadCellTypeHist;
+            const size_t * db = sweep.deadCellTypeBytes;
+            std::fprintf(stderr,
+                "v3 dead-celltypes: None=%zu Value=%zu Closure=%zu Thunk=%zu "
+                "Bindings=%zu List=%zu Pair=%zu Env=%zu Chars=%zu\n",
+                dh[0], dh[1], dh[2], dh[3], dh[4], dh[5], dh[6], dh[7], dh[8]);
+            std::fprintf(stderr,
+                "v3 dead-celltype-MB: Closure=%.1f Thunk=%.1f Bindings=%.1f "
+                "List=%.1f Pair=%.1f (Bindings total-tenured=%zu -> "
+                "P1a aux-shrink ceiling=%.2fMB)\n",
+                db[2]/1e6, db[3]/1e6, db[4]/1e6, db[5]/1e6, db[6]/1e6,
+                lh[4] + dh[4],
+                double(lh[4] + dh[4]) * 8.0 / 1e6);
         }
         // Step 11′ (Immix, 2026-05-29): line-mark bitmap summary.
         // Each block has 131,072 lines of 128 B; a line is "live"

@@ -110,6 +110,23 @@ columns; DEAD = resident arena − live):
 **C3 RESOLVED**: neither A1 (~592MB live thunks) nor A3 (~71MB) was right —
 it's ~210MB LIVE / ~413MB DEAD thunks on M5.  The arena is ~64% DEAD.
 
+### P0b — total-tenured per-type census (measured 2026-07-06, darwin-4, NIX_V3_MIDEVAL_GC near-peak sweep @ arena ~1510MB)
+Added a DEAD-cell type histogram to the sweep (mark_sweep.cc sweepOneBlock,
+mirrors the live cellTypeHist) so total-tenured(type) = live + dead is known.
+Near-peak sweep (liveBytes 672.6MB + deadBytes 837.4MB):
+- **Bindings total-tenured = 3.84M** (live 2.32M + dead 1.52M) →
+  **P1a aux-shrink ceiling = 8B × 3.84M ≈ 30.7MB.**  OVERTURNS the naive
+  projection (~9MB): tenured Bindings are millions of SMALL attrsets (few
+  entries), NOT the ~19-entry average of the LIVE subset — the 24B header is a
+  large fraction of a small binding.  Ceiling sits AT the SHIP gate → P1a MUST
+  be BUILT + measured, cannot be projection-killed.  (Live-count discrepancy
+  vs P0's 730K is marking-conservatism; total-tenured is bit-census, so it is
+  robust to how live/dead are split.)
+- **P2 dead arena sizing** (dead MB per type at near-peak): Thunk 362.5 (43%),
+  Bindings 135.5 (16%), Closure 103.6 (12%), Pair 74.6 (9%), List 44.7 (5%),
+  Chars+Value ~16 — total ~837MB dead.  Thunk dominates the dead sink →
+  P2's munmap-to-OS falsifier is sized against ~837MB, Thunk-heavy.
+
 ### P0-GATE DECISION: **GC-LEVER** (dead-heavy, 64%).
 The dominant reducible sink is the ~934MB DEAD arena (≈30% of the 3121MB M5
 peak RSS), and it is GC-bound (mid-eval reclamation + munmap-to-OS), NOT cell
