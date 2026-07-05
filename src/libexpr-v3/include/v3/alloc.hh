@@ -186,12 +186,40 @@ struct Bindings
     uint32_t size;                           // offset 4 — Sorted: count of entries[]
                                              //         — Chain:  count of overlay entries[]
     const Bindings * parent = nullptr;       // offset 8 — nullptr for Sorted
-    Value    aux;                            // offset 16 — MapAttrs: mapping function
-    Entry    entries[];                      // offset 24 — FAM, sorted ascending by name
+    Entry    entries[];                      // offset 16 — FAM, sorted ascending by name
                                              //          (overlay-only for Chain)
+    // 2026-07-06 P1a (REPRESENTATION_REWRITE): the `Value aux` (MapAttrs
+    // mapping function) that used to sit at offset 16 is GONE from the header,
+    // shrinking it 24B → 16B.  For kind==MapAttrs ONLY, the aux Value now lives
+    // in a TAIL slot immediately after entries[size] (allocated by
+    // allocMapAttrsBindings; see mapAttrsAux()).  This mirrors the Thunk
+    // withs-slot tail idiom (thunkScanSize).  On M5 there are ~3.84M tenured
+    // Bindings, ~all Sorted/Chain (aux dead for 99%+), so dropping the 8B/header
+    // is the P1a peak-RSS lever (ceiling ~30.7MB); MapAttrs (rare) pay +8B tail
+    // (net zero for them).
 
     bool isChain() const noexcept { return kind == uint8_t(Kind::Chain); }
     bool isMapAttrs() const noexcept { return kind == uint8_t(Kind::MapAttrs); }
+
+    /// MapAttrs mapping-fn accessor.  VALID ONLY when kind==MapAttrs (the tail
+    /// slot exists iff the binding was made by allocMapAttrsBindings).  `size`
+    /// must already be set (it is, at every call site — allocators set it
+    /// before writing aux, and reads happen post-construction).  UB otherwise.
+    Value * mapAttrsAux() noexcept {
+        return reinterpret_cast<Value *>(&entries[size]);
+    }
+    const Value * mapAttrsAux() const noexcept {
+        return reinterpret_cast<const Value *>(&entries[size]);
+    }
+
+    /// Canonical allocated byte size of this Bindings (header + entries FAM +
+    /// the MapAttrs aux tail when present).  The single source of truth for
+    /// any copy/move/scavenge/evacuate/line-mark size computation — mirrors
+    /// what allocBindings/allocMapAttrsBindings reserved.
+    size_t allocBytes() const noexcept {
+        return sizeof(Bindings) + sizeof(Entry) * size
+             + (isMapAttrs() ? sizeof(Value) : 0);
+    }
 
     /// Binary search the entries array of `this` (does NOT walk parent).
     /// Internal helper used by `lookupEntry` to factor the chain walk.
@@ -527,6 +555,14 @@ struct Bindings
         while (const Entry * e = c.next()) func(e->name);
     }
 };
+
+// 2026-07-06 P1a: lock the shrunk header at 16B (kind+pad 4 + size 4 + parent
+// 8).  The FAM `entries[]` starts at offset 16; MapAttrs' aux tail follows
+// entries[size].  GC size accounting keys off sizeof(Bindings) at many sites,
+// so this size is load-bearing.
+static_assert(sizeof(Bindings) == 16,
+    "Bindings header must be 16B after the P1a aux removal (kind+_pad8=4, "
+    "size=4, parent=8); entries[] FAM at offset 16");
 
 // ---------------------------------------------------------------------------
 // Allocation counters (defined before Alloc so allocBindings can record
@@ -3143,7 +3179,7 @@ struct Alloc
         b->_pad8[0] = b->_pad8[1] = b->_pad8[2] = 0;
         b->size = overlaySize;
         b->parent = parent;
-        b->aux.mkUninitialized();
+        // P1a: no header aux to init (Chain never carries a MapAttrs tail).
         // Histogram bucketing same as Sorted.
         V3_STATS_BLOCK {
             auto & buckets = allocStats().attrsetSizeBuckets;
@@ -3205,7 +3241,8 @@ struct Alloc
         b->_pad8[0] = b->_pad8[1] = b->_pad8[2] = 0;
         b->size = n;
         b->parent = nullptr;
-        b->aux.mkUninitialized();
+        // P1a: no header aux to init.  Sorted bindings never carry a MapAttrs
+        // tail; a caller that wants MapAttrs uses allocMapAttrsBindings.
         // Track size distribution for VM-2 sizing decisions.  Cheap
         // (one branch + one increment) — runs once per attrset.
         //
@@ -3233,6 +3270,48 @@ struct Alloc
             // later in this header).  Zero cost when the env-var is off
             // (early-return inside), but the call+return itself isn't
             // free; eliding it under V3_RELEASE removes the call as well.
+            bindingsAllocSiteRecord(b, file, line);
+        }
+        return b;
+    }
+
+    /// P1a (2026-07-06): allocate a MapAttrs Bindings with the aux mapping-fn
+    /// TAIL slot reserved (header + n entries + one Value).  Callers set
+    /// parent + entries[] + `*mapAttrsAux()` after; kind is set here.  n==0 has
+    /// no realizable entries → returns the shared empty sentinel (no tail
+    /// needed, aux would never be read).  Mirrors allocBindings' explicit
+    /// header init (free-list reuse gives STALE bytes — must not rely on zero).
+    static Bindings * allocMapAttrsBindings(uint32_t n,
+                                             const char * file = __builtin_FILE(),
+                                             uint32_t     line = __builtin_LINE()) noexcept
+    {
+        V3_STATS_INC(attrsetsAllocated);
+        if (n == 0) {
+            V3_STATS_INC(attrsetSizeBuckets[0]);
+            return emptyBindingsSentinel();
+        }
+        const size_t bytes = sizeof(Bindings)
+                           + sizeof(Bindings::Entry) * n
+                           + sizeof(Value);            // MapAttrs aux tail
+        V3_STATS_BUMP(bytesBindings, bytes);
+        auto * b = static_cast<Bindings *>(
+            threadArena().alloc(bytes, CellType::Bindings));
+        b->kind = uint8_t(Bindings::Kind::MapAttrs);
+        b->_pad8[0] = b->_pad8[1] = b->_pad8[2] = 0;
+        b->size = n;
+        b->parent = nullptr;
+        b->mapAttrsAux()->mkUninitialized();  // tail; size is set above
+        V3_STATS_BLOCK {
+            auto & buckets = allocStats().attrsetSizeBuckets;
+            if      (n == 1)        buckets[1]++;
+            else if (n == 2)        buckets[2]++;
+            else if (n <= 4)        buckets[3]++;
+            else if (n <= 8)        buckets[4]++;
+            else if (n <= 16)       buckets[5]++;
+            else if (n <= 32)       buckets[6]++;
+            else if (n <= 64)       buckets[7]++;
+            else if (n <= 128)      buckets[8]++;
+            else                    buckets[9]++;
             bindingsAllocSiteRecord(b, file, line);
         }
         return b;

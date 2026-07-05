@@ -33,7 +33,7 @@ namespace nix::v3 {
 }
 
 /// Value an immediate consumer should see for `e`: for an unrealized MapAttrs
-/// entry, apply the mapper `owner->aux` to (name, source) so the MAPPED value
+/// entry, apply the mapper `*owner->mapAttrsAux()` to (name, source) so the MAPPED value
 /// (with its side effects) is produced; otherwise the stored value unchanged.
 inline Value entryValueForImmediateDemand(
     VMState & vm, const Bindings * owner, const Bindings::Entry & e)
@@ -45,7 +45,7 @@ inline Value entryValueForImmediateDemand(
     auto * mutEntry = const_cast<Bindings::Entry *>(&e);
     Value nameStr = Bindings::makeMapAttrsNameValue(e.name);
     Value src = mutOwner->mapAttrsEntrySource(mutEntry);
-    return callClosure2(vm, mutOwner->aux, nameStr, src);
+    return callClosure2(vm, *mutOwner->mapAttrsAux(), nameStr, src);
 }
 
 /// `entryValueForImmediateDemand` then force to WHNF.

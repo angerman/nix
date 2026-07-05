@@ -762,13 +762,13 @@ private:
     }
     void walkBindings(Bindings * b) noexcept
     {
-        // Step 11′: line-mark the Bindings cell (header + FAM entries).
+        // Step 11′: line-mark the Bindings cell (header + FAM entries + the
+        // MapAttrs aux tail, via allocBytes()).
         if (arenaSetForSlot_) {
-            arenaSetForSlot_->markLinesForCell(
-                b, sizeof(Bindings) + sizeof(Bindings::Entry) * b->size);
+            arenaSetForSlot_->markLinesForCell(b, b->allocBytes());
         }
         if (b->isMapAttrs())
-            visitValue(b->aux);
+            visitValue(*b->mapAttrsAux());
         for (uint32_t i = 0; i < b->size; ++i)
             visitValue(b->entries[i].value);
         if (b->parent)
@@ -1240,8 +1240,9 @@ static size_t evacCellSize(const void * p, CellType t) noexcept
     case CellType::Thunk:
         return thunkScanSize(static_cast<const Thunk *>(p));  // FP-2b: incl. withs slot
     case CellType::Bindings:
-        return sizeof(Bindings)
-             + sizeof(Bindings::Entry) * static_cast<const Bindings *>(p)->size;
+        // P1a: allocBytes() includes the MapAttrs aux tail — the evacuator
+        // must copy it or a moved MapAttrs loses its mapping fn.
+        return static_cast<const Bindings *>(p)->allocBytes();
     case CellType::List:
         return sizeof(ListVec)
              + sizeof(Value) * static_cast<const ListVec *>(p)->size;
@@ -1643,7 +1644,7 @@ private:
         }
         case CellType::Bindings: {
             auto * b = static_cast<Bindings *>(cell);
-            if (b->isMapAttrs()) visitValue(b->aux);
+            if (b->isMapAttrs()) visitValue(*b->mapAttrsAux());
             for (uint32_t i = 0; i < b->size; ++i) visitValue(b->entries[i].value);
             if (b->parent) visitBindings(const_cast<Bindings * &>(b->parent));
             break;
@@ -2099,7 +2100,7 @@ static void runEvacuation(VMState & vm, Arena & arena,
                     switch (arena.cellTypeAt(cs)) {
                     case CellType::Bindings: {
                         auto * bn = reinterpret_cast<const Bindings *>(cs);
-                        if (bn->isMapAttrs() && refCand(bn->aux)) { note("Bindings.aux", cs); break; }
+                        if (bn->isMapAttrs() && refCand(*bn->mapAttrsAux())) { note("Bindings.aux", cs); break; }
                         for (uint32_t i = 0; i < bn->size; ++i)
                             if (refCand(bn->entries[i].value)) { note("Bindings.entry", cs); break; }
                         if (bn->parent && inFreeable(reinterpret_cast<uintptr_t>(bn->parent))) note("Bindings.parent", cs);

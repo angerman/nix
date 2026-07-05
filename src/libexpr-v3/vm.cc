@@ -1848,7 +1848,8 @@ inline Bindings * mergeBindings(const Bindings * a, const Bindings * b,
 
         const Bindings * mapShape = a->isMapAttrs() ? a : b;
         if (a->isMapAttrs() && b->isMapAttrs()
-            && (a->parent != b->parent || a->aux.w != b->aux.w))
+            && (a->parent != b->parent
+                || a->mapAttrsAux()->w != b->mapAttrsAux()->w))
             return nullptr;
 
         if (!a->isMapAttrs() && b->isMapAttrs()
@@ -1876,10 +1877,9 @@ inline Bindings * mergeBindings(const Bindings * a, const Bindings * b,
         if (kExact == 0)
             return Alloc::allocBindings(0);
 
-        Bindings * out = Alloc::allocBindings(kExact);
-        out->kind = uint8_t(Bindings::Kind::MapAttrs);
+        Bindings * out = Alloc::allocMapAttrsBindings(kExact);  // P1a: aux tail
         out->parent = mapShape->parent;
-        out->aux = mapShape->aux;
+        *out->mapAttrsAux() = *mapShape->mapAttrsAux();
 
         V3_STATS_BLOCK {
             const uint8_t s = static_cast<uint8_t>(siteId);
@@ -3524,7 +3524,7 @@ enum class MapAttrsSelectResult : uint8_t {
 
     Value nameStr = Bindings::makeMapAttrsNameValue(e.name);
     Value src = b->mapAttrsEntrySource(&e);
-    Value mapped = callClosure2(vm, b->aux, nameStr, src);
+    Value mapped = callClosure2(vm, *b->mapAttrsAux(), nameStr, src);
     // Chain lookup may find a MapAttrs entry in a shared parent layer.  In
     // that case compute the mapped value, but leave the parent entry untouched;
     // only a leaf hit may memoize into the Bindings entry itself.

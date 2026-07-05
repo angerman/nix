@@ -155,7 +155,7 @@ void Bindings::realizeMapAttrsEntry(Entry * e) noexcept
     Value src = mapAttrsEntrySource(e);
 
     ValuePair * pp = Alloc::allocPair();
-    pp->left = aux;
+    pp->left = *mapAttrsAux();  // P1a: aux is now a tail slot (this isMapAttrs)
     pp->right = nameStr;
     pp->third = src;
     pairPostConstructBarrier(pp);

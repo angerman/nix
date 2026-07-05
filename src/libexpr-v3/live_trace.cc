@@ -334,7 +334,7 @@ private:
             ++e.bindingsCount;
         }
         if (b->isMapAttrs())
-            auditAndVisit(b->aux);
+            auditAndVisit(*b->mapAttrsAux());
         for (uint32_t i = 0; i < b->size; ++i)
             auditAndVisit(b->entries[i].value);
         // Chain bindings: walk parent.  Each segment of the chain
@@ -813,9 +813,9 @@ private:
     }
     void walkBindings(Bindings * b)
     {
-        account(sizeof(Bindings) + sizeof(Bindings::Entry) * b->size);
+        account(b->allocBytes());  // P1a: incl. MapAttrs aux tail
         if (b->isMapAttrs())
-            visitValue(b->aux);
+            visitValue(*b->mapAttrsAux());
         for (uint32_t i = 0; i < b->size; ++i) visitValue(b->entries[i].value);
         if (b->parent) enqueue(const_cast<Bindings *>(b->parent), GK_BINDINGS);
     }
@@ -1120,7 +1120,7 @@ public:
             credit(t, bytes);
         }
         for (Bindings  * b : markedBindings_)
-            credit(b, sizeof(Bindings) + sizeof(Bindings::Entry) * b->size);
+            credit(b, b->allocBytes());  // P1a: incl. MapAttrs aux tail
         for (ListVec   * l : markedLists_)
             credit(l, sizeof(ListVec) + sizeof(Value) * l->size);
         for (ValuePair * p : markedPairs_)
@@ -1412,8 +1412,7 @@ private:
             markRange(t, bytes);
         }
         for (Bindings * b : markedBindings_)
-            markRange(b,
-                sizeof(Bindings) + sizeof(Bindings::Entry) * b->size);
+            markRange(b, b->allocBytes());  // P1a: incl. MapAttrs aux tail
         for (ListVec * l : markedLists_)
             markRange(l, sizeof(ListVec) + sizeof(Value) * l->size);
         for (ValuePair * p : markedPairs_)
@@ -1705,7 +1704,7 @@ private:
     void walkBindings(Bindings * b) noexcept
     {
         if (b->isMapAttrs())
-            visitValue(b->aux);
+            visitValue(*b->mapAttrsAux());
         for (uint32_t i = 0; i < b->size; ++i)
             visitValue(b->entries[i].value);
         if (b->parent)
@@ -1779,7 +1778,7 @@ void dumpV3LiveBlockProbe() noexcept
         liveBytesApprox += b;
     }
     for (Bindings * b : pr.markedBindingsPub())
-        liveBytesApprox += sizeof(Bindings) + sizeof(Bindings::Entry) * b->size;
+        liveBytesApprox += b->allocBytes();  // P1a: incl. MapAttrs aux tail
     for (ListVec * l : pr.markedListsPub())
         liveBytesApprox += sizeof(ListVec) + sizeof(Value) * l->size;
     for ([[maybe_unused]] ValuePair * p : pr.markedPairsPub())

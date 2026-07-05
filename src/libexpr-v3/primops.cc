@@ -494,11 +494,14 @@ inline const Bindings::Entry * lookupEntryNoMapAttrsRealize(
 template <typename Keep>
 inline Bindings * copyMapAttrsSubset(const Bindings * src, uint32_t n, Keep && keep)
 {
-    Bindings * result = Alloc::allocBindings(n);
+    // P1a: MapAttrs needs the aux tail reserved up front (allocMapAttrsBindings);
+    // n==0 → plain empty sentinel (no realizable entries → aux never read).
+    Bindings * result = (n > 0)
+        ? Alloc::allocMapAttrsBindings(n)
+        : Alloc::allocBindings(0);
     if (n > 0) {
-        result->kind = uint8_t(Bindings::Kind::MapAttrs);
         result->parent = src->parent;
-        result->aux = src->aux;
+        *result->mapAttrsAux() = *src->mapAttrsAux();
     }
     uint32_t k = 0;
     for (uint32_t i = 0; i < src->size; ++i) {
@@ -2313,11 +2316,14 @@ void primIntersectAttrs(EvalState &, Value * args, Value & out)
     forEachEntryNoMapAttrsRealize(iter, [&](const Bindings::Entry & e) {
         if (search->has(e.name)) ++kExact;
     });
-    Bindings * result = Alloc::allocBindings(kExact);
-    if (src->isMapAttrs() && kExact > 0) {
-        result->kind = uint8_t(Bindings::Kind::MapAttrs);
+    // P1a: reserve the aux tail only when the result is actually MapAttrs.
+    const bool wantMapAttrs = src->isMapAttrs() && kExact > 0;
+    Bindings * result = wantMapAttrs
+        ? Alloc::allocMapAttrsBindings(kExact)
+        : Alloc::allocBindings(kExact);
+    if (wantMapAttrs) {
         result->parent = src->parent;
-        result->aux = src->aux;
+        *result->mapAttrsAux() = *src->mapAttrsAux();
     }
     V3_STATS_INC(attrsetsAllocated);
     const bool resultPreservesMapAttrs = result->isMapAttrs();
@@ -2372,10 +2378,9 @@ void primMapAttrs(EvalState &, Value * args, Value & out)
     }
     uint32_t n = src->countDistinct();
     if (n == 0) { out.mkAttrs(Alloc::allocBindings(0)); return; }
-    Bindings * result = Alloc::allocBindings(n);
-    result->kind = uint8_t(Bindings::Kind::MapAttrs);
+    Bindings * result = Alloc::allocMapAttrsBindings(n);  // P1a: reserves aux tail
     result->parent = src;
-    result->aux = fn;
+    *result->mapAttrsAux() = fn;
     V3_STATS_INC(attrsetsAllocated);
     recordBindingsOrigin(result, 0, "primMapAttrs");
     uint32_t i = 0;

@@ -807,9 +807,9 @@ void Scavenger::walkList(ListVec * l)
 
 void Scavenger::walkBindings(Bindings * b)
 {
-    recordLiveTenured(b, sizeof(Bindings) + sizeof(Bindings::Entry) * b->size, CellType::Bindings);
+    recordLiveTenured(b, b->allocBytes(), CellType::Bindings);  // P1a: incl. MapAttrs aux tail
     if (b->isMapAttrs())
-        visitValue(b->aux);
+        visitValue(*b->mapAttrsAux());
     for (uint32_t i = 0; i < b->size; ++i) {
         visitValue(b->entries[i].value);
     }
@@ -1362,7 +1362,7 @@ struct Auditor {
         const BindingsOrigin * origin = lookupBindingsOrigin(b);
         const char * originSrc = origin ? origin->source : "(no-origin)";
         if (b->isMapAttrs())
-            visitValue(b->aux, "Bindings.mapAttrs.fn");
+            visitValue(*b->mapAttrsAux(), "Bindings.mapAttrs.fn");
         for (uint32_t i = 0; i < b->size; ++i) {
             // Build a per-entry site string so the audit message
             // identifies which Bindings + which entry + origin.
