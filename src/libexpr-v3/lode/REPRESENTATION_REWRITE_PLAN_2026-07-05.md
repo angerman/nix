@@ -96,6 +96,30 @@ is Phase 0.
 
 ## PHASED PLAN (measure-first, pre-committed gates, Rule 0)
 
+### P0 RESULT (measured 2026-07-06, darwin-4 @ b636f62c4, bench/rss-live-dead-split.sh)
+Per-type LIVE-vs-DEAD at peak, from the periodic L(t) trace (per-type live_*_mb
+columns; DEAD = resident arena − live):
+- **M5: arena 1456MB resident, LIVE 522MB (L=0.36), DEAD ~934MB (64%).**
+  Live per-type: thunks 210MB, bindings 227MB, closures 21MB, pairs 48MB,
+  lists 16MB.  (Allocated: thunks 623, bindings 362, closures 125, pairs 125.)
+  So dead ≈ thunks 413 + bindings 135 + pairs 77 + … — spread across types.
+  Major-mark-sweep live COUNTS: thunks 2.29M, bindings 731K, closures 163K.
+- **firefox: arena 208MB, LIVE 86MB (41%), DEAD ~122MB (59%).**
+- CU-bytecode (M5): 80MB, 100% cold/evictable at end (referenced=0).
+
+**C3 RESOLVED**: neither A1 (~592MB live thunks) nor A3 (~71MB) was right —
+it's ~210MB LIVE / ~413MB DEAD thunks on M5.  The arena is ~64% DEAD.
+
+### P0-GATE DECISION: **GC-LEVER** (dead-heavy, 64%).
+The dominant reducible sink is the ~934MB DEAD arena (≈30% of the 3121MB M5
+peak RSS), and it is GC-bound (mid-eval reclamation + munmap-to-OS), NOT cell
+size.  P1 (leaner cells) addresses only the ~522MB LIVE portion, of which just
+~90-130MB is reducible (aux + closure diet) = ~3-4% of peak — worth banking
+(cheap, low-risk) but NOT the needle-mover.  The real lever is P2 (GC).  NB:
+NIX_V3_MIDEVAL_GC already exists (non-moving mid-eval mark-sweep, reclaims dead
+into free-list bins) — so P2's spike targets the MUNMAP-TO-OS gap (the arena
+never returns pages), not the collector itself.
+
 ### Phase 0 — MEASURE the live-vs-dead split (resolves C3; ~1 day; darwin-4)
 Run A1's recipe on M5+firefox: `NIX_VM_STATS=1 NIX_V3_LIVE_TRACE=1
 NIX_V3_LIVE_TRACE_PERIODIC=100` + a forced peak major-mark-sweep
