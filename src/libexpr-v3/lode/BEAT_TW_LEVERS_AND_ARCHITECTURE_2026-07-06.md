@@ -1,0 +1,155 @@
+# Beat-TW: full lever + architecture review with fresh profiles (2026-07-06, HEAD de6ceb4d5)
+
+A consolidated review — v3 VM + all prior literature — of every lever to beat the
+tree-walker (TW), grounded in FRESH profiling on darwin-4. Four independent
+deep-review agents (CPU levers, architecture alternatives, TW structural
+advantage, repeated-eval moat) + a fresh profile-at-scale run. All four converge.
+
+## TL;DR verdict
+1. **Single-eval CPU parity is unreachable by any known lever.** The cheap-lever
+   search is COMPLETE (this review re-confirmed it at HEAD). Even at ZERO
+   dispatch, v3 is ~1.5-2.2× TW ("Reason B": the per-op 8B-NaN-box codec + the
+   moving-GC write-barrier/nursery/safepoint tax that Boehm-TW never pays ≈ 2×
+   TW's total per-op work, vs a 15-year-tuned target). A JIT is the only CPU
+   step-change and it only NARROWS to ~1.5-2.2×; it does not cross 1× alone.
+2. **Single-eval RSS is a defended structural floor ~1.6-2.0×** (P2 falsifier
+   KILL, 8e64923e2: the ~837MB dead M5 arena is uniformly interleaved, 0MB
+   reclaimable-to-OS). Representation-shrinking banked ~74MB (P1a+P1b) = ~2-3%.
+3. **The WINNING play is the repeated-eval MOAT.** v3 beats TW at **N≥3** evals of
+   the same expression (amortized `k·T_TW/N < T_TW` ⇔ N>k, k≤2.5) — and that
+   regime (CI, `nix build` loops, daemon, dev iteration, Hydra) is the NORM, not
+   the exception. TW structurally cannot cache across runs. This is the only axis
+   where v3 is structurally AHEAD.
+
+## FRESH PROFILE (darwin-4, cache-off, de6ceb4d5 — the "where do we spend time")
+
+### Deterministic dynamics (host-independent, reliable)
+| workload | ops | thunks alloc | % never forced | nursery hit |
+|---|---|---|---|---|
+| firefox | 36.8M | 2.83M | 66.0% | 22.8% |
+| M5 (cardano) | 224.5M | 16.1M | 65.8% | **7.7%** |
+| HNE | 49.3M | 4.03M | 67.8% | 44.5% |
+
+### Opcode histogram (stable across all 3; firefox shown)
+`GET_UPVALUE 14.6% · SET_LOCAL 11.9% · GET_LOCAL 10.5% · MAKE_THUNK 8.3% ·
+GET_LOCAL2 7.0% · RETURN 7.0% · BRANCH_FALSE 4.6% · ATTRS_SELECT 2.5% · …`
+→ **~46% of all opcodes are trivial local/upvalue load-store shuffling**, each
+paying full dispatch. Classic dispatch-bound signature.
+
+### On-CPU self-time (fresh `sample`, excl. kernel-wait)
+- **firefox**: `dispatchLoop` 226 (plurality; the trivial ops are handled INLINE
+  here) ≫ `mergeBindings` 66 > TLS `_tlv_get_addr` 45 > `countDistinct` 24 >
+  `forceValue` 20 > string ops.
+- **M5**: `dispatchLoop` 1733 ≫ `forceValue` 175 > **GC** (`tryMark` 115 +
+  `visitValue` 48 + `fwdThunk` 31 + `Arena::alloc` 30 ≈ 224, ~10-12%) >
+  `lookupStringContextEntries` 56 > `deserializeCU` 53 (disk-cache load) >
+  `allocThunkSuspended` 50 > `callClosure` 38 > `applyForceWriteback` 35 > regex
+  57 > `PosSnapshotKey` hash 29 > `realizeMapAttrsEntry` 21 > `globalInternSymbol` 21.
+
+**Reading**: dispatch (incl. inline trivial-op handlers) is the plurality;
+separate-Thunk allocation (68.8% never forced) is the #2 structural cost; GC is
+~10-12% at M5 scale; then a diffuse tail (merge, TLS, string-context, CU-
+deserialize, regex, symbol/pos interning). No single dominant fixable hotspot —
+the cost is spread across per-op semantic work.
+
+## CPU LEVER TABLE (shipped / killed / remaining)
+| lever | on-CPU % | effort | prior verdict | recommendation |
+|---|---|---|---|---|
+| **JIT** (native hot bodies, register-VM operand model) | dispatch+per-op → ~1.5-2.2× | multi-week (needs J3 safepoints) | RCA'd/deferred; narrows, ≠ beat | THE only CPU step-change; multi-quarter; won't cross 1× alone |
+| register-VM standalone | ~5-10% (K≥16) | multi-week | measured 2026-06-29 | not standalone → only INSIDE the JIT |
+| countDistinct memoize | ~9-15% | — | **SHIPPED** (L1) | closed |
+| SET_LOCAL_KEEP superinstruction | +1.4% wall | — | **SHIPPED** | closed; 2nd superinstr = register-VM territory |
+| OP_GET_UPVALUE inline cache | ~2-4% | medium | UNBUILT | marginal; real fix = JIT reg-alloc |
+| computed-goto dispatch | ~0 | small | **NEUTRAL (CG-1..4)** | **dead — do not revisit** (cost is per-op WORK not switch) |
+| thunk-churn / strictness | ALLOC slice | large | **KILLED** (T2a: 0.85% removable; 99.3% genuine laziness) | dead as strictness; only a JIT (inline bodies) removes it |
+| TLS hoisting | was ~6% sample | small | **FALSIFIED+reverted** (T1a) | dead (OOO-hidden, not attackable) |
+| FFI/primop marshalling | <0.5% | — | not a target (hot primops v3-native) | dead (also V3-NATIVE rule) |
+| forceValue/callClosure | ≤3% | — | overturned narrative | dead |
+
+**Conclusion: the cheap-lever search is complete. v3 is not doing a single
+fixable thing wrong on CPU.**
+
+## ARCHITECTURE VERDICT
+| architecture | CPU vs TW (single-eval) | status | recommendation |
+|---|---|---|---|
+| **Incremental / result cache (the moat)** | **≪1× repeated; 1× cold** | applied cache SHIPPED default-on (eval#2 free, byte-id); top-level phase-1 active default-off | **PURSUE — the only game-changer** |
+| Copy-patch→optimizing JIT | ~1.5-2.2× (→1.3-1.8× w/ reg-alloc) | J0-J3 proven standalone; integration unbuilt; J3 GC-safepoint blocker | CPU-quality investment; won't beat TW alone |
+| Parallel / multi-core (Stage 13) | <1× wall on parallel-structured only | speculative, no trace run | measure critical-path first; process-parallel + async-I/O first |
+| AOT cached bytecode / LINKING | ~1× (attacks cold parse ~5% warm) | AOT shipped opt-in | foundational substrate for the cache; not a beat lever |
+| threaded-code / superinstructions | ~1× (dispatch ~5% wall) | computed-goto NEUTRAL; SET_LOCAL_KEEP shipped | harvest cheap peepholes only (largely done) |
+| 16B Value + inline thunk | ~1× CPU (RSS lever, +1-4% wall) | cell-shrinks shipped; inline thunk BLOCKED by moving GC | do not fund on RSS grounds (P2 KILL → 1.6-2.0× floor) |
+| HAMT persistent attrsets | **negative (1.3× CPU / 4.7-9.2× RSS)** | **KILLED + deleted** | **dead — do not revisit** |
+
+## TWO GENUINELY NEW, ACTIONABLE FINDINGS this review surfaced
+### N1 — The non-moving-GC CPU case is UNMEASURED (the biggest unexplored lever)
+The P2 GC-rewrite falsifier KILL (8e64923e2) was **RSS-only** (reclaim-to-OS at
+peak = 0MB). It did NOT evaluate the **CPU** case for a non-moving GC. But TW's
+#1 per-op advantage (inline `{Env*,Expr*}` thunk = ZERO separate allocation) is
+blocked in v3 SOLELY by the *moving* GC (the PhD-6 root cause is the moving GC,
+not laziness): a Value cell inside a tenured Bindings can't hold a mutable
+forwardable payload, so v3 indirects through a separately-allocated 24B Thunk
+cell — which the profile shows is the #2 CPU cost (68.8% never-forced, ALLOC
+~20%, `allocThunkSuspended` on the M5 leaf list) AND drives the moving-GC tax
+(`tryMark`/`fwdThunk`/`visitValue`/barriers ≈ 10-12% on M5). A **non-moving
+tenured region (Immix/mark-region)** would (a) unblock TW-style inline thunks
+→ eliminate the separate-cell alloc, (b) drop the Phase-D write-barrier +
+scavenge bookkeeping. This CPU justification is DISTINCT from the RSS
+justification that was killed, and it has never been measured. **Recommended
+spike**: a "16B direct-tag Value + non-moving collector + inline thunk"
+prototype, measured for CPU (not RSS) — potentially the largest single lever on
+"Reason B." Falsifier: does eliminating the separate-thunk-cell alloc + barriers
+buy ≥15% warm CPU on firefox/M5? (Independently flagged by both the
+architecture-alternatives and TW-structural reviews.)
+
+### N2 — Content-addressed IR fragments make eval#1 faster cross-file/cross-machine
+Today the CU disk cache is FILE-granular (whole-file source SHA). Two files
+sharing `lib.fix`/`mkDerivation`/`mapAttrs`-shape lambdas re-lower
+independently. Structural hash-consing of IR fragments (recursive over free-var
+hashes, salted by the opcode fingerprint — Unison Item 1 / ABT Item 2) makes
+"the second time anyone anywhere evaluates anything using `lib.fix`, it compiles
+once globally." This attacks the **~40% compile share** (parse+lower ≈ 4.5s of
+M5's cold ~11s) on the COLD/first eval across files and machines — the CI regime.
+~3-4 weeks (ABT refactor + content-addressed IR, ~600 LOC). Reinforces the moat.
+
+## THE MOAT — quantified (the recommended strategic direction)
+- **Applied-import cache (in-process): SHIPPED default-on** (eb9653706). Measured
+  eval#2 = **0.00× CPU** on hello/firefox (in-graph thunk memo makes it free);
+  firefox 2×-separate-import 73M→37M insns. Byte-identical, --brute clean.
+  CAVEAT: does ~0 for FLAKE workloads (M5/HNE: **99.76% of overlay args are
+  unhashable functions**) — only pure-nixpkgs (firefox-class) benefits in-process.
+- **Top-level cross-process cache: built, phase-1 ACTIVE, default-off** (0868e81ec).
+  A hit skips the ENTIRE pipeline (parse+lower+run). Falsifier `T_hit/T_eval =
+  0.044`. This is the tier that generalizes to ALL workloads (caches the whole
+  result, not the args). **Blocker = precise data-flow impurity taint**: nixpkgs
+  calls `currentTime`/`getEnv` in result-IRRELEVANT branches, so conservative
+  global taint over-rejects the very workloads it targets. THE crux.
+- **Persistent forced-result store: KILLed** (`T_hit/T_eval=1.00` — reload+relink
+  of a forced graph ≈ re-eval; the cost is force, which a store can't avoid).
+- v3 beats TW at **N≥3** evals; crossover regime = CI/daemon/loops = the norm.
+
+### Roadmap (priority order)
+1. **Precise data-flow taint** for the top-level cross-process cache (or the
+   empirical-corpus shortcut). Turns the biggest TW-impossible win (skip the
+   whole cold pipeline) from default-off to production. Covers all workloads.
+2. **Soak + default-on-audit** the applied cache (shipped; complete the nixpkgs
+   byte-eq sweep). Banked; keep healthy.
+3. **Resolved-NIX_PATH content key + codegen fingerprint** → cross-machine
+   soundness (small).
+4. **Content-addressed IR fragments** (N2) — the eval#1 / cold-CI lever.
+5. **Optional CPU-quality track**: the N1 non-moving-GC-for-CPU spike; then the
+   JIT (only as a deliberate multi-quarter program, knowing it narrows not beats).
+6. **Do NOT**: rebuild the persistent forced-result store (KILLed), chase RSS
+   parity (structural floor), or revisit HAMT / computed-goto / TLS-hoist / thunk-
+   strictness (all KILLed).
+
+## Honest framing for the human
+"Beat TW" has two readings. On **single-eval speed/memory**, v3 cannot win — it's
+a measured wall (15-year-tuned interpreter; v3's per-op tax is ~2× even dispatch-
+free; RSS floored at 1.6-2.0×). On **repeated eval** (the real production
+regime), v3 already wins at N≥3 and TW structurally cannot follow. The strategic
+call is to STOP chasing single-eval parity and FUND the moat (precise-taint
+cross-process cache + content-addressed IR), with the non-moving-GC-for-CPU spike
+(N1) as the one unmeasured single-eval lever worth a falsifier before the JIT.
+
+Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>,
+Input Output Group. SPDX-License-Identifier: Apache-2.0.
