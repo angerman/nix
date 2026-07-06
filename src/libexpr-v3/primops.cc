@@ -6949,6 +6949,8 @@ inline std::pair<int64_t, int64_t> importStat(const std::string & path)
     return {mtimeNs, (int64_t)st.st_size};
 }
 
+} // anonymous namespace (closed so codegenGateFingerprint has external linkage)
+
 /// T-1 (CODEBASE_REVIEW_2026-06-11): deterministic fingerprint of the env gates
 /// that change EMITTED BYTECODE.  The CU disk-cache key keys only on
 /// (path, content, schema); a bisect run with e.g. NIX_V3_NO_DEFER=1 would
@@ -6959,7 +6961,9 @@ inline std::pair<int64_t, int64_t> importStat(const std::string & path)
 /// production (no gates set) the fingerprint is EMPTY, so existing warm caches
 /// are unchanged.  Keep this list in sync with the getenv() reads in emit.cc /
 /// opt_*.cc / cli/lower_v3.hh / ir.cc (test/lint-cache-coherence.sh enforces).
-static const std::string & codegenGateFingerprint()
+/// A1 (2026-07-06): also folded into the TOP-LEVEL cache key (run.cc), so this
+/// must have external linkage — hence hoisted out of the anonymous namespace.
+const std::string & codegenGateFingerprint()
 {
     static const std::string fp = []() {
         // Sorted canonical list of codegen-affecting gates (see header).
@@ -7000,6 +7004,8 @@ static const std::string & codegenGateFingerprint()
     }();
     return fp;
 }
+
+namespace {  // reopen: restore file-local linkage for the helpers below
 
 /// builtins.import path -- read the file at `path`, parse, lower, run.
 /// Returns the resulting v3 Value.  Requires state.nixEvalState to be

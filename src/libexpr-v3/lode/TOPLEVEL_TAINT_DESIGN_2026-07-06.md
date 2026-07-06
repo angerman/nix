@@ -215,5 +215,120 @@ Q4 gate + harness manifest-emit (>=3 clocks) + TL7-TL12 + `--brute` + shadow
 mismatch==0 + darwin-4 T_hit/T_eval<=0.20 → SHIP (pinned .drvPath) / DEFER-to-A3
 (M5.name + mutable NIX_PATH).
 
+## A1 VERDICT (2026-07-06) — mechanism SHIPPED (sound + tested); real-workload SHIP = **DEFER to A3**
+The sound insert-gate (reject-set + offline clock-stability manifest, Q4) is BUILT
++ TESTED + committed: keyBodyBytes refactor, v3→v4, codegenGateFingerprint +
+manifest-content-hash folded into the key (run.cc topLevelCacheKey), a fail-CLOSED
+manifest loader (`namespace toplevel_manifest`, `NIX_V3_TOPLEVEL_MANIFEST` hook),
+the Q4 gate (reject-bits FIRST, manifest LAST, `perturbable = CURRENTTIME | (pure ?
+GETENV : 0)`), and TL7-TL12 (26 assertions, in `--brute` core, 35/35 GREEN). TL7
+DEMONSTRATES the mechanism: a blessed clock-stable source (`builtins.seq
+builtins.currentTime "stable"`) gets a cross-process byte-id ACTIVE HIT under
+`--pure-eval`. Gate soundness independently confirmed: reject-bits-first (TL10),
+getEnv-under-impure-rejected (TL9), fail-closed on malformed manifest, manifest-hash
+keyspace partition (TL11/TL12).
+
+**But the SHIP-gate REAL WORKLOADS (hello/firefox.drvPath) are STRUCTURALLY BLOCKED
+without A3 — an EMPIRICAL discovery from building it:**
+- The manifest tier is honored ONLY under `--pure-eval` (to bound R1, the untainted-
+  ambient-impurity surface — this is the soundness contract, NOT loosenable without
+  re-exposing R1; "never weaken a gate").
+- **`--pure-eval` forbids `<nixpkgs>` search-paths** (`cannot look up '<nixpkgs>' in
+  pure evaluation mode`) **AND explicit absolute/store-path imports** (`access to
+  absolute path '…-source' is forbidden in pure evaluation mode`) — VERIFIED both.
+- ⇒ under pure-eval the ONLY route to pinned nixpkgs is a **flake** (getFlake / a
+  flake input), which is `TAINT_FETCH` → hard-reject until A3 keys the flake-lock.
+- ⇒ the coupling is BROADER than the spec's M5.name-only finding: **EVERY pinned-
+  nixpkgs .drvPath workload is coupled to A3**, because pure-eval ⟹ flakes ⟹ A3.
+  Under `--impure` the manifest tier is off by design (getEnv reads real env) →
+  currentTime-tainted .drvPath is rejected there too.
+
+**DISPOSITION: A1 mechanism = SHIPPED sound foundation (default-off, brute-clean,
+byte-id inert without a manifest); A1 real-workload SHIP = DEFER, gated on A3.**
+A3 (resolved-NIX_PATH content-ids + flake-lock rev + codegenGateFingerprint into
+the key, demoting getFlake FETCH-taint → keyed) is now the CRITICAL-PATH unblocker
+for A1's SHIP gate — not an optional follow-on. Once A3 lands, a flake-pinned
+nixpkgs evals under pure-eval, getFlake becomes keyed (not tainted), and the
+manifest tier serves hello/firefox.drvPath → the SHIP gate becomes demonstrable
+(cross-process byte-id HIT + shadow mismatch==0 + T_hit/T_eval≤0.20).
+
+## A3 VETTED IMPLEMENTATION SPEC (2026-07-06, opus adversarial pass) — flake-lock + resolved-NIX_PATH keying
+Resolves the pre-eval-key vs during-eval-lock tension. DECISIVE facts: (1) the v3
+top-level cache fires ONLY for `--expr`/`--file` (installable `path:#attr` → TW
+fallback), so a flake ref is ALWAYS a literal string in `source`; (2)
+`ffi::lockFlakeAndRead(state, ref, pure)` is pre-eval-computable + idempotent +
+returns `lockFileStr` = the FULL flake.lock text = a complete immutable lock
+identity (under pure-eval it REJECTS unlocked refs); it is an FFI call → bumps NO
+taint; (3) getFlake bumps TAINT_FETCH (bit 3) today = the A1 SHIP blocker.
+
+**CHOSEN: option (a)∩(c)** — pre-eval lock resolution RESTRICTED to statically-
+extractable literal refs. Reject (b) two-phase (coarse-lookup + post-eval-verify
+BREAKS skip-on-hit — the whole point is skipping eval; can't make the pre-eval
+lookup sound). (a) alone risks parse-fragility on computed refs; (c) makes the
+non-literal case fall back to today's sound hard-reject.
+
+1. **Resolved-NIX_PATH (stated A3 gate).** Replace the raw `getenv("NIX_PATH")`
+   string in keyBodyBytes with resolved content-ids via a NEW read-only FFI
+   `resolveNixPathContentIds(state)` (`resolveLookupPathPath`, initAccessControl=
+   FALSE — must not allowPath/mutate): archive-URL-with-rev → URL verbatim (sound);
+   store path / channel symlink → `resolveSymlinks()`→store-path hash (SOUND, closes
+   R2 mutable-channel — a channel update changes the target hash → key changes →
+   MISS-not-stale); working-tree dir → realpath only (BEST-EFFORT, gated). Companion
+   strictly-sound fix: add `topLevelTaintBump(TAINT_READFILE)` to primFindFile
+   (~primops.cc:3143) — a `<x>` lookup reads ambient FS → any search-path-consuming
+   --impure eval rejects unless store-addressed.
+2. **Flake-lock keying (the A1-SHIP unblocker, HARD part).**
+   - NEW axis `TAINT_GETFLAKE = 1u<<5` (primop.hh); primGetFlake (primops.cc:10429)
+     bumps GETFLAKE not FETCH. fetchTree/Tarball/Closure/Git/storePath STAY FETCH
+     (non-locked → hard-reject, never demoted).
+   - Pre-parse STATIC literal-ref extraction from `source`: match `builtins.getFlake
+     "<ref>"` / `getFlake "<ref>"` where <ref> is a plain double-quoted literal (NO
+     `${}` interpolation, NO `\` escapes, NO `'' ''`); an occurrence-count GUARD
+     (extracted-literals ≥ coarse `getFlake` token count, else REJECT) catches the
+     `let g=builtins.getFlake; in g "…"` alias miss. Over-reject = safe; under-extract
+     = unsound → the guard forbids it.
+   - For each extracted ref: `ffi::lockFlakeAndRead(state, ref, pure)` INSIDE
+     keyBodyBytes; append `ref ‖ lockFileStr` to the key. ANY failure (unlocked-in-
+     pure, parse err, dirty input) → `flakeKeyingFailed` → NOT cacheable (fail closed).
+   - DEMOTION (Q4 gate extension): `keyedDemotable = flakeLockFullyKeyed ? TAINT_GETFLAKE
+     : 0; rejectBits = mask & ~(perturbable | keyedDemotable)`. GETFLAKE cleared from
+     reject ONLY when the exact lock is in the key ⇒ a flake.lock change → different
+     lockFileStr → different key → MISS-not-stale; a non-extractable getFlake →
+     flakeLockFullyKeyed=false → GETFLAKE stays reject → hard reject. LOAD-BEARING
+     INVARIANT: **demote iff keyed, else reject.** Lookup-key (run.cc:1940) + insert-
+     key MUST both use the identical keyBodyBytes (they do — preserve it).
+   - Dirty flake input → lockFlake (pure, allowUnlocked=false) throws → reject; +belt:
+     any node with dirtyRev/dirtyShortRev → flakeKeyingFailed → reject.
+3. **A1 manifest interaction.** A flake-pinned .drvPath (pure) → mask =
+   GETFLAKE|CURRENTTIME → GETFLAKE demoted (keyed), CURRENTTIME still flows through
+   A1's manifest bless (offline ≥3-clock). manifestEntryId auto-incorporates the new
+   key body (lock + resolved-NIX_PATH) → the generator blesses the exact (source,
+   NIX_PATH, system, basePath, flake-lock) tuple. SHIP demonstrable for M5.name/HNE +
+   FLAKE-PINNED-rephrased hello/firefox.drvPath; the raw `<nixpkgs>` search-path
+   phrasing under pure-eval stays structurally impossible (must rephrase to a flake).
+4. **Version v4→v5** (key inputs + insert policy change; a v4 entry served by v5 =
+   poisoning). Manifest must be REGENERATED for v5 (old ids fail closed → reject).
+5. **Tests TL13-TL18 (--brute core), TL15 = failing-first CRUX:** TL13 same-pin HIT;
+   TL14 diff-pin MISS; **TL15 (−) mutate flake.lock in place (source unchanged) →
+   MUST MISS-not-stale** (RED if keyed only on source); TL16 dirty-flake-input reject;
+   TL17 (−) mutable-symlink retarget MISS-not-stale (R2); TL18 (R) cross-pin round-trip.
+   Hook `V3_DBG_TOPLEVEL_FLAKEKEY` (retirement-noted).
+6. **RANKED RISKS:** A3-R1 (HIGH, THE dangerous surface) — static literal-ref
+   extraction unsoundness (mis-extract/miss a ref) → **must be adversarially FUZZED**
+   (getFlake in comments/string-bodies, `let`-alias, `builtins.` vs bare); mitigated
+   by conservative matcher + count-guard + fail-closed default. A3-R2 computed ref
+   (reject). A3-R3 best-effort working-tree NIX_PATH (taint-gated). A3-R4 lock-twice
+   non-determinism (pure-eval useRegistries=false deterministic; prefer demote-only-
+   when-pure). A3-R5 transitive input mutability (lockFileStr includes all narHashes →
+   sound). A3-R6 --apply boundary (each leg keyed independently).
+   **HONEST T_hit CAVEAT:** an ACTIVE hit now pays the key-time lockFlake cost →
+   T_hit/T_eval≤0.20 MUST be re-measured on darwin-4 for flake workloads (lockFlake on
+   a cheap `.name` query may not clear the bar even when byte-id correct). = the A3
+   SHIP go/no-go, an empirical darwin-4 measurement.
+
+**BUILD STATUS:** A3 spec vetted; NOT built. This build is LARGE + high-soundness-
+risk (A3-R1 matcher needs a fuzz pass) → a focused fresh-context build with the
+mandated adversarial fuzzing of the ref-matcher, NOT a tail-of-session rush.
+
 Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>,
 Input Output Group. SPDX-License-Identifier: Apache-2.0.

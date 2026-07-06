@@ -42,6 +42,10 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>          // A1: top-level manifest loader (read manifest file)
+#include <sstream>          // A1: manifest content read into a string buffer
+#include <string>
+#include <unordered_set>    // A1: manifest membership set
 #include <sys/resource.h>
 #ifdef __APPLE__
 #include <malloc/malloc.h>   // M1.D: malloc_zone_pressure_relief
@@ -1813,29 +1817,111 @@ bool topLevelCacheActive() {
     return std::strcmp(m, "1") == 0 || std::strcmp(m, "active") == 0;
 }
 
-// Shared key: (namespaced ‖ schema ‖ currentSystem ‖ NIX_PATH ‖ basePath ‖
-// source).  Computable WITHOUT parsing/evaluating → an ACTIVE hit skips the
-// whole pipeline.  v1 uses the NIX_PATH ENV STRING (sound only for IMMUTABLE
-// pins — archive URLs / store paths; a mutable channel symlink is a known v1
-// gap → ACTIVE is opt-in and documented for pinned inputs only.  v3-production
-// will resolve NIX_PATH entries to content ids + mix codegenGateFingerprint).
-disk_cache::CacheKey topLevelCacheKey(nix::EvalState & state,
-                                      const std::string & source,
-                                      const std::string & basePath) {
+// -------------------------------------------------------------------------
+// A1 (TOPLEVEL_TAINT_DESIGN_2026-07-06 VETTED SPEC) — offline clock-stability
+// manifest.  A currentTime-tainted top-level result is normally REJECTED (not
+// cached), but the offline perturbation harness (bench/toplevel-cache-
+// coverage.sh) certifies specific (source,NIX_PATH,system,basePath) tuples as
+// byte-stable across >=3 adversarial straddling clocks and emits their ids into
+// a signed manifest.  Production then inserts a clock-ONLY-tainted result iff
+// its id is in the manifest — recovering the corpus win with NO in-process
+// re-run (= nix's flake-eval-cache trust model).
+//
+// The manifest id (Q3) is SHA-256 of the key BODY (schema ‖ system ‖ NIX_PATH ‖
+// basePath ‖ source) — i.e. the key MINUS the version tag / fingerprint /
+// manifest-hash — so production lookup == manifest key BY CONSTRUCTION.
+//
+// FAIL CLOSED (Q4 SINGLE MOST IMPORTANT INVARIANT + R7): env unset, file
+// missing/unreadable, or a malformed line ⇒ empty set ⇒ manifestContains()
+// returns false.  NEVER true on error.  The manifest's content hash is folded
+// into the cache key so any manifest change invalidates clock-tainted entries.
+// -------------------------------------------------------------------------
+namespace toplevel_manifest {
+
+/// Load the manifest once at static init.  Returns the parsed id set (empty on
+/// ANY error) and the raw file bytes (for the content hash), so both derive
+/// from the SAME single read — no TOCTOU between membership and key.
+struct Manifest {
+    std::unordered_set<std::string> ids;
+    std::string rawBytes;
+};
+
+const Manifest & manifest() {
+    static const Manifest m = []() -> Manifest {
+        Manifest out;
+        // A1 test/bring-up hook; retire when the production manifest path is
+        // wired.  This is a RUNTIME gate (selects WHICH clock-stable entries are
+        // blessed), NOT a codegen gate — deliberately NOT in kGates: it changes
+        // no emitted bytecode, only the cache-insert policy, and its identity is
+        // already folded into the key via manifestContentHashHex().
+        const char * path = std::getenv("NIX_V3_TOPLEVEL_MANIFEST");
+        if (!path || path[0] == '\0') return out;  // FAIL CLOSED: no manifest → empty
+        std::ifstream f(path, std::ios::binary);
+        if (!f) return out;                         // FAIL CLOSED: unreadable → empty
+        std::ostringstream buf;
+        buf << f.rdbuf();
+        if (f.bad()) return out;                    // FAIL CLOSED: read error → empty
+        std::string raw = buf.str();
+        // Parse newline-separated 64-hex-char ids; ignore blank lines + '#'
+        // comments.  A malformed (non-64-hex) line FAILS CLOSED for the whole
+        // manifest — a partially-parsed manifest could bless a wrong entry.
+        std::unordered_set<std::string> ids;
+        std::istringstream lines(raw);
+        std::string line;
+        auto isHex64 = [](const std::string & s) {
+            if (s.size() != 64) return false;
+            for (char c : s)
+                if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+            return true;
+        };
+        while (std::getline(lines, line)) {
+            // Strip a trailing '\r' (CRLF-tolerant) but nothing else — an id is
+            // exactly 64 lowercase hex chars with no surrounding whitespace.
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (line.empty() || line[0] == '#') continue;  // blank / comment
+            if (!isHex64(line)) return out;                // FAIL CLOSED: malformed
+            ids.insert(line);
+        }
+        out.ids = std::move(ids);
+        out.rawBytes = std::move(raw);
+        return out;
+    }();
+    return m;
+}
+
+/// Membership test — FAILS CLOSED (empty set on any load error → always false).
+bool contains(const std::string & id) {
+    const auto & ids = manifest().ids;
+    return ids.find(id) != ids.end();
+}
+
+/// Hex SHA-256 of the raw manifest file bytes (folded into the cache key so a
+/// manifest change invalidates clock-tainted entries).  If no manifest was
+/// loaded, a fixed 64-char string of '0' (a stable "no manifest" sentinel).
+/// Computed once at static init.
+const std::string & contentHashHex() {
+    static const std::string h = []() -> std::string {
+        const auto & m = manifest();
+        if (m.rawBytes.empty()) return std::string(64, '0');
+        return disk_cache::computeKeyForString(m.rawBytes).hex();
+    }();
+    return h;
+}
+
+} // namespace toplevel_manifest
+
+// A1: the POST-version-tag key body — schema ‖ currentSystem ‖ NIX_PATH ‖
+// basePath ‖ source (exactly the old topLevelCacheKey bytes minus the version
+// tag).  Extracted so the manifest id (SHA of THIS) equals the production
+// lookup key body BY CONSTRUCTION (Q3).  v1 uses the NIX_PATH ENV STRING (sound
+// only for IMMUTABLE pins — archive URLs / store paths; a mutable channel
+// symlink is a known v1 gap → ACTIVE is opt-in for pinned inputs only.  A3 will
+// resolve NIX_PATH entries to content ids).
+static std::string keyBodyBytes(nix::EvalState & state,
+                                const std::string & source,
+                                const std::string & basePath) {
     std::string keyBytes;
     keyBytes.reserve(64 + source.size() + basePath.size());
-    // Namespace + CACHE-POLICY VERSION.  BUMP this whenever the key inputs OR
-    // the impurity-taint policy change — else entries written by an older
-    // binary (different soundness rules) are served by a newer one, a
-    // cross-version cache-poisoning silent-wrong-result (found 2026-07-05: a
-    // pre-taint "v1" getEnv entry was served after taint landed).  v2 = taint
-    // on getEnv/currentTime.
-    // v3 = A1 taint extended to ALL ambient impurities (readFile/readDir/
-    // pathExists/readFileType/hashFile/fetch*/getFlake/storePath/fetchClosure),
-    // not just getEnv+currentTime.  A v2-binary entry used a laxer taint policy
-    // → must never be served by this stricter binary (cross-version poisoning).
-    keyBytes.append("v3-toplevel-v3");
-    keyBytes.push_back('\0');
     uint32_t schema = disk_cache::kEvalResultSchemaVersion;
     keyBytes.append(reinterpret_cast<const char *>(&schema), sizeof schema);
     keyBytes.push_back('\0');
@@ -1846,7 +1932,51 @@ disk_cache::CacheKey topLevelCacheKey(nix::EvalState & state,
     keyBytes.append(basePath);
     keyBytes.push_back('\0');
     keyBytes.append(source);
+    return keyBytes;
+}
+
+// Shared key: (namespace/version ‖ codegenGateFingerprint ‖ manifestContentHash
+// ‖ keyBody).  Computable WITHOUT parsing/evaluating → an ACTIVE hit skips the
+// whole pipeline.
+disk_cache::CacheKey topLevelCacheKey(nix::EvalState & state,
+                                      const std::string & source,
+                                      const std::string & basePath) {
+    std::string keyBytes;
+    keyBytes.reserve(160 + source.size() + basePath.size());
+    // Namespace + CACHE-POLICY VERSION.  BUMP this whenever the key inputs OR
+    // the impurity-taint / insert policy change — else entries written by an
+    // older binary (different soundness rules) are served by a newer one, a
+    // cross-version cache-poisoning silent-wrong-result (found 2026-07-05: a
+    // pre-taint "v1" getEnv entry was served after taint landed).  v2 = taint on
+    // getEnv/currentTime.  v3 = taint extended to ALL ambient impurities.
+    // v4 (A1, 2026-07-06) = per-axis reject-set + offline clock-stability
+    // manifest INSERT policy; a v3-binary entry used a laxer insert policy →
+    // must never be served by this binary (cross-version poisoning).
+    keyBytes.append("v3-toplevel-v4");
+    keyBytes.push_back('\0');
+    // R4 (Q5): fold codegenGateFingerprint UNCONDITIONALLY — a differently-
+    // compiled binary (a NIX_V3_* codegen gate set) must never serve a
+    // differently-compiled result.  EMPTY in production (no gates).
+    keyBytes.append(codegenGateFingerprint());
+    keyBytes.push_back('\0');
+    // Q5: fold the manifest content hash UNCONDITIONALLY — a manifest change
+    // (different blessed set) must invalidate the clock-tainted entries it
+    // authorized.  A stable "no manifest" sentinel when unset (one key shape;
+    // the lookup precedes eval, so the taint/insert decision isn't known yet).
+    keyBytes.append(toplevel_manifest::contentHashHex());
+    keyBytes.push_back('\0');
+    keyBytes.append(keyBodyBytes(state, source, basePath));
     return disk_cache::computeKeyForString(keyBytes);
+}
+
+// A1 (Q3): the manifest id keying a (source,NIX_PATH,system,basePath) tuple —
+// SHA-256 of the key BODY WITHOUT the version tag / fingerprint / manifest-hash,
+// so `contains(manifestEntryId(...))` matches the offline generator's id BY
+// CONSTRUCTION (the generator hashes the same body bytes).
+static std::string manifestEntryId(nix::EvalState & state,
+                                   const std::string & source,
+                                   const std::string & basePath) {
+    return disk_cache::computeKeyForString(keyBodyBytes(state, source, basePath)).hex();
 }
 
 /// v1 SHADOW: serialize the forced WHNF result, key it on pre-eval inputs,
@@ -1863,12 +1993,47 @@ void topLevelCacheShadow(nix::EvalState & state, const std::string & source,
         if (s_dbg) std::fprintf(stderr, "  TOPLEVEL eval#%llu tag=%d source=%.50s\n",
             (unsigned long long)st.evals, (int)result.tag(), source.c_str());
     }
+    // A1 debug: print the manifest id so the test harness can capture it and
+    // bless the exact tuple.  V3_DBG_TOPLEVEL_MANIFEST_ID test/bring-up hook;
+    // retire when the production manifest path is wired.
+    {
+        static const bool s_dbgId = std::getenv("V3_DBG_TOPLEVEL_MANIFEST_ID") != nullptr;
+        if (s_dbgId) std::fprintf(stderr, "TOPLEVEL manifestEntryId=%s source=%.60s\n",
+            manifestEntryId(state, source, basePath).c_str(), source.c_str());
+    }
     // Only serializable-WHNF results are cacheable; value_serialize throws on
     // unforced thunks / closures / functions → natural bypass (counted).
-    // Impurity taint (v2): an eval that touched an impure builtin (getEnv,
-    // currentTime, …) is NOT a pure function of the key → must not be cached.
-    // Checked BEFORE serialize so a tainted eval never inserts/compares.
-    if (topLevelTainted()) { ++st.tainted; return; }
+    //
+    // A1 (TOPLEVEL_TAINT_DESIGN_2026-07-06 VETTED SPEC, Q4) — the INSERT GATE.
+    // A wrong top-level cache = SILENT WHOLE-EVAL MISCOMPILE, so this predicate
+    // is soundness-critical.  ORDER IS LOAD-BEARING:
+    //   1. reject-bits FIRST — any impurity outside the perturbable set
+    //      (readFile/readDir/fetch/store, or getEnv under --impure) HARD-rejects,
+    //      dominating any wrongful manifest bless (TL10).
+    //   2. manifest LAST — an only-perturbable-tainted (clock/env) result caches
+    //      iff it is BLESSED in the offline manifest AND we are under pure-eval.
+    //   3. manifestContains FAILS CLOSED (empty set on any load error → false).
+    // Checked BEFORE serialize so a rejected eval never inserts/compares.
+    {
+        const uint32_t mask = topLevelTaintMask();
+        // Q1: under pure/restricted eval, getEnv returns "" UNCONDITIONALLY
+        // (primops.cc:1865) → env-independent BY CONSTRUCTION, so getEnv is
+        // perturbable-and-recoverable; under --impure it reads the real env
+        // (not in the key) → DEMOTED to reject.  currentTime is always
+        // perturbable (recoverable via the >=3-clock manifest).
+        const bool pure = ffi::pureEval(state) || ffi::restrictEval(state);
+        const uint32_t perturbable = TAINT_CURRENTTIME | (pure ? TAINT_GETENV : 0u);
+        const uint32_t rejectBits = mask & ~perturbable;
+        bool insertable;
+        if (rejectBits != 0)
+            insertable = false;                       // hard reject (checked FIRST)
+        else if ((mask & perturbable) == 0)
+            insertable = true;                        // untainted
+        else
+            insertable = pure                         // only-perturbable + blessed + pure
+                      && toplevel_manifest::contains(manifestEntryId(state, source, basePath));
+        if (!insertable) { ++st.tainted; return; }
+    }
     std::string blob;
     try { value_serialize::serialize(result, blob); }
     catch (const std::exception & e) {

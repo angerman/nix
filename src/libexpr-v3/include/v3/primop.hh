@@ -154,6 +154,13 @@ void     topLevelTaintReset() noexcept;              // outermost eval entry
 bool     topLevelTainted() noexcept;                 // any axis set (reject-all-tainted today)
 uint32_t topLevelTaintMask() noexcept;               // which axes fired (for the reject-set + manifest)
 
+/// A1 (top-level cache key hardening, R4): the codegen/optimizer env-gate
+/// fingerprint (EMPTY in production; non-empty iff a NIX_V3_* codegen gate is
+/// set) — must be folded into the top-level cache key so a differently-compiled
+/// binary never serves a differently-compiled result.  Defined in primops.cc
+/// (kGates list there; test/lint-cache-coherence.sh keeps it in sync).
+const std::string & codegenGateFingerprint();
+
 /// SHADOW mode (#16a) support: non-mutating entry peek + compare accounting.
 bool appliedCacheLookupPeek(const std::string & key, Value & out) noexcept;
 void appliedCacheNoteShadowCompare(bool ok, uint64_t comparedNodes) noexcept;
