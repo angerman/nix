@@ -101,6 +101,42 @@ prototype, measured for CPU (not RSS) — potentially the largest single lever o
 buy ≥15% warm CPU on firefox/M5? (Independently flagged by both the
 architecture-alternatives and TW-structural reviews.)
 
+#### C1 SOUND MEASUREMENT DESIGN (2026-07-06) — decompose the "Reason B" tax into 3 additive components
+Gate: total tax (barrier + separate-thunk-alloc + scavenge) **≥15% warm CPU on
+BOTH firefox AND M5 → GO** (fund the non-moving-repr prototype); **<8% → KILL**.
+The non-moving inline-thunk repr eliminates ALL THREE, so their SUM is the ceiling.
+
+**Do NOT** naively no-op the write-barriers with scavenge live: the barriers
+build the generational remembered set (`dirtyContainers`, barrier.hh:238/258/276/287
++ thunkSetEvaluated:287) that young-gen scavenge consumes as old→young roots.
+Scavenge is hardcoded-ON (CLAUDE.md constraint 0) → a barrier no-op with scavenge
+live = missed-root UAF = NOT byte-identical. The three components must be
+measured by three DIFFERENT sound methods:
+
+1. **Barrier instruction cost (C1a) — byte-id A/B in a NO-SCAVENGE config.**
+   The per-write barrier cost is a FIXED per-instruction cost, workload-independent.
+   Measure it byte-id on firefox with a nursery large enough that NO scavenge fires
+   for the whole eval (`NIX_V3_NURSERY_SIZE` ≫ firefox young-gen; the remembered set
+   is then never consumed → no-op'ing the barrier writes is byte-identical BY
+   CONSTRUCTION). Build a `#ifdef NIX_V3_BARRIER_NOOP` (or constexpr) variant that
+   compiles the dirtyContainers pushes to nothing; A/B firefox CPU (median-of-5,
+   darwin-4). Δ = pure barrier %. NB firefox big-nursery avoids scavenge; M5 CANNOT
+   (GBs of churn) → for M5, scale: barrier% = (M5 barrier-invocation-count ×
+   per-write cost) / M5 CPU, with the count from a barrier counter.
+2. **Separate-thunk-alloc cost (C1b) — on-CPU sample + counter.** `allocThunkSuspended`
+   self-time from `bench/profile-at-scale.sh` sample (firefox + M5) — the alloc+init
+   of the 24B Thunk cell an inline {env,code} repr removes. Cross-check vs thunk
+   alloc count × per-alloc ns.
+3. **Scavenge cost (C1c) — on-CPU sample.** The Cheney young-gen copy self-time
+   (tryMark/fwdThunk/visitValue) from the same sample. Prior profiles: ~1.2–7% M5.
+
+Sum C1a+C1b+C1c on firefox AND M5 → render GO/KILL. Prior rough estimate lands in
+the ambiguous 8–15% band, so the median-of-5 precision on darwin-4 matters. darwin-4
+is REACHABLE (verified 2026-07-06, 8-core arm64). This is ~1–2 focused darwin-4
+build+measure cycles (barrier-noop build + firefox big-nursery A/B + counters + M5
+sample); it is NOT a same-turn task and touches the GC-UAF-risk surface, so it
+warrants its own session with the byte-id no-scavenge invariant verified first.
+
 ### N2 — Content-addressed IR fragments make eval#1 faster cross-file/cross-machine
 Today the CU disk cache is FILE-granular (whole-file source SHA). Two files
 sharing `lib.fix`/`mkDerivation`/`mapAttrs`-shape lambdas re-lower
