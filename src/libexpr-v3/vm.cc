@@ -29,6 +29,7 @@
 #include "v3/barrier.hh"  // Phase D write-barrier helpers
 #include "v3/mark_sweep.hh"      // Stage 6 runMajorMarkSweep dispatch trigger
 #include "v3/live_trace.hh"      // Step 4 periodic L(t) trace dispatch hook
+#include "v3/par_trace.hh"       // parallel-potential (work/span) trace instrument
 
 // FFI consolidation (audit Phase 2/3): vm.cc's only tree-walker touchpoints
 // are COLD FFI-leaf paths — store/path coercion + the TW-bridge call round-
@@ -4455,9 +4456,15 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
     // drags every opcode through this whole diagnostic cluster (audit §1.4).
     // Retire when computed-goto dispatch lands (the bigger lever per P-6;
     // measure the mask first — measure-twice).
+    // par-trace op-weighted model: bump the innermost forcing frame's
+    // self-op counter once per dispatched opcode.  Folded into the
+    // slow-gate mask so the default hot path pays nothing when
+    // NIX_V3_PAR_TRACE is unset (retire with the rest of the instrument).
+    const bool kParTrace = nix::v3::partrace::enabled();
     const bool kAnySlowGate =
         kCountInstructions | (s_trace_env != nullptr)
-        | g_periodicLiveTrace | g_countOpcodes | g_countOpCycles;
+        | g_periodicLiveTrace | g_countOpcodes | g_countOpCycles
+        | kParTrace;
     // P0.3: limits are polled OUTSIDE kAnySlowGate (at the top of the
     // dispatch loop) via a plain function-local countdown.  limitsActive()
     // is fixed for this invocation (initLimits() runs before dispatch), so
@@ -5014,6 +5021,11 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             vm.nrInstructions++;
             allocStats().bytecodeInstructions++;
         }
+        // par-trace OP-weighted model: credit this opcode to the
+        // innermost currently-forcing frame's self-op counter (excludes
+        // nested forces — those get their own frames).  No-op if no
+        // force is in progress or NIX_V3_PAR_TRACE is unset.
+        if (kParTrace) nix::v3::partrace::opTick();
         // P0.3 (2026-07-02): resource-limit polling MOVED out of this
         // kAnySlowGate cluster to the top of the dispatch loop (see
         // kPollLimits) — a configured NIX_V3_MAX_* cap must not force every
@@ -9042,6 +9054,12 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 }
                 fr.thunk->state = ThunkState::Evaluated;
                 thunkSetEvaluated(fr.thunk, retVal);  // Phase D barrier
+                // par-trace: force EXIT.  The CFF_THUNK_RETURN frame was
+                // popped above (vm.frames.pop_back at ~8752), so the index
+                // it occupied is the current vm.frames.size().  Fold this
+                // completed force's span/work into its parent + the run.
+                // No-op unless NIX_V3_PAR_TRACE.
+                nix::v3::partrace::exitForce(vm.frames.size());
                 // STG-8 (#498): cell update.  If this thunk was stored
                 // at a heap-stable cell (recorded at OP_ATTRS_REC_SET
                 // time), overwrite the cell's contents with the body's
@@ -9297,6 +9315,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // comment for rationale.
             {
             int forceChaseIters = 0;
+            // par-trace: at-most-one memo-hit per OP_FORCE chase (mirror
+            // of forceValue's guard).  Inert unless NIX_V3_PAR_TRACE.
+            bool opfMemoCounted = false;
             // #558 Phase 4 follow-up: path compression for the
             // OP_FORCE chase loop — mirror of forceValue's chase.
             // Records up to kCompressMax Evaluated thunks; after the
@@ -9505,6 +9526,13 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 }
                 if (!v.isThunk()) break;
                 if (v.asThunk()->state == ThunkState::Evaluated) {
+                    // par-trace: OP_FORCE request satisfied by an
+                    // already-Evaluated thunk = near-zero-cost leaf
+                    // (sharing removed it).  Count once per request.
+                    if (!opfMemoCounted) {
+                        nix::v3::partrace::memoHit();
+                        opfMemoCounted = true;
+                    }
                     if (!s_opForceNoCompress
                         && opForceCompressCount < kOpForceCompressMax)
                         opForceCompressChain[opForceCompressCount++] =
@@ -9983,6 +10011,12 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 .withStackBase = newWithBase,
                 .flags = CFF_THUNK_RETURN,
             });
+            // par-trace: force ENTRY for the frame-based op_force_slow
+            // path.  The just-pushed CFF_THUNK_RETURN frame is at index
+            // vm.frames.size()-1; the reconcile point is the pre-push
+            // size (== that index).  No-op unless NIX_V3_PAR_TRACE.
+            nix::v3::partrace::enterForce(vm.frames.size() - 1,
+                                          vm.frames.size() - 1);
             pushCapturedWiths(vm, thunkWiths);
             cu = thunkCu;
 
@@ -14621,6 +14655,10 @@ Value forceValue(VMState & vm, Value v)
     // the thunk chain again).  Without memoization, every withLookup
     // through a Tag::Slot would re-force the underlying thunk.
     Value * memoSlot = nullptr;
+    // par-trace: guard so a single forceValue request contributes at
+    // most one memo-hit (the first Evaluated-thunk hop of the chase),
+    // not one per path-compression hop.  Inert unless NIX_V3_PAR_TRACE.
+    bool memoCounted = false;
     // #558 Phase 4 follow-up: path compression for Evaluated thunk
     // chains.  When we walk through Tag::Thunk → Tag::Thunk → ... in
     // the Evaluated state, every consumer that holds a pointer to the
@@ -14846,6 +14884,14 @@ Value forceValue(VMState & vm, Value v)
         if (!v.isThunk()) break;
         Thunk * t = v.asThunk();
         if (t->state == ThunkState::Evaluated) {
+            // par-trace: this forceValue request landed on an
+            // already-Evaluated thunk — a near-zero-cost leaf (sharing /
+            // memoization already removed it from the parallel-work pool).
+            // Count once per force request (first Evaluated hop of the
+            // chase); path-compression hops through further Evaluated
+            // thunks are the same resolution, not new requests.  No-op
+            // unless NIX_V3_PAR_TRACE.
+            if (!memoCounted) { nix::v3::partrace::memoHit(); memoCounted = true; }
             // #558 Phase 4 follow-up: record this thunk for path
             // compression below.  After the chase resolves to a final
             // WHNF, we rewrite each recorded thunk's `evaluated` slot
@@ -15511,6 +15557,11 @@ Value forceValue(VMState & vm, Value v)
             .withStackBase = newWithBase,
             .flags = CFF_THUNK_RETURN,
         });
+        // par-trace: force ENTRY for the forceValue (C-recursive) path.
+        // The pushed CFF_THUNK_RETURN frame sits at index `exitDepth`
+        // (== the pre-push vm.frames.size()); pass it as both the anchor
+        // and the reconcile point.  No-op unless NIX_V3_PAR_TRACE.
+        nix::v3::partrace::enterForce(exitDepth, exitDepth);
         pushCapturedWiths(vm, thunkWiths);
 
         // WC-5: if dispatchLoop throws, every thunk frame we'd unwind

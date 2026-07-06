@@ -139,6 +139,12 @@ lib_sources = files(
   # ditch-Boehm load-bearing claim BEFORE committing to Stages 5-6.
   # NIX_V3_LIVE_TRACE=1 reports the LIVE-vs-ALLOCATED ratio per type.
   'live_trace.cc',
+  # Parallel-potential (work/span) trace instrument.  NIX_V3_PAR_TRACE=1
+  # reports the idealized ∞-core fork-join speedup ceiling for the
+  # parallel-eval candidate (lode/PARALLEL_EVAL_CAPABILITIES_2026-05-18
+  # §8/§9).  Byte-id neutral (counters only).  Delete once the
+  # parallel-eval GO/NO-GO is decided.
+  'par_trace.cc',
   # Stage 5 of precise-root foundation: RAII GcRoot helper + thread-local
   # registry for C++-stack roots.  See lode/GC_PRECISE_ROOT_FOUNDATION_
   # 2026-05-27.md.  Forward-looking infrastructure for Stage 6 production.

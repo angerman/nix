@@ -19,6 +19,7 @@
 #include "v3/cache_probe.hh"    // #827 / A3 per-call-site cache-hook dump
 #include "v3/precise_root.hh"   // 2026-05-27 Stage 3: dumpAllV3Roots diagnostic
 #include "v3/live_trace.hh"     // 2026-05-27 Stage 6 SPIKE: live-fraction trace
+#include "v3/par_trace.hh"      // parallel-potential (work/span) trace instrument
 #include "v3/dedup_survey.hh"   // #772 Stage 9 L0 spike
 #include "v3/disasm.hh"         // #778 opcount dumper — opName()
 #include "v3/bytecode.hh"
@@ -419,6 +420,15 @@ RootResult runRootExprModule(nix::EvalState & state, ir::Module module)
     // the `nix` binary.  Cumulative; the LAST line per process is authoritative.
     dumpAppliedCacheProbeStats();
     appliedCacheStatsDump();   // LEVER-1 real-cache counters (self-gates on activity)
+    // Parallel-potential trace (NIX_V3_PAR_TRACE): work/span ceiling on
+    // intra-eval parallelism — the measure-first input for the
+    // parallel-eval candidate (PARALLEL_EVAL_CAPABILITIES §8/§9).  Placed
+    // here (NOT inside the NIX_VM_STATS block) + self-gated internally so
+    // the integrated `nix` CLI (flake/IFD workloads like M5) reaches it —
+    // the atexit variant loses output in the `nix` binary, same reason as
+    // appliedCacheStatsDump above.  Delete with the instrument once the
+    // parallel-eval GO/NO-GO is decided (Rule 0: no lingering opt-in gate).
+    nix::v3::partrace::dumpReport();
     // (top-level result cache shadow dumps from runRootExprFromString, AFTER
     // the outermost eval's shadow — see topLevelCacheShadow call there.)
 

@@ -44,6 +44,7 @@
 #include "v3/alloc.hh"
 #include "v3/barrier.hh"       // standaloneCellRoots (root the result for the bucket walk)
 #include "v3/live_trace.hh"    // dumpV3MemoryBuckets (NIX_V3_MEM_BUCKETS)
+#include "v3/par_trace.hh"     // dumpReport (NIX_V3_PAR_TRACE work/span ceiling)
 #include "v3/bytecode_primops.hh"
 #include "v3/disasm.hh"
 #include "v3/ir.hh"
@@ -548,6 +549,12 @@ int main(int argc, char ** argv)
         // attribute names from imported CUs that the top-level CU's
         // (frozen-at-compile-time) snapshot wouldn't see.
         int rc = printValue(vm, r, jsonOut, nix::v3::ir::globalSymbolTable());
+        // Parallel-potential trace (NIX_V3_PAR_TRACE): v3-eval runs the
+        // workload via run() directly (not runRootExpr), so the run.cc
+        // dumpReport is never hit here — fire it after all forcing (eval
+        // + print, and --strict's forceDeep) has completed.  Internally
+        // gated; delete with the instrument once parallel-eval is decided.
+        nix::v3::partrace::dumpReport();
         // LIVE MEMORY BUCKETS (NIX_V3_MEM_BUCKETS): v3-eval runs the main
         // expression via run() directly, not runRootExpr, so the run.cc
         // dump path is never hit for the workload.  Fire it here.  The

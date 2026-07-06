@@ -105,15 +105,26 @@ churn win, ceiling bounded by how often is-unique holds under Nix's heavy sharin
 (probably LOW, per Perceus's own "sharing → slow path"). MEASURE-FIRST (is-unique hit-rate
 at force time). Value × cost: LOW × MED.
 
-### 6. [ORTHOGONAL, ecosystem] Parallel evaluation
+### 6. [ORTHOGONAL, ecosystem] Parallel evaluation — MEASURED CEILING (2026-07-07)
 Determinate's atomic-thunk-state work: `nix flake show` 4.1× (12c), `nix search` 3.0×
-(16t); Lix is adopting it. **But:** it's a WALL-CLOCK lever orthogonal to our single-thread
-CPU/RSS walls, HARD under a moving GC (can't move cells under concurrent readers), Amdahl-
-capped by the serial stdenv bootstrap, and the wide-parallel cases are already FREE at the
-process level (nix-eval-jobs/Hydra/`xargs -P`). Ceiling = the parallel-potential trace
-(work/span) — [PENDING; fold in]. Cheaper adjacent: I/O concurrency (async, ~4-8wk),
-speculative pre-forcing (~2-4wk). Value × cost: MED wall-clock × VERY HIGH (9-15mo + a
-parallel GC, bigger than the non-moving-GC change we just KILLed). Not the lever.
+(16t); Lix is adopting it. **Parallel-potential trace (NIX_V3_PAR_TRACE work/span, byte-id
+ON==OFF):** op-weighted (realistic) ceiling = **17.9× hello / 24.5× git / 17.7× python3 /
+46.6× M5**; count-based 164-229×; deepest single force-chain only 129-191 vs 0.77M-11M
+total forces (a WIDE, SHALLOW DAG — NOT a deep serial spine). So the DAG has ENOUGH width
+to feed 8 cores — **it is NOT Amdahl-dead** (this UPDATES the doc's pessimistic 1.2-2× per-
+workload table; the earlier take was too low). BUT: **~48-53% of all force-REQUESTS are
+memo-hits** (shared/memoized thunks) → half the work is serialized-by-reuse and can't be
+re-parallelized — exactly why Determinate measured SUB-linear (3-4× on 8-16c, "stdenv
+serializes"). And the ceiling is IDEALIZED (ignores sync + GC-lock + FFI-serialization,
+which §5 says cap real wins well below it). Net: parallelism CAN buy ~3-4× WALL-CLOCK
+(matching the ecosystem), but it's ORTHOGONAL to the per-op/RSS walls + the moat, HARD
+under a moving GC (can't move cells under concurrent readers), disproportionately expensive
+(9-15mo + a parallel GC — bigger than the non-moving-GC change we KILLed), and the
+1.7k-16.8k INDEPENDENT ROOT forces mean the free process-level path (nix-eval-jobs / Hydra
+/ `xargs -P`) already captures the wide parallelism. Cheaper adjacent if single-eval LATENCY
+is the goal: I/O concurrency (async, ~4-8wk), speculative pre-forcing (~2-4wk). Value × cost:
+MED wall-clock × VERY HIGH. Not the beat-TW lever. (Trace instrument: par_trace.{hh,cc},
+gated NIX_V3_PAR_TRACE, byte-id-neutral.)
 
 ### 7. [CHEAP refinements] Moat hardening
 Failure-caching (cppnix `Failed` type — cache throws too); Salsa durability firewall
