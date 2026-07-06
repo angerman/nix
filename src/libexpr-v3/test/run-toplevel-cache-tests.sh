@@ -81,5 +81,12 @@ chk TL5-pathexists-true    "$p1" '1'
 chk TL5-pathexists-nostale "$p2" ''    # must be '' (false), not a stale '1'
 rm -rf "$D"
 
+# TL6 — A1 perturbation hook: NIX_V3_FAKE_CURRENTTIME forces a fixed clock (the
+# empirical-corpus harness's clock-perturbation lever). Test-only scaffolding.
+D=$(mktemp -d)
+c1=$(ev "$D" 'builtins.toString builtins.currentTime' NIX_V3_FAKE_CURRENTTIME=555)
+chk TL6-fake-currenttime "$c1" '555'   # hook forces the fake value
+rm -rf "$D"
+
 echo "toplevel-cache: $pass passed, $fail failed"
 [[ $fail -eq 0 ]]

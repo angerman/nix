@@ -3919,6 +3919,16 @@ void primCurrentSystem(EvalState & state, Value *, Value & out)
 void primCurrentTime(EvalState &, Value *, Value & out)
 {
     topLevelTaintBump();  // wall clock — not in the top-level cache key
+    // A1 perturbation hook: NIX_V3_FAKE_CURRENTTIME=<int> forces a fixed value so
+    // the empirical-corpus harness can perturb the clock and detect whether it
+    // reaches the serialized result (a result byte-stable across two fake clocks
+    // does not depend on currentTime → cacheable).  TEST-ONLY; RETIRE once policy
+    // P ships (production needs no runtime clock injection).
+    static const char * s_fake = std::getenv("NIX_V3_FAKE_CURRENTTIME");
+    if (__builtin_expect(s_fake != nullptr, 0)) {
+        out.mkInt(static_cast<int64_t>(std::strtoll(s_fake, nullptr, 10)));
+        return;
+    }
     out.mkInt(static_cast<int64_t>(std::time(nullptr)));
 }
 
