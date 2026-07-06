@@ -145,8 +145,16 @@ enum TaintAxis : uint32_t {
     TAINT_GETENV      = 1u << 0,  // perturbable (getEnv sentinel)
     TAINT_CURRENTTIME = 1u << 1,  // perturbable (fake clock)
     TAINT_READFILE    = 1u << 2,  // NOT perturbable: readFile/readDir/pathExists/readFileType/hashFile
-    TAINT_FETCH       = 1u << 3,  // NOT perturbable: fetch*/getFlake/fetchClosure
+    TAINT_FETCH       = 1u << 3,  // NOT perturbable: fetch*/fetchClosure/fetchGit/fetchTarball
     TAINT_STORE       = 1u << 4,  // NOT perturbable: storePath
+    // A3 (2026-07-06): getFlake is its own axis so the top-level cache can
+    // KEY-then-DEMOTE it (fetch* stay hard-reject).  A getFlake ref is always a
+    // literal string in the source (the cache fires only for --expr/--file), so
+    // its exact flake.lock text can be pre-eval resolved into the key body; then
+    // GETFLAKE taint is cleared from the reject-set (a lock change → different
+    // key → MISS-not-stale).  NOT perturbable, NOT demoted unless keyed — see the
+    // "demote IFF keyed" invariant at the run.cc Q4 gate.
+    TAINT_GETFLAKE    = 1u << 5,  // NOT perturbable: getFlake (demotable IFF the flake.lock is in the key)
     TAINT_PERTURBABLE = TAINT_GETENV | TAINT_CURRENTTIME,
 };
 void     topLevelTaintBump(uint32_t axis) noexcept;  // an impure primop ran (set its axis bit)

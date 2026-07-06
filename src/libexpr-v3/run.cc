@@ -45,6 +45,9 @@
 #include <fstream>          // A1: top-level manifest loader (read manifest file)
 #include <sstream>          // A1: manifest content read into a string buffer
 #include <string>
+#include <string_view>      // A3: static getFlake literal-ref extraction
+#include <vector>           // A3: extracted refs + resolved lock bytes
+#include <cstring>          // A3: token-scan helpers
 #include <unordered_set>    // A1: manifest membership set
 #include <sys/resource.h>
 #ifdef __APPLE__
@@ -1910,25 +1913,100 @@ const std::string & contentHashHex() {
 
 } // namespace toplevel_manifest
 
-// A1: the POST-version-tag key body — schema ‖ currentSystem ‖ NIX_PATH ‖
-// basePath ‖ source (exactly the old topLevelCacheKey bytes minus the version
-// tag).  Extracted so the manifest id (SHA of THIS) equals the production
-// lookup key body BY CONSTRUCTION (Q3).
+// =========================================================================
+// A3 (TOPLEVEL_TAINT_DESIGN_2026-07-06 §"A3 VETTED IMPLEMENTATION SPEC", item 2)
+// — flake-lock keying.  A `builtins.getFlake "<ref>"` pins nixpkgs (the ONLY
+// route under --pure-eval), which was TAINT_FETCH → hard-reject → A1's SHIP
+// blocker.  This makes getFlake its own axis (TAINT_GETFLAKE) and, when the
+// flake ref is a STATIC literal in the source, resolves its FULL flake.lock text
+// into the key body so the reject can be DEMOTED to a key input — a lock change
+// then changes the key → MISS-not-stale (never a stale cross-lock serve).
 //
-// A3 (2026-07-06): the NIX_PATH slot is no longer the raw `getenv("NIX_PATH")`
-// STRING (sound only for IMMUTABLE pins — a mutable channel symlink is a stable
-// string whose TARGET moves on `nix-channel --update`, so a raw-string key
-// served STALE results across a channel update — the R2 gap).  It is now the
-// RESOLVED content ids of each lookup-path entry (in lookup-path order): a
-// store-path base name for a store-resident target (content-addressed → sound)
-// or the resolved absolute path for a working-tree dir (best-effort).  A channel
-// retarget now changes the store hash → changes the key → MISS-not-stale.
-// Unsound (unresolvable / non-store) entries carry a fixed marker so they can
-// NEVER key-collide with a sound entry.
-static std::string keyBodyBytes(nix::EvalState & state,
-                                const std::string & source,
-                                const std::string & basePath) {
-    std::string keyBytes;
+// A wrong cached result = SILENT WHOLE-EVAL MISCOMPILE via a stale lock, so the
+// literal-ref matcher below is THE dangerous surface (spec risk A3-R1).  It is a
+// DELIBERATELY CONSERVATIVE pre-parse text scan (NOT a real parser): over-
+// rejection is SAFE (falls to the sound hard-reject baseline); under-extraction
+// is a stale-result bug, so the occurrence-count guard MUST err toward reject.
+// =========================================================================
+
+// A3: statically extract `builtins.getFlake "…"` / bare `getFlake "…"` literal
+// refs from `source`.  A clean literal is a double-quoted string with NO `${`
+// (interpolation), NO backslash `\` (escape), terminated by the next `"`.  We do
+// NOT extract `'' … ''` indented strings or interpolated/escaped literals — a
+// getFlake whose ref we cannot pin cleanly must fail the count guard → reject.
+//
+// The matcher scans for the token `getFlake` followed (allowing only whitespace)
+// by a `"` and then a clean literal body.  It intentionally ignores WHERE the
+// token appears (comment/string-body) — soundness is delegated to the count
+// guard (`extractedCount >= tokenCount`), so a getFlake token that does NOT
+// yield a clean literal (comment noise, alias, computed ref) drives the count
+// mismatch that rejects the whole eval.
+struct FlakeRefExtraction {
+    std::vector<std::string> refs;   // clean literal refs, in source-appearance order
+    size_t                   tokenCount = 0;   // coarse count of `getFlake` tokens
+};
+
+static FlakeRefExtraction extractGetFlakeLiterals(const std::string & source) {
+    FlakeRefExtraction out;
+    static const std::string_view kTok = "getFlake";
+    const size_t n = source.size();
+    size_t pos = 0;
+    while (true) {
+        size_t hit = source.find(kTok, pos);
+        if (hit == std::string::npos) break;
+        // Coarse token count: every textual occurrence of `getFlake` (identifier
+        // boundary NOT required — a substring like `myGetFlake` still inflates
+        // the count, which only makes the guard STRICTER = safe).  This is the
+        // denominator the guard compares against; under-counting it would be
+        // unsound, so we count generously.
+        ++out.tokenCount;
+        // Try to read a clean literal ref immediately following the token.  Skip
+        // any run of ASCII whitespace, then require a `"` and a clean body.
+        size_t i = hit + kTok.size();
+        while (i < n && (source[i] == ' ' || source[i] == '\t' || source[i] == '\n'
+                         || source[i] == '\r' || source[i] == '\f' || source[i] == '\v'))
+            ++i;
+        pos = hit + kTok.size();  // default: next search resumes just past the token
+        if (i >= n || source[i] != '"') continue;   // no opening quote → not a clean literal
+        // Read the body up to the next `"`.  REJECT (skip) if we hit `${`
+        // (interpolation), a backslash (escape → the terminating-quote scan is
+        // unreliable for this conservative matcher), or EOF before the close.
+        size_t bodyStart = i + 1;
+        size_t j = bodyStart;
+        bool clean = true;
+        for (; j < n; ++j) {
+            char c = source[j];
+            if (c == '"') break;                          // clean close
+            if (c == '\\') { clean = false; break; }      // escape → not clean
+            if (c == '$' && j + 1 < n && source[j + 1] == '{') { clean = false; break; }  // interpolation
+        }
+        if (!clean || j >= n) continue;   // unterminated / interpolated / escaped → not extracted
+        out.refs.emplace_back(source.substr(bodyStart, j - bodyStart));
+        pos = j + 1;   // resume just past the closing quote
+    }
+    return out;
+}
+
+// A3: the resolved key inputs for one (source, NIX_PATH, system, basePath) tuple,
+// computed ONCE and SHARED by BOTH the key (topLevelCacheKey / manifestEntryId)
+// AND the insert-gate demotion decision.  Sharing is LOAD-BEARING: if the gate
+// demoted GETFLAKE without the lock bytes being in the key (or vice versa) we
+// could serve a result across differing locks.  So `flakeLockFullyKeyed` and the
+// `keyBody` bytes come from the SAME resolution pass.
+struct TopLevelKeyInputs {
+    std::string keyBody;                 // schema‖system‖resolvedNIX_PATH‖basePath‖source‖flakeLocks
+    bool        flakeLockFullyKeyed = false;  // ≥1 clean ref extracted, count guard passed, all locks resolved
+};
+
+// A3: resolve `source`'s getFlake literals to their flake.lock text and build the
+// key body.  fail-closed: ANY failure (count-guard miss, lock exception, dirty
+// input, unlocked-in-pure) leaves flakeLockFullyKeyed=false → GETFLAKE is NOT
+// demoted at the gate → the eval hard-rejects (never a stale cross-lock serve).
+static TopLevelKeyInputs computeTopLevelKeyInputs(nix::EvalState & state,
+                                                  const std::string & source,
+                                                  const std::string & basePath) {
+    TopLevelKeyInputs out;
+    std::string & keyBytes = out.keyBody;
     keyBytes.reserve(64 + source.size() + basePath.size());
     uint32_t schema = disk_cache::kEvalResultSchemaVersion;
     keyBytes.append(reinterpret_cast<const char *>(&schema), sizeof schema);
@@ -1956,7 +2034,90 @@ static std::string keyBodyBytes(nix::EvalState & state,
     keyBytes.append(basePath);
     keyBytes.push_back('\0');
     keyBytes.append(source);
-    return keyBytes;
+
+    // ---- A3 flake-lock keying (spec item 2) ----------------------------------
+    // Extract clean getFlake literal refs.  Occurrence-count GUARD: if we
+    // extracted FEWER clean literals than there are `getFlake` tokens, some
+    // getFlake could not be statically pinned (let-alias, computed/interpolated
+    // ref, comment/string noise) → fail closed.  Over-rejection is safe.
+    keyBytes.push_back('\0');  // delimit the source from the flake-lock section
+    FlakeRefExtraction ex = extractGetFlakeLiterals(source);
+    bool keyingFailed = false;
+    const bool countGuardPassed = ex.refs.size() >= ex.tokenCount;
+    if (!countGuardPassed) keyingFailed = true;
+    // Demotion requires ≥1 clean literal AND the guard passing; a source with NO
+    // getFlake at all is handled by the gate anyway (mask has no GETFLAKE bit).
+    const bool anyRefs = !ex.refs.empty();
+    // Resolve each extracted ref's flake.lock and append `ref '\0' lockFileStr
+    // '\0'` in source-appearance order.  ANY exception (unlocked-in-pure, parse
+    // error, dirty input) → keyingFailed.
+    const bool pure = ffi::pureEval(state) || ffi::restrictEval(state);
+    if (countGuardPassed) {
+        for (const auto & ref : ex.refs) {
+            try {
+                ffi::LockedFlakeInfo info = ffi::lockFlakeAndRead(state, ref, pure);
+                // Belt: a dirty flake input has NO immutable identity → never
+                // cacheable.  Any node reporting a dirty rev/shortRev poisons the
+                // whole eval.  (Under --pure-eval lockFlakeAndRead already throws
+                // on an unlocked ref; this catches a dirty node that still locked.)
+                bool dirty = false;
+                for (const auto & node : info.nodes) {
+                    if ((node.sourceInfo.dirtyRev && !node.sourceInfo.dirtyRev->empty())
+                     || (node.sourceInfo.dirtyShortRev && !node.sourceInfo.dirtyShortRev->empty())) {
+                        dirty = true; break;
+                    }
+                }
+                if (dirty) { keyingFailed = true; break; }
+                keyBytes.append(ref);
+                keyBytes.push_back('\0');
+                keyBytes.append(info.lockFileStr);  // FULL flake.lock text = complete immutable lock identity
+                keyBytes.push_back('\0');
+            } catch (...) {
+                keyingFailed = true;
+                break;
+            }
+        }
+    }
+    // demote IFF keyed: only when we extracted ≥1 clean ref, the count guard
+    // passed, AND every lock resolved without failure.
+    out.flakeLockFullyKeyed = anyRefs && countGuardPassed && !keyingFailed;
+
+    // V3_DBG_TOPLEVEL_FLAKEKEY test/bring-up hook (retirement-noted): print the
+    // extracted refs + the fully-keyed decision so the A3 fuzz test can assert
+    // the extraction/demotion directly.  RETIRE with the A3 fuzz suite once the
+    // matcher is field-proven.
+    {
+        static const bool s_dbg = std::getenv("V3_DBG_TOPLEVEL_FLAKEKEY") != nullptr;
+        if (s_dbg) {
+            std::fprintf(stderr,
+                "TOPLEVEL flakekey tokens=%zu extracted=%zu guard=%d keyingFailed=%d "
+                "flakeLockFullyKeyed=%d",
+                ex.tokenCount, ex.refs.size(), (int)countGuardPassed, (int)keyingFailed,
+                (int)out.flakeLockFullyKeyed);
+            for (const auto & r : ex.refs) std::fprintf(stderr, " ref=[%s]", r.c_str());
+            std::fprintf(stderr, "\n");
+        }
+    }
+    return out;
+}
+
+// A1: the POST-version-tag key body — schema ‖ currentSystem ‖ resolved-NIX_PATH
+// ‖ basePath ‖ source ‖ flake-locks (exactly the old topLevelCacheKey bytes
+// minus the version tag, extended with the A3 flake-lock section).  Extracted so
+// the manifest id (SHA of THIS) equals the production lookup key body BY
+// CONSTRUCTION (Q3).
+//
+// A3 (2026-07-06): the NIX_PATH slot is no longer the raw `getenv("NIX_PATH")`
+// STRING (sound only for IMMUTABLE pins — a mutable channel symlink is a stable
+// string whose TARGET moves on `nix-channel --update`, so a raw-string key
+// served STALE results across a channel update — the R2 gap).  It is now the
+// RESOLVED content ids of each lookup-path entry, plus the FULL flake.lock text
+// of every statically-extractable getFlake ref (spec item 2).  A channel
+// retarget or a flake.lock bump now changes the key → MISS-not-stale.
+static std::string keyBodyBytes(nix::EvalState & state,
+                                const std::string & source,
+                                const std::string & basePath) {
+    return computeTopLevelKeyInputs(state, source, basePath).keyBody;
 }
 
 // Shared key: (namespace/version ‖ codegenGateFingerprint ‖ manifestContentHash
@@ -1979,7 +2140,11 @@ disk_cache::CacheKey topLevelCacheKey(nix::EvalState & state,
     // v5 (A3, 2026-07-06) = resolved-NIX_PATH content-ids in the key body (was
     // the raw NIX_PATH string; closes the mutable-channel R2 stale gap).  A v4
     // entry keyed on the raw NIX_PATH string must NEVER be served by v5.
-    keyBytes.append("v3-toplevel-v5");
+    // v6 (A4, 2026-07-06) = flake lockFileStr in the key body + TAINT_GETFLAKE
+    // demotion insert policy.  A v5 entry (getFlake was hard-reject → never
+    // inserted a flake-pinned result, and the key lacked the lock text) must
+    // NEVER be served by v6's flake-keyed insert policy.
+    keyBytes.append("v3-toplevel-v6");
     keyBytes.push_back('\0');
     // R4 (Q5): fold codegenGateFingerprint UNCONDITIONALLY — a differently-
     // compiled binary (a NIX_V3_* codegen gate set) must never serve a
@@ -1996,10 +2161,10 @@ disk_cache::CacheKey topLevelCacheKey(nix::EvalState & state,
     return disk_cache::computeKeyForString(keyBytes);
 }
 
-// A1 (Q3): the manifest id keying a (source,NIX_PATH,system,basePath) tuple —
-// SHA-256 of the key BODY WITHOUT the version tag / fingerprint / manifest-hash,
-// so `contains(manifestEntryId(...))` matches the offline generator's id BY
-// CONSTRUCTION (the generator hashes the same body bytes).
+// A1 (Q3): the manifest id keying a (source,NIX_PATH,system,basePath,flake-lock)
+// tuple — SHA-256 of the key BODY WITHOUT the version tag / fingerprint /
+// manifest-hash, so `contains(manifestEntryId(...))` matches the offline
+// generator's id BY CONSTRUCTION (the generator hashes the same body bytes).
 static std::string manifestEntryId(nix::EvalState & state,
                                    const std::string & source,
                                    const std::string & basePath) {
@@ -2050,15 +2215,33 @@ void topLevelCacheShadow(nix::EvalState & state, const std::string & source,
         // perturbable (recoverable via the >=3-clock manifest).
         const bool pure = ffi::pureEval(state) || ffi::restrictEval(state);
         const uint32_t perturbable = TAINT_CURRENTTIME | (pure ? TAINT_GETENV : 0u);
-        const uint32_t rejectBits = mask & ~perturbable;
+        // A3/A4 (spec item 2, DEMOTION): compute the key inputs ONCE and SHARE
+        // — the manifest id AND the GETFLAKE demotion decision BOTH derive from
+        // this SAME resolution pass, so we can never key without demoting (serve
+        // across locks) nor demote without keying (stale cross-lock serve).
+        const TopLevelKeyInputs ki = computeTopLevelKeyInputs(state, source, basePath);
+        // LOAD-BEARING INVARIANT — demote IFF keyed: clear TAINT_GETFLAKE from
+        // the reject-set ONLY when `flakeLockFullyKeyed` (the EXACT flake.lock
+        // text of every statically-extractable getFlake ref is in the key body).
+        // A non-extractable getFlake (let-alias / computed / interpolated ref, or
+        // a dirty/unlocked input) → flakeLockFullyKeyed=false → GETFLAKE stays a
+        // reject bit → hard reject.  We ALSO require `pure` for the demotion
+        // (A3-R4): under --pure-eval lockFlake uses useRegistries=false + the
+        // unlocked-ref guard, so the lock is deterministic + immutable; under
+        // --impure a registry entry can drift the ref out from under a stable
+        // key, so getFlake stays a reject bit there.
+        const uint32_t keyedDemotable =
+            (ki.flakeLockFullyKeyed && pure) ? TAINT_GETFLAKE : 0u;
+        const uint32_t rejectBits = mask & ~(perturbable | keyedDemotable);
         bool insertable;
         if (rejectBits != 0)
             insertable = false;                       // hard reject (checked FIRST)
         else if ((mask & perturbable) == 0)
-            insertable = true;                        // untainted
+            insertable = true;                        // untainted (or only GETFLAKE-keyed)
         else
             insertable = pure                         // only-perturbable + blessed + pure
-                      && toplevel_manifest::contains(manifestEntryId(state, source, basePath));
+                      && toplevel_manifest::contains(
+                             disk_cache::computeKeyForString(ki.keyBody).hex());
         if (!insertable) { ++st.tainted; return; }
     }
     std::string blob;

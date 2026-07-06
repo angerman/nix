@@ -20,6 +20,20 @@
 #        --impure rejected despite the manifest; TL10 (−) readFile hard-reject
 #        dominates a wrongful bless (reject-bits FIRST); TL11/TL12 manifest-hash
 #        keyspace partition (a manifest change invalidates clock-tainted entries).
+#   TL13-TL14,TL17 A3 (§"A3 VETTED SPEC" item 1): resolved-NIX_PATH content-ids.
+#   TL15-TL16 + TL-FUZZ A4 (§"A3 VETTED SPEC" item 2): flake-lock keying — a
+#        `builtins.getFlake "<ref>"` is DEMOTED from hard-reject to a KEYED input
+#        iff the ref is a statically-extractable clean literal AND its FULL
+#        flake.lock text resolves into the key body (demote-only-when-pure).
+#        TL15 (− CRUX, failing-first): a different flake.lock → different key →
+#        MISS-not-stale (the lockFileStr is genuinely in the key).  TL16 (−):
+#        an unlocked/dirty flake ref under pure-eval → lockFlakeAndRead throws →
+#        flakeKeyingFailed → hard reject (never cached).  TL-FUZZ (− MANDATORY,
+#        A3-R1 matcher soundness): adversarial sources (getFlake in a comment /
+#        string body / let-alias / interpolated / escaped ref / two real refs)
+#        each either correctly-keyed OR safely-rejected — never keyed-with-wrong-
+#        ref, never demoted-without-keying.  Asserted directly via the
+#        V3_DBG_TOPLEVEL_FLAKEKEY hook (extracted refs + flakeLockFullyKeyed).
 # Each test uses a FRESH cache dir (NIX_V3_CACHE_DIR) so it is hermetic and
 # immune to stale cross-version entries.
 #
@@ -367,6 +381,257 @@ chk_nohit TL17-symlink-retarget-misses "$s17"
 rm -f "$S"; rm -rf "$D"
 
 rm -rf "$NPD1" "$NPD2"
+
+# ---------------------------------------------------------------------------
+# TL15-TL16 + TL-FUZZ — A4 (TOPLEVEL_TAINT_DESIGN_2026-07-06 §"A3 VETTED SPEC"
+# item 2): flake-lock keying.  A `builtins.getFlake "<ref>"` bumps TAINT_GETFLAKE
+# (its own axis), which the top-level gate DEMOTES from hard-reject to a KEYED
+# input IFF (a) the ref is a statically-extractable clean literal, (b) the count
+# guard passed, (c) the FULL flake.lock text resolved into the key body, AND
+# (d) we are under --pure-eval (demote-only-when-pure, A3-R4: avoids registry
+# drift under --impure).  A wrong cached result here = SILENT WHOLE-EVAL
+# MISCOMPILE via a stale lock, so the matcher is fuzzed adversarially below.
+#
+# DESIGN NOTE (pure-eval + locked-ref constraint): demote-only-when-pure means
+# these run under --pure-eval, where `getFlake` REJECTS an unlocked ref.  The
+# only pure-eval-acceptable local flake ref is `path:<dir>?narHash=<H>` (a
+# content-addressed pin).  Because that narHash pins the WHOLE dir (including
+# any flake.lock), a genuinely-sound ref's lock CANNOT change while its source
+# ref stays byte-identical — that impossibility IS the soundness property.  So
+# TL15 demonstrates "a different lock ⇒ different key ⇒ MISS-not-stale" by
+# bumping a TRANSITIVE input (so the outer flake.lock text genuinely differs)
+# and asserting BOTH the key-body id changed AND the second pin MISSES with the
+# fresh value (never a cross-served stale one).  The lockFileStr's presence in
+# the key is asserted directly via the V3_DBG_TOPLEVEL_MANIFEST_ID id + the
+# V3_DBG_TOPLEVEL_FLAKEKEY hook.
+# ---------------------------------------------------------------------------
+
+# Build a locked outer flake F pinning input G; echo F's narHash (SRI).  G's
+# body is $2 so a bump changes F's flake.lock (G's pin) while F/flake.nix stays
+# byte-identical.  $1=basedir  $2=G-body-attr (e.g. 'g = 1;')
+mk_locked_flake() { # $1=base $2=Gbody -> stdout: narHash of F
+    local base="$1" gbody="$2"
+    mkdir -p "$base/G" "$base/F"
+    printf '{\n  outputs = _: { %s };\n}\n' "$gbody" > "$base/G/flake.nix"
+    # F/flake.nix is byte-identical regardless of G's body (only G's PIN changes).
+    cat > "$base/F/flake.nix" <<EOF
+{
+  inputs.g.url = "path:$base/G";
+  outputs = { g, ... }: { x = 7; };
+}
+EOF
+    # DELETE any stale lock + --refresh so G is RE-PINNED to its CURRENT content.
+    # (Without this, `nix flake lock` sees the input ref `path:$base/G` unchanged
+    # and reuses the old pin → F's narHash would not move after a G bump, which
+    # would make TL15/FUZZ-6 wrongly appear to serve stale — a fixture artifact,
+    # NOT an implementation bug.)
+    rm -f "$base/F/flake.lock"
+    "$NIX" flake lock "$base/F" --refresh >/dev/null 2>&1
+    "$NIX" hash path --type sha256 --sri "$base/F" 2>/dev/null
+}
+# capture manifestEntryId (key body id) for a pure-eval expr.
+capture_id_expr() { # $1=expr -> stdout: 64-hex id
+    local expr="$1" tmpd; tmpd=$(mktemp -d)
+    env V3_DBG_TOPLEVEL_MANIFEST_ID=1 NIX_V3_CACHE_DIR="$tmpd" \
+        NIX_V3_TOPLEVEL_CACHE=active NIX_V3_DIRECT_EVAL=1 NIX_V3_MAX_WALL_TIME=60s \
+        "$NIX" eval --pure-eval --raw --expr "$expr" 2>&1 >/dev/null \
+        | sed -n 's/^TOPLEVEL manifestEntryId=\([0-9a-f]*\).*/\1/p' | head -1
+    rm -rf "$tmpd"
+}
+# capture the FLAKEKEY hook line (extracted refs + flakeLockFullyKeyed) for a
+# pure-eval expr.  Returns the last flakekey line (the top-level expr's key).
+capture_flakekey() { # $1=expr ; rest=env  -> stdout: "flakekey ..." line
+    local expr="$1"; shift
+    local tmpd; tmpd=$(mktemp -d)
+    env "$@" V3_DBG_TOPLEVEL_FLAKEKEY=1 NIX_V3_CACHE_DIR="$tmpd" \
+        NIX_V3_TOPLEVEL_CACHE=active NIX_V3_DIRECT_EVAL=1 NIX_V3_MAX_WALL_TIME=60s \
+        "$NIX" eval --pure-eval --raw --expr "$expr" 2>&1 >/dev/null \
+        | grep 'TOPLEVEL flakekey' | tail -1
+    rm -rf "$tmpd"
+}
+
+# TL15 (− CRUX, failing-first) — bump a flake's transitive input → its flake.lock
+# text differs → the key body differs → MISS-not-stale (never a stale HIT).
+# NB: ids are captured BEFORE the G-bump — after the bump, F's content narHash
+# changes, so the OLD ref (narHash=$NHF_A) would fail to lock (narHash mismatch).
+BASE1=$(mktemp -d "$HOME/tlflake15.XXXXXX")
+NHF_A=$(mk_locked_flake "$BASE1" 'g = 1;')      # F pins G with g=1
+E15A="builtins.toString (builtins.getFlake \"path:$BASE1/F?narHash=$NHF_A\").x"
+D=$(mktemp -d)
+# First pin: insert (keyed → cacheable) and re-run → ACTIVE hit (proves it caches).
+r15a=$(evp "$D" "" "$E15A")
+s15hit=$(evp_stats "$D" "" "$E15A")
+id15a=$(capture_id_expr "$E15A")   # capture the id of pin-A NOW (before the bump)
+chk TL15-keyed-value        "$r15a" '7'
+chk_hit TL15-keyed-caches   "$s15hit"     # a flake-pinned pure-eval result CACHES (A4 unblocks it)
+# Now bump G (g=1 → g=2): mk_locked_flake re-pins (rm lock + --refresh), so
+# F/flake.lock's G-pin changes → F's narHash changes → a NEW ref whose
+# lockFileStr differs.  The outer F/flake.nix is byte-identical.
+NHF_B=$(mk_locked_flake "$BASE1" 'g = 2;')
+E15B="builtins.toString (builtins.getFlake \"path:$BASE1/F?narHash=$NHF_B\").x"
+# Sanity: the outer narHash MUST have moved (else the fixture failed to re-pin G).
+if [[ -n "$NHF_A" && -n "$NHF_B" && "$NHF_A" != "$NHF_B" ]]; then
+    pass=$((pass+1)); echo "PASS TL15-fixture-repinned ($NHF_A -> $NHF_B)"
+else
+    fail=$((fail+1)); echo "FAIL TL15-fixture-repinned: NHF_A=$NHF_A NHF_B=$NHF_B (fixture did not re-pin G)"
+fi
+# Key-body ids must DIFFER (the lock is in the key).  RED-before: keying only on
+# source-minus-lock would collide these (F/flake.nix identical, only G's pin
+# moved) → GREEN: lockFileStr-in-key makes them distinct.
+id15b=$(capture_id_expr "$E15B")
+if [[ -n "$id15a" && -n "$id15b" && "$id15a" != "$id15b" ]]; then
+    pass=$((pass+1)); echo "PASS TL15-lock-in-key-distinct (${id15a:0:12}.. != ${id15b:0:12}..)"
+else
+    fail=$((fail+1)); echo "FAIL TL15-lock-in-key-distinct: id_A=$id15a id_B=$id15b (must differ — lock in key)"
+fi
+# In the SAME cache dir, the bumped pin must MISS (no stale HIT of the old entry).
+s15miss=$(evp_stats "$D" "" "$E15B")
+r15b=$(evp "$D" "" "$E15B")
+chk_nohit TL15-bumped-lock-misses "$s15miss"
+chk TL15-bumped-lock-nostale      "$r15b" '7'   # value is still 7 (F.x=7), but from a FRESH eval, not a stale HIT
+rm -rf "$BASE1" "$D"
+
+# TL16 (−, reject) — an UNLOCKED flake ref under --pure-eval: lockFlakeAndRead
+# throws ("cannot call 'getFlake' on unlocked flake reference") → flakeKeyingFailed
+# → flakeLockFullyKeyed=0 → GETFLAKE stays a reject bit → HARD REJECT (tainted++,
+# inserts==0, no cache).  (A dirty git working tree also rejects via the same
+# throw path; the unlocked-in-pure ref is the portable equivalent — no git
+# fixture needed.  Documented deviation: we simulate "no immutable identity" via
+# an unlocked path ref rather than a dirty git tree.)
+BASE16=$(mktemp -d "$HOME/tlflake16.XXXXXX")
+mkdir -p "$BASE16/F"
+printf '{\n  outputs = _: { x = 5; };\n}\n' > "$BASE16/F/flake.nix"
+E16="builtins.toString (builtins.getFlake \"path:$BASE16/F\").x"   # BARE path: → unlocked in pure-eval
+fk16=$(capture_flakekey "$E16")
+# The hook must report keyingFailed=1 / flakeLockFullyKeyed=0 (fail closed).
+if [[ "$fk16" == *"flakeLockFullyKeyed=0"* ]]; then
+    pass=$((pass+1)); echo "PASS TL16-unlocked-fail-closed ($fk16)"
+else
+    fail=$((fail+1)); echo "FAIL TL16-unlocked-fail-closed: expected flakeLockFullyKeyed=0; got [$fk16]"
+fi
+# End-to-end: the eval errors on the unlocked ref (getFlake throws) → nothing
+# cached.  We assert no ACTIVE hit + no insert on a fresh dir (the gate never
+# demotes an un-keyed getFlake).
+D=$(mktemp -d)
+s16=$(env NIX_V3_CACHE_DIR="$D" NIX_V3_TOPLEVEL_CACHE=active NIX_V3_DIRECT_EVAL=1 \
+        NIX_V3_MAX_WALL_TIME=60s "$NIX" eval --pure-eval --raw --expr "$E16" 2>&1 >/dev/null | grep 'TOPLEVEL-CACHE')
+# On an eval error there may be no stats line at all; either way, no hit + no insert.
+if [[ -z "$s16" ]] || { [[ "$s16" =~ inserts=([0-9]+) && ${BASH_REMATCH[1]} -eq 0 ]] && [[ "$s16" =~ activeHits=0 ]]; }; then
+    pass=$((pass+1)); echo "PASS TL16-unlocked-not-cached"
+else
+    fail=$((fail+1)); echo "FAIL TL16-unlocked-not-cached: stats=[$s16] (must not insert/hit an unlocked flake)"
+fi
+rm -rf "$BASE16" "$D"
+
+# ---------------------------------------------------------------------------
+# TL-FUZZ (− MANDATORY, A3-R1 matcher soundness) — adversarial sources over the
+# static getFlake literal-ref extraction + count guard.  Each case must be
+# EITHER correctly-keyed on the RIGHT ref OR safely-rejected (flakeLockFullyKeyed
+# =0) — NEVER keyed-with-wrong-ref, NEVER demoted-without-keying.  Asserted
+# directly via the V3_DBG_TOPLEVEL_FLAKEKEY hook (extracted refs + fully-keyed).
+# ---------------------------------------------------------------------------
+FBASE=$(mktemp -d "$HOME/tlfuzz.XXXXXX")
+NHF=$(mk_locked_flake "$FBASE" 'g = 1;')        # a real, lockable F pin
+REF="path:$FBASE/F?narHash=$NHF"
+# helper: assert the FLAKEKEY hook line matches an EXPECTED substring.
+chk_fuzz() { # $1=name $2=expr $3=expected-substring
+    local fk; fk=$(capture_flakekey "$2")
+    if [[ "$fk" == *"$3"* ]]; then
+        pass=$((pass+1)); echo "PASS $1 ($fk)"
+    else
+        fail=$((fail+1)); echo "FAIL $1: expected [$3] in the flakekey line; got [$fk]"
+    fi
+}
+# helper: assert the eval is NOT cached (fresh dir, no insert of a demoted-but-
+# unkeyed getFlake — belt for the reject cases).
+chk_fuzz_reject_e2e() { # $1=name $2=expr
+    local d; d=$(mktemp -d)
+    local s; s=$(env NIX_V3_CACHE_DIR="$d" NIX_V3_TOPLEVEL_CACHE=active NIX_V3_DIRECT_EVAL=1 \
+        NIX_V3_MAX_WALL_TIME=60s "$NIX" eval --pure-eval --raw --expr "$2" 2>&1 >/dev/null | grep 'TOPLEVEL-CACHE')
+    rm -rf "$d"
+    if [[ -z "$s" ]] || [[ "$s" =~ inserts=([0-9]+) && ${BASH_REMATCH[1]} -eq 0 ]]; then
+        pass=$((pass+1)); echo "PASS $1 (not cached)"
+    else
+        fail=$((fail+1)); echo "FAIL $1: expected inserts=0; stats=[$s]"
+    fi
+}
+
+# FUZZ-1 — getFlake inside a COMMENT plus a real getFlake.  The comment inflates
+# the coarse token count (2 tokens), but only ONE clean literal is extractable
+# (the real ref; the comment's ref may or may not scan as a clean literal).  If
+# the comment's `"path:/evil"` ALSO scans as a clean literal, both are keyed
+# (harmless — the comment ref locks-or-fails; if it fails → reject).  Either way
+# it must NOT key ONLY the evil ref.  We assert the REAL ref is present; if the
+# count guard trips (comment token uncounted-literal), reject is also acceptable.
+FUZZ1="# builtins.getFlake \"path:/evil\"
+builtins.toString (builtins.getFlake \"$REF\").x"
+fk1=$(capture_flakekey "$FUZZ1")
+if [[ "$fk1" == *"flakeLockFullyKeyed=0"* ]]; then
+    pass=$((pass+1)); echo "PASS TL-FUZZ-1-comment (safely rejected: $fk1)"
+elif [[ "$fk1" == *"ref=[$REF]"* && "$fk1" != *"ref=[path:/evil]"* ]]; then
+    pass=$((pass+1)); echo "PASS TL-FUZZ-1-comment (keyed on real ref only: $fk1)"
+elif [[ "$fk1" == *"ref=[$REF]"* && "$fk1" == *"ref=[path:/evil]"* && "$fk1" == *"keyingFailed=1"* ]]; then
+    # both extracted, evil ref fails to lock → keyingFailed → reject (safe)
+    pass=$((pass+1)); echo "PASS TL-FUZZ-1-comment (evil ref extracted but reject: $fk1)"
+else
+    fail=$((fail+1)); echo "FAIL TL-FUZZ-1-comment: unsafe extraction [$fk1]"
+fi
+
+# FUZZ-2 — getFlake token inside a STRING BODY (a let-bound string literal) plus
+# a real getFlake.  The string's `getFlake` token inflates the count (its inner
+# ref is escaped `\"…\"` so NOT a clean literal) → count guard trips → REJECT.
+FUZZ2="let s = \"builtins.getFlake \\\"x\\\"\"; in builtins.toString (builtins.getFlake \"$REF\").x"
+chk_fuzz TL-FUZZ-2-string-body "$FUZZ2" "flakeLockFullyKeyed=0"
+chk_fuzz_reject_e2e TL-FUZZ-2-string-body-e2e "$FUZZ2"
+
+# FUZZ-3 — let-alias: `let g = builtins.getFlake; in (g "…")`.  The literal-shape
+# matcher misses `g "…"` (no `getFlake` token before the ref), but the token
+# appears at `let g = builtins.getFlake` (no clean literal follows it) →
+# extracted(0) < tokens(1) → count guard trips → REJECT (not demoted).
+FUZZ3="let g = builtins.getFlake; in builtins.toString (g \"$REF\").x"
+chk_fuzz TL-FUZZ-3-let-alias "$FUZZ3" "flakeLockFullyKeyed=0"
+chk_fuzz_reject_e2e TL-FUZZ-3-let-alias-e2e "$FUZZ3"
+
+# FUZZ-4 — interpolated ref: `${` in the literal → not extracted → count guard
+# trips → REJECT.
+FUZZ4='builtins.toString (builtins.getFlake "path:${toString ./.}").x'
+chk_fuzz TL-FUZZ-4-interpolated "$FUZZ4" "flakeLockFullyKeyed=0"
+chk_fuzz_reject_e2e TL-FUZZ-4-interpolated-e2e "$FUZZ4"
+
+# FUZZ-5 — escaped quote in the ref: `\` in the body → not a clean literal →
+# count guard trips → REJECT.
+FUZZ5='builtins.toString (builtins.getFlake "path:a\"b").x'
+chk_fuzz TL-FUZZ-5-escaped "$FUZZ5" "flakeLockFullyKeyed=0"
+chk_fuzz_reject_e2e TL-FUZZ-5-escaped-e2e "$FUZZ5"
+
+# FUZZ-6 — TWO real getFlakes, both extractable → both keyed (fully-keyed=1); a
+# lock change to EITHER → different key → MISS.  Build a second lockable flake H.
+FBASE2=$(mktemp -d "$HOME/tlfuzz6.XXXXXX")
+NHH=$(mk_locked_flake "$FBASE2" 'g = 1;')
+REF2="path:$FBASE2/F?narHash=$NHH"
+FUZZ6="builtins.toString ((builtins.getFlake \"$REF\").x + (builtins.getFlake \"$REF2\").x)"
+chk_fuzz TL-FUZZ-6-two-refs-keyed "$FUZZ6" "flakeLockFullyKeyed=1"
+# both refs must appear (right refs, not swapped/dropped)
+fk6=$(capture_flakekey "$FUZZ6")
+if [[ "$fk6" == *"ref=[$REF]"* && "$fk6" == *"ref=[$REF2]"* && "$fk6" == *"extracted=2"* ]]; then
+    pass=$((pass+1)); echo "PASS TL-FUZZ-6-both-refs-present"
+else
+    fail=$((fail+1)); echo "FAIL TL-FUZZ-6-both-refs-present: [$fk6]"
+fi
+# lock change to the SECOND ref (bump H's transitive input) → key body differs.
+id6a=$(capture_id_expr "$FUZZ6")
+NHH2=$(mk_locked_flake "$FBASE2" 'g = 2;')       # bump H's input pin
+REF2b="path:$FBASE2/F?narHash=$NHH2"
+FUZZ6b="builtins.toString ((builtins.getFlake \"$REF\").x + (builtins.getFlake \"$REF2b\").x)"
+id6b=$(capture_id_expr "$FUZZ6b")
+if [[ -n "$id6a" && -n "$id6b" && "$id6a" != "$id6b" ]]; then
+    pass=$((pass+1)); echo "PASS TL-FUZZ-6-lock-change-misses (${id6a:0:12}.. != ${id6b:0:12}..)"
+else
+    fail=$((fail+1)); echo "FAIL TL-FUZZ-6-lock-change-misses: id_a=$id6a id_b=$id6b (must differ)"
+fi
+rm -rf "$FBASE" "$FBASE2"
+
+rm -rf "$NPD1" "$NPD2" 2>/dev/null
 
 echo "toplevel-cache: $pass passed, $fail failed"
 [[ $fail -eq 0 ]]

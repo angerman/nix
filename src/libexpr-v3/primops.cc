@@ -10426,8 +10426,13 @@ void primFilterSource(EvalState & s, Value * a, Value & o) {
 Value callFlakeV3(EvalState & state, const ffi::LockedFlakeInfo & flakeInfo);
 
 void primGetFlake(EvalState & s, Value * a, Value & o) {
-    topLevelTaintBump(TAINT_FETCH);  // A1: flake inputs (lock) not in the key → taint
-                          // (policy P + A3 resolved-pin key recover locked flakes)
+    topLevelTaintBump(TAINT_GETFLAKE);  // A3: getFlake's own axis — the top-level
+                          // cache DEMOTES it from reject IFF the flake.lock text
+                          // was resolved into the key body (run.cc computeTopLevel-
+                          // KeyInputs); a non-statically-extractable getFlake stays
+                          // a reject bit.  (A3 resolved-pin key recovers locked
+                          // flakes; fetch*/fetchClosure/storePath stay TAINT_FETCH/
+                          // TAINT_STORE = hard-reject, never demoted.)
     // History:
     //   - 88199c4a0 / 511074ff6: first default-on attempt — REVERTED
     //     by 6cb4ecdb7 (over-forcing on haskell.nix flakes).
