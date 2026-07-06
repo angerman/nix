@@ -4789,6 +4789,21 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                                 arena.bytesAllocated() >> 20);
                     }
                     const MajorGcResult gcr = runMajorMarkSweep(vm);
+                    // NONMOVING_INLINE_THUNK_PLAN §5.2(3): Phase-S spike.
+                    // After the (non-moving) precise mark, rebuild the free-line
+                    // spans from the freshly-recomputed line-marks so the NEXT
+                    // allocations bump into reclaimed line-spans of the SAME
+                    // blocks — IN-PLACE reclaim, NO move, NO whole-block-free,
+                    // NO evacuation (runMajorMarkSweep's sparse-block relocation
+                    // stays off; its own rebuild call is g_immixAllocEnabled-only
+                    // so it does not fire under this compile flag).  The mark
+                    // ran post-forceScavenge (nursery empty), so every surviving
+                    // cell is tenured + its lines are marked live; the dead lines
+                    // become spans.  Reclaim is safepoint-only (never mid-primop)
+                    // — the live-cell / C-stack-live hazard (plan §6 #1) cannot
+                    // hand back a marked-live span.
+                    if (nix::v3::detail::nonmovingTenured())
+                        threadArena().rebuildFreeSpansFromLineMarks();
                     // Frame pointers may have been forwarded.
                     // Re-read dispatch locals.
                     if (!vm.frames.empty()) {

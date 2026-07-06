@@ -1240,6 +1240,38 @@ namespace detail {
 // skips nursery-resident cells).  The old NIX_V3_NO_MAJOR_GC opt-out is now
 // vestigial (per-op major never runs regardless).
 inline const bool g_majorGcEnabled = false;
+
+// ---------------------------------------------------------------------------
+// NIX_V3_NONMOVING_TENURED — Phase-S spike gate (compile-time, like
+// NIX_V3_BARRIER_NOOP in barrier.hh; NOT a getenv — Rule 5).
+//
+// NONMOVING_INLINE_THUNK_PLAN_2026-07-06 §5 THE FIRST SPIKE: prove the
+// NON-MOVING tenured region (the already-built, correctness-clean Immix
+// Steps 11′-13′ line-region machinery) is byte-identical to the current
+// moving-tenured behaviour, with the SMALLEST change and ZERO representation
+// or barrier change.  It FLIPS EXISTING GATES ON — it writes no new allocator.
+//
+// When defined it makes `cellMetaEnabled()` + `blocksAreMmapped()` true and
+// lets `alloc()` take the line-region span path, and the gen-major safepoint
+// rebuilds free-spans from the post-mark line-marks (in-place reclaim, NO
+// move).  It does NOT touch `g_majorGcEnabled` (which must stay false — that
+// re-enables the per-op legacy major trigger = the M-3 UAF trap) and does NOT
+// enable the free-list pop/reuse path (NIX_V3_MIDEVAL_REUSE — a live SEGV,
+// plan §6 hazard #1); reclaim is safepoint span-only.
+//
+// RETIREMENT (Rule 4/5): this gate is deleted when Phase A routes the tenured
+// allocation into the non-moving region as the default (it supersedes this
+// spike flag), OR the spike's byte-id gate FAILS and the plan is falsified
+// (write NONMOVING_INLINE_THUNK_FALSIFIED_YYYY-MM-DD.md).  Requires explicit
+// -DNIX_V3_NONMOVING_TENURED; inert + byte-id in every normal build.
+[[gnu::always_inline]] constexpr bool nonmovingTenured() noexcept
+{
+#ifdef NIX_V3_NONMOVING_TENURED
+    return true;
+#else
+    return false;
+#endif
+}
 } // namespace detail
 
 /// R2.1′ (2026-06-03): per-cell TYPE metadata for Nofl-style evacuation.
@@ -1320,7 +1352,11 @@ public:
     /// in-block free-list reuse, which needs no munmap.  Keeping the block method
     /// unchanged avoids the munmap-on-calloc hazard.
     static bool cellMetaEnabled() noexcept {
-        return detail::g_majorGcEnabled || detail::g_midEvalGcEnabled;
+        // Phase-S spike: the non-moving tenured region needs cell-start +
+        // CellType + lineMarks maintained so the safepoint mark can set line
+        // marks and rebuildFreeSpansFromLineMarks can reclaim in place.
+        return detail::g_majorGcEnabled || detail::g_midEvalGcEnabled
+            || detail::nonmovingTenured();
     }
 
     /// Are arena blocks mmap'd (vs calloc'd)?  mmap'd blocks can be munmap'd by
@@ -1329,7 +1365,11 @@ public:
     /// win is in-block reuse, no munmap.  This gate keys alloc (refill/huge) AND free
     /// (freeWholeBlock/freeHugeBlock) to the SAME primitive, so the inverse always matches.
     static bool blocksAreMmapped() noexcept {
-        return detail::g_majorGcEnabled;
+        // Phase-S spike: mmap tenured blocks (so freeWholeBlock/freeHugeBlock's
+        // munmap primitive matches how refill()/huge-alloc mapped them).  The
+        // spike does NOT whole-block-free at the safepoint (that stays gated on
+        // majorGcEnabled()); mmap'd-vs-calloc'd is otherwise transparent.
+        return detail::g_majorGcEnabled || detail::nonmovingTenured();
     }
 
     /// 16 MB blocks: each block holds many thousands of typical
@@ -1545,7 +1585,14 @@ public:
         //
         // Acceptance gate (per task #848): hit rate (allocs served
         // from spans / total allocs) ≥70% on HNE.
-        if (__builtin_expect(majorGcEnabled() && detail::g_immixAllocEnabled, 0)) {
+        // Line-region span path fires under EITHER the legacy Immix opt-in
+        // (majorGcEnabled + V3_DBG_IMMIX_ALLOC) OR the Phase-S non-moving-
+        // tenured spike gate.  Under the spike this is the ONLY reclaim
+        // consumer (the free-list pop path below stays inert — plan §6 #1).
+        if (__builtin_expect(
+                (majorGcEnabled() && detail::g_immixAllocEnabled)
+                    || detail::nonmovingTenured(),
+                0)) {
             auto & is = immixAllocStats();
             ++is.allocs;
             // Fast path: current span has room.
@@ -1602,9 +1649,15 @@ public:
         // let the allocator CONSUME them under EITHER opt-in.  Default-OFF (both
         // gates) → byte-for-byte the old default path.  Correctness: bins hold
         // cells the precise+conservative non-moving mark proved dead.
+        // Phase-S spike NEVER pops the free-list bins: the pop/reuse path has
+        // a live SEGV (NIX_V3_MIDEVAL_REUSE — plan §6 hazard #1: hands back a
+        // still-C-stack-live cell).  The spike reclaims ONLY via the safepoint
+        // line-region span path above.  Exclude nonmovingTenured() here even
+        // if a reuse env gate is co-set, so the span path is the sole consumer.
         if (__builtin_expect((detail::g_freeListReuseEnabled
                               || (detail::g_midEvalGcEnabled && detail::g_midEvalReuseEnabled))
-                             && !detail::g_immixAllocEnabled, 0)) {
+                             && !detail::g_immixAllocEnabled
+                             && !detail::nonmovingTenured(), 0)) {
             if (void * p = freeListTryPop(bytes)) {
                 // Step 6: count the hit.  Bin is the requested size's
                 // bin, NOT the popped slot's actual bin (per-exact-size
@@ -1757,7 +1810,8 @@ public:
     /// stays empty) or when no blocks allocated yet.
     void clearAllLineMarks() noexcept
     {
-        if (!majorGcEnabled()) return;
+        // Phase-S spike also maintains line marks (non-moving reclaim).
+        if (!majorGcEnabled() && !detail::nonmovingTenured()) return;
         for (auto & bits : active_.lineMarks)
             std::fill(bits.begin(), bits.end(), 0ULL);
     }
@@ -1774,7 +1828,9 @@ public:
     /// cell spans.
     void markLinesForCell(const void * addr, size_t bytes) noexcept
     {
-        if (!majorGcEnabled() || !addr || bytes == 0) return;
+        // Phase-S spike also populates line marks during the safepoint mark.
+        if ((!majorGcEnabled() && !detail::nonmovingTenured())
+            || !addr || bytes == 0) return;
         const char * cp = static_cast<const char *>(addr);
         const size_t nBlocks = active_.blocks.size();
         if (nBlocks == 0 || nBlocks > active_.lineMarks.size()) return;
@@ -1804,7 +1860,7 @@ public:
     /// arena, or gate OFF.
     bool isLineMarked(const void * addr) const noexcept
     {
-        if (!majorGcEnabled() || !addr) return false;
+        if ((!majorGcEnabled() && !detail::nonmovingTenured()) || !addr) return false;
         const char * cp = static_cast<const char *>(addr);
         for (size_t i = 0; i < active_.blocks.size(); ++i) {
             const char * blk = active_.blocks[i];
@@ -1875,7 +1931,9 @@ public:
     /// * mixed              → walk bits within word
     void rebuildFreeSpansFromLineMarks() noexcept
     {
-        if (!majorGcEnabled()) return;
+        // Phase-S spike: rebuild spans from post-mark line-marks (in-place,
+        // non-moving reclaim) — the spike's sole reclaim mechanism.
+        if (!majorGcEnabled() && !detail::nonmovingTenured()) return;
         const size_t nBlocks = active_.blocks.size();
         active_.freeSpans.clear();
         active_.freeSpans.resize(nBlocks);
@@ -2038,7 +2096,11 @@ public:
     /// avoiding the linear-scan in `setCellStartBitFor()`.
     void setCellStartBitInBlock(const void * p, size_t blockIdx) noexcept
     {
-        if (!majorGcEnabled() || !p) return;
+        // Use cellMetaEnabled() (not majorGcEnabled()) so the Phase-S spike's
+        // span-allocated cells record their cell-start bit — the sweep
+        // enumerates cells via these bits.  Sibling setCellTypeInBlock already
+        // keys on cellMetaEnabled().
+        if (!cellMetaEnabled() || !p) return;
         if (blockIdx >= active_.cellStarts.size()) return;
         const char * blk = active_.blocks[blockIdx];
         const size_t offset =
