@@ -179,6 +179,7 @@ if [[ "$mode" == "core" || "$mode" == "full" || "$mode" == "brute" ]]; then
   SUITES+=( "attrs-init-cache|P3.3 §3.4 warm-disk-cache OP_ATTRS_INIT round-trip (non-rec attrset import; guards the reverted pre-sort lever)|$TEST_DIR/run-attrs-init-cache-roundtrip-tests.sh" )
   SUITES+=( "applied-cache|LEVER-1 applied-import result cache (CU-key collision + distinct-args + insns-collapse + throw-not-cached)|NIX=$NIX $TEST_DIR/run-applied-cache-tests.sh" )
   SUITES+=( "toplevel-cache|top-level result cache soundness (pure round-trip + getEnv/currentTime taint not-stale)|NIX=$NIX $TEST_DIR/run-toplevel-cache-tests.sh" )
+  SUITES+=( "dedup-survey|B1 instrument accuracy: cold+warm import CUs observed + FINAL report (guards disk-load observe + atexit total)|$TEST_DIR/run-dedup-survey-tests.sh" )
   SUITES+=( "lint-no-inline-getenv|cached env-var lint|$TEST_DIR/lint-no-inline-getenv.sh" )
   SUITES+=( "lint-no-direct-tw-include|FFI consolidation: no new direct TW #includes|$TEST_DIR/lint-no-direct-tw-include.sh" )
   SUITES+=( "lint-cache-coherence|#814/#815 schema-bump operating rules|$TEST_DIR/lint-cache-coherence.sh" )
@@ -204,6 +205,7 @@ if [[ "$mode" == "full" ]]; then
   already_added[run-attrs-init-cache-roundtrip-tests.sh]=1  # in core
   already_added[run-applied-cache-tests.sh]=1  # in core
   already_added[run-toplevel-cache-tests.sh]=1  # in core
+  already_added[run-dedup-survey-tests.sh]=1  # in core
 
   for script in "$TEST_DIR"/run-*.sh; do
     base="$(basename "$script")"

@@ -111,6 +111,53 @@ once globally." This attacks the **~40% compile share** (parse+lower ≈ 4.5s of
 M5's cold ~11s) on the COLD/first eval across files and machines — the CI regime.
 ~3-4 weeks (ABT refactor + content-addressed IR, ~600 LOC). Reinforces the moat.
 
+#### B1 VERDICT (2026-07-06) — MEASURED, gate = ≥2× cross-file dedup → **DOCUMENT-CLOSE (KILL)**
+The pre-committed gate for building B2 (content-addressed IR fragments / ABT):
+cross-file IR-fragment dedup **≥2× → GO**, **<2× → document-close**.
+
+**Measured 1.08–1.32× — a huge margin below 2× → B2 does NOT clear the gate.**
+
+Method: `NIX_V3_DEDUP_SURVEY=1` (FNV-1a per-lambda bytecode fragments, process-wide
+`seenHashes`), full drvPath evals on nixpkgs 24.05 (zw3rk checkout, aarch64-darwin)
+via `v3-eval` — the survey observes ALL compiled AND disk-loaded CUs (see the
+instrument fix below):
+
+| workload         | totalFns | uniqueFns | **fn_dedup_lb** | totalBytes | **byte_dedup_lb** |
+|------------------|---------:|----------:|----------------:|-----------:|------------------:|
+| hello.drvPath    |   91 427 |    69 451 |         1.32×   |  5 367 KB  |       **1.08×**   |
+| git.drvPath      |   92 387 |    70 074 |         1.32×   |  5 425 KB  |       **1.08×**   |
+| python3.drvPath  |   91 399 |    69 431 |         1.32×   |  5 366 KB  |       **1.08×**   |
+
+- **byte_dedup_lb = 1.08× is the honest lever** (compile/storage work saved).
+  fn_dedup_lb = 1.32× (count) is inflated by ~22 K tiny identical stubs
+  (`x: x`-class) whose bytecode is a handful of words — deduping them saves only
+  **~8% of bytecode bytes**, nowhere near the 2× that would fund an ABT rewrite.
+- **Corroborates the prior Stage 9 LINKING KILL** (2026-05-22, thunk-body IR-level
+  dedup = **1.17×**, killed at the same 2× threshold). Two independent
+  measurements (IR-level 1.17×, bytecode-level 1.08–1.32×) agree: cross-file
+  structural redundancy is LOW because the FILE-granular CU disk cache + the
+  applied-import cache already capture the whole-file sharing; sub-file fragments
+  that recur are small.
+- Note the survey's count ratio is a LOWER BOUND on true alpha-equivalent dedup
+  (run.cc:929) — but the prior IR-level 1.17× already measured the
+  alpha-equivalent regime and lands in the same band, so reaching 2× is
+  falsified from two directions.
+
+**Disposition:** B2 (ABT + content-addressed IR fragments) is NOT built — the
+eval#1/cold-CI compile lever is real but ~8%, disproportionate to a 3-4 wk ~600
+LOC rewrite. The moat (Phase A: applied-import cache SHIPPED + top-level
+cross-process cache) remains the strategic direction. A CLEAN KILL = deliverable.
+
+**Instrument fix shipped with this verdict** (the survey was under-observing by
+~700×): (1) warm imports HIT the CU disk cache and restore via `deserializeCU`
+(primops.cc:7514), bypassing the fresh-compile observe (8164) → added a
+`surveyCUBytecodeDedup` at the disk-load path (7523). (2) The per-runRootExpr
+report (run.cc:933) is only reached by the builtins-install evals (the user
+eval's imports run re-entrantly via `run()`, not `runRootExpr`) → it printed a
+mid-eval snapshot of ~131 fns; added an `atexit` reporter (`dedup_survey [FINAL]:`)
+reading the same process-wide accumulator after all imports are surveyed.
+Guarded by `test/run-dedup-survey-tests.sh` (+cold/+warm/-off, in --brute core).
+
 ## THE MOAT — quantified (the recommended strategic direction)
 - **Applied-import cache (in-process): SHIPPED default-on** (eb9653706). Measured
   eval#2 = **0.00× CPU** on hello/firefox (in-graph thunk memo makes it free);

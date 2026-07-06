@@ -7515,6 +7515,13 @@ void primImport(EvalState & state, Value * args, Value & out)
                 cache.cus.back().fromImportCU = true;  // LEVER-1 memo-hook discriminator
                 impBumpNs(importTimingTotals().deserializeNs, tDes);
 
+                // B1 (cross-file IR-fragment dedup measurement): warm imports
+                // enter HERE (disk-cache HIT → deserialize) and bypass the
+                // fresh-compile observe below (8157).  Survey the loaded CU too
+                // so the dedup ratio reflects the FULL imported-CU set, not just
+                // the top-level user CU.  No-op unless NIX_V3_DEDUP_SURVEY is set.
+                surveyCUBytecodeDedup(cache.cus.back());
+
                 // #815 RCA: V3_DBG_DESERIALIZE_VERIFY=path forks a side
                 // path that ALSO fresh-compiles the same source in this
                 // process and compares the deserialized CU's bytecode

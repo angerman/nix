@@ -9,6 +9,7 @@
 #include "v3/bytecode.hh"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <unordered_set>
 #include <utility>
@@ -26,6 +27,30 @@ bool dedupSurveyEnabled() noexcept
 {
     static const bool e = std::getenv("NIX_V3_DEDUP_SURVEY") != nullptr;
     return e;
+}
+
+/// Emit the FINAL cumulative survey (all CUs observed process-wide, incl.
+/// the hundreds of imported nixpkgs CUs).  The per-runRootExpr report at
+/// run.cc:933 only fires for the builtins-install evals (it is not reached by
+/// the user's top-level eval, whose imports run re-entrantly via `run()` — not
+/// `runRootExpr`), so it printed a mid-eval snapshot (≈131 fns) that MASSIVELY
+/// under-counted.  Registering the report at process exit reads the same
+/// process-wide accumulator AFTER every import has been surveyed.  Reads the
+/// dedupSurvey() singleton in THIS TU — identical instance the survey writes.
+static void reportFinalDedupSurveyAtExit() noexcept
+{
+    const auto & sur = dedupSurvey();
+    if (sur.totalFunctions == 0) return;
+    double fnRatio = sur.uniqueHashes > 0
+        ? (double)sur.totalFunctions / (double)sur.uniqueHashes : 0.0;
+    double byteRatio = sur.uniqueBytes > 0
+        ? (double)sur.totalBytes / (double)sur.uniqueBytes : 0.0;
+    std::fprintf(stderr,
+        "v3-direct dedup_survey [FINAL]: totalFunctions=%llu uniqueHashes=%llu "
+        "fn_dedup_lb=%.2fx totalBytes=%.1fKB uniqueBytes=%.1fKB byte_dedup_lb=%.2fx\n",
+        (unsigned long long)sur.totalFunctions,
+        (unsigned long long)sur.uniqueHashes, fnRatio,
+        sur.totalBytes / 1024.0, sur.uniqueBytes / 1024.0, byteRatio);
 }
 
 namespace {
@@ -63,6 +88,14 @@ std::unordered_set<uint64_t> & seenHashes() noexcept
 void surveyCUBytecodeDedup(const CompilationUnit & cu)
 {
     if (!dedupSurveyEnabled()) return;
+
+    // Register the process-exit final report ONCE (reads the same accumulator
+    // this function writes; the per-eval report at run.cc:933 under-counts).
+    static const bool s_atexitRegistered = [] {
+        std::atexit(reportFinalDedupSurveyAtExit);
+        return true;
+    }();
+    (void)s_atexitRegistered;
 
     auto & sur = dedupSurvey();
     auto & seen = seenHashes();
