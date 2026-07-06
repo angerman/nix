@@ -3389,6 +3389,7 @@ void primDirOf(EvalState &, Value * args, Value & out)
 
 void primPathExists(EvalState & state, Value * args, Value & out)
 {
+    topLevelTaintBump();  // A1: reads ambient filesystem state (not in the key)
     std::string s;
     if (args[0].isString()) {
         // #741 Phase 4 measurement: path with non-empty context →
@@ -3825,6 +3826,7 @@ void primHashString(EvalState & state, Value * args, Value & out)
 
 void primHashFile(EvalState & state, Value * args, Value & out)
 {
+    topLevelTaintBump();  // A1: reads ambient file content (not in the key)
     // #693 — match TW's forceStringNoCtx-style phrasings.
     if (!args[0].isString())
         throw std::runtime_error(expectedTypeButFound("a string", args[0]));
@@ -3964,6 +3966,7 @@ void primStoreDir(EvalState & state, Value *, Value & out)
 /// and rejects NUL bytes in the file content.
 void primReadFile(EvalState & state, Value * args, Value & out)
 {
+    topLevelTaintBump();  // A1: reads ambient file content (not in the key)
     std::string path;
     if (args[0].isString()) {
         // #741 Phase 4 measurement: ctx-bearing readFile path goes
@@ -4044,6 +4047,7 @@ void primReadFile(EvalState & state, Value * args, Value & out)
 /// builtins.readDir path -> attrset of name -> "regular"|"directory"|"symlink"|"unknown".
 void primReadDir(EvalState & state, Value * args, Value & out)
 {
+    topLevelTaintBump();  // A1: reads ambient directory listing (not in the key)
     std::string path;
     if (args[0].isString()) {
         // #793 (2026-05-24): mirror TW's prim_readDir (libexpr/primops.cc:2542),
@@ -4230,6 +4234,7 @@ void primGroupBy(EvalState & state, Value * args, Value & out)
 
 void primReadFileType(EvalState &, Value * args, Value & out)
 {
+    topLevelTaintBump();  // A1: reads ambient filesystem state (not in the key)
     std::string path;
     if (args[0].isString()) path = args[0].asString();
     else if (args[0].isPath()) path = args[0].asPath();
@@ -9879,6 +9884,7 @@ void primBreak(EvalState &, Value * args, Value & out)
 /// (prim_storePath).  Requires tree-walker store (state.nixEvalState).
 void primStorePath(EvalState & state, Value * args, Value & out)
 {
+    topLevelTaintBump();  // A1: reads ambient store state (not in the key)
     if (!state.nixEvalState)
         throw std::runtime_error("v3 storePath: no tree-walker state available");
     auto * ns = state.nixEvalState;
@@ -10151,6 +10157,8 @@ static std::string v3ForceStringNoCtx(EvalState & state, const Value & vIn, cons
 static void v3Fetch(EvalState & s, Value * a, Value & o,
                     const char * who, bool unpack, const char * defaultName)
 {
+    topLevelTaintBump();  // A1: fetch touches network/mutable inputs not in the
+                          // cache key → taint (policy P recovers pinned-stable ones)
     if (!s.nixEvalState)
         throw std::runtime_error(std::string("v3 ") + who + ": no tree-walker state available");
     auto & ns = *s.nixEvalState;
@@ -10282,6 +10290,7 @@ void primFetchMercurial(EvalState & s, Value * a, Value & o) {
 // ffi::fetchClosure (openStore + copyClosure/makeContentAddressed dispatch),
 // build the result store-path string v3-native with Opaque context.
 void primFetchClosure(EvalState & s, Value * a, Value & o) {
+    topLevelTaintBump();  // A1: fetches store content not in the key → taint
     if (!s.nixEvalState)
         throw std::runtime_error("v3 fetchClosure: no tree-walker state available");
     auto & ns = *s.nixEvalState;
@@ -10393,6 +10402,8 @@ void primFilterSource(EvalState & s, Value * a, Value & o) {
 Value callFlakeV3(EvalState & state, const ffi::LockedFlakeInfo & flakeInfo);
 
 void primGetFlake(EvalState & s, Value * a, Value & o) {
+    topLevelTaintBump();  // A1: flake inputs (lock) not in the key → taint
+                          // (policy P + A3 resolved-pin key recover locked flakes)
     // History:
     //   - 88199c4a0 / 511074ff6: first default-on attempt — REVERTED
     //     by 6cb4ecdb7 (over-forcing on haskell.nix flakes).

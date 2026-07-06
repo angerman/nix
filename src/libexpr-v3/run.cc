@@ -1830,7 +1830,11 @@ disk_cache::CacheKey topLevelCacheKey(nix::EvalState & state,
     // cross-version cache-poisoning silent-wrong-result (found 2026-07-05: a
     // pre-taint "v1" getEnv entry was served after taint landed).  v2 = taint
     // on getEnv/currentTime.
-    keyBytes.append("v3-toplevel-v2");
+    // v3 = A1 taint extended to ALL ambient impurities (readFile/readDir/
+    // pathExists/readFileType/hashFile/fetch*/getFlake/storePath/fetchClosure),
+    // not just getEnv+currentTime.  A v2-binary entry used a laxer taint policy
+    // → must never be served by this stricter binary (cross-version poisoning).
+    keyBytes.append("v3-toplevel-v3");
     keyBytes.push_back('\0');
     uint32_t schema = disk_cache::kEvalResultSchemaVersion;
     keyBytes.append(reinterpret_cast<const char *>(&schema), sizeof schema);

@@ -60,5 +60,26 @@ else
 fi
 rm -rf "$D"
 
+# TL4 — A1 (2026-07-06): readFile-derived result must NOT be served stale.
+# File content is NOT in the cache key, so a readFile-derived top-level result
+# MUST be tainted (not cached) — else changing the file serves a stale value.
+# Failing-first: before A1 extended taint beyond getEnv+currentTime, readFile
+# was un-tainted → this would cache "aaa" and serve it after the file changed.
+D=$(mktemp -d); F=$(mktemp -t tlcache-rf.XXXXXX)
+printf 'aaa' > "$F"; r1=$(ev "$D" "builtins.readFile $F")
+printf 'bbb' > "$F"; r2=$(ev "$D" "builtins.readFile $F")
+chk TL4-readfile-first   "$r1" 'aaa'
+chk TL4-readfile-nostale "$r2" 'bbb'   # must be 'bbb', not a stale cached 'aaa'
+rm -rf "$D" "$F"
+
+# TL5 — A1: pathExists-derived result must NOT be served stale (ambient FS state).
+D=$(mktemp -d); F=$(mktemp -t tlcache-pe.XXXXXX)
+p1=$(ev "$D" "builtins.toString (builtins.pathExists $F)")   # file exists → "1"
+rm -f "$F"
+p2=$(ev "$D" "builtins.toString (builtins.pathExists $F)")   # gone → "" (false)
+chk TL5-pathexists-true    "$p1" '1'
+chk TL5-pathexists-nostale "$p2" ''    # must be '' (false), not a stale '1'
+rm -rf "$D"
+
 echo "toplevel-cache: $pass passed, $fail failed"
 [[ $fail -eq 0 ]]
