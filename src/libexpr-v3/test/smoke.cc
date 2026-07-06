@@ -25,6 +25,7 @@
 #include "v3/primop.hh"
 #include "v3/serialize.hh"
 #include "v3/disk_cache.hh"
+#include "v3/gc.hh"
 
 #include <algorithm>
 #include <cassert>
@@ -4264,6 +4265,60 @@ static int testBindingsForEachMaterialise()
     return 0;
 }
 
+// #34 (2026-07-06): the post-scavenge BRUTE scan skips provably-NON-POINTER
+// scalar slots so a scalar word (e.g. a Bindings entry's packed
+// {SymbolId,PosIdx32}) that coincidentally lands in the nursery's ASLR-varying
+// address range can't be reported as a false-positive "missed root" (the
+// brute-audit flake, RCA 2026-07-06).  This locks the offset->slot
+// classification against cell-layout drift: a header-size change (e.g. P1a
+// Bindings 24->16B, P1b Closure 40->32B) that broke these offsets would either
+// re-expose the flake (scalar slot not skipped) or hide real misses (pointer
+// slot wrongly skipped).
+static int testBruteScanScalarClassifier()
+{
+    int rc = 0;
+    auto ct = [](CellType t) { return static_cast<uint8_t>(t); };
+    auto check = [&](const char * what, bool got, bool want) {
+        if (got != want) {
+            std::fprintf(stderr,
+                "testBruteScanScalarClassifier: %s expected scalar=%d got %d\n",
+                what, (int)want, (int)got);
+            rc = 1;
+        }
+    };
+    // Bindings: header 16B ([0,8)=kind/size SCALAR, [8,16)=parent PTR); entry
+    // 16B ([+0,+8)={SymbolId,PosIdx32} SCALAR, [+8,+16)=Value).
+    check("Bindings@0 kind/size",      bruteScanSlotIsScalar(ct(CellType::Bindings), 0),  true);
+    check("Bindings@8 parent(ptr)",    bruteScanSlotIsScalar(ct(CellType::Bindings), 8),  false);
+    check("Bindings@16 e0 Sym/Pos",    bruteScanSlotIsScalar(ct(CellType::Bindings), 16), true);
+    check("Bindings@24 e0 value",      bruteScanSlotIsScalar(ct(CellType::Bindings), 24), false);
+    check("Bindings@32 e1 Sym/Pos",    bruteScanSlotIsScalar(ct(CellType::Bindings), 32), true);
+    check("Bindings@40 e1 value",      bruteScanSlotIsScalar(ct(CellType::Bindings), 40), false);
+    // Closure (post-P1b header 32B): desc@0/capturedWiths@8/upvalEnv@16 PTRs,
+    // {nUpvalues,_pad}@24 SCALAR, upvalues@32 Values.
+    check("Closure@0 desc(ptr)",       bruteScanSlotIsScalar(ct(CellType::Closure), 0),  false);
+    check("Closure@8 capWiths(ptr)",   bruteScanSlotIsScalar(ct(CellType::Closure), 8),  false);
+    check("Closure@16 upvalEnv(ptr)",  bruteScanSlotIsScalar(ct(CellType::Closure), 16), false);
+    check("Closure@24 nUpvalues/_pad", bruteScanSlotIsScalar(ct(CellType::Closure), 24), true);
+    check("Closure@32 upvalue0",       bruteScanSlotIsScalar(ct(CellType::Closure), 32), false);
+    // Env: parent@0 PTR, {isWithEnv,nValues}@8 SCALAR, values@16 Values.
+    check("Env@0 parent(ptr)",         bruteScanSlotIsScalar(ct(CellType::Env), 0),  false);
+    check("Env@8 isWithEnv/nValues",   bruteScanSlotIsScalar(ct(CellType::Env), 8),  true);
+    check("Env@16 values0",            bruteScanSlotIsScalar(ct(CellType::Env), 16), false);
+    // Thunk/List: only the [0,8) header word is scalar; rest is pointer-capable.
+    check("Thunk@0 state/flags/forces",bruteScanSlotIsScalar(ct(CellType::Thunk), 0),  true);
+    check("Thunk@16 non-header",       bruteScanSlotIsScalar(ct(CellType::Thunk), 16), false);
+    check("List@0 size/_pad",          bruteScanSlotIsScalar(ct(CellType::List), 0),  true);
+    check("List@8 elem0",              bruteScanSlotIsScalar(ct(CellType::List), 8),  false);
+    // ValuePair is all-Value — never scalar.
+    check("Pair@0 left",               bruteScanSlotIsScalar(ct(CellType::Pair), 0),  false);
+    check("Pair@16 third",             bruteScanSlotIsScalar(ct(CellType::Pair), 16), false);
+    if (rc == 0)
+        std::fprintf(stderr,
+            "testBruteScanScalarClassifier: OK (scalar/pointer slot classification)\n");
+    return rc;
+}
+
 int main()
 {
     registerBuiltinPrimOps();
@@ -4364,6 +4419,10 @@ int main()
 
     // #825 / A1a Phase B — forEach + materialize iteration helpers.
     rc |= testBindingsForEachMaterialise();
+
+    // #34 — post-scavenge BRUTE scalar-slot classifier (guards the false-
+    // positive fix + cell-layout drift).
+    rc |= testBruteScanScalarClassifier();
 
     auto & st = allocStats();
     std::fprintf(stderr,

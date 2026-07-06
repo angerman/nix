@@ -1636,6 +1636,31 @@ void postScavengeAudit(const Nursery & n, const VMState & vm)
 // `liveRanges` MUST be sorted by start ascending; the caller is
 // responsible.  Binary search via std::upper_bound for O(log N)
 // per word.
+} // namespace
+
+// #34 (2026-07-06): scalar-slot classifier for the BRUTE raw-word scan.  See
+// gc.hh for the rationale.  Offsets track the CURRENT cell layouts (Bindings
+// header 16B post-P1a; Closure header 32B post-P1b) — update on any change.
+bool bruteScanSlotIsScalar(uint8_t cellType, size_t off) noexcept
+{
+    switch (static_cast<CellType>(cellType)) {
+    case CellType::Bindings:
+        // header 16B: [0,8)=kind/size SCALAR; parent@[8,16) is a pointer.
+        // entry 16B: [+0,+8)={SymbolId,PosIdx32} SCALAR; value@[+8,+16) is a Value.
+        return (off < 8) || (off >= 16 && ((off - 16) % 16) < 8);
+    case CellType::Env:     return (off >= 8 && off < 16);   // {isWithEnv,nValues}
+    case CellType::Closure: return (off >= 24 && off < 32);  // {nUpvalues,_pad}
+    case CellType::Thunk:   return (off < 8);                // {state,hasWithsSlot,nUpvalues,forces}
+    case CellType::List:    return (off < 8);                // {size,_pad}
+    case CellType::None: case CellType::Value:
+    case CellType::Pair: case CellType::Chars:
+        return false;  // Pair/Value: all-Value slots; Chars/None: opaque
+    }
+    return false;
+}
+
+namespace {
+
 void postScavengeBruteScan(
     const Nursery & n,
     const std::vector<ScavLiveRange> & liveRanges)
@@ -1671,6 +1696,7 @@ void postScavengeBruteScan(
 
     size_t hitsLive = 0;
     size_t hitsDead = 0;
+    size_t hitsScalarFalsePos = 0;  // #34: raw-word hits filtered as scalar slots
     size_t cap = 16;  // dump first N LIVE hits (dead hits are noise; just count)
     for (auto & blk : blocks) {
         // Walk 8-byte aligned words.
@@ -1683,21 +1709,74 @@ void postScavengeBruteScan(
             if (w == 0) continue;
             if (!n.contains(reinterpret_cast<const void *>(w))) continue;
             if (const ScavLiveRange * r = inLive(p)) {
+                const size_t off = (size_t)(p - r->lo);
+                // #34 FIX (2026-07-06): SKIP provably-NON-POINTER scalar/metadata
+                // slots.  This raw-word scan otherwise flags e.g. a Bindings
+                // entry's packed {SymbolId,PosIdx32} word when its 64-bit value
+                // coincidentally lands in the nursery's ASLR-varying address range
+                // — a ~0.07%/run TOOLING FALSE-POSITIVE (RCA 2026-07-06: nursery
+                // high-32 matches a PosIdx and low-32 lands in the SymbolId range;
+                // AUDIT precise-walk is CLEAN, so it is NOT a real missed root).
+                // A pointer never lives in a scalar slot, so skipping cannot hide
+                // a real missed root; the AUDIT deep-walk remains the precise
+                // reachability check.  Offsets track the CURRENT cell layouts
+                // (update on any header change — e.g. P1a Bindings 24->16B, P1b
+                // Closure 40->32B).
+                if (bruteScanSlotIsScalar(r->type, off)) {
+                    ++hitsScalarFalsePos; continue;
+                }
                 if (hitsLive < cap) {
-                    // PhD-6: type the HOLDER + the field offset (p - holder.lo)
-                    // so the missed-root edge is identifiable (e.g. "Bindings
-                    // @+48" = entry[?].value; "ValuePair @+16" = evaluated).
+                    // PhD-6: type the HOLDER + field offset so the missed-root
+                    // edge is identifiable.  Decode the word as a Value too: a
+                    // genuine Value-pointer slot has a POINTER tag.
+                    Value asVal; asVal.w = w;
                     std::fprintf(stderr,
                         "v3 SCAVENGE BRUTE: arena word @ %p holds nursery "
-                        "pointer %p  [holder=%s @+%zu, size=%zu]\n",
+                        "pointer %p  [holder=%s @+%zu, size=%zu | "
+                        "pointer-capable slot | word-as-Value: tag=%d ptr-tagged=%s]\n",
                         (void*)p, (void*)w, typeName(r->type),
-                        (size_t)(p - r->lo), (size_t)(r->hi - r->lo));
+                        off, (size_t)(r->hi - r->lo),
+                        (int)asVal.tag(), tagIsPointer(asVal.tag()) ? "yes" : "no");
                 }
                 ++hitsLive;
             } else {
                 ++hitsDead;
             }
         }
+    }
+    // #34 RCA near-miss pass: for the SCALAR {SymbolId,PosIdx32} words of every
+    // LIVE tenured Bindings entry, measure the closest approach to the nursery.
+    // If scalar words routinely land NEAR the nursery's ASLR-varying range, the
+    // conservative raw-word BRUTE scan CAN false-positive when the exact window
+    // aligns (the rare flake).  Gated on V3_DBG_NURSERY_BRUTE_NEARMISS to keep
+    // the default brute path unchanged.
+    static const bool s_nearMiss = std::getenv("V3_DBG_NURSERY_BRUTE_NEARMISS") != nullptr;
+    if (__builtin_expect(s_nearMiss, 0)) {
+        uintptr_t minDist = ~uintptr_t(0);
+        uintptr_t minWord = 0;
+        size_t scalarWords = 0, near4G = 0, near256M = 0, near1M = 0;
+        for (const auto & r : liveRanges) {
+            if (static_cast<CellType>(r.type) != CellType::Bindings) continue;
+            if (r.hi <= r.lo + 16) continue;
+            size_t nEntries = (r.hi - r.lo - 16) / 16;
+            for (size_t i = 0; i < nEntries; ++i) {
+                uintptr_t sp = r.lo + 16 + 16 * i;  // {SymbolId,PosIdx32} word
+                uintptr_t sw = *reinterpret_cast<const uintptr_t *>(sp);
+                if (sw == 0) continue;
+                ++scalarWords;
+                uintptr_t d = n.minDistanceToNursery(sw);
+                if (d < minDist) { minDist = sw ? d : minDist; minWord = sw; }
+                if (d < (uintptr_t(4) << 30))   ++near4G;
+                if (d < (uintptr_t(256) << 20)) ++near256M;
+                if (d < (uintptr_t(1) << 20))   ++near1M;
+            }
+        }
+        std::fprintf(stderr,
+            "v3 BRUTE-NEARMISS: nursery young=[%p,%p)  scalarWords=%zu  "
+            "closest={word=%p dist=%zuB}  within[4G=%zu 256M=%zu 1M=%zu]\n",
+            (void*)n.youngLo(), (void*)n.youngHi(), scalarWords,
+            (void*)minWord, (size_t)(minDist == ~uintptr_t(0) ? 0 : minDist),
+            near4G, near256M, near1M);
     }
     // Continue to report the combined "tenured words" count — but
     // ONLY when hitsLive > 0 (live hits are the actionable signal).
@@ -1707,6 +1786,16 @@ void postScavengeBruteScan(
     std::fprintf(stderr,
         "v3 SCAVENGE BRUTE: %zu tenured words point into nursery "
         "(first %zu dumped above)\n", hits, std::min(hits, cap));
+    if (hitsScalarFalsePos > 0) {
+        // #34: raw-word hits landing in provably-NON-POINTER scalar slots
+        // (a Bindings entry's {SymbolId,PosIdx32}, a header count, etc.) whose
+        // 64-bit value coincidentally fell in the nursery's ASLR range.  Not a
+        // missed root (no pointer lives there) — filtered from the count above.
+        std::fprintf(stderr,
+            "v3 SCAVENGE BRUTE: %zu scalar-slot words coincided with the "
+            "nursery range — FILTERED (non-pointer metadata, not a missed "
+            "root; see #34 RCA)\n", hitsScalarFalsePos);
+    }
     if (hitsDead > 0) {
         // Dead hits = arena bloat (Boehm pins arena → dead tenured
         // objects retain stale nursery pointers).  Informational

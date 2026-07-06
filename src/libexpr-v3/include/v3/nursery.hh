@@ -223,6 +223,33 @@ public:
         return false;
     }
 
+    /// #34 RCA (2026-07-06): minimum byte distance from raw word `w` to any of
+    /// the nursery regions (0 iff contains(w)).  Used by the BRUTE-scan
+    /// near-miss diagnostic to test whether SCALAR (non-pointer) words — e.g. a
+    /// Bindings entry's packed {SymbolId,PosIdx32} — routinely land NEAR the
+    /// nursery's ASLR-varying address range (a false-positive risk for the
+    /// conservative raw-word scan), even on clean runs where the exact 1MB
+    /// window isn't hit.
+    uintptr_t minDistanceToNursery(uintptr_t w) const noexcept
+    {
+        auto dist = [w](const char * lo, const char * hi) -> uintptr_t {
+            uintptr_t l = reinterpret_cast<uintptr_t>(lo);
+            uintptr_t h = reinterpret_cast<uintptr_t>(hi);
+            if (w >= l && w < h) return 0;
+            return (w < l) ? (l - w) : (w - h + 1);
+        };
+        uintptr_t d = dist(base, end);
+        if (phaseEEnabled) {
+            uintptr_t da = dist(survBaseA, survEndA);
+            uintptr_t db = dist(survBaseB, survEndB);
+            if (da < d) d = da;
+            if (db < d) d = db;
+        }
+        return d;
+    }
+    uintptr_t youngLo() const noexcept { return reinterpret_cast<uintptr_t>(base); }
+    uintptr_t youngHi() const noexcept { return reinterpret_cast<uintptr_t>(end); }
+
     /// Mid-eval non-moving GC (MIDEVAL_GC_DESIGN_2026-06-22): invoke `f(lo, hi)`
     /// for each USED byte range that may hold pointers into the tenured arena —
     /// the young region `[base, next)` and, under Phase E, both survivor buffers'
