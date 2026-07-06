@@ -123,5 +123,97 @@ manifest recovers the same win soundly.
 5. darwin-4 GATE: cross-process byte-id HITs on hello/firefox.drvPath + M5.name,
    shadow mismatch==0 over the corpus, T_hit/T_eval<=0.20 → SHIP; else DEFER.
 
+## VETTED IMPLEMENTATION SPEC (2026-07-06, opus adversarial soundness pass)
+Grounded at HEAD (taint = per-axis mask primops.cc:6814; key `v3-toplevel-v3`
+run.cc:1837; gate = reject-all-tainted run.cc:1871). The DECISIVE soundness
+resolution + the buildable spec (a wrong top-level cache = SILENT WHOLE-EVAL
+MISCOMPILE, so this was reviewed before any gate edit):
+
+**Q1 getEnv (the hole found pre-build): RESOLVED.** Under `--pure-eval`/`--restrict-eval`
+`primGetEnv` returns `""` UNCONDITIONALLY (primops.cc:1865-1872) → env-independent
+BY CONSTRUCTION, so the key omitting env values is harmless. So:
+`perturbable = TAINT_CURRENTTIME | (pure ? TAINT_GETENV : 0)`. Under `--impure`
+getEnv reads the real env (not in key) → getEnv DEMOTED TO REJECT. The whole
+manifest tier is honored ONLY under pure-eval (the manifest is generated/valid
+only there); under `--impure` only untainted inserts.
+
+**Q4 exact insert gate** (replaces run.cc:1871):
+```
+mask = topLevelTaintMask();
+pure = ffi::pureEval(*state.nixEvalState) || ffi::restrictEval(*state.nixEvalState);
+perturbable = TAINT_CURRENTTIME | (pure ? TAINT_GETENV : 0);
+rejectBits = mask & ~perturbable;
+insert  iff  rejectBits==0
+        &&  ( (mask & perturbable)==0                              // untainted
+              || (pure && manifestContains(manifestEntryId(...))) ) // blessed clock-stable
+```
+Order is load-bearing: **reject-bits FIRST** (readFile/fetch/store/impure-getEnv
+dominate the manifest — TL10), **manifest LAST**, **manifestContains fails CLOSED**
+(missing/unreadable/hash-mismatch/bad-signature → false).
+
+**Q3 manifest id = SHA-256(keyBody)** where keyBody = the topLevelCacheKey bytes
+MINUS the `"v3-toplevel-vN"` version tag (schema‖system‖NIX_PATH‖basePath‖source).
+Refactor topLevelCacheKey → `keyBodyBytes()` helper so production lookup ==
+manifest key BY CONSTRUCTION. Manifest blesses the EXACT (source,NIX_PATH,system,
+basePath) tuple; coverage limit = only pre-blessed exprs get the clock-tainted win
+(novel exprs fall to the sound untainted-only baseline — a coverage gap, not a
+stale-result hole).
+
+**Q5 key v3→v4** + fold `manifestContentHashHex()` (a manifest change invalidates
+clock-tainted entries) + `codegenGateFingerprint()` (R4; currently ABSENT from the
+top-level key — present only in the CU key primops.cc:7445; must be exposed to
+run.cc). Fold both UNCONDITIONALLY (one key shape; lookup precedes eval so taint
+isn't known at lookup).
+
+**Q2 manifest certifies** currentTime-stability via >=3 ADVERSARIAL STRADDLING
+clocks (not 2 — 2 can wrongly bless an `if currentTime>T` source; TL8). Extend
+bench/toplevel-cache-coverage.sh to emit a SIGNED manifest of sources byte-stable
+across all points; the generator's refuse-to-bless-unstable IS the sole soundness
+gate for clock-tainted entries (runtime trusts the manifest). Add a getEnv-sentinel
+pass as a generation-time leak cross-check.
+
+**Q6 M5.name/A3: CONFIRMED** getFlake→TAINT_FETCH→reject until A3 keys the flake
+lock. A3 must add to the key: resolved-NIX_PATH content-ids (replace the raw
+NIX_PATH env string — the R2 mutable-channel gap), flake-lock rev/narHash, and
+codegenGateFingerprint; then getFlake taint can demote reject→keyed. Until A3,
+M5.name reject is SOUND. **A1 full SHIP gate is COUPLED with A3** for the M5.name
+leg AND for mutable-NIX_PATH robustness (R2 ship-blocker: A1 on a mutable channel
+is UNSOUND; pinned/immutable archive-URL NIX_PATH is fine → A1-alone can SHIP the
+pinned hello/firefox.drvPath leg).
+
+**Q7 tests (TL7-TL12, in --brute core), test hook `NIX_V3_TOPLEVEL_MANIFEST=<path>`
+(inline retirement: retire when the production manifest path is wired):**
+- TL7 (+) manifest-blessed clock-independent source caches+reuses byte-id (pure-eval).
+- **TL8 (− CRUX, failing-first): a clock-DEPENDENT source (`if currentTime>1.5e9…`)
+  wrongly blessed by a 2-clock manifest is ACCEPTED (red); the >=3-adversarial-clock
+  generator REFUSES to bless it (green). Proves >=3 straddling points is load-bearing.**
+- TL9 (−) getEnv under `--impure` rejected despite manifest (mode-dependent perturbable).
+- TL10 (−) readFile hard-reject dominates a wrongful manifest bless (reject-bits-first).
+- TL11 (−) v3 entry NOT served by v4 (version-tag keyspace partition).
+- TL12 (R) manifest swap M1→M2 = miss then hit (manifest-hash-in-key invalidation).
+
+**Residual soundness risks (ranked, with mitigations):** R1 FFI-leaf ambient reads
+below the primop boundary (HIGH — audit the 11 bump sites + derivationStrict/
+writeDerivation; getEnv-sentinel catches env leaks; pure-eval bounds the surface);
+R2 mutable NIX_PATH (HIGH — deferred to A3, ship-blocker for mutable channels;
+pinned OK); R3 tryEval taint-non-restore (LOW, safe over-approx); R4 codegen
+non-determinism (MED — codegenGateFingerprint in key + shadow mismatch==0 gate);
+R5 IFD reads (MED — go through readFile→TAINT_READFILE→reject, confirmed); R6
+__currentTime in drv (NONE — writeDerivation embeds no timestamp, store paths are
+content-hash; confirms the empirical 98% clock-stability is structural); R7
+manifest fail-open (HIGH if mishandled — fail CLOSED + sign + verify + hash-in-key);
+R8 corpus coverage gap (LOW — perf not soundness; ensure SHIP workloads are in corpus).
+
+**SINGLE MOST IMPORTANT INVARIANT:** gate checks reject-bits FIRST, manifest LAST,
+fails CLOSED, honors the manifest ONLY under `--pure-eval`; the manifest's validity
+rests ENTIRELY on the offline generator's >=3-adversarial-point perturbation refusing
+to bless any moving result. TL8 keeps that honest.
+
+**BUILD STATUS:** spec vetted; mechanism NOT yet built. Remaining = keyBodyBytes
+refactor + expose codegenGateFingerprint + v4 + manifest loader (fail-closed) +
+Q4 gate + harness manifest-emit (>=3 clocks) + TL7-TL12 + `--brute` + shadow
+mismatch==0 + darwin-4 T_hit/T_eval<=0.20 → SHIP (pinned .drvPath) / DEFER-to-A3
+(M5.name + mutable NIX_PATH).
+
 Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>,
 Input Output Group. SPDX-License-Identifier: Apache-2.0.
