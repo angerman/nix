@@ -3142,6 +3142,10 @@ void primNixPath(EvalState & state, Value *, Value & out)
 /// SourcePath.  Throws if no entry matches.
 void primFindFile(EvalState & state, Value * args, Value & out)
 {
+    // A5-fix (taint-mask completion): resolves a path against the ambient
+    // LookupPath / NIX_PATH search state — was un-tainted (cross-process stale
+    // hole).
+    topLevelTaintBump(TAINT_READFILE);
     if (!state.nixEvalState)
         throw std::runtime_error("v3 primop findFile: no nix EvalState wired");
     if (!args[0].isList()) typeError("findFile", "list of {path, prefix}");
@@ -7012,6 +7016,9 @@ namespace {  // reopen: restore file-local linkage for the helpers below
 /// set (the host EvalState providing parser + symbol table).
 void primImport(EvalState & state, Value * args, Value & out)
 {
+    // A5-fix (taint-mask completion): reads+parses an arbitrary .nix file (incl.
+    // IFD via realisePath) — was un-tainted (cross-process stale hole).
+    topLevelTaintBump(TAINT_READFILE);
     if (!state.nixEvalState)
         throw std::runtime_error("v3 primop import: no nix EvalState wired (run via v3-eval)");
 
@@ -8699,6 +8706,9 @@ static void primPathFilteredNative(EvalState & state, Value * args, Value & out)
 /// VM on every fs entry — left to a follow-up).
 void primPath(EvalState & state, Value * args, Value & out)
 {
+    // A5-fix (taint-mask completion): reads a filesystem path into the store —
+    // was un-tainted (cross-process stale hole).
+    topLevelTaintBump(TAINT_READFILE);
     if (!args[0].isAttrs() || !args[0].asAttrs())
         typeError("path", "attrset");
     // V3-NATIVE builtins.path (TW_VALUE_ERADICATION F3/F4): primPathNative /
@@ -8768,6 +8778,11 @@ void primPath(EvalState & state, Value * args, Value & out)
 // see primPath).
 static void primPathNative(EvalState & state, Value * args, Value & out)
 {
+    // A5-fix (taint-mask completion): reads a filesystem path into the store —
+    // was un-tainted (cross-process stale hole).  (Idempotent with primPath's
+    // bump — this is the only caller, but bumping here guards any future
+    // direct call site too.)
+    topLevelTaintBump(TAINT_READFILE);
     auto & ns = *state.nixEvalState;
     auto * src = args[0].asAttrs();
 
@@ -8839,6 +8854,10 @@ static void primPathNative(EvalState & state, Value * args, Value & out)
 // 20034-dispatch builtins.path bridge feeder on cardano-node.
 static void primPathFilteredNative(EvalState & state, Value * args, Value & out)
 {
+    // A5-fix (taint-mask completion): reads a filesystem tree (with filter) into
+    // the store — was un-tainted (cross-process stale hole).  (Idempotent with
+    // primPath's bump — this is the only caller.)
+    topLevelTaintBump(TAINT_READFILE);
     auto & ns = *state.nixEvalState;
     auto * src = args[0].asAttrs();
 
@@ -8930,6 +8949,9 @@ static void primPathFilteredNative(EvalState & state, Value * args, Value & out)
 /// closure is then applied to the scope value.
 void primScopedImport(EvalState & state, Value * args, Value & out)
 {
+    // A5-fix (taint-mask completion): reads+parses an arbitrary .nix file — was
+    // un-tainted (cross-process stale hole).
+    topLevelTaintBump(TAINT_READFILE);
     if (!state.nixEvalState)
         throw std::runtime_error("v3 primop scopedImport: no nix EvalState wired");
     Value scope = forceValue(*state.vm, args[0]);
@@ -10152,6 +10174,10 @@ static void v3FetchTree(EvalState & s, Value * a, Value & o,
                         bool allowNameArgument, bool emptyRevFallback,
                         bool isFinal = false)
 {
+    // A5-fix (taint-mask completion): fetchTree/fetchGit/fetchFinalTree touch
+    // network/mutable inputs not in the key — was un-tainted (cross-process
+    // stale hole).  Mirrors the v3Fetch sibling which already bumps FETCH.
+    topLevelTaintBump(TAINT_FETCH);
     if (!s.nixEvalState)
         throw std::runtime_error(std::string("v3 ") + fetcher + ": no tree-walker state available");
     auto & ns = *s.nixEvalState;
@@ -10247,6 +10273,9 @@ void primFetchGit    (EvalState & s, Value * a, Value & o) {
 // Note: fetchMercurial's result shape ≠ emitTreeAttrs (branch + 12-char
 // shortRev, no narHash/lastModified), so it has its own builder.
 void primFetchMercurial(EvalState & s, Value * a, Value & o) {
+    // A5-fix (taint-mask completion): fetches a mercurial repo (network/mutable
+    // input not in the key) — was un-tainted (cross-process stale hole).
+    topLevelTaintBump(TAINT_FETCH);
     if (!s.nixEvalState)
         throw std::runtime_error("v3 fetchMercurial: no tree-walker state available");
     auto & ns = *s.nixEvalState;
@@ -10369,6 +10398,9 @@ void primFetchClosure(EvalState & s, Value * a, Value & o) {
 // bridge: the filter stays a v3 closure; ffi::addPathFiltered drives the
 // libstore copy + calls back via the v3filter lambda below.
 void primFilterSource(EvalState & s, Value * a, Value & o) {
+    // A5-fix (taint-mask completion): reads a filesystem tree into the store —
+    // was un-tainted (cross-process stale hole).
+    topLevelTaintBump(TAINT_READFILE);
     if (!s.nixEvalState)
         throw std::runtime_error("v3 filterSource: no tree-walker state available");
     auto & ns = *s.nixEvalState;

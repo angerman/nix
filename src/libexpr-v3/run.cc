@@ -2144,7 +2144,11 @@ disk_cache::CacheKey topLevelCacheKey(nix::EvalState & state,
     // demotion insert policy.  A v5 entry (getFlake was hard-reject → never
     // inserted a flake-pinned result, and the key lacked the lock text) must
     // NEVER be served by v6's flake-keyed insert policy.
-    keyBytes.append("v3-toplevel-v6");
+    // v7 = taint mask COMPLETED (import/scopedImport/fetchTree/fetchGit/
+    // fetchMercurial/filterSource/path*/findFile now bump their axis); a v6
+    // entry was written under an incomplete mask that under-tainted file/fetch
+    // reads → must never be served (cross-version stale).
+    keyBytes.append("v3-toplevel-v7");
     keyBytes.push_back('\0');
     // R4 (Q5): fold codegenGateFingerprint UNCONDITIONALLY — a differently-
     // compiled binary (a NIX_V3_* codegen gate set) must never serve a

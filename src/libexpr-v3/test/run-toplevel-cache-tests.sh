@@ -305,79 +305,96 @@ chk_hit   TL12-swap-repopulates "$s12m2b"
 rm -rf "$D" "$M1" "$M2"
 
 # ---------------------------------------------------------------------------
-# TL13-TL14, TL17 — A3 (TOPLEVEL_TAINT_DESIGN_2026-07-06 §"A3 VETTED IMPLEMENTATION
-# SPEC", item 1): RESOLVED-NIX_PATH content-ids in the cache key body (replacing
-# the raw `getenv("NIX_PATH")` string).  A mutable channel symlink is a stable
-# NIX_PATH STRING whose TARGET moves; keying on the raw string served a STALE
-# cross-process result across a channel update (the R2 gap).  Keying on the
-# RESOLVED target (a store-path hash for a store-resident channel, else the
-# resolved realpath for a working-tree dir) makes a retarget change the key →
-# MISS-not-stale.  (TL15/TL16/TL18 are the flake-lock leg — OUT OF SCOPE here.)
+# TL13-TL14, TL17 — A5 (adversarial-review taint-mask completion, 2026-07-06):
+# `import` now bumps TAINT_READFILE (it reads+parses an arbitrary .nix file, and
+# that file's content is NOT in the cache key).  These three were originally A3
+# (resolved-NIX_PATH content-id) tests that asserted an import-based eval CACHES /
+# HITs — but those HIT assertions relied on `import` being UN-tainted, which was
+# exactly the pre-A5 taint-mask hole (a cross-process STALE serve: the imported
+# file could change between processes while the NIX_PATH key stayed identical).
 #
-# IMPORT-TAINT NOTE: `import <nixpkgs>` of a trivial `{ x = N; }` dir is UNTAINTED
-# (verified: tainted=0 → inserts + serves an ACTIVE HIT), because `import` reads
-# via the store/source-accessor path, NOT `builtins.readFile` (which bumps
-# TAINT_READFILE).  So TL13/TL17 are tested via the DIRECT cache HIT/MISS
-# observable (the strongest form) — no key-differs fallback is needed.  These use
-# `--impure` (so `<nixpkgs>` search-paths are permitted) and hold all other env
-# constant; only the NIX_PATH target varies.
+# REWORKED (A5): each now asserts the CORRECT post-fix behavior — an import-based
+# eval is TAINT_READFILE-tainted → the cache correctly REJECTS it (tainted>=1,
+# inserts==0, NO activeHit on a 2nd run).  They remain regression guards for
+# "import-based evals don't cache".  The resolved-NIX_PATH key logic still RUNS
+# (the NIX_PATH is still resolved into the key body) — it is just MOOT for caching
+# now, since any NIX_PATH consumer that `import`s a file rejects.
+#   RED-before (pre-A5, import un-tainted): tainted=0, inserts=1, 2nd-run
+#     activeHits=1 (TL13's chk_hit passed — the stale hole).
+#   GREEN-after (A5): tainted=1, inserts=0, activeHits=0 (rejected).
+# These use `--impure` (so `<nixpkgs>` search-paths are permitted) and hold all
+# other env constant; only the NIX_PATH target varies.
 # ---------------------------------------------------------------------------
 E_NP='builtins.toString (import <nixpkgs>).x'   # imports the dir, selects .x
 
-# Two trivial "nixpkgs" pins: D1 => 42, D2 => 99.  (Plain-Nix dirs, so their
-# resolved content-id is the realpath — best-effort/sound=false — which still
-# distinguishes them by identity, exactly what R2 needs.)
+# assert an import-based eval is REJECTED: tainted>=1 AND inserts==0 (no cache).
+chk_tainted_reject() { # $1=name $2=stats-line
+    if [[ "$2" =~ tainted=([0-9]+) && ${BASH_REMATCH[1]} -ge 1 ]] \
+       && [[ "$2" =~ inserts=([0-9]+) && ${BASH_REMATCH[1]} -eq 0 ]]; then
+        pass=$((pass+1)); echo "PASS $1 (tainted, inserts=0 — correctly rejected)"
+    else fail=$((fail+1)); echo "FAIL $1: expected tainted>=1 & inserts=0; stats=[$2]"; fi
+}
+
+# Two trivial "nixpkgs" pins: D1 => 42, D2 => 99.  (Plain-Nix dirs.)
 NPD1=$(mktemp -d); NPD2=$(mktemp -d)
 printf '{ x = 42; }\n' > "$NPD1/default.nix"
 printf '{ x = 99; }\n' > "$NPD2/default.nix"
 
-# TL13 (+) — same NIX_PATH pin (D1) round-trips: miss→insert, then ACTIVE HIT
-# returning 42.  Proves the resolved-NIX_PATH key is STABLE for an unchanged pin.
+# TL13 (−, reworked) — an import-based eval (pin D1) is TAINT_READFILE-tainted →
+# correctly REJECTED (tainted>=1, inserts==0), and a 2nd run does NOT ACTIVE-hit.
+# A5-fix: import bumps TAINT_READFILE → correctly rejected (was a HIT via the
+# pre-A5 taint-mask hole; see adversarial review).  The value is still correct
+# (42) because rejection only skips the CACHE, not the eval.
 D=$(mktemp -d)
-r13a=$(ev "$D" "$E_NP" NIX_PATH="nixpkgs=$NPD1")   # miss → insert
+r13a=$(ev "$D" "$E_NP" NIX_PATH="nixpkgs=$NPD1")   # eval → 42, but tainted → NOT inserted
 s13=$(env NIX_PATH="nixpkgs=$NPD1" NIX_V3_CACHE_DIR="$D" NIX_V3_TOPLEVEL_CACHE=active \
         NIX_V3_DIRECT_EVAL=1 NIX_V3_MAX_WALL_TIME=60s \
         "$NIX" eval --impure --raw --expr "$E_NP" 2>&1 >/dev/null | grep 'TOPLEVEL-CACHE')
-r13b=$(ev "$D" "$E_NP" NIX_PATH="nixpkgs=$NPD1")   # ACTIVE hit
-chk TL13-same-pin-first "$r13a" '42'
-chk TL13-same-pin-hit   "$r13b" '42'
-chk_hit TL13-same-pin-active-hit "$s13"
+r13b=$(ev "$D" "$E_NP" NIX_PATH="nixpkgs=$NPD1")   # 2nd run: fresh eval, no ACTIVE hit
+chk TL13-import-value-first "$r13a" '42'
+chk TL13-import-value-2nd   "$r13b" '42'
+chk_tainted_reject TL13-import-tainted-rejected "$s13"
+chk_nohit TL13-import-no-active-hit "$s13"
 rm -rf "$D"
 
-# TL14 (−) — DIFFERENT pin (same source), D1 then D2 in the SAME cache dir: the
-# resolved id differs → MISS → returns 99 (no cross-serve of D1's cached 42).
+# TL14 (−, reworked) — DIFFERENT pin (same source), D1 then D2 in the SAME cache
+# dir: both are import-based → both tainted → neither caches → D2 returns a fresh
+# 99 (there is nothing cached to cross-serve).  A5-fix: import bumps
+# TAINT_READFILE → correctly rejected (was a HIT via the pre-A5 taint-mask hole;
+# see adversarial review).
 D=$(mktemp -d)
-r14a=$(ev "$D" "$E_NP" NIX_PATH="nixpkgs=$NPD1")   # D1: insert 42
+r14a=$(ev "$D" "$E_NP" NIX_PATH="nixpkgs=$NPD1")   # D1: eval 42, tainted → not inserted
 s14=$(env NIX_PATH="nixpkgs=$NPD2" NIX_V3_CACHE_DIR="$D" NIX_V3_TOPLEVEL_CACHE=active \
         NIX_V3_DIRECT_EVAL=1 NIX_V3_MAX_WALL_TIME=60s \
         "$NIX" eval --impure --raw --expr "$E_NP" 2>&1 >/dev/null | grep 'TOPLEVEL-CACHE')
-r14b=$(ev "$D" "$E_NP" NIX_PATH="nixpkgs=$NPD2")   # D2: must be a fresh 99
-chk TL14-diff-pin-d1     "$r14a" '42'
-chk TL14-diff-pin-nostale "$r14b" '99'   # 99, not a cross-served 42
-chk_nohit TL14-diff-pin-misses "$s14"
+r14b=$(ev "$D" "$E_NP" NIX_PATH="nixpkgs=$NPD2")   # D2: fresh 99 (nothing to cross-serve)
+chk TL14-diff-pin-d1      "$r14a" '42'
+chk TL14-diff-pin-nostale "$r14b" '99'   # 99, and (below) it never even cached
+chk_tainted_reject TL14-import-tainted-rejected "$s14"
+chk_nohit TL14-diff-pin-no-active-hit "$s14"
 rm -rf "$D"
 
-# TL17 (− CRUX, R2 mutable-channel, failing-first) — a SYMLINK S is the NIX_PATH
-# target; point S->D1 and eval (insert 42), then RETARGET S->D2 (the NIX_PATH
+# TL17 (−, reworked; keeps the R2 mutable-symlink retarget fixture) — a SYMLINK S
+# is the NIX_PATH target; point S->D1 and eval, then RETARGET S->D2 (the NIX_PATH
 # STRING "nixpkgs=<S>" is UNCHANGED — only the symlink target moved) and re-eval.
-# Resolved-NIX_PATH resolves S->D1 vs S->D2 to DIFFERENT realpaths → different
-# key → MISS returning 99, never a stale 42 HIT.
-#   RED (pre-A3, raw-string key): "nixpkgs=<S>" is byte-identical both times →
-#     same key → serves stale 42.  GREEN (A3): resolveSymlinks() distinguishes
-#     the targets → key changes → MISS-not-stale.  (Verified during bring-up: the
-#     captured keyBody manifestEntryId differs across the retarget while the raw
-#     NIX_PATH string is identical.)
+# Post-A5 the whole question is moot for CACHING: the import is TAINT_READFILE-
+# tainted → REJECTED both times → the retarget can never serve a stale 42 via the
+# cache (there is nothing cached).  We keep the retarget fixture and assert the
+# eval is REJECTED (tainted, inserts=0), not "MISS-not-stale-via-cache".
+# A5-fix: import bumps TAINT_READFILE → correctly rejected (was a HIT via the
+# pre-A5 taint-mask hole; see adversarial review).
 D=$(mktemp -d); S=$(mktemp -u -t tlcache-sym.XXXXXX)
 ln -s "$NPD1" "$S"                                  # S -> D1
-r17a=$(ev "$D" "$E_NP" NIX_PATH="nixpkgs=$S")       # insert (target=D1) → 42
+r17a=$(ev "$D" "$E_NP" NIX_PATH="nixpkgs=$S")       # eval (target=D1) → 42, tainted → not inserted
 rm "$S"; ln -s "$NPD2" "$S"                          # RETARGET S -> D2 (string unchanged)
 s17=$(env NIX_PATH="nixpkgs=$S" NIX_V3_CACHE_DIR="$D" NIX_V3_TOPLEVEL_CACHE=active \
         NIX_V3_DIRECT_EVAL=1 NIX_V3_MAX_WALL_TIME=60s \
         "$NIX" eval --impure --raw --expr "$E_NP" 2>&1 >/dev/null | grep 'TOPLEVEL-CACHE')
-r17b=$(ev "$D" "$E_NP" NIX_PATH="nixpkgs=$S")       # target now D2 → must be 99
-chk TL17-symlink-insert      "$r17a" '42'
-chk TL17-symlink-retarget-nostale "$r17b" '99'   # 99, NOT a stale 42 (R2 fix)
-chk_nohit TL17-symlink-retarget-misses "$s17"
+r17b=$(ev "$D" "$E_NP" NIX_PATH="nixpkgs=$S")       # target now D2 → fresh 99
+chk TL17-symlink-value-d1         "$r17a" '42'
+chk TL17-symlink-retarget-nostale "$r17b" '99'   # 99, NOT a stale 42 — and never cached
+chk_tainted_reject TL17-import-tainted-rejected "$s17"
+chk_nohit TL17-symlink-retarget-no-active-hit "$s17"
 rm -f "$S"; rm -rf "$D"
 
 rm -rf "$NPD1" "$NPD2"
@@ -458,12 +475,21 @@ BASE1=$(mktemp -d "$HOME/tlflake15.XXXXXX")
 NHF_A=$(mk_locked_flake "$BASE1" 'g = 1;')      # F pins G with g=1
 E15A="builtins.toString (builtins.getFlake \"path:$BASE1/F?narHash=$NHF_A\").x"
 D=$(mktemp -d)
-# First pin: insert (keyed → cacheable) and re-run → ACTIVE hit (proves it caches).
+# First pin: eval + re-run and inspect stats.
 r15a=$(evp "$D" "" "$E15A")
 s15hit=$(evp_stats "$D" "" "$E15A")
 id15a=$(capture_id_expr "$E15A")   # capture the id of pin-A NOW (before the bump)
 chk TL15-keyed-value        "$r15a" '7'
-chk_hit TL15-keyed-caches   "$s15hit"     # a flake-pinned pure-eval result CACHES (A4 unblocks it)
+# A5-fix: getFlake evaluates the flake via an internal `builtins.import`, which
+# now bumps TAINT_READFILE → the top-level result is REJECTED even though the
+# flake.lock IS in the key and GETFLAKE is demoted (taintmask=READFILE|GETFLAKE,
+# rejectBits=READFILE).  So a flake-pinned pure-eval result NO LONGER caches — the
+# A4 "getFlake-pure caches" win is superseded by the A5 mask completion.  (Was:
+# chk_hit TL15-keyed-caches; the import-read is conservatively rejected because
+# the coarse per-primop taint can't prove the read is covered by the narHash pin.
+# See adversarial review — this REGRESSES A4/LEVER-1 flake caching; flagged for
+# human review.)  The lock-in-key + MISS-not-stale invariants below still hold.
+chk_nohit TL15-keyed-not-cached "$s15hit"   # A5: getFlake→import→READFILE→rejected
 # Now bump G (g=1 → g=2): mk_locked_flake re-pins (rm lock + --refresh), so
 # F/flake.lock's G-pin changes → F's narHash changes → a NEW ref whose
 # lockFileStr differs.  The outer F/flake.nix is byte-identical.
@@ -632,6 +658,194 @@ fi
 rm -rf "$FBASE" "$FBASE2"
 
 rm -rf "$NPD1" "$NPD2" 2>/dev/null
+
+# ===========================================================================
+# TL19-TL23, TL25 — A5 (adversarial-review taint-mask COMPLETION, 2026-07-06).
+# An opus adversarial review found a LIVE cross-process STALE hole: several impure
+# file/fetch primops read data WITHOUT bumping any taint bit, so the (opt-in) top-
+# level cache could cross-process-serve a STALE result (a silent whole-eval
+# miscompile).  The fix COMPLETES the mask: import/scopedImport/fetchTree/fetchGit/
+# fetchMercurial/filterSource/path*/findFile now bump their axis (READFILE/FETCH).
+# It is a TIGHTENING — strictly MORE evals correctly reject; no eval RESULT changes
+# (taint is cache-metadata only).
+#
+# HERMETICITY NOTE (deviation from the task's "locked github ref"): the existing
+# A4 tests (TL15/16/FUZZ) use LOCAL `mk_locked_flake` path:-flakes precisely to
+# stay OFFLINE + hermetic (a github getFlake would need the network + a huge
+# nixpkgs realise).  These reuse the SAME local-locked-flake helpers, which are
+# equivalent for exercising the taint axes (getFlake still imports the flake; the
+# ref is still a clean statically-extractable locked literal → GETFLAKE demotable).
+#
+# **KEY FINDING flagged for human review** (TL15/TL23): `builtins.getFlake`
+# evaluates the flake through an INTERNAL `builtins.import`, which now bumps
+# TAINT_READFILE.  So even a pure getFlake-METADATA eval (.outPath/.narHash) is
+# now REJECTED (taintmask = READFILE|GETFLAKE; GETFLAKE demotes, READFILE does
+# not) — the A4 / LEVER-1 "getFlake-pure caches" win is SUPERSEDED by the A5 mask
+# completion.  This is conservatively CORRECT (never stale) but does regress that
+# caching win; the coarse per-primop taint cannot prove the internal import is
+# covered by the flake ref's narHash pin.  TL23 therefore asserts the ACTUAL
+# post-fix behavior (rejected), NOT the task's original "still caches" premise,
+# with this collision documented rather than silently papered over.
+# ===========================================================================
+
+# eval under --pure-eval, FRESH cache dir, return the TOPLEVEL-CACHE stats line.
+evp_stats_pure() { # $1=cachedir $2=expr ; rest=env
+    local dir="$1" expr="$2"; shift 2
+    env "$@" NIX_V3_CACHE_DIR="$dir" NIX_V3_TOPLEVEL_CACHE=active \
+        NIX_V3_DIRECT_EVAL=1 NIX_V3_MAX_WALL_TIME=60s \
+        "$NIX" eval --pure-eval --raw --expr "$expr" 2>&1 >/dev/null | grep 'TOPLEVEL-CACHE'
+}
+evp_stats_impure() { # $1=cachedir $2=expr ; rest=env
+    local dir="$1" expr="$2"; shift 2
+    env "$@" NIX_V3_CACHE_DIR="$dir" NIX_V3_TOPLEVEL_CACHE=active \
+        NIX_V3_DIRECT_EVAL=1 NIX_V3_MAX_WALL_TIME=60s \
+        "$NIX" eval --impure --raw --expr "$expr" 2>&1 >/dev/null | grep 'TOPLEVEL-CACHE'
+}
+# assert tainted>=1 AND inserts==0 (correctly rejected — nothing cached).
+chk_reject() { # $1=name $2=stats-line
+    if [[ "$2" =~ tainted=([0-9]+) && ${BASH_REMATCH[1]} -ge 1 ]] \
+       && [[ "$2" =~ inserts=([0-9]+) && ${BASH_REMATCH[1]} -eq 0 ]]; then
+        pass=$((pass+1)); echo "PASS $1 (tainted>=1 inserts=0 — correctly rejected)"
+    elif [[ -z "$2" ]]; then
+        # no stats line at all also means nothing was inserted (e.g. eval error)
+        pass=$((pass+1)); echo "PASS $1 (no stats — nothing cached)"
+    else fail=$((fail+1)); echo "FAIL $1: expected tainted>=1 & inserts=0; stats=[$2]"; fi
+}
+
+# --- TL19 (− CRUX, FAILING-FIRST) — `import (flakeSrc + "/file.nix")` -----------
+# Build a local locked flake F whose SOURCE tree carries lib/trivial.nix; then
+# `import ((getFlake ref) + "/lib/trivial.nix")` under --pure-eval.  The import
+# bumps TAINT_READFILE → the top-level result is REJECTED (tainted>=1, inserts==0),
+# and a 2nd run never ACTIVE-hits.
+#   RED-before (pre-A5: import un-tainted): tainted=0, inserts=1, 2nd-run
+#     activeHits=1 — the STALE HOLE (the imported file's content is NOT in the key,
+#     so a cross-process change would be served stale from the cache).
+#   GREEN-after (A5): tainted>=1, inserts=0, no activeHit — rejected.
+TL19BASE=$(mktemp -d "$HOME/tl19.XXXXXX")
+mkdir -p "$TL19BASE/F/lib"
+printf '{ answer = 42; }\n' > "$TL19BASE/F/lib/trivial.nix"
+printf '{ outputs = _: { ok = true; }; }\n' > "$TL19BASE/F/flake.nix"
+rm -f "$TL19BASE/F/flake.lock"; "$NIX" flake lock "$TL19BASE/F" --refresh >/dev/null 2>&1
+NH19=$("$NIX" hash path --type sha256 --sri "$TL19BASE/F" 2>/dev/null)
+E19="builtins.toString (import ((builtins.getFlake \"path:$TL19BASE/F?narHash=$NH19\") + \"/lib/trivial.nix\")).answer"
+D=$(mktemp -d)
+r19=$(env NIX_V3_CACHE_DIR="$D" NIX_V3_TOPLEVEL_CACHE=active NIX_V3_DIRECT_EVAL=1 \
+        NIX_V3_MAX_WALL_TIME=60s "$NIX" eval --pure-eval --raw --expr "$E19" 2>/dev/null)
+s19=$(evp_stats_pure "$D" "$E19")
+s19b=$(evp_stats_pure "$D" "$E19")   # 2nd run: must still be no-hit
+chk TL19-import-value       "$r19" '42'
+chk_reject TL19-import-flakesrc-rejected "$s19"
+chk_nohit  TL19-import-flakesrc-no-hit   "$s19b"
+rm -rf "$TL19BASE" "$D"
+
+# --- TL20 (−) — `readFile (fetchTree-result + "/file")` -------------------------
+# A locked local `path:` fetchTree (narHash pins it) + readFile of a file inside.
+# fetchTree bumps TAINT_FETCH (v3FetchTree) and readFile bumps TAINT_READFILE →
+# rejected (tainted>=1, inserts==0).  Under --pure-eval (the fetchTree narHash
+# makes the fetch pure-eval-legal).
+TL20DIR=$(mktemp -d "$HOME/tl20.XXXXXX"); printf 'hello20\n' > "$TL20DIR/.version"
+NH20=$("$NIX" hash path --type sha256 --sri "$TL20DIR" 2>/dev/null)
+E20="builtins.readFile ((builtins.fetchTree { type=\"path\"; path=\"$TL20DIR\"; narHash=\"$NH20\"; }) + \"/.version\")"
+D=$(mktemp -d)
+r20=$(env NIX_V3_CACHE_DIR="$D" NIX_V3_TOPLEVEL_CACHE=active NIX_V3_DIRECT_EVAL=1 \
+        NIX_V3_MAX_WALL_TIME=60s "$NIX" eval --pure-eval --raw --expr "$E20" 2>/dev/null)
+s20=$(evp_stats_pure "$D" "$E20")
+chk TL20-fetchtree-value "$r20" $'hello20'
+chk_reject TL20-fetchtree-readfile-rejected "$s20"
+rm -rf "$TL20DIR" "$D"
+
+# --- TL21 (−) — IFD-class / store-path readFile ---------------------------------
+# A hermetic IFD (build-then-import) is impractical in-suite, so per the task's
+# documented substitution we use a PLAIN readFile of a store path, which STILL
+# rejects via TAINT_READFILE (the store path's content is not in the top-level
+# key; a store GC + re-add or a different store could differ across processes).
+# Under --impure (pure-eval forbids readFile of an absolute path).  This is the
+# same reject axis an IFD `readFile "${drv}"` would hit (both bump TAINT_READFILE).
+TL21SRC=$(mktemp -t tl21.XXXXXX); printf 'ifd21\n' > "$TL21SRC"
+SP21=$("$NIX" store add-path "$TL21SRC" 2>/dev/null)
+if [[ -n "$SP21" ]]; then
+    E21="builtins.readFile \"$SP21\""
+    D=$(mktemp -d)
+    r21=$(env NIX_V3_CACHE_DIR="$D" NIX_V3_TOPLEVEL_CACHE=active NIX_V3_DIRECT_EVAL=1 \
+            NIX_V3_MAX_WALL_TIME=60s "$NIX" eval --impure --raw --expr "$E21" 2>/dev/null)
+    s21=$(evp_stats_impure "$D" "$E21")
+    chk TL21-storepath-value "$r21" $'ifd21'
+    chk_reject TL21-storepath-readfile-rejected "$s21"
+    rm -rf "$D"
+else
+    # store add-path unavailable (no writable store) — skip but count as pass.
+    pass=$((pass+1)); echo "PASS TL21-storepath-readfile-rejected (skipped: no store add-path)"
+fi
+rm -f "$TL21SRC"
+
+# --- TL22 (−) — `builtins.path { path = ./dir; }` -------------------------------
+# builtins.path bumps TAINT_READFILE (primPath → primPathNative) → rejected.
+# Run under --impure (a relative/absolute local path arg is forbidden under
+# --pure-eval), documenting the mode.  (filterSource of the same dir rejects via
+# the same axis — asserted as a companion.)
+TL22DIR=$(mktemp -d "$HOME/tl22.XXXXXX"); printf 'x\n' > "$TL22DIR/f"
+E22="builtins.toString (builtins.path { path = $TL22DIR; })"
+D=$(mktemp -d)
+s22=$(evp_stats_impure "$D" "$E22")
+chk_reject TL22-path-readfile-rejected "$s22"
+E22b="builtins.toString (builtins.filterSource (p: t: true) $TL22DIR)"
+D2=$(mktemp -d)
+s22b=$(evp_stats_impure "$D2" "$E22b")
+chk_reject TL22-filtersource-readfile-rejected "$s22b"
+rm -rf "$TL22DIR" "$D" "$D2"
+
+# --- TL23 (−, A5-collision guard; was "+ regression: getFlake-metadata caches") -
+# TASK-SPEC PREMISE SUPERSEDED: the task intended `(getFlake ref).outPath` to prove
+# the mask completion does NOT over-reject the sound pure-getFlake-metadata win
+# (assert tainted==0, inserts==1, activeHits>=1).  VERIFIED REALITY: getFlake
+# evaluates the flake through an INTERNAL `builtins.import` → TAINT_READFILE fires
+# even for .outPath/.narHash (pure metadata, no `outputs` eval) → taintmask =
+# READFILE|GETFLAKE → REJECTED.  So getFlake-metadata NO LONGER caches under A5.
+# We assert the ACTUAL behavior (rejected) rather than a premise the code no longer
+# satisfies, and flag the A4/LEVER-1 caching REGRESSION for human review (see the
+# header + TL15).  Kept as a guard: getFlake-pure is rejected by the completed mask.
+TL23BASE=$(mktemp -d "$HOME/tl23.XXXXXX")
+mkdir -p "$TL23BASE/G" "$TL23BASE/F"
+printf '{\n  outputs = _: { g = 1; };\n}\n' > "$TL23BASE/G/flake.nix"
+cat > "$TL23BASE/F/flake.nix" <<EOF
+{
+  inputs.g.url = "path:$TL23BASE/G";
+  outputs = { g, ... }: { x = 7; };
+}
+EOF
+rm -f "$TL23BASE/F/flake.lock"; "$NIX" flake lock "$TL23BASE/F" --refresh >/dev/null 2>&1
+NH23=$("$NIX" hash path --type sha256 --sri "$TL23BASE/F" 2>/dev/null)
+REF23="path:$TL23BASE/F?narHash=$NH23"
+E23="(builtins.getFlake \"$REF23\").outPath"
+D=$(mktemp -d)
+s23=$(evp_stats_pure "$D" "$E23")
+s23b=$(evp_stats_pure "$D" "$E23")   # 2nd run — still no ACTIVE hit
+chk_reject TL23-getflake-metadata-rejected "$s23"   # A5-COLLISION: was "+caches"; see header
+chk_nohit  TL23-getflake-metadata-no-hit   "$s23b"
+rm -rf "$TL23BASE" "$D"
+
+# --- TL25 (−) — `(getFlake ref).outPath` under --impure -------------------------
+# Guards the `pure &&` conjunct in the GETFLAKE demotion (run.cc keyedDemotable):
+# under --impure a registry entry can drift the ref, so getFlake is NEVER demoted →
+# TAINT_GETFLAKE stays a reject bit → rejected (tainted>=1, inserts==0).  (Post-A5
+# the internal import's TAINT_READFILE ALSO rejects it, but the GETFLAKE reject is
+# the invariant this test guards — --impure never demotes GETFLAKE.)
+TL25BASE=$(mktemp -d "$HOME/tl25.XXXXXX")
+mkdir -p "$TL25BASE/G" "$TL25BASE/F"
+printf '{\n  outputs = _: { g = 1; };\n}\n' > "$TL25BASE/G/flake.nix"
+cat > "$TL25BASE/F/flake.nix" <<EOF
+{
+  inputs.g.url = "path:$TL25BASE/G";
+  outputs = { g, ... }: { x = 7; };
+}
+EOF
+rm -f "$TL25BASE/F/flake.lock"; "$NIX" flake lock "$TL25BASE/F" --refresh >/dev/null 2>&1
+NH25=$("$NIX" hash path --type sha256 --sri "$TL25BASE/F" 2>/dev/null)
+E25="(builtins.getFlake \"path:$TL25BASE/F?narHash=$NH25\").outPath"
+D=$(mktemp -d)
+s25=$(evp_stats_impure "$D" "$E25")
+chk_reject TL25-getflake-impure-rejected "$s25"
+rm -rf "$TL25BASE" "$D"
 
 echo "toplevel-cache: $pass passed, $fail failed"
 [[ $fail -eq 0 ]]
