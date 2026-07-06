@@ -161,7 +161,28 @@ namespace detail { extern const bool g_dbgCellWriteSite; }
 /// + branched).  The extern-const global is retired along with the opt-out.
 [[gnu::always_inline]] constexpr bool phaseDActive() noexcept
 {
+#ifdef NIX_V3_BARRIER_NOOP
+    // C1 FALSIFIER MEASUREMENT BUILD (lode/BEAT_TW..._2026-07-06 §C1 VERDICT=GO):
+    // compile out ALL Phase-D write barriers so every `if (phaseDActive()){...}`
+    // block (residence checks + dirtyContainers push) is dead-code-eliminated.
+    // Isolates the barrier component of the "Reason B" moving-GC tax that a
+    // non-moving inline-thunk repr would eliminate (MEASURED: 16.4% firefox /
+    // 19.0% git warm CPU, darwin-4 median-5 → GO).
+    // ⚠ UNSOUND BUILD — DO NOT SHIP, MEASUREMENT-ONLY: byte-identical ONLY when
+    // NO scavenge fires (the remembered set is written by these barriers and read
+    // by young-gen scavenge, gc.cc:1089).  gen-major forces a scavenge at
+    // exitDepth==0 safepoints regardless of nursery size, so ANY non-trivial eval
+    // WILL scavenge → a barrier-recorded old→young root is missed → forwarding
+    // miss → heap corruption / STALE-THUNK abort (M5 aborts; firefox/git happen to
+    // have no barrier-dependent roots in their few forced scavenges — verified
+    // byte-id 5/5, which is why their A/B numbers are valid).
+    // RETIREMENT: kept ONLY as the reproducible C1 A/B apparatus; delete when the
+    // non-moving-repr prototype lands (it supersedes this) or the GO is retracted.
+    // Requires explicit -DNIX_V3_BARRIER_NOOP; inert + byte-id in every normal build.
+    return false;
+#else
     return true;
+#endif
 }
 
 // ---------------------------------------------------------------------------

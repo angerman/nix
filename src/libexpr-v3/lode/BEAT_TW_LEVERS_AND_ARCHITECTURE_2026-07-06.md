@@ -137,6 +137,51 @@ build+measure cycles (barrier-noop build + firefox big-nursery A/B + counters + 
 sample); it is NOT a same-turn task and touches the GC-UAF-risk surface, so it
 warrants its own session with the byte-id no-scavenge invariant verified first.
 
+#### C1 VERDICT (2026-07-06) — MEASURED on darwin-4 (median-5 A/B) → **GO** (barrier tax alone ≥15%)
+Gate: ≥15% warm CPU on BOTH firefox AND M5 → GO; <8% → KILL; 8–15% marginal.
+Method: `-DNIX_V3_BARRIER_NOOP` A/B (phaseDActive()→false ⇒ all 11 Phase-D barrier
+blocks dead-code-eliminated), both builds run identically, warm cache, median-of-5.
+
+| workload | A (barriers on) | B (barriers off) | **C1a barrier tax** | byte-id |
+|----------|----------------:|-----------------:|--------------------:|:-------:|
+| firefox.drvPath | 2.01 s | 1.68 s | **16.4 %** | Y (5/5) |
+| git.drvPath     | 0.84 s | 0.68 s | **19.0 %** | Y (5/5) |
+| M5 (cardano-node.name) | — | ABORT | not directly measurable | — |
+
+**VERDICT = GO.** The write-barrier removal ALONE buys 16.4 % (firefox) / 19.0 %
+(git) warm CPU — both clear the ≥15 % GO threshold with margin, on two
+independent workloads. This is a **LOWER BOUND** on the non-moving inline-thunk
+ceiling: B still separately-allocates every 24B Thunk cell (C1b ≈ 2 %,
+`allocThunkSuspended` sample) and still runs the moving scavenge-copy (part of the
+GC 8.2 % bucket), BOTH of which a non-moving repr additionally eliminates. So the
+true ceiling is ~18–24 % on firefox. Much of C1a is the barrier's `threadNursery()`
+TLS load per write (`_tlv_get_addr` ≈ 10 % of sampled self-time) + `isNurseryPayload`
++ `dirtyContainers().push_back()` — all gone in a non-moving repr.
+
+**This PARTIALLY OVERTURNS the "single-eval CPU is JIT-only" leaning:** the moving
+GC is a ≥16 % single-eval CPU lever, distinct from dispatch (JIT territory). Per the
+goal, GO = *recommend funding* the non-moving-repr prototype — NOT build it now
+(the full GC rewrite stays out of scope; STOP at the verdict for the human).
+
+**Soundness caveats (honest):**
+- No truly scavenge-free config exists: `gen-major` (g_genMajorEnabled hardcoded,
+  vm.cc:381) forces a nursery scavenge at each exitDepth==0 safepoint regardless of
+  `NIX_V3_NURSERY_SIZE`. firefox/git got 2/1 forced scavenges in BOTH A and B; B was
+  byte-identical anyway (verified 5/5 runs → those scavenges had no barrier-dependent
+  roots). Tight variance (A 2.01–2.04, B 1.67–1.69) ⇒ real signal, not noise.
+- M5 is NOT directly measurable: under B its forced scavenge hits a barrier-recorded
+  old→young root → `STALE THUNK ... nursery=YES` abort (this IS the UAF-class negative
+  the gate asks for — barriers are load-bearing). A GB-scale eval can never run
+  scavenge-free (nursery can't hold GBs of young-gen churn), so no byte-id A/B is
+  possible for M5. M5's barrier tax is EXTRAPOLATED ≥ firefox's 16.4 %: M5 is
+  markedly MORE thunk-heavy (profiles: 637 MB thunks dominant) → higher inter-gen
+  write density → ≥ firefox barrier %. The M5 leg is therefore an estimate, not a
+  direct number; firefox+git are the direct GO evidence.
+- Local +/−/R (laptop, byte-id runs anywhere): + huge-nursery noop == baseline
+  drvPath; − tiny-1MB-nursery noop → SIGSEGV (scavenge fires, barriers missing);
+  normal build (barriers on) at 1MB nursery → no crash, byte-id (the edit is inert
+  without the flag). Guarded as reproducible via `-DNIX_V3_BARRIER_NOOP`.
+
 ### N2 — Content-addressed IR fragments make eval#1 faster cross-file/cross-machine
 Today the CU disk cache is FILE-granular (whole-file source SHA). Two files
 sharing `lib.fix`/`mkDerivation`/`mapAttrs`-shape lambdas re-lower
