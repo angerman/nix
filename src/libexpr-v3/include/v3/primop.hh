@@ -135,9 +135,24 @@ void appliedCacheNoteTryKeyException() noexcept;
 /// the top-level shadow/active cache checks it before insert/reuse.  Per-eval
 /// (reset at the outermost runRootExprFromString entry).  The shadow's
 /// getEnv-mismatch probe (2026-07-05) proved this is required for soundness.
-void topLevelTaintBump() noexcept;    // an impure primop ran this eval
-void topLevelTaintReset() noexcept;   // outermost eval entry
-bool topLevelTainted() noexcept;      // did an impure primop run?
+/// A1 (2026-07-06): per-AXIS taint bitmask (was a single bool). Policy needs to
+/// know WHICH impurity fired: {getEnv,currentTime} are PERTURBABLE (recoverable
+/// via the offline clock/env-stability manifest); readFile/fetch/store are NOT
+/// perturbable in-process → must hard-reject. A single bool could not
+/// distinguish these → served a wrong drvPath (see the review verdict in
+/// lode/TOPLEVEL_TAINT_DESIGN_2026-07-06.md).
+enum TaintAxis : uint32_t {
+    TAINT_GETENV      = 1u << 0,  // perturbable (getEnv sentinel)
+    TAINT_CURRENTTIME = 1u << 1,  // perturbable (fake clock)
+    TAINT_READFILE    = 1u << 2,  // NOT perturbable: readFile/readDir/pathExists/readFileType/hashFile
+    TAINT_FETCH       = 1u << 3,  // NOT perturbable: fetch*/getFlake/fetchClosure
+    TAINT_STORE       = 1u << 4,  // NOT perturbable: storePath
+    TAINT_PERTURBABLE = TAINT_GETENV | TAINT_CURRENTTIME,
+};
+void     topLevelTaintBump(uint32_t axis) noexcept;  // an impure primop ran (set its axis bit)
+void     topLevelTaintReset() noexcept;              // outermost eval entry
+bool     topLevelTainted() noexcept;                 // any axis set (reject-all-tainted today)
+uint32_t topLevelTaintMask() noexcept;               // which axes fired (for the reject-set + manifest)
 
 /// SHADOW mode (#16a) support: non-mutating entry peek + compare accounting.
 bool appliedCacheLookupPeek(const std::string & key, Value & out) noexcept;
