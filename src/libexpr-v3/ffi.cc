@@ -256,6 +256,65 @@ std::optional<std::string> storePathNarHash(nix::EvalState & state,
     }
 }
 
+std::vector<ResolvedPathEntry> resolveNixPathContentIds(nix::EvalState & state)
+{
+    // A3 (2026-07-06): resolve each NIX_PATH lookup-path entry to a content id
+    // for the top-level cache key (replaces the raw `getenv("NIX_PATH")` string,
+    // which is stale-serving on a mutable channel symlink — R2).  Read-only: we
+    // pass initAccessControl=FALSE so resolveLookupPathPath does NOT allowPath /
+    // allowClosure (that would mutate the eval's access-control set and perturb
+    // the subsequent real eval — a wrong-result risk).
+    std::vector<ResolvedPathEntry> out;
+    // getLookupPath() returns a copy; iterate its elements IN ORDER (order is
+    // semantically significant — the first matching entry wins on `<x>` lookup,
+    // so the key must preserve it).
+    auto lookupPath = state.getLookupPath();
+    out.reserve(lookupPath.elements.size());
+    for (const auto & elem : lookupPath.elements) {
+        ResolvedPathEntry e;
+        e.prefix = elem.prefix.s;
+        try {
+            // resolveLookupPathPath does NOT itself follow symlinks in the
+            // returned SourcePath (it only .resolveSymlinks() to TEST existence,
+            // returning the un-resolved path); a channel entry is a symlink into
+            // the store, so we resolveSymlinks() here to reach the TARGET (whose
+            // store hash IS the content id — a channel update retargets it → the
+            // hash changes → the key changes → MISS-not-stale).
+            auto resolved = state.resolveLookupPathPath(elem.path,
+                                                        /*initAccessControl=*/false);
+            if (!resolved) {
+                // Unresolvable (missing / disallowed) → poison (sound=false).
+                out.push_back(std::move(e));
+                continue;
+            }
+            std::string abs = resolved->resolveSymlinks().path.abs();
+            if (state.store->isInStore(abs)) {
+                // Under the store → content-addressed.  The store-path BASE NAME
+                // (`<hash>-<name>`) is the content id (SOUND); a pseudo-URL /
+                // archive entry that resolveLookupPathPath downloaded into the
+                // store also lands here (its store path is content-addressed).
+                auto [storePath, _sub] = state.store->toStorePath(abs);
+                e.contentId = std::string(storePath.to_string());
+                e.sound = true;
+            } else {
+                // A plain working-tree dir / non-store path.  We can only key on
+                // path IDENTITY, not content (BEST-EFFORT) → sound=false so the
+                // caller partitions it away from the content-addressed ids.
+                e.contentId = std::move(abs);
+                e.sound = false;
+            }
+        } catch (...) {
+            // ANY exception (toStorePath parse, symlink loop, access denied, …)
+            // → poison the entry (sound=false, empty id).  Over-partition is
+            // safe; a silently-wrong id is not.
+            e.contentId.clear();
+            e.sound = false;
+        }
+        out.push_back(std::move(e));
+    }
+    return out;
+}
+
 std::string currentSystem(nix::EvalState & state)
 {
     // C-20 (CODEBASE_REVIEW_2026-06-11): mirror TW's

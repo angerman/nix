@@ -1913,10 +1913,18 @@ const std::string & contentHashHex() {
 // A1: the POST-version-tag key body — schema ‖ currentSystem ‖ NIX_PATH ‖
 // basePath ‖ source (exactly the old topLevelCacheKey bytes minus the version
 // tag).  Extracted so the manifest id (SHA of THIS) equals the production
-// lookup key body BY CONSTRUCTION (Q3).  v1 uses the NIX_PATH ENV STRING (sound
-// only for IMMUTABLE pins — archive URLs / store paths; a mutable channel
-// symlink is a known v1 gap → ACTIVE is opt-in for pinned inputs only.  A3 will
-// resolve NIX_PATH entries to content ids).
+// lookup key body BY CONSTRUCTION (Q3).
+//
+// A3 (2026-07-06): the NIX_PATH slot is no longer the raw `getenv("NIX_PATH")`
+// STRING (sound only for IMMUTABLE pins — a mutable channel symlink is a stable
+// string whose TARGET moves on `nix-channel --update`, so a raw-string key
+// served STALE results across a channel update — the R2 gap).  It is now the
+// RESOLVED content ids of each lookup-path entry (in lookup-path order): a
+// store-path base name for a store-resident target (content-addressed → sound)
+// or the resolved absolute path for a working-tree dir (best-effort).  A channel
+// retarget now changes the store hash → changes the key → MISS-not-stale.
+// Unsound (unresolvable / non-store) entries carry a fixed marker so they can
+// NEVER key-collide with a sound entry.
 static std::string keyBodyBytes(nix::EvalState & state,
                                 const std::string & source,
                                 const std::string & basePath) {
@@ -1927,7 +1935,23 @@ static std::string keyBodyBytes(nix::EvalState & state,
     keyBytes.push_back('\0');
     try { keyBytes.append(ffi::currentSystem(state)); } catch (...) {}
     keyBytes.push_back('\0');
-    if (const char * np = std::getenv("NIX_PATH")) keyBytes.append(np);
+    // A3: resolved-NIX_PATH content ids (replaces the raw env string).  Append
+    // `prefix '\0' contentId '\0'` per entry, IN ORDER.  For an UNSOUND entry
+    // (unresolvable or a best-effort non-store path) ALSO emit a fixed
+    // "\x01UNSOUND" marker INTO the contentId slot so an unsound entry is
+    // strictly partitioned — it can never produce the same key bytes as a sound
+    // entry (we never silently treat unsound as sound).  The \x01 leader cannot
+    // occur in a store-path base name or an absolute path, so the partition is
+    // collision-free.
+    try {
+        for (const auto & e : ffi::resolveNixPathContentIds(state)) {
+            keyBytes.append(e.prefix);
+            keyBytes.push_back('\0');
+            keyBytes.append(e.contentId);
+            if (!e.sound) keyBytes.append("\x01UNSOUND");
+            keyBytes.push_back('\0');
+        }
+    } catch (...) {}
     keyBytes.push_back('\0');
     keyBytes.append(basePath);
     keyBytes.push_back('\0');
@@ -1952,7 +1976,10 @@ disk_cache::CacheKey topLevelCacheKey(nix::EvalState & state,
     // v4 (A1, 2026-07-06) = per-axis reject-set + offline clock-stability
     // manifest INSERT policy; a v3-binary entry used a laxer insert policy →
     // must never be served by this binary (cross-version poisoning).
-    keyBytes.append("v3-toplevel-v4");
+    // v5 (A3, 2026-07-06) = resolved-NIX_PATH content-ids in the key body (was
+    // the raw NIX_PATH string; closes the mutable-channel R2 stale gap).  A v4
+    // entry keyed on the raw NIX_PATH string must NEVER be served by v5.
+    keyBytes.append("v3-toplevel-v5");
     keyBytes.push_back('\0');
     // R4 (Q5): fold codegenGateFingerprint UNCONDITIONALLY — a differently-
     // compiled binary (a NIX_V3_* codegen gate set) must never serve a

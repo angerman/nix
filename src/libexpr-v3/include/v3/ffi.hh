@@ -480,6 +480,42 @@ std::optional<std::string> storePathNarHash(nix::EvalState & state,
 /// nixpkgs compares it against a minimum).  Cold.
 std::string nixVersion();
 
+// -------------------------------------------------------------------------
+// A3 (2026-07-06): resolved-NIX_PATH content-ids for the top-level cache key.
+//
+// The top-level result cache keys on the RAW `getenv("NIX_PATH")` string, which
+// is UNSOUND for a mutable channel symlink (R2): `nixpkgs=/nix/var/nix/profiles/
+// per-user/…/channels/nixpkgs` is a stable string whose TARGET changes on
+// `nix-channel --update` → a v1 key serves a STALE cross-process result.  This
+// shim RESOLVES each lookup-path entry to a content id so a target change
+// changes the key → MISS-not-stale.  Read-only (initAccessControl=false — it
+// must NOT allowPath / mutate eval permissions, else it perturbs the real eval).
+// -------------------------------------------------------------------------
+
+/// One resolved NIX_PATH lookup-path entry.  `prefix` is the search-path prefix
+/// (`nixpkgs` in `nixpkgs=…`; empty for a bare entry).  `contentId` is the
+/// resolved identity: a store-path base name (`<hash>-<name>`, content-addressed
+/// → SOUND) when the resolved target is under the store, else the resolved
+/// absolute path string (working-tree dir → path identity, NOT content → BEST-
+/// EFFORT).  `sound` is false for an unresolvable entry (→ poison) OR a
+/// non-store best-effort path (the caller strictly partitions unsound ids so
+/// they can never key-collide with a sound one).
+struct ResolvedPathEntry
+{
+    std::string prefix;
+    std::string contentId;
+    bool        sound = false;
+};
+
+/// Resolve every `state.getLookupPath()` entry to a content id, IN LOOKUP-PATH
+/// ORDER (order is semantically significant — first match wins).  Each entry is
+/// resolved via `state.resolveLookupPathPath(elem.path, /*initAccessControl=*/
+/// false)` then `.resolveSymlinks()` (a channel symlink → its TARGET store path;
+/// a pseudo-URL → its downloaded store path; a working-tree dir → itself).  Any
+/// exception on an entry → `{prefix, "", false}` (unresolvable → poison).  Cold
+/// (once per eval, pre-eval key computation).
+std::vector<ResolvedPathEntry> resolveNixPathContentIds(nix::EvalState & state);
+
 }  // namespace ffi
 
 // =========================================================================

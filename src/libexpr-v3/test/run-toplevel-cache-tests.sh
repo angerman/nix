@@ -290,5 +290,83 @@ chk_nohit TL12-swap-invalidates "$s12m2a"
 chk_hit   TL12-swap-repopulates "$s12m2b"
 rm -rf "$D" "$M1" "$M2"
 
+# ---------------------------------------------------------------------------
+# TL13-TL14, TL17 — A3 (TOPLEVEL_TAINT_DESIGN_2026-07-06 §"A3 VETTED IMPLEMENTATION
+# SPEC", item 1): RESOLVED-NIX_PATH content-ids in the cache key body (replacing
+# the raw `getenv("NIX_PATH")` string).  A mutable channel symlink is a stable
+# NIX_PATH STRING whose TARGET moves; keying on the raw string served a STALE
+# cross-process result across a channel update (the R2 gap).  Keying on the
+# RESOLVED target (a store-path hash for a store-resident channel, else the
+# resolved realpath for a working-tree dir) makes a retarget change the key →
+# MISS-not-stale.  (TL15/TL16/TL18 are the flake-lock leg — OUT OF SCOPE here.)
+#
+# IMPORT-TAINT NOTE: `import <nixpkgs>` of a trivial `{ x = N; }` dir is UNTAINTED
+# (verified: tainted=0 → inserts + serves an ACTIVE HIT), because `import` reads
+# via the store/source-accessor path, NOT `builtins.readFile` (which bumps
+# TAINT_READFILE).  So TL13/TL17 are tested via the DIRECT cache HIT/MISS
+# observable (the strongest form) — no key-differs fallback is needed.  These use
+# `--impure` (so `<nixpkgs>` search-paths are permitted) and hold all other env
+# constant; only the NIX_PATH target varies.
+# ---------------------------------------------------------------------------
+E_NP='builtins.toString (import <nixpkgs>).x'   # imports the dir, selects .x
+
+# Two trivial "nixpkgs" pins: D1 => 42, D2 => 99.  (Plain-Nix dirs, so their
+# resolved content-id is the realpath — best-effort/sound=false — which still
+# distinguishes them by identity, exactly what R2 needs.)
+NPD1=$(mktemp -d); NPD2=$(mktemp -d)
+printf '{ x = 42; }\n' > "$NPD1/default.nix"
+printf '{ x = 99; }\n' > "$NPD2/default.nix"
+
+# TL13 (+) — same NIX_PATH pin (D1) round-trips: miss→insert, then ACTIVE HIT
+# returning 42.  Proves the resolved-NIX_PATH key is STABLE for an unchanged pin.
+D=$(mktemp -d)
+r13a=$(ev "$D" "$E_NP" NIX_PATH="nixpkgs=$NPD1")   # miss → insert
+s13=$(env NIX_PATH="nixpkgs=$NPD1" NIX_V3_CACHE_DIR="$D" NIX_V3_TOPLEVEL_CACHE=active \
+        NIX_V3_DIRECT_EVAL=1 NIX_V3_MAX_WALL_TIME=60s \
+        "$NIX" eval --impure --raw --expr "$E_NP" 2>&1 >/dev/null | grep 'TOPLEVEL-CACHE')
+r13b=$(ev "$D" "$E_NP" NIX_PATH="nixpkgs=$NPD1")   # ACTIVE hit
+chk TL13-same-pin-first "$r13a" '42'
+chk TL13-same-pin-hit   "$r13b" '42'
+chk_hit TL13-same-pin-active-hit "$s13"
+rm -rf "$D"
+
+# TL14 (−) — DIFFERENT pin (same source), D1 then D2 in the SAME cache dir: the
+# resolved id differs → MISS → returns 99 (no cross-serve of D1's cached 42).
+D=$(mktemp -d)
+r14a=$(ev "$D" "$E_NP" NIX_PATH="nixpkgs=$NPD1")   # D1: insert 42
+s14=$(env NIX_PATH="nixpkgs=$NPD2" NIX_V3_CACHE_DIR="$D" NIX_V3_TOPLEVEL_CACHE=active \
+        NIX_V3_DIRECT_EVAL=1 NIX_V3_MAX_WALL_TIME=60s \
+        "$NIX" eval --impure --raw --expr "$E_NP" 2>&1 >/dev/null | grep 'TOPLEVEL-CACHE')
+r14b=$(ev "$D" "$E_NP" NIX_PATH="nixpkgs=$NPD2")   # D2: must be a fresh 99
+chk TL14-diff-pin-d1     "$r14a" '42'
+chk TL14-diff-pin-nostale "$r14b" '99'   # 99, not a cross-served 42
+chk_nohit TL14-diff-pin-misses "$s14"
+rm -rf "$D"
+
+# TL17 (− CRUX, R2 mutable-channel, failing-first) — a SYMLINK S is the NIX_PATH
+# target; point S->D1 and eval (insert 42), then RETARGET S->D2 (the NIX_PATH
+# STRING "nixpkgs=<S>" is UNCHANGED — only the symlink target moved) and re-eval.
+# Resolved-NIX_PATH resolves S->D1 vs S->D2 to DIFFERENT realpaths → different
+# key → MISS returning 99, never a stale 42 HIT.
+#   RED (pre-A3, raw-string key): "nixpkgs=<S>" is byte-identical both times →
+#     same key → serves stale 42.  GREEN (A3): resolveSymlinks() distinguishes
+#     the targets → key changes → MISS-not-stale.  (Verified during bring-up: the
+#     captured keyBody manifestEntryId differs across the retarget while the raw
+#     NIX_PATH string is identical.)
+D=$(mktemp -d); S=$(mktemp -u -t tlcache-sym.XXXXXX)
+ln -s "$NPD1" "$S"                                  # S -> D1
+r17a=$(ev "$D" "$E_NP" NIX_PATH="nixpkgs=$S")       # insert (target=D1) → 42
+rm "$S"; ln -s "$NPD2" "$S"                          # RETARGET S -> D2 (string unchanged)
+s17=$(env NIX_PATH="nixpkgs=$S" NIX_V3_CACHE_DIR="$D" NIX_V3_TOPLEVEL_CACHE=active \
+        NIX_V3_DIRECT_EVAL=1 NIX_V3_MAX_WALL_TIME=60s \
+        "$NIX" eval --impure --raw --expr "$E_NP" 2>&1 >/dev/null | grep 'TOPLEVEL-CACHE')
+r17b=$(ev "$D" "$E_NP" NIX_PATH="nixpkgs=$S")       # target now D2 → must be 99
+chk TL17-symlink-insert      "$r17a" '42'
+chk TL17-symlink-retarget-nostale "$r17b" '99'   # 99, NOT a stale 42 (R2 fix)
+chk_nohit TL17-symlink-retarget-misses "$s17"
+rm -f "$S"; rm -rf "$D"
+
+rm -rf "$NPD1" "$NPD2"
+
 echo "toplevel-cache: $pass passed, $fail failed"
 [[ $fail -eq 0 ]]
