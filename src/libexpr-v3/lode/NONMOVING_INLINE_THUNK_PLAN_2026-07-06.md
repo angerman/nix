@@ -459,3 +459,27 @@ it does not "keep both behind a flag."** The substrate stays gated (like Steps
   pre-merge `--brute` gate + darwin-4 perf discipline
 
 *Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>, Input Output Group. SPDX-License-Identifier: Apache-2.0.*
+
+---
+
+## PHASE-S VERDICT (2026-07-06, darwin-4) — GATE FIRED → LEVER KILLED
+
+Phase S built + committed (e6f8ee33c), byte-id PASS (ON==OFF), --brute 36/36. But
+the pre-committed Phase-S CPU gate ("KILL if regresses >8%") **FIRED**: warm CPU
+median-5 flag-ON vs OFF = **firefox +5.4%, M5 +10.4%** (M5 > 8%).
+
+**DECISIVE ARITHMETIC — this KILLs the whole lever, not just Phase S:** the C1 A/B
+(16.4%/19.0%) measured the barrier-CHECK cost WITH the moving GC present. Dropping
+the barriers (Phase C) REQUIRES the non-moving GC, whose reclaim cost Phase S
+measures as +5.4%/+10.4%. Net = barrier-win − reclaim-cost ≈ 11% ff / 5-9% M5.
+Even if Phase A recovered the ENTIRE moving-scavenge cost (~1.2-7% per prior
+profiles), the net stays ~7-13% — BELOW the Phase-C SHIP gate (≥15% ff / ≥12% git).
+Phase A cannot lift it above 15%. The lever's net is robustly below its own SHIP
+gate regardless of the remaining phases → **KILL** (Rule 0: honor the gate; KILL is
+a deliverable).
+
+This REFINES C1 GO: the 16% barrier tax is real, but NOT an achievable net win —
+the enabling mechanism (non-moving tenured GC) costs 5-10% that offsets it. Phases
+A-F NOT built. Phase-S code stays gated/default-off/byte-id-neutral as the KILL
+reference. Single-eval CPU parity remains out of reach; the moat is the applied-
+import cache #1 (repeated-eval), consistent with the whole program's conclusion.
