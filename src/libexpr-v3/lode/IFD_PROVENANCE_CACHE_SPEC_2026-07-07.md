@@ -12,6 +12,36 @@ that content, same imported-file path+narHash → STALE HIT (silent wrong result
 real soundness bug in what ships today (test N1 fails on current HEAD). The fix is also the
 moat extension that reaches the IFD workloads (M5/HNE) the whole-eval top-level cache couldn't.
 
+## PHASE 2 VERDICT (2026-07-07, darwin-4, git-noted): KILL-active-to-shadow
+Phase 1 (shadow) shipped + shadow-validated on the real IFD workloads: mismatchHits==0,
+wouldHits==inserts (100% cross-process recall), poisonSkips==0 → **the v2 key is SOUND +
+the cache FIRES**. Phase 2 built the Active serve path (deserialize + serve on a v2 HIT,
+byte-id P3 + N1-active anti-stale, --brute 37/37) and ran the darwin-4 perf gate:
+
+  workload      T_eval(cold)  T_hit(warm)  T_hit/T_eval   vs Off-baseline warm
+  HNE.drvPath      7.750s        3.150s       0.406        +0.3% (net-NEGATIVE)
+  M5.name         12.480s        7.590s       0.608 (FAIL) +0.3% (net-NEGATIVE)
+
+**KILL** per the pre-committed gate: M5 0.608 > 0.50, AND active is net-negative vs the Off
+baseline on BOTH. STRUCTURAL ROOT CAUSE (the load-bearing finding): the v2 key is **POST-EVAL**
+— built from the transitive content-ids that only exist AFTER the fragment's reads fire — so an
+Active HIT **cannot skip the fragment body**; it only replaces the freshly-evaluated result with
+the deserialized one. T_hit ≈ T_eval_body + deserialize. The actual work-skipping (parse/lower/
+run) on the warm path is already delivered by the shipped v1 IFD cache + applied-cache, which are
+ALREADY active in the Off baseline (Off gets the same warm times). The v2 active cache can only
+ADD the accumulator + v2-key + per-input storePathNarHash + deserialize cost on top (+0.3%,
+noise). Matches IFD_S4_FALSIFIED (lookup+deserialize ≥ re-eval). DISPOSITION: Active retired to
+Shadow (Rule-4 inline criterion in primops.cc); kept committed gated-off as the KILL reference +
+regression tests. Phase 1 SHADOW is the deliverable (it fixes the demonstrated N1 stale-HIT
+mechanism + is the sound foundation). **PHASE-3 DIRECTION (DEFER-with-data):** the ONLY sound+fast
+design is a PRE-eval-computable key — fold the realised IFD build-output narHash (known right
+after `realisePath`, BEFORE the downstream parse/eval — the Bazel build-then-key boundary) into a
+lookup that CAN skip the body, rather than the full post-eval transitive set. That makes the v1
+fast path sound WITHOUT losing the skip. Not built: the N1 hole is real-but-rare (needs an atypical
+mutable transitive read inside an IFD import; store-path IFD is content-addressed so N1 can't fire
+— shadow saw 0 mismatches on M5/HNE), so per the pre-committed rule (v1-disable only on observed
+mismatch) no default-path action is triggered.
+
 ## SCOPE (what to build)
 Extend the shipped IFD import cache (NOT the applied-import cache — its desc-pointer key is
 in-process-only; NOT the RESULT_STORE lazy-graph serializer — out of scope). Fragment = the

@@ -34,6 +34,13 @@
 #   P2 (−) v1 entry not served by v2 (version-tag partition).
 #   R1 (−) A1→A2→A1 miss/miss/would-HIT (the v2 key round-trips A's identity).
 #
+# PHASE 2 (ACTIVE reuse; NIX_V3_IFD_PROV_CACHE=active — a v2 HIT is deserialized
+# + SERVED in place of the freshly-evaluated result):
+#   P3 (+) an ACTIVE hit == a fresh eval byte-identically (cross-process, shared
+#      cache dir), and an activeServe actually fired (reuse happened).
+#   N1-ACTIVE (−) the anti-stale proof under active serving: changing the
+#      transitive input A→A2 MISSES (serves no stale A1) even in active mode.
+#
 # Each test uses a FRESH cache dir (NIX_V3_CACHE_DIR) so it is hermetic.  SHADOW
 # never serves a cached value → every RESULT is the freshly-computed one.
 #
@@ -107,6 +114,22 @@ evoff() { # $1=cachedir $2=expr ; rest=env
     local dir="$1" expr="$2"; shift 2
     env "$@" NIX_V3_CACHE_DIR="$dir" NIX_V3_DIRECT_EVAL=1 NIX_V3_MAX_WALL_TIME=60s \
         "$NIX" eval --impure --raw --expr "$expr" 2>/dev/null
+}
+# eval in ACTIVE mode (Phase 2: a v2 HIT is deserialized + SERVED in place of the
+# fresh result) with a per-call cache dir; extra env via trailing assignments.
+eva() { # $1=cachedir $2=expr ; rest=env assignments
+    local dir="$1" expr="$2"; shift 2
+    env "$@" NIX_V3_CACHE_DIR="$dir" NIX_V3_IFD_PROV_CACHE=active \
+        NIX_V3_DIRECT_EVAL=1 NIX_V3_MAX_WALL_TIME=60s \
+        "$NIX" eval --impure --raw --expr "$expr" 2>/dev/null
+}
+# Same, but return ALL IFD-PROV stats lines (stderr) for an ACTIVE eval.
+eva_stats() { # $1=cachedir $2=expr ; rest=env assignments
+    local dir="$1" expr="$2"; shift 2
+    env "$@" NIX_V3_CACHE_DIR="$dir" NIX_V3_IFD_PROV_CACHE=active \
+        NIX_V3_DIRECT_EVAL=1 NIX_V3_MAX_WALL_TIME=60s \
+        "$NIX" eval --impure --raw --expr "$expr" 2>&1 >/dev/null \
+      | grep 'IFD-PROV-CACHE'
 }
 # Extract the MAX value of counter $2 across all (cumulative, monotonic) stats
 # lines in $1 — the authoritative final value regardless of dump-flush order.
@@ -327,6 +350,63 @@ p1() {
   rm -rf "$D"
 }
 p1
+
+# ===========================================================================
+# PHASE 2 — ACTIVE reuse (a v2 HIT is deserialized + SERVED, not re-evaluated).
+# The v2 key is POST-EVAL (built from the transitive content-ids), so ACTIVE
+# does NOT skip the fragment body — it replaces the freshly-evaluated result with
+# the deserialized cached one.  These tests prove the served result is CORRECT.
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# P3 (+ CRUX ACTIVE): an ACTIVE hit must equal a fresh eval, byte-identically.
+# Run 1 (cold cache) inserts; run 2 (fresh PROCESS, same cache dir) SERVES the
+# cached result.  Assert run-2 result == run-1 result byte-for-byte + that an
+# activeServe actually fired (the reuse happened, not a silent re-eval).
+# ---------------------------------------------------------------------------
+p3() {
+  local A; A=$(store_text p3data 'P3-DATA-payload')
+  local E; E=$(IMPEXPR p3mod.nix '"P3:" + (builtins.readFile <adata>)')
+  local D; D=$(mktemp -d)
+  local r1 r2 s2
+  r1=$(eva "$D" "$E" NIX_PATH="adata=$A")            # process 1: cold → insert
+  r2=$(eva "$D" "$E" NIX_PATH="adata=$A")            # process 2: warm → SERVE
+  s2=$(eva_stats "$D" "$E" NIX_PATH="adata=$A")      # process 3: warm → SERVE (stats)
+  chk P3-active-run1-result "$r1" 'P3:P3-DATA-payload'
+  chk P3-active-run2-result "$r2" 'P3:P3-DATA-payload'
+  chk P3-active-run2-byteid-run1 "$r2" "$r1"          # served == fresh (byte-id)
+  chkge P3-active-serve-fired "$(field "$s2" activeServes)" 1
+  chk   P3-active-no-mismatch "$(field "$s2" mismatchHits)" '0'
+  rm -rf "$D"
+}
+p3
+
+# ---------------------------------------------------------------------------
+# N1-ACTIVE (− anti-stale): even in ACTIVE mode, changing the transitive input
+# A→A2 must MISS (serve NO stale A1 result).  This is the v2-key fix proven under
+# active serving: eval#1 (adata=A1) inserts A1's entry; eval#2 (adata=A2, fresh
+# process, SAME cache dir) has a DIFFERENT v2 key (A's narHash folded) → MISS →
+# fresh A2 result (NOT the stale A1 the shipped v1 cache would have served).
+# ---------------------------------------------------------------------------
+n1_active() {
+  local A1 A2 E
+  A1=$(store_text n1a-a1 'N1A-ONE')
+  A2=$(store_text n1a-a2 'N1A-TWO')
+  chkne N1ACTIVE-precond-A-distinct "$A1" "$A2"
+  E=$(IMPEXPR n1amod.nix '"MOD:" + (builtins.readFile <adata>)')
+  local D; D=$(mktemp -d)
+  local a1 a2 a1b s1b
+  a1=$(eva "$D" "$E" NIX_PATH="adata=$A1")            # A1: cold → insert A1 entry
+  a2=$(eva "$D" "$E" NIX_PATH="adata=$A2")            # A2: different v2 key → MISS → fresh
+  a1b=$(eva "$D" "$E" NIX_PATH="adata=$A1")           # A1 again → SERVE A1 entry (not stale A2)
+  s1b=$(eva_stats "$D" "$E" NIX_PATH="adata=$A1")
+  chk N1ACTIVE-A1-result "$a1" 'MOD:N1A-ONE'
+  chk N1ACTIVE-A2-not-stale "$a2" 'MOD:N1A-TWO'        # the anti-stale proof: A2 not A1
+  chk N1ACTIVE-A1-again-served-correct "$a1b" 'MOD:N1A-ONE'
+  chkge N1ACTIVE-A1-again-serve-fired "$(field "$s1b" activeServes)" 1
+  rm -rf "$D"
+}
+n1_active
 
 echo "PASS N2-covered-by-N1-GREEN+R1 (distinct content ⇒ distinct narHash ⇒ distinct v2 key)"
 pass=$((pass+1))

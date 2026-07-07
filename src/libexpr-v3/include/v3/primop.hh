@@ -220,13 +220,30 @@ void provNoteSelfId(const std::string & id) noexcept;
 /// V3_DBG_IFD_PROV (N4 fuzz): dump the folded content-id set + poison bit.
 void provDebugDump(const std::string & path, const ProvenanceFrame & f) noexcept;
 
-/// NIX_V3_IFD_PROV_CACHE mode.  Phase 1 ships only Off / Shadow (ACTIVE reuse is
-/// Phase 2, perf-gated — this enum has no Active variant on purpose).
-enum class IfdProvMode { Off, Shadow };
+/// NIX_V3_IFD_PROV_CACHE mode.
+///   Off    — inert (default; the whole subsystem is a null-check on the hot path).
+///   Shadow — Phase 1: accumulate provenance, build the v2 key, compare-not-serve
+///            (a would-HIT re-evaluates + byte-compares → mismatchHits==0 proves
+///            the key is sound before any active serving).
+///   Active — Phase 2 (perf-gated): on a v2-key HIT, deserialize the cached
+///            result and SERVE it in place of the freshly-evaluated `out`.  Only
+///            sound because Shadow proved mismatch==0 on the target workloads
+///            (M5/HNE); the v2 key already encodes the full transitive input set,
+///            so a HIT means same key = same inputs (see the serve comment at the
+///            ifdProvFold lookup site).  NOTE the v2 key is POST-EVAL (built from
+///            the transitive content-ids that only exist after the fragment runs),
+///            so Active replaces `out` after eval — it does NOT skip the fragment
+///            body; the perf gate (T_hit/T_eval ≤ 0.50 on HNE.drvPath, darwin-4)
+///            decides whether this deserialize-in-place is a net win or a KILL.
+enum class IfdProvMode { Off, Shadow, Active };
 IfdProvMode ifdProvMode() noexcept;
-/// Shadow accounting (dumped at exit under the gate).
+/// True iff provenance accumulation is armed (Shadow OR Active).  Both modes run
+/// the accumulator + v2-key fold; they diverge only on the HIT disposition.
+inline bool ifdProvArmed(IfdProvMode m) noexcept { return m != IfdProvMode::Off; }
+/// Shadow / Active accounting (dumped at exit under the gate).
 void ifdProvNoteShadowInsert() noexcept;
 void ifdProvNoteShadowHit(bool byteIdentical) noexcept;  // would-hit; false = MISMATCH
+void ifdProvNoteActiveServe() noexcept;                  // Active: a v2 HIT was served
 void ifdProvNotePoisonSkip() noexcept;
 void ifdProvStatsDump() noexcept;
 

@@ -6951,17 +6951,23 @@ void provDebugDump(const std::string & path, const ProvenanceFrame & f) noexcept
         path.c_str(), f.poisoned ? 1 : 0, f.axisMask, f.pendingReads, ids.c_str());
 }
 
-// NIX_V3_IFD_PROV_CACHE gate.  Phase 1: only "shadow" turns the accumulator +
-// v2 shadow cache on; anything else (incl. unset) leaves it OFF — so the whole
-// subsystem is a no-op in production + the --brute default path is unchanged.
-// (No "active"/"1" branch: ACTIVE reuse is Phase 2, perf-gated.  Adding one
-//  here would be the phase-2 flip — DO NOT until the perf gate clears.)
+// NIX_V3_IFD_PROV_CACHE gate.
+//   =shadow  → Shadow (Phase 1: accumulate + v2-key + compare-not-serve).
+//   =active  → Active (Phase 2: on a v2 HIT, deserialize + serve in place of the
+//              freshly-evaluated result — perf-gated; see the serve site).
+//   anything else (incl. unset) → Off (inert; the --brute default path is
+//              unchanged + production is a per-primop null-check).
+// Retirement criterion (Rule 4): Active is retired to Shadow if the darwin-4
+// perf gate (T_hit/T_eval ≤ 0.50 on HNE.drvPath) FAILS — the v2 key is POST-EVAL
+// so a HIT cannot skip the fragment body, only replace its result; whether the
+// deserialize-in-place amortizes below re-eval is exactly what the gate decides.
 IfdProvMode ifdProvMode() noexcept
 {
     static const IfdProvMode m = [] {
         const char * e = std::getenv("NIX_V3_IFD_PROV_CACHE");
-        return (e && std::strcmp(e, "shadow") == 0) ? IfdProvMode::Shadow
-                                                     : IfdProvMode::Off;
+        if (e && std::strcmp(e, "active") == 0) return IfdProvMode::Active;
+        if (e && std::strcmp(e, "shadow") == 0) return IfdProvMode::Shadow;
+        return IfdProvMode::Off;
     }();
     return m;
 }
@@ -6969,8 +6975,10 @@ IfdProvMode ifdProvMode() noexcept
 namespace {
 struct IfdProvStats {
     std::atomic<uint64_t> shadowInserts{0};
-    std::atomic<uint64_t> shadowHits{0};      // would-HITs (re-eval + compare)
-    std::atomic<uint64_t> shadowMismatch{0};  // byte-differing would-HITs
+    std::atomic<uint64_t> shadowHits{0};      // would-HITs (Shadow: re-eval+compare;
+                                              //             Active: hits that were served)
+    std::atomic<uint64_t> shadowMismatch{0};  // byte-differing would-HITs (Shadow only)
+    std::atomic<uint64_t> activeServes{0};    // Active: v2 HITs deserialized + served
     std::atomic<uint64_t> poisonSkips{0};     // fail-closed (frame poisoned)
 };
 IfdProvStats & ifdProvStats() { static IfdProvStats s; return s; }
@@ -6982,17 +6990,26 @@ void ifdProvNoteShadowHit(bool byteIdentical) noexcept
     ifdProvStats().shadowHits.fetch_add(1);
     if (!byteIdentical) ifdProvStats().shadowMismatch.fetch_add(1);
 }
+void ifdProvNoteActiveServe() noexcept
+{
+    // Active: a v2-key HIT was deserialized + served.  Also counts as a would-HIT
+    // so the wouldHits counter is comparable across Shadow/Active runs.
+    ifdProvStats().shadowHits.fetch_add(1);
+    ifdProvStats().activeServes.fetch_add(1);
+}
 void ifdProvNotePoisonSkip() noexcept { ifdProvStats().poisonSkips.fetch_add(1); }
 void ifdProvStatsDump() noexcept
 {
     if (ifdProvMode() == IfdProvMode::Off) return;
     const auto & s = ifdProvStats();
     std::fprintf(stderr,
-        "v3 IFD-PROV-CACHE (shadow): inserts=%llu wouldHits=%llu mismatchHits=%llu "
-        "poisonSkips=%llu\n",
+        "v3 IFD-PROV-CACHE (%s): inserts=%llu wouldHits=%llu mismatchHits=%llu "
+        "activeServes=%llu poisonSkips=%llu\n",
+        ifdProvMode() == IfdProvMode::Active ? "active" : "shadow",
         (unsigned long long)s.shadowInserts.load(),
         (unsigned long long)s.shadowHits.load(),
         (unsigned long long)s.shadowMismatch.load(),
+        (unsigned long long)s.activeServes.load(),
         (unsigned long long)s.poisonSkips.load());
 }
 
@@ -7435,16 +7452,20 @@ void primImport(EvalState & state, Value * args, Value & out)
     std::optional<std::string> ifdNarHash;
     if (s_ifdImportDiskCache && isIfdImport)
         ifdNarHash = ffi::storePathNarHash(*state.nixEvalState, path);
-    // IFD provenance cache (IFD_PROVENANCE_CACHE_SPEC_2026-07-07, Phase 1 SHADOW).
+    // IFD provenance cache (IFD_PROVENANCE_CACHE_SPEC_2026-07-07).
+    //   Phase 1 SHADOW: accumulate + v2-key + compare-not-serve.
+    //   Phase 2 ACTIVE: on a v2 HIT, deserialize + serve in place of `out`.
     // PUSH a provenance frame at the IFD fragment boundary — BEFORE the eval that
     // triggers the transitive reads (readFile/import/fetch/…) whose content-ids
     // must fold into the v2 key.  An RAII guard guarantees the frame is popped on
     // EVERY exit (incl. a thrown parse/eval error) — popping folds the frame INTO
     // the parent (transitive IFD), so an exception mid-fragment still folds its
     // partial provenance up (append-only, N5).  The NORMAL exit path calls
-    // commit() to capture the folded frame for the v2 shadow logic.
-    const bool ifdProvShadow =
-        ifdProvMode() == IfdProvMode::Shadow && isIfdImport && ifdNarHash.has_value();
+    // commit() to capture the folded frame for the v2 fold logic.  BOTH modes arm
+    // the accumulator identically (`ifdProvArm`); they diverge only on a HIT.
+    const IfdProvMode ifdProvM = ifdProvMode();
+    const bool ifdProvArm =
+        ifdProvArmed(ifdProvM) && isIfdImport && ifdNarHash.has_value();
     struct ProvFrameGuard {
         bool active;
         bool committed = false;
@@ -7452,24 +7473,24 @@ void primImport(EvalState & state, Value * args, Value & out)
         explicit ProvFrameGuard(bool a) : active(a) { if (active) provFramePush(); }
         void commit() { if (active && !committed) { folded = provFramePop(); committed = true; } }
         ~ProvFrameGuard() { if (active && !committed) (void)provFramePop(); }
-    } provGuard(ifdProvShadow);
+    } provGuard(ifdProvArm);
     // Fold THIS fragment's OWN file-identity (the imported module's narHash) into
     // the frame, so a TRANSITIVE import (outer M importing inner MID) folds MID's
     // narHash up into M's outer key — otherwise a change to MID's content that
     // did not change MID's transitive reads would not change M's key (a
     // transitive stale-hit hole).  R1 (transitive-under-capture) is resolved by
     // this + the child-into-parent fold in provFramePop.
-    if (ifdProvShadow) provNoteSelfId(*ifdNarHash);
-    // The v2 SHADOW fold — POP the frame + build the v2 key + insert-or-compare.
-    // Defined as a lambda because primImport has TWO exits after `out` is
-    // produced: (1) the CU-disk-cache HIT `return;` (a warm-CU process, where
-    // the imported bytecode is restored from disk but the body STILL runs — so
-    // the transitive reads still populate the frame) and (2) the normal
-    // miss/insert path.  Both MUST run the fold or a warm-CU process silently
-    // skips the soundness cache (the LEVER-1 disk-HIT-exit hazard, comment at
-    // the appliedCacheRecordImportResult call).  Idempotent via provGuard.committed.
+    if (ifdProvArm) provNoteSelfId(*ifdNarHash);
+    // The v2 fold — POP the frame + build the v2 key + insert-or-compare (SHADOW)
+    // or insert-or-serve (ACTIVE).  Defined as a lambda because primImport has TWO
+    // exits after `out` is produced: (1) the CU-disk-cache HIT `return;` (a warm-
+    // CU process, where the imported bytecode is restored from disk but the body
+    // STILL runs — so the transitive reads still populate the frame) and (2) the
+    // normal miss/insert path.  Both MUST run the fold or a warm-CU process
+    // silently skips the soundness cache (the LEVER-1 disk-HIT-exit hazard, comment
+    // at the appliedCacheRecordImportResult call).  Idempotent via provGuard.committed.
     auto ifdProvFold = [&]() {
-        if (!ifdProvShadow) return;
+        if (!ifdProvArm) return;
         provGuard.commit();
         ProvenanceFrame & f = provGuard.folded;
         provDebugDump(path, f);  // V3_DBG_IFD_PROV (N4 fuzz assertion hook)
@@ -7501,23 +7522,43 @@ void primImport(EvalState & state, Value * args, Value & out)
             for (const auto & ax : rejectAxes) { keyBytes.append(ax); keyBytes.push_back('\x1e'); }
             auto v2Key = disk_cache::computeKeyForString(keyBytes);
 
-            // serialize the fresh result (natural bypass on non-serializable).
-            std::string blob;
-            value_serialize::serialize(out, blob);
-
             auto existing = disk_cache::lookupEvalResult(v2Key);
             if (existing) {
-                // would-HIT: byte-compare fresh-vs-cached (serialize is
-                // deterministic — sorted attrs + sorted context).  A mismatch
-                // means the v2 key MISSES an input → the soundness signal.  We
-                // NEVER serve `*existing` (shadow — active reuse is Phase 2).
-                bool same = (*existing == blob);
-                ifdProvNoteShadowHit(same);
-                if (!same)
-                    std::fprintf(stderr,
-                        "v3 IFD-PROV-CACHE SHADOW MISMATCH: differing result under a "
-                        "matching v2 key (path: %s)\n", path.c_str());
+                if (ifdProvM == IfdProvMode::Active) {
+                    // ACTIVE — SERVE the cached result.  The v2 key encodes the
+                    // full transitive input set (path+narHash + every content-id +
+                    // the fired axes), so a HIT means same key = same inputs =>
+                    // same result.  Soundness is what Shadow proved (mismatch==0
+                    // on M5/HNE); here we deserialize + replace `out`.  BELT (spec
+                    // §4): if the deserialize itself fails, we DO NOT serve — we
+                    // keep the freshly-evaluated `out` (correctness over reuse).
+                    try {
+                        out = value_serialize::deserialize(*existing);
+                        ifdProvNoteActiveServe();
+                    } catch (...) {
+                        // Deserialize failed — keep the fresh `out` (never serve a
+                        // value we can't reconstruct).  Not a mismatch, just a
+                        // bypass; the fresh result stands.
+                    }
+                } else {
+                    // SHADOW — byte-compare fresh-vs-cached (serialize is
+                    // deterministic: sorted attrs + sorted context).  A mismatch
+                    // means the v2 key MISSES an input → the soundness signal.
+                    // We NEVER serve `*existing` in Shadow.
+                    std::string blob;
+                    value_serialize::serialize(out, blob);
+                    bool same = (*existing == blob);
+                    ifdProvNoteShadowHit(same);
+                    if (!same)
+                        std::fprintf(stderr,
+                            "v3 IFD-PROV-CACHE SHADOW MISMATCH: differing result under a "
+                            "matching v2 key (path: %s)\n", path.c_str());
+                }
             } else {
+                // MISS (both modes) — serialize the fresh result + insert (natural
+                // bypass on non-serializable via the catch below).
+                std::string blob;
+                value_serialize::serialize(out, blob);
                 disk_cache::insertEvalResult(v2Key, blob);
                 ifdProvNoteShadowInsert();
             }
@@ -7527,11 +7568,14 @@ void primImport(EvalState & state, Value * args, Value & out)
             // never enters the cache — sound.)
         }
     };
-    // SHADOW never SERVES a cached result: skip the shipped v1 active lookup so
-    // the fragment ALWAYS re-evaluates (mirrors the applied/top-level shadow —
-    // a would-HIT is re-evaluated + byte-compared, never short-circuited).  This
-    // also means the shipped v1 STALE-HIT bug (N1) cannot fire under the shadow.
-    if (s_ifdImportDiskCache && isIfdImport && ifdNarHash && !ifdProvShadow) {
+    // When the prov cache is ARMED (Shadow OR Active), skip the shipped v1 active
+    // lookup so the fragment ALWAYS re-evaluates (the v2 key needs the transitive
+    // reads that only fire during eval; and serving the UNSOUND v1 key here would
+    // reintroduce the N1 stale-HIT bug the v2 key fixes).  So the fragment runs to
+    // completion, THEN ifdProvFold either compares (Shadow) or deserialize-serves
+    // (Active) under the sound v2 key.  With the cache Off this v1 lookup is the
+    // shipped production path, unchanged.
+    if (s_ifdImportDiskCache && isIfdImport && ifdNarHash && !ifdProvArm) {
         CACHE_HOOK_DEFINE_SITE(siteImportIfdLookup,
             "primImport-ifd-disk-lookup");
         CacheHookTimer timer(siteImportIfdLookup);
@@ -8346,10 +8390,13 @@ void primImport(EvalState & state, Value * args, Value & out)
                 // run the fold here too (else a warm-CU process silently skips
                 // the soundness cache).  forceDeep first so `out` serializes to
                 // the SAME bytes as the cold path's forceDeep'd result (a
-                // byte-identical would-HIT across cold/warm-CU processes).
-                if (ifdProvShadow) {
+                // byte-identical would-HIT across cold/warm-CU processes).  In
+                // ACTIVE mode a v2 HIT sets `out` to the served value; since the
+                // served value is byte-identical to the fresh one (shadow proof),
+                // the in-memory cache above (fresh `out`) stays consistent.
+                if (ifdProvArm) {
                     try { out = forceDeep(*state.vm, out); } catch (...) {}
-                    ifdProvFold();
+                    ifdProvFold();  // may set out = served value (Active)
                 }
                 return;
             }
@@ -8575,9 +8622,12 @@ skipDiskCacheLookup:
             // this process.
         }
     }
-    // IFD provenance cache — Phase 1 SHADOW fold (soundness fix for N1).  Run on
-    // the normal miss/insert exit (the CU-disk-HIT exit runs it before its own
-    // `return;`).  See the lambda definition above for the full rationale.
+    // IFD provenance cache fold — SHADOW (compare) or ACTIVE (serve).  Run on the
+    // normal miss/insert exit (the CU-disk-HIT exit runs it before its own
+    // `return;`).  In ACTIVE mode a v2 HIT replaces `out` with the served value
+    // here (byte-identical to the fresh `out` by the shadow proof, so the v1 disk
+    // insert above stays consistent); the served `out` is primImport's result.
+    // See the lambda definition above for the full rationale.
     ifdProvFold();
     if (s_dbg_import) {
         std::fprintf(stderr, "v3 IMPORT-DONE RSS=%lluMB: %s\n",
