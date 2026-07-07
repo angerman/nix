@@ -7,7 +7,7 @@
 CXX      ?= clang++
 CXXFLAGS ?= -std=c++20 -O2 -Wall
 
-.PHONY: help jit-spike jit-encoder-test jit-intop-test jit-safepoint-test clean
+.PHONY: help jit-spike jit-encoder-test jit-intop-test jit-safepoint-test jit-copypatch-bench clean
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) \
@@ -41,5 +41,12 @@ jit-safepoint-test: jit_safepoint_test ## J3: build + RUN the safepoint spill/re
 jit_safepoint_test: jit_safepoint_test.cc ../include/v3/jit.hh ## Build the J3 safepoint proof
 	$(CXX) $(CXXFLAGS) -I../include -o $@ $<
 
+jit-copypatch-bench: jit_copypatch_bench ## J2/J3: build + RUN the copy-patch-vs-interpreter THROUGHPUT spike (stitched stencils + spill/reload tax under a moving toy GC)
+	@echo "── running JIT copy-patch throughput spike (J2/J3 perf de-risk) ──"
+	@./jit_copypatch_bench
+
+jit_copypatch_bench: jit_copypatch_bench.cc ../include/v3/jit.hh ## Build the copy-patch throughput spike
+	$(CXX) $(CXXFLAGS) -I../include -o $@ $<
+
 clean: ## Remove built spike binaries
-	rm -f jit_feasibility_spike jit_encoder_test jit_intop_test jit_safepoint_test
+	rm -f jit_feasibility_spike jit_encoder_test jit_intop_test jit_safepoint_test jit_copypatch_bench
