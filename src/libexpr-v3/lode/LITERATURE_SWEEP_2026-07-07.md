@@ -64,11 +64,23 @@ avoidance. Two flavors:
   just reverts, no observable effect). HIGH-risk (abort/profiling machinery).
 - **My cross-check (decisive):** v3 measures **62-68% NEVER-forced** → blind speculation
   WASTES work on those. The win requires a **per-site BIMODAL force-rate** (some sites
-  always-forced → speculate; some never → keep lazy) that the adaptation sorts. **MEASURE
-  FIRST (cheap):** a per-site force-rate + per-thunk static-cheapness histogram. If the
-  distribution is bimodal, (a) is a low-risk partial win and (b) has a real ceiling; if
-  it's uniformly-rarely-forced, both are dead. This histogram is the Rule-0 gate.
-- Value × cost: (a) MED × LOW; (b) HIGH × HIGH. Do the histogram, then (a), then maybe (b).
+  always-forced → speculate; some never → keep lazy) that the adaptation sorts.
+- **MEASURED (2026-07-07, NIX_V3_FORCERATE_TRACE per-creation-site histogram; git/python3/
+  hello; byte-id ON==OFF; brute 36/36):** OP_MAKE_THUNK-site never-forced = 41-44% (< the
+  62-68% whole-population figure — this scopes to MAKE_THUNK sites only). Distribution is
+  **extreme-weighted (67-69% of created mass at the 0%+100% extremes) but NOT clean-bimodal**
+  — a fat 50-70% "genuinely-mixed" middle bump (~14-15%). GOOD: **~75% of never-forced thunks
+  are at <10%-rate sites** (a classifier keeps them lazy correctly), only **~1% at ≥90% sites**
+  (mis-speculation waste ≈ nil) → the "don't waste work on never-forced" precondition is MET.
+  BAD (the killer): only **~28% of the always-forced mass has a statically-cheap/bounded/
+  non-lazy RHS** → static cheap-eagerness can safely eager-eval only **~11% of all thunks**
+  (the other ~72% of always-forced RHSs are heavy — nested calls/thunks, unsafe to eager).
+- **VERDICT: NOT a priority lever.** (a) static cheap-eagerness = LOW ceiling (~11% of thunks →
+  low-single-digit % CPU); (b) adaptive optimistic-eval could reach the 14-15% mixed middle +
+  heavy-always-forced but at HIGH cost (abort + per-site profiling) + risk (eager heavy/
+  unbounded work). Both attack the single-eval CPU axis which is a structural dead-end anyway.
+  Measure-first did its job: KILLED as a priority before any build. Instrument (forcerate_trace)
+  kept gated for future re-measurement. Value × cost: (a) LOW-CEILING × LOW; (b) LOW-value × HIGH.
 
 ### 3. [MED, CPU/RSS] Scavenger indirection-shortcutting (evaluatedness-tag + selector thunks)
 GHC's collector opportunistically (i) shortcuts an already-forced thunk's indirection and

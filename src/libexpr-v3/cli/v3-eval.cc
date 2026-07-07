@@ -45,6 +45,7 @@
 #include "v3/barrier.hh"       // standaloneCellRoots (root the result for the bucket walk)
 #include "v3/live_trace.hh"    // dumpV3MemoryBuckets (NIX_V3_MEM_BUCKETS)
 #include "v3/par_trace.hh"     // dumpReport (NIX_V3_PAR_TRACE work/span ceiling)
+#include "v3/forcerate_trace.hh" // dumpReport (NIX_V3_FORCERATE_TRACE per-site force-rate)
 #include "v3/bytecode_primops.hh"
 #include "v3/disasm.hh"
 #include "v3/ir.hh"
@@ -555,6 +556,10 @@ int main(int argc, char ** argv)
         // + print, and --strict's forceDeep) has completed.  Internally
         // gated; delete with the instrument once parallel-eval is decided.
         nix::v3::partrace::dumpReport();
+        // Per-creation-site force-rate histogram (NIX_V3_FORCERATE_TRACE):
+        // same run()-direct placement rationale as partrace above; internally
+        // gated; delete with the instrument once cheap-eagerness is decided.
+        nix::v3::forcerate::dumpReport();
         // LIVE MEMORY BUCKETS (NIX_V3_MEM_BUCKETS): v3-eval runs the main
         // expression via run() directly, not runRootExpr, so the run.cc
         // dump path is never hit for the workload.  Fire it here.  The

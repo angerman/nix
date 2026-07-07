@@ -20,6 +20,7 @@
 #include "v3/precise_root.hh"   // 2026-05-27 Stage 3: dumpAllV3Roots diagnostic
 #include "v3/live_trace.hh"     // 2026-05-27 Stage 6 SPIKE: live-fraction trace
 #include "v3/par_trace.hh"      // parallel-potential (work/span) trace instrument
+#include "v3/forcerate_trace.hh" // per-creation-site force-rate histogram instrument
 #include "v3/dedup_survey.hh"   // #772 Stage 9 L0 spike
 #include "v3/disasm.hh"         // #778 opcount dumper — opName()
 #include "v3/bytecode.hh"
@@ -429,6 +430,10 @@ RootResult runRootExprModule(nix::EvalState & state, ir::Module module)
     // appliedCacheStatsDump above.  Delete with the instrument once the
     // parallel-eval GO/NO-GO is decided (Rule 0: no lingering opt-in gate).
     nix::v3::partrace::dumpReport();
+    // Per-creation-site force-rate histogram (NIX_V3_FORCERATE_TRACE): the
+    // cheap-eagerness / optimistic-eval measure-first gate. Same placement
+    // rationale + self-gate + retirement rule as partrace above.
+    nix::v3::forcerate::dumpReport();
     // (top-level result cache shadow dumps from runRootExprFromString, AFTER
     // the outermost eval's shadow — see topLevelCacheShadow call there.)
 

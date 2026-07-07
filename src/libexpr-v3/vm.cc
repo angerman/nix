@@ -30,6 +30,7 @@
 #include "v3/mark_sweep.hh"      // Stage 6 runMajorMarkSweep dispatch trigger
 #include "v3/live_trace.hh"      // Step 4 periodic L(t) trace dispatch hook
 #include "v3/par_trace.hh"       // parallel-potential (work/span) trace instrument
+#include "v3/forcerate_trace.hh" // per-creation-site force-rate histogram instrument
 
 // FFI consolidation (audit Phase 2/3): vm.cc's only tree-walker touchpoints
 // are COLD FFI-leaf paths — store/path coercion + the TW-bridge call round-
@@ -6329,6 +6330,11 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // referenced function (treated as 0-arg for thunks).
             // Reuse the LambdaDescriptor pointer through suspended.desc.
             t->suspended.desc = &thunkDesc;
+            // forcerate-trace: CREATED at this OP_MAKE_THUNK site. Keyed by
+            // the descriptor (== a stable per-site id). Paired with the
+            // first-force hook at the Suspended→Blackhole transition. No-op
+            // unless NIX_V3_FORCERATE_TRACE. Byte-id neutral (counters only).
+            nix::v3::forcerate::created(&thunkDesc, cu);
             // #135 (M4/C1) thunk-body categorization RCA lived here:
             // NIX_V3_THUNK_BODY_STATS measured that only 0.7% of v3's thunks are the
             // trivial alias/const forms TW's maybeThunk avoids (99.3% are real
@@ -9675,6 +9681,13 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // Suspended: blackhole and run.
             // We treat suspended.desc as a LambdaDescriptor* (see OP_MAKE_THUNK).
             const LambdaDescriptor * desc = t->suspended.desc;
+            // forcerate-trace: FIRST force of this thunk. This is the
+            // Suspended→Blackhole gate — reached exactly once per thunk
+            // lifetime (re-entry hits the Blackhole cycle guard above; a
+            // force on an already-Evaluated thunk takes the memo-hit branch,
+            // never here). So this counts distinct first-forces, keyed by the
+            // creation-site descriptor. No-op unless NIX_V3_FORCERATE_TRACE.
+            nix::v3::forcerate::forcedFirst(desc);
             // Phase 13 instrumentation: bump per-thunk + per-descriptor +
             // global counters at the Suspended → Blackhole gate.  Each
             // thunk should transition exactly once per lifetime, so
@@ -15238,6 +15251,12 @@ Value forceValue(VMState & vm, Value v)
         //  apparatus — TW_VALUE_ERADICATION F4, 2026-06-02.)
 
         const LambdaDescriptor * desc = t->suspended.desc;
+        // forcerate-trace: FIRST force via the C-recursive forceValue path
+        // (the OP_FORCE-driven twin is at the op_force_slow Suspended gate).
+        // Same guarantee: the Blackhole guard above throws on re-entry, so
+        // this fires exactly once per thunk lifetime. No-op unless the gate
+        // is on. Byte-id neutral (counters only).
+        nix::v3::forcerate::forcedFirst(desc);
         // #705 (2026-05-20): diagnostic — if we got here with a null
         // desc, something handed us a Thunk whose Suspended payload
         // is zeroed-out.  Most likely cause: stale nursery pointer

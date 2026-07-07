@@ -145,6 +145,11 @@ lib_sources = files(
   # §8/§9).  Byte-id neutral (counters only).  Delete once the
   # parallel-eval GO/NO-GO is decided.
   'par_trace.cc',
+  # Per-creation-site force-rate histogram (NIX_V3_FORCERATE_TRACE): the
+  # cheap-eagerness / optimistic-eval measure-first gate (LITERATURE_SWEEP
+  # _2026-07-07 §2).  Byte-id neutral (counters only).  Delete once the
+  # cheap-eagerness / optimistic-eval GO/NO-GO is decided.
+  'forcerate_trace.cc',
   # Stage 5 of precise-root foundation: RAII GcRoot helper + thread-local
   # registry for C++-stack roots.  See lode/GC_PRECISE_ROOT_FOUNDATION_
   # 2026-05-27.md.  Forward-looking infrastructure for Stage 6 production.
