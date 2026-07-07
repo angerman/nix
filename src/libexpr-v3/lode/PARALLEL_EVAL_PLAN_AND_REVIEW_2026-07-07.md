@@ -461,13 +461,165 @@ parallel-potential question is now decided by this doc.
 
 ---
 
+## 4.6 Phase-0 measured ceiling (2026-07-07) — the Rule-0 gate, re-run + verdict
+
+**Re-ran `NIX_V3_PAR_TRACE` at HEAD `b500141b7` (laptop; deterministic,
+host-independent counters — the ratios are properties of the eval DAG, not the
+host, so load does not affect them).** This is the explicit Rule-0 gate the
+literature sweep named ("parallel-potential trace quantifies the ceiling"). It
+confirms the `aac10b894` numbers and adds a fresh `firefox.drvPath` reference. All
+runs: `nix eval --impure --no-eval-cache --option allow-import-from-derivation
+true`, `NIX_V3_DIRECT_EVAL=1 NIX_V3_NO_DISK_CACHE=1`, flakes also
+`NIX_V3_NO_NATIVE_CALL_FLAKE=1`, local nixpkgs.
+
+### The ceiling table (op-weighted W/S is the load-bearing Amdahl input)
+
+| Workload | root forces | work-forces | op-work | op-span (serial roots) | **op W/S serial-roots** (realistic ∞-core) | op W/S roots-parallel (optimistic) | deepest op-chain | **memo-hit** | peak nesting |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| **firefox.drvPath** (ref, pure eval) | 156 | 1.44M | 33.3M | 941,984 | **35.3×** | 98.1× | 339,297 | **0.533** | 105 |
+| **M5** cardano-node.name (IFD-heavy) | 16,752 | 11.12M | 234.6M | 5,038,535 | **46.6×** | 150.8× | 1,555,229 | **0.481** | 129 |
+| hello.name (git-noted `aac10b894`) | — | — | — | — | 17.9× | — | — | 0.48–0.53 | — |
+| git.drvPath (git-noted + re-confirmed) | — | 1.07M | 23.0M | 939,867 | 24.5× | 328× | 70,106 | 0.529 | 191 |
+| python3 (git-noted `aac10b894`) | — | — | — | — | 17.7× | — | — | 0.48–0.53 | — |
+
+- **COUNT-model ceilings are far higher** (firefox serial-roots 1767×, M5 167×;
+  roots-parallel 13,718× / 86,240×) but the COUNT model gives every force self=1
+  regardless of size, so it over-counts trivial leaves. **The op-weighted
+  serial-roots column (35–47×) is the honest Amdahl ceiling** — it weights each
+  force by the opcodes it actually dispatched, and treats the driver's top-level
+  root forces as sequential (which they are in a single process).
+- **HNE (`hello.drvPath`) and simplex (`exe:simplex-chat.name`) did NOT measure**
+  on the current local checkouts: both are haskell.nix flakes whose local trees are
+  stale on this host — HNE dies with `attribute 'array' missing` in the plan.nix
+  module system (the documented compiler-nix-name/`flake update` drift), simplex
+  with a `git-ls-files/files does not exist` IFD-source failure. Neither is a v3 or
+  instrument fault; both are workload-tree environment breakage, out of scope for a
+  Phase-0 measurement (fixing them would edit user workload trees). Their DAG *shape*
+  is bracketed by the measured IFD flagship (M5) on one side and, per project memory,
+  simplex is store/flake-bound (~10% JIT-addressable) — i.e. it would show the
+  **lowest** parallel potential of the set (mostly serialized on FFI/store), which
+  only strengthens the verdict below.
+
+### What the numbers say (analysis)
+
+1. **The DAG is wide+shallow — NOT Amdahl-dead.** Idealized op-weighted ceiling is
+   **35–47×** on the two measured workloads (and 18–25× on the small git-noted
+   ones). The deepest single dependency chain is tiny relative to the work
+   (firefox 339K-op chain vs 33.3M op-work; M5 1.56M vs 234.6M) and force-stack
+   nesting peaks at only 105–191. So the critical path is short; the width is real.
+   There is genuine parallel structure to exploit.
+
+2. **…but ~50% of every workload's forces are memo-hits (0.48–0.53), and that is
+   the ceiling that bites.** This fraction is astonishingly stable across every
+   workload measured (firefox 0.533, M5 0.481, git 0.529, hello/python3 0.48–0.53).
+   These are forces that land on an already-`Evaluated` thunk — the shared subgraph
+   (stdenv, lib, the fix-point) that memoization computes ONCE and reuses. Under
+   parallel eval those shared thunks are exactly where every worker's
+   `Suspended→Pending` CAS collides and waiter lists pile up. **The sharing that
+   makes v3 fast single-threaded is the same sharing that serializes it in
+   parallel** — this is precisely why Determinate measured *sub-linear* 3.0×/16t
+   (search) and 4.1×/12t (flake-show) despite far-higher idealized ceilings. The
+   idealized 35–47× is not achievable; the memo-serialized realistic ceiling is
+   **~3–4× at 8–16 cores**, matching the ecosystem.
+
+3. **The idealized ceiling ignores the three real taxes** (the trace says so in its
+   own header): synchronization, the GC lock, and FFI serialization. Fold those in:
+   - **Moving-GC synchronization tax:** the always-on scavenger/major collector
+     MOVES cells with a per-thread forwarding map (gc.cc:85). Option A parks all
+     workers at a *global* version of the existing `exitDepth==0` safepoint
+     (vm.cc:4482) and runs the existing STW moving collect — throughput-neutral only
+     while GC stays a small % of runtime. It is (≤7% on-CPU, project memory
+     PROFILE_AT_SCALE). BUT: the barrier/repr campaign already measured what
+     touching this layer costs — the `-DNIX_V3_NONMOVING_TENURED` Phase-S A/B (git
+     note `e6f8ee33c`) showed the moving-GC's barrier+reclaim machinery is worth
+     **+5.4% (firefox) / +10.4% (M5)** CPU *single-threaded*; a global STW rendezvous
+     + N-C-stack/N-VMState root walk + one-forwarding-map-per-cycle adds rendezvous
+     latency and serializes all N workers for the collect. On a ≤7%-GC batch
+     evaluator this is affordable (Option A, not Option B), but it is a real slice
+     off the top of the 3–4×, not free.
+   - **FFI serialization (the M5 term):** every store/IFD/fetch call routes through
+     `nix::EvalState`/libstore/Boehm (ffi.cc: `realisePath`:172, `outputOf`:828,
+     `getFlake`:868), which are NOT thread-safe → a global FFI mutex. M5 is
+     IFD-heavy (its 16,752 roots are driven through plan-to-nix IFD builds; the trace
+     ignores the seconds spent *in* the serialized IFD sub-eval + store). For M5/HNE/
+     simplex the serialized IFD/store fraction caps the parallel win well below the
+     46.6× idealized number — and the store-level parallelism that DOES exist is
+     already exploited by the daemon's build scheduler, not the evaluator.
+
+4. **Granularity — are the parallel units big enough?** Yes for the fan-out unit,
+   marginal for the tail. The natural spark unit is the **top-level independent root
+   force**: firefox 156, M5 16,752. M5's roots are coarse (234.6M op-work / 16,752 ≈
+   14K ops each on average — well above spark/scheduler overhead). firefox's 156
+   roots are very coarse (213K ops each). So the *headline* fan-out amortizes
+   scheduling fine. The risk is the long tail of tiny forces inside each root
+   (work-forces ≫ root-forces: 11.1M vs 16.7K on M5) — sparking those is finer than
+   spark+GC-sync overhead can amortize, so P5 must spark at the root/`buildInputs`
+   grain, not per-thunk. The measured shape supports root-grain sparking.
+
+### Verdict: **DEFER** (unchanged, now measurement-backed)
+
+The re-run does not overturn §4.4 — it hardens it. Precisely:
+
+- **Ceiling is real but capped:** idealized 35–47× (op-weighted) collapses to a
+  **realistic ~3–4× at 8–16 cores** because of the **structural ~50% memo-hit
+  serialization** (0.48–0.53, dead-stable across all five workloads) — exactly the
+  Determinate ceiling. Not Amdahl-dead, but not the idealized number either.
+- **GC tax is affordable but non-zero:** Option A (STW moving collect at a global
+  `exitDepth==0` safepoint) is the right, cheaper path (the architecture is ~80%
+  shaped for it — thread-local nursery/arena/dirty-list all confirmed present, the
+  safepoint already exists); it does NOT eat the whole ceiling. But it is 4–7 months
+  + the multi-threaded-race bug class, and it shaves a real slice (the STW
+  rendezvous + the already-measured +5–10% GC-machinery cost) off the 3–4×.
+- **Option A too expensive relative to the orthogonality:** the 3–4× is orthogonal
+  to BOTH beat-TW walls (per-op 1.5–2.2×, RSS 1.6–2× — and N nurseries make RSS
+  *worse*) and to the moat, AND is **already free at the process level** for the
+  wide/batch workloads it helps most (the 156–16,752 independent roots are exactly
+  what nix-eval-jobs / Hydra / `xargs -P` fan out today at zero v3 cost, zero race
+  risk).
+
+**GO/NO-GO = DEFER the full P0–P6 stack.** **CONDITIONAL** only on the appearance of
+a pinned objective process-parallelism cannot serve — **single-eval LATENCY** (one
+un-splittable big `nix eval`/`nixos-rebuild`/repl) or a **shared-state daemon**. If
+that objective lands: do **P1 (atomic thunk state) + P2 (lock-free symbols)** first
+(independently useful, hardens the thunk machine, ~6–8wk), then gate P3–P5 on a
+per-workload **FFI-wall-fraction pre-measurement** (HP-2) and the memo-contention
+(HP-3) on the *target* workload; P5's ≥2.5×/8-core gate is the final falsifier.
+Otherwise pursue the cheaper `PARALLEL_EVAL_CAPABILITIES §6` alternatives (I/O
+concurrency ~4–8wk; speculative pre-forcing ~2–4wk) and steer throughput to
+process-level parallelism.
+
+**`par_trace.cc` retirement:** its retirement criterion (par_trace.hh §"Retirement
+criterion") is "delete once the parallel-eval GO/NO-GO is decided." This Phase-0
+gate decides it (DEFER). The instrument MAY now be retired per Rule 0; keep it only
+if the CONDITIONAL objective above is expected imminently (it is the HP-2/HP-3
+pre-gate instrument).
+
+**Git-note-worthy numbers (HEAD `b500141b7`, laptop, deterministic; re-confirms
+`aac10b894`):** Phase-0 parallel-potential ceiling — op-weighted serial-roots W/S
+**firefox.drvPath 35.3× / M5 cardano-node.name 46.6×** (re-confirmed) / git 24.5× /
+hello 17.9× / python3 17.7×; **memo-hit 0.48–0.53 dead-stable across all** (firefox
+0.533, M5 0.481, git 0.529); root forces firefox 156 / M5 16,752; deepest op-chain
+firefox 339K / M5 1.56M (≪ op-work 33.3M / 234.6M → wide+shallow); peak nesting
+105–129. HNE + simplex un-measurable (stale haskell.nix local checkouts:
+`array missing` / `git-ls-files` IFD — not a v3 fault). VERDICT = **DEFER**: real
+35–47× idealized ceiling collapses to ~3–4×/8–16c on the structural ~50% memo-sharing
+serialization (= Determinate's measured ceiling); orthogonal to both beat-TW walls +
+the moat; already free at the process level for the wide roots; Option A = 4–7mo +
+race-bug class + a non-zero STW-GC tax. CONDITIONAL only on a single-eval-latency /
+daemon objective (then P1+P2 first, FFI-wall pre-gate before P3–P5).
+
+---
+
 ## 5. Cross-references & provenance
 - Prior candidate design: `PARALLEL_EVAL_CAPABILITIES_2026-05-18.md` (this doc
   supersedes its §5 pessimism + closes its §8 spike; §6 alternatives + §12 reading
   list still valid).
-- Measured parallel potential: `LITERATURE_SWEEP_2026-07-07.md` §6 + git note on
-  `aac10b894` (`NIX_V3_PAR_TRACE`: op-weighted W/S 17.9× hello / 24.5× git / 46.6×
-  M5; deepest chain 129-191 vs 0.77M-11M forces; **48-53% memo-hit**).
+- Measured parallel potential: **§4.6 Phase-0 measured ceiling (2026-07-07, HEAD
+  `b500141b7`)** — the Rule-0 gate, re-run + verdict — plus
+  `LITERATURE_SWEEP_2026-07-07.md` §6 + git note on `aac10b894` (`NIX_V3_PAR_TRACE`:
+  op-weighted W/S 17.9× hello / 24.5× git / 46.6× M5 / **35.3× firefox.drvPath
+  (added §4.6)**; deepest op-chain 129-191 count / 339K-1.56M op vs 0.77M-234.6M
+  work; **memo-hit 0.48-0.53 dead-stable across all five workloads**).
 - Determinate `parallel-nix-eval` (atomic `type` field, Pending/Awaited/Failed, CAS,
   waiter list stored off-value, payload-before-type, lock-free symbol table; 4.1×/12t
   flake-show, 3.0×/16t search) + `changelog-determinate-nix-3111` (2.2-5× real cases,
