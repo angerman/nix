@@ -401,9 +401,11 @@ static nix::SourcePath v3RealisePathArg(
     std::optional<nix::SymlinkResolution> symRes = nix::SymlinkResolution::Full)
 {
     nix::Value tw;
+    bool hadCtx = false;
     if (arg.isString()) {
         auto * ctxEntries = lookupStringContextEntries(arg.asString());
         if (ctxEntries && !ctxEntries->empty()) {
+            hadCtx = true;
             nix::NixStringContext twCtx = decodeStringContext(*ctxEntries);
             tw.mkString(arg.asString(), twCtx, ns.mem);
         } else {
@@ -412,6 +414,11 @@ static nix::SourcePath v3RealisePathArg(
     } else {
         tw.mkPath(nix::SourcePath(ns.rootFS, nix::CanonPath(arg.asPath())), ns.mem);
     }
+    // WS-2 V2: only a CONTEXT-bearing realise can trigger an IFD build; time
+    // just those so the end-of-eval "IFD blocked" figure excludes plain
+    // source-path realisation (which never builds).
+    std::optional<IfdRealiseTimer> _ifdT;
+    if (hadCtx) _ifdT.emplace();
     return ns.realisePath(nix::noPos, tw, symRes);
 }
 
@@ -4070,13 +4077,16 @@ void primReadFile(EvalState & state, Value * args, Value & out)
     topLevelTaintBump(TAINT_READFILE);  // A1: reads ambient file content (not in the key)
     provNoteReadEntry(TAINT_READFILE);  // IFD-prov: a readFile fired (resolved below)
     std::string path;
+    bool hadCtx = false;  // WS-2 V2: context-bearing read → potential IFD build
     if (args[0].isString()) {
         // #741 Phase 4 measurement: ctx-bearing readFile path goes
         // through realisePath below (the TW-wired branch), which
         // CAN trigger a build for un-realised DrvDeep/Built entries.
         auto * ctxEntries = lookupStringContextEntries(args[0].asString());
-        if (ctxEntries && !ctxEntries->empty())
+        if (ctxEntries && !ctxEntries->empty()) {
             ++allocStats().ifdProbeWithCtx[kIfdReadFile];
+            hadCtx = true;
+        }
         path = args[0].asString();
     }
     else if (args[0].isPath()) path = args[0].asPath();
@@ -4101,6 +4111,9 @@ void primReadFile(EvalState & state, Value * args, Value & out)
         nix::Value tw;
         if (args[0].isString()) tw.mkString(path, ns.mem);
         else                    tw.mkPath(nix::SourcePath(ns.rootFS, nix::CanonPath(path)), ns.mem);
+        // WS-2 V2: only time context-bearing reads (potential IFD build).
+        std::optional<IfdRealiseTimer> _ifdT;
+        if (hadCtx) _ifdT.emplace();
         auto sp = ns.realisePath(nix::noPos, tw);
         content = sp.readFile();
         // IFD-prov (N1 CRUX): the imported fragment `readFile`s a store path A
@@ -4182,6 +4195,7 @@ void primReadDir(EvalState & state, Value * args, Value & out)
             nix::NixStringContext twCtx = decodeStringContext(*ctxEntries);
             tw->mkString(args[0].asString(), twCtx, ns.mem);
             try {
+                IfdRealiseTimer _ifdT;  // WS-2 V2: account realise wall-time
                 auto resolved = ns.realisePath(nix::noPos, *tw);
                 path = resolved.path.abs();
             } catch (...) {
@@ -4220,6 +4234,7 @@ void primReadDir(EvalState & state, Value * args, Value & out)
         std::string coerced =
             toStringCoerceCtx(state, args[0], rctx, /*copyPathsToStore=*/false);
         try {
+            IfdRealiseTimer _ifdT;  // WS-2 V2: account realise wall-time
             path = ffi::realisePath(ns, coerced, rctx);
         } catch (...) {
             throw;  // surface TW's error verbatim
@@ -7372,6 +7387,7 @@ void primImport(EvalState & state, Value * args, Value & out)
                 tw->mkString(args[0].asString(), ns.mem);
             }
             try {
+                IfdRealiseTimer _ifdT;  // WS-2 V2: account realise wall-time
                 auto resolved = ns.realisePath(nix::noPos, *tw);
                 path = resolved.path.abs();
             } catch (...) {
@@ -7417,6 +7433,7 @@ void primImport(EvalState & state, Value * args, Value & out)
         std::string coerced =
             toStringCoerceCtx(state, args[0], ictx, /*copyPathsToStore=*/false);
         try {
+            IfdRealiseTimer _ifdT;  // WS-2 V2: account realise wall-time
             path = ffi::realisePath(ns, coerced, ictx);
         } catch (...) {
             // Surface TW's error verbatim (build failures, missing

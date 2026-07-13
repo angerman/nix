@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstddef>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -854,6 +855,16 @@ struct AllocStats
     /// If non-zero, those primop calls are Phase 4 cache candidates.
     uint64_t ifdProbeWithCtx[16] = {};
 
+    /// WS-2 V2 (2026-07-13): default-on IFD visibility.  Wall-time (ns) spent
+    /// inside the realise FFI leaf — i.e. blocked on IFD builds/substitutions
+    /// during eval — and the number of realise calls that entered it.  Unlike
+    /// nrIFDs/totalIFDTime (which are gated behind
+    /// `profile-import-from-derivation`), these are ALWAYS accumulated so the
+    /// end-of-eval summary can report "blocked X.Xs (Y% of wall)" by default.
+    /// Accumulated by IfdRealiseTimer (below) at the v3 realise sites.
+    uint64_t ifdRealiseNanos = 0;
+    uint64_t ifdRealiseCalls = 0;
+
     /// #795 (2026-05-24): per-call-site counter for v3ToTreeWalker
     /// (the v3→TW bridge entry).  Each call site in primops.cc is
     /// assigned a numeric ID below.  When NIX_VM_STATS, the dump
@@ -886,6 +897,28 @@ inline AllocStats & allocStats()
     static AllocStats stats;
     return stats;
 }
+
+/// WS-2 V2: RAII timer scoped around a v3 realise call (the FFI leaf that may
+/// block on an IFD build/substitution).  On destruction it folds the elapsed
+/// wall-time into `allocStats().ifdRealiseNanos` and bumps `ifdRealiseCalls`.
+/// Always-on and cheap (one steady_clock read at entry + exit); the goal is
+/// the default-on end-of-eval "IFD blocked X.Xs" line, so it must not depend
+/// on any diagnostic gate.  Drop one at each v3→realise site; keep the sites
+/// non-overlapping (a leaf like ffi::realisePath OR its caller, not both) so
+/// time is not double-counted.
+struct IfdRealiseTimer
+{
+    std::chrono::steady_clock::time_point t0{std::chrono::steady_clock::now()};
+    ~IfdRealiseTimer()
+    {
+        auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                      std::chrono::steady_clock::now() - t0)
+                      .count();
+        auto & a = allocStats();
+        a.ifdRealiseNanos += (uint64_t) ns;
+        ++a.ifdRealiseCalls;
+    }
+};
 
 // ---------------------------------------------------------------------------
 // FreeListStats — Step 6 of post-Phase-3.8 plan (2026-05-29).

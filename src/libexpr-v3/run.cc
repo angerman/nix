@@ -2310,6 +2310,54 @@ void dumpTopLevelCacheStats() noexcept {
         (unsigned long long)s.mismatch, (unsigned long long)s.inserts,
         (unsigned long long)s.activeHits);
 }
+
+// WS-2 V2 (2026-07-13): default-on end-of-eval IFD visibility.  Emits ONE (or
+// two) stderr lines when the eval touched any IFD candidate — so CI SEES IFD
+// activity without enabling any diagnostic — and is SILENT otherwise (the
+// common pure-eval / `nix build` case: no context-bearing reads → nothing
+// printed).  The line goes to stderr DURING eval, before the CLI writes the
+// result value to stdout, so value-capturing callers (`… | tail -1`) are
+// unaffected.  v3 measures candidate counts + realise-blocked wall-time
+// unconditionally; the per-derivation built/substituted/ms detail still
+// requires `--option profile-import-from-derivation true` (which populates
+// nrIFDs/totalIFDTime — those are private EvalState members populated only
+// under that setting, and NIX_SHOW_STATS already emits them, so V2 stays
+// purely v3-native and points there for the per-derivation detail).
+static void emitIfdEndOfEvalSummary(std::chrono::steady_clock::time_point wallStart)
+{
+    const auto & a = allocStats();
+    uint64_t candidates = 0;
+    for (int k = 1; k < (int) kIfdProbeKindCount; ++k)
+        candidates += a.ifdProbeWithCtx[k];
+    // Only real IFD activity triggers output: context-bearing IFD-class reads
+    // or timed context-bearing realises.  Plain source-file reads (no context)
+    // never count, so a pure eval / `nix build` stays silent.
+    if (candidates == 0 && a.ifdRealiseCalls == 0)
+        return;
+
+    double blockedS = (double) a.ifdRealiseNanos / 1e9;
+    double wallS = std::chrono::duration<double>(
+                       std::chrono::steady_clock::now() - wallStart).count();
+    double pct = wallS > 0.0 ? 100.0 * blockedS / wallS : 0.0;
+
+    std::string kinds;
+    for (int k = 1; k < (int) kIfdProbeKindCount; ++k)
+        if (a.ifdProbeWithCtx[k] > 0) {
+            kinds += " ";
+            kinds += ifdProbeKindName(static_cast<uint8_t>(k));
+            kinds += "=";
+            kinds += std::to_string((unsigned long long) a.ifdProbeWithCtx[k]);
+        }
+
+    std::fprintf(stderr,
+        "v3: IFD — %llu context-bearing IFD-class read(s):%s; "
+        "blocked %.3fs in realise across %llu call(s) (%.1f%% of %.3fs eval wall). "
+        "Per-derivation build/substitute/ms detail: "
+        "--option profile-import-from-derivation true\n",
+        (unsigned long long) candidates,
+        kinds.empty() ? " (none)" : kinds.c_str(),
+        blockedS, (unsigned long long) a.ifdRealiseCalls, pct, wallS);
+}
 } // namespace
 
 RootResult runRootExprFromString(nix::EvalState & state, const std::string & source,
@@ -2323,6 +2371,10 @@ RootResult runRootExprFromString(nix::EvalState & state, const std::string & sou
     static thread_local int s_rrDepth = 0;
     struct DepthGuard { int & d; ~DepthGuard() { --d; } } _dg{s_rrDepth};
     ++s_rrDepth;
+    // WS-2 V2: outermost eval wall-clock start, for the default-on IFD summary
+    // ("blocked X.Xs = Y% of eval wall").  Captured per-invocation; only the
+    // depth-1 frame's span covers the whole eval (incl. nested imports).
+    auto _v2WallStart = std::chrono::steady_clock::now();
     // Top-level result cache — ACTIVE pre-run lookup (skip-on-hit).  Keyed on
     // inputs computable BEFORE parsing (source ‖ NIX_PATH ‖ system ‖ schema),
     // so a hit skips the WHOLE pipeline (parse+lower+run).  SOUND: only
@@ -2373,6 +2425,7 @@ RootResult runRootExprFromString(nix::EvalState & state, const std::string & sou
     if (s_rrDepth == 1) {
         topLevelCacheShadow(state, source, basePath, rr.value);
         dumpTopLevelCacheStats();  // after the main shadow (self-gates)
+        emitIfdEndOfEvalSummary(_v2WallStart);  // WS-2 V2 (default-on, silent at 0 IFDs)
     }
     return rr;
 }

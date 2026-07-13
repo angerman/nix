@@ -331,6 +331,50 @@ nix develop -c python3 src/libexpr-v3/bench/bench.py \
 nix develop -c python3 src/libexpr-v3/bench/bench.py --no-caps ...
 ```
 
+## IFD visibility (WS-2, 2026-07-13)
+
+Import-from-derivation (IFD) builds block evaluation synchronously — they are
+the dominant wall-clock cost of IFD-heavy CI evals.  Two layers make them
+visible; both were previously off by default.
+
+### Default-on v3 summary (no flag)
+
+Every v3-direct eval that performs a context-bearing IFD-class read
+(`import` / `readFile` / `readDir` / `pathExists` / `readFileType` /
+`findFile` / `scopedImport` / `hashFile` over a `"${drv}/…"` path) prints one
+line to **stderr** at end of eval:
+
+```
+v3: IFD — 12 context-bearing IFD-class read(s): import=8 readFile=4; \
+   blocked 4.213s in realise across 12 call(s) (63.7% of 6.610s eval wall). \
+   Per-derivation build/substitute/ms detail: --option profile-import-from-derivation true
+```
+
+It is **silent** when no IFD occurred (pure eval / `nix build` of a
+non-IFD derivation), so it never pollutes the common case.  The value is
+printed to stdout *after* this line, so `nix eval … | tail -1` still captures
+the result.  `blocked … in realise` is wall-time spent in the realise FFI leaf
+(IFD builds/substitutions + already-valid checks); on a WARM CI rerun (IFDs
+already in the store) it collapses to the already-valid check cost, so the
+percentage tells you how much of the *warm* eval is still IFD-bound.
+
+### Per-derivation detail (opt-in setting)
+
+`--option profile-import-from-derivation true` makes the tree-walker log each
+IFD as it happens and export totals into `NIX_SHOW_STATS`:
+
+```
+nix eval --impure --option profile-import-from-derivation true \
+    --show-stats --expr '…'
+# stderr:  IFD #1: /nix/store/…-foo.drv^out [built] 2986ms at file.nix:3:2
+# stats JSON:  "nrIFDs": 3, "nrIFDsCached": 1, "totalIFDTimeUs": 9123456
+```
+
+Recommended in CI: enable `profile-import-from-derivation` and capture
+`NIX_SHOW_STATS` so every job records its IFD count + total build time.
+`bench/ifd-decomp.sh` wraps this to report the wall decomposition (compute vs
+IFD-blocked vs store-RPC) per workload.
+
 ## Profiling workflow (2026-05-18)
 
 Two complementary profiling tools, layered for different
