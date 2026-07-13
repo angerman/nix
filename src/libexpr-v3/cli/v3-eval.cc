@@ -53,6 +53,7 @@
 #include "v3/limits.hh"
 #include "v3/print.hh"
 #include "v3/heap_trace.hh"
+#include "v3/run.hh"            // WS-3 W1: runRootExprFromString for --worker
 
 #include "nix/expr/eval.hh"
 #include "nix/expr/eval-gc.hh"
@@ -135,7 +136,10 @@ static void usage(const char * argv0)
         "  dump modes (suppress eval): --emit-ir | --emit-ir-raw |\n"
         "       --emit-bytecode [--no-opt]\n"
         "  --optimize : run production pipeline before eval (faithful\n"
-        "       NIX_VM_STATS / V3_TIMING; default --expr skips optimise)\n",
+        "       NIX_VM_STATS / V3_TIMING; default --expr skips optimise)\n"
+        "  --worker   : persistent mode — read one expression per stdin line,\n"
+        "       print each result + a blank delimiter line; caches persist so\n"
+        "       repeated evals reuse prior work (WS-3 CI throughput)\n",
         argv0, argv0);
 }
 
@@ -185,6 +189,15 @@ int main(int argc, char ** argv)
     // UNOPTIMISED counts (e.g. fib's strict-arg thunks that production
     // elides).  See lode/NEXT_STEPS_2026-06-05.md §1.
     bool optimizeEval = false;
+    // WS-3 W1 (2026-07-13): persistent worker mode.  `--worker` keeps ONE
+    // process alive and evaluates a stream of expressions (one per stdin
+    // line), printing each result followed by a blank delimiter line.  The
+    // point is CI throughput: the in-process import cache + applied-import
+    // "moat" cache persist across evals (clearPostEvalGlobalRoots is never
+    // called), so eval #2..N of the same/near-same script reuse eval #1's
+    // work — the cross-process pointer-keyed applied cache is worthless to a
+    // fresh `nix` per run, but a worker converts it to its designed win.
+    bool worker = false;
     // Extra search-path entries (each is either "PATH" or "NAME=PATH").
     // Mirrors `nix-instantiate -I` so the lang test runner's per-test
     // .flags files (which reference `-I lang/dir1` etc.) work.
@@ -207,6 +220,7 @@ int main(int argc, char ** argv)
         else if (a == "--json")     jsonOut = true;
         else if (a == "--strict")   strict = true;
         else if (a == "--parse" || a == "--parse-only") parseOnly = true;
+        else if (a == "--worker")   worker = true;
         else if (a == "--help" || a == "-h") { usage(argv[0]); return 0; }
         else if (a == "-I" && i + 1 < argc)
             extraSearchPath.emplace_back(argv[++i]);
@@ -252,7 +266,7 @@ int main(int argc, char ** argv)
         else { expr = argv[i]; }
     }
 
-    if (expr.empty() && path.empty()) { usage(argv[0]); return 2; }
+    if (expr.empty() && path.empty() && !worker) { usage(argv[0]); return 2; }
 
     try {
         nix::initNix();
@@ -322,7 +336,11 @@ int main(int argc, char ** argv)
         // Always v3-native: parse → v3 AST → lowerV3Ast (no nix::Expr).
         // --parse shows the v3 AST directly (below).  Relative/`~` path
         // literals resolve against the file dir / $HOME (as TW does).
-        if (!path.empty() && path != "-") {
+        // Worker mode parses per-request inside the loop below, so skip the
+        // one-shot parse of --expr/--file here.
+        if (worker) {
+            /* no upfront expression */
+        } else if (!path.empty() && path != "-") {
             std::filesystem::path abs = std::filesystem::absolute(path);
             nix::SourcePath sp(state.rootFS, nix::CanonPath(abs.string()));
             std::string text = slurp(path);
@@ -385,6 +403,52 @@ int main(int argc, char ** argv)
             std::getenv("NIX_V3_NO_BYTECODE_PRIMOPS") != nullptr;
         if (!s_noBytecodePrimops)
             nix::v3::installAllBytecodePrimops(state);
+
+        // WS-3 W1: persistent worker loop.  One-time setup (initNix,
+        // EvalState, primop install, limits) is amortised across every
+        // request.  Each stdin line is one expression; we route it through
+        // the SAME production entry the CLI uses (runRootExprFromString), so
+        // the import + applied-import caches (process-lifetime statics, never
+        // cleared here) persist and eval #2..N hit them.
+        //
+        // Between-evals reset (the correctness core): runRootExprFromString
+        // calls topLevelTaintReset() itself right before run(); we re-arm the
+        // resource-limit deadline per request (initLimits); and each request's
+        // VMState fully unwinds before the next (tlActiveVMStack is empty at
+        // the top level).  The caches deliberately STAY — that is the point.
+        //
+        // Protocol: read a line → print the value → print a blank delimiter
+        // line → flush.  An eval error prints `<error>` as the value and the
+        // worker continues (one bad request must not kill the process).
+        if (worker) {
+            std::string cwd = std::filesystem::current_path().string();
+            std::string line;
+            while (std::getline(std::cin, line)) {
+                // Trim trailing CR (CRLF-safe) and skip blank lines.
+                if (!line.empty() && line.back() == '\r') line.pop_back();
+                if (line.empty()) continue;
+                nix::v3::initLimits();  // re-arm the per-request deadline
+                try {
+                    auto rr = nix::v3::runRootExprFromString(
+                        state, line, cwd, homePath, nullptr);
+                    nix::v3::VMState vm;
+                    vm.frames.push_back(nix::v3::CallFrame{
+                        .cu = rr.cu.get(), .closure = nullptr, .thunk = nullptr,
+                        .ip = rr.cu->entryOffset, .stackBaseOffset = 0,
+                        .withStackBase = 0, .flags = 0,
+                    });
+                    Value r = nix::v3::forceValue(vm, rr.value);
+                    if (strict) r = nix::v3::forceDeep(vm, r);
+                    printValue(vm, r, jsonOut, nix::v3::ir::globalSymbolTable());
+                } catch (const std::exception & e) {
+                    std::fprintf(stderr, "v3-worker error: %s\n", e.what());
+                    std::cout << "<error>\n";
+                }
+                std::cout << "\n";  // blank line = end-of-response delimiter
+                std::cout.flush();
+            }
+            return 0;
+        }
 
         // Native lowering (Stage 2): v3 AST → IR directly (no nix::Expr).
         // canLowerV3 is total for parsed source (guard = should-never-fire).

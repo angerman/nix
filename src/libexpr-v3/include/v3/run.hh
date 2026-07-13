@@ -68,7 +68,7 @@ struct RootResult {
 /// here, with no nix::Expr).  Same side-effects + lifetime contract as
 /// runRootExpr.  registerBuiltinPrimOps() must have run before lowering
 /// (lower-time findPrimOp); this repeats the idempotent setup.
-RootResult runRootExprModule(EvalState & state, ir::Module module);
+RootResult runRootExprModule(nix::EvalState & state, ir::Module module);
 
 /// Native parse+lower+run from raw `.nix` source (no nix::Expr) — the
 /// top-level entry for the CLI + any caller that has source text.
@@ -78,7 +78,7 @@ RootResult runRootExprModule(EvalState & state, ir::Module module);
 /// (`Pos::String`).  Positions then match TW.  Throws on a (provably-
 /// impossible for parsed source) canLowerV3 miss.  (Takes the SourcePath
 /// by pointer so run.hh needs no `nix/...` position header.)
-RootResult runRootExprFromString(EvalState & state, const std::string & source,
+RootResult runRootExprFromString(nix::EvalState & state, const std::string & source,
                                  const std::string & basePath, const std::string & homePath,
                                  const nix::SourcePath * originPath);
 
@@ -86,6 +86,6 @@ RootResult runRootExprFromString(EvalState & state, const std::string & source,
 /// literals) — e.g. the bytecode-primop wrapper installer.  Builds a
 /// Pos::String origin internally + empty base/home, so the caller needs
 /// no eval.hh / parser / position headers — just run.hh.
-RootResult runRootExprFromString(EvalState & state, const std::string & source);
+RootResult runRootExprFromString(nix::EvalState & state, const std::string & source);
 
 } // namespace nix::v3

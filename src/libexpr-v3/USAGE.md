@@ -375,6 +375,68 @@ Recommended in CI: enable `profile-import-from-derivation` and capture
 `bench/ifd-decomp.sh` wraps this to report the wall decomposition (compute vs
 IFD-blocked vs store-RPC) per workload.
 
+## Persistent worker mode for CI (WS-3, 2026-07-13)
+
+CI re-runs the same / near-same evals many times.  A fresh `nix` per run
+throws away the in-process caches — worst of all the applied-import "moat"
+cache, which is keyed on a raw descriptor pointer and cannot exist across
+processes.  `v3-eval --worker` keeps ONE process alive and streams evals, so
+those caches persist and reruns are near-free.
+
+### W1 — the worker (`v3-eval --worker`)
+
+Reads one expression per stdin line; prints each result followed by a blank
+delimiter line.  A per-request error prints `<error>` and the worker
+continues.  Between requests the impurity taint is reset and the resource
+limits are re-armed; the import + applied caches deliberately persist.
+
+```
+printf '%s\n' \
+  '(import <nixpkgs> {}).hello.name' \
+  '(import <nixpkgs> {}).git.name' \
+  | NIX_V3_DIRECT_EVAL=1 v3-eval --worker
+```
+
+Measured (laptop, pinned `<nixpkgs>`): fresh-process warm eval ≈ **109 ms**
+each; in a worker, eval #1 ≈ 109 ms but **eval #2..N ≈ 0.1 ms** — the applied
+cache serves the memoised result.  Correctness gate: eval #1 == eval #2 ==
+fresh-process result, byte-for-byte (`test/run-worker-mode-tests.sh`).
+
+### W2 — memory
+
+Repeated identical evals do **not** leak: worker peak RSS is flat across
+10→200 evals (~114–172 MB, no growth).  For a long-lived worker fed
+*unbounded-distinct* inputs, bound the import cache with
+`NIX_V3_IMPORT_CACHE_MAX_ENTRIES=<n>` (default 0 = never evict — fine for the
+repeated-CI case, where the distinct-import set is bounded by nixpkgs).  A
+zygote-style respawn after N evals or an RSS ceiling is the belt-and-braces
+option for truly unbounded streams.
+
+### W3 — ship an AOT cache in the CI image (`make aot-cache-ci`)
+
+The AOT cache file (`NIX_V3_AOT_CACHE_FILE`) is a read-only mmap consulted
+before SQLite; N parallel evals share its pages.  Build + verify it for your
+CI's workload:
+
+```
+nix develop -c make -C src/libexpr-v3 aot-cache-ci \
+    WORKLOAD='(import <nixpkgs> {}).hello.name' OUT=/img/v3-aot.bin
+# → packs the CUs/IFD-results the workload touches, then verifies a fresh
+#   process hits >= 95% from the file (measured 157/157 = 100%).
+# In CI:  export NIX_V3_AOT_CACHE_FILE=/img/v3-aot.bin
+```
+
+### W4 — SQLite disk-cache growth policy (wipe-per-image)
+
+The SQLite disk cache (`CompilationUnits` / `EvalResults`) has **no runtime
+eviction** — the LRU bump was deliberately removed (per-hit writes cost more
+than they save), so the DB grows unboundedly.  **Policy: wipe it per CI image
+build**, not evict at runtime.  Rationale: the AOT file (W3) is the immutable,
+distributable warm cache for the image; the SQLite DB is only a local warm-up
+scratch that a fresh image rebuilds.  Runtime LRU eviction is explicitly NOT
+implemented (it would reintroduce the per-hit write cost for no CI benefit).
+Set `NIX_V3_CACHE_DIR` to an image-local path and clear it on image rebuild.
+
 ## Profiling workflow (2026-05-18)
 
 Two complementary profiling tools, layered for different

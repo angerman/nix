@@ -22,7 +22,7 @@ BLUE   := \033[1;34m
 YELLOW := \033[1;33m
 RESET  := \033[0m
 
-.PHONY: help all smoke smoke-dbg clean check check-debug list profile profile-note
+.PHONY: help all smoke smoke-dbg clean check check-debug list profile profile-note aot-cache-ci
 
 help: ## Show this help message
 	@printf "$(BLUE)v3 evaluator — make targets$(RESET)\n\n"
@@ -63,6 +63,9 @@ profile: ## Re-profile v3 at scale (QUIET host, e.g. darwin-4): on-CPU phases + 
 
 profile-note: ## Same as `profile` but also attach the summary to HEAD as a git note
 	@bench/profile-at-scale.sh --git-note
+
+aot-cache-ci: ## Build + verify an AOT cache file for a CI image (WORKLOAD=<expr>, OUT=<path>)
+	@WORKLOAD="$(WORKLOAD)" bench/build-aot-cache-ci.sh $(if $(OUT),-o $(OUT),)
 
 list: ## List source files
 	@printf "$(BLUE)library sources$(RESET)\n"
