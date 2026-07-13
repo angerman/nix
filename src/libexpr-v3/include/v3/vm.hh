@@ -60,9 +60,14 @@ enum CallFrameFlag : uint8_t
     CFF_FORCE_WB_PTR_KEEP = 1 << 5,
 };
 
-/// Slim CallFrame — 40 bytes, 2 fit in a 64B cache line minus 24B.
-/// resultSlot/resultPtr were never read on return paths and are gone;
-/// the return value is pushed onto valueStack and consumed by the caller.
+/// CallFrame — 72 bytes.  (The old "40 bytes" comment was stale, WS-1 C5:
+/// the frame grew via forceWriteTarget / deepForceCursor / defEnv /
+/// memoKeyIdx.)  resultSlot/resultPtr were never read on return paths and are
+/// gone; the return value is pushed onto valueStack and consumed by the
+/// caller.  The static_assert after the struct pins the size so this doc
+/// can't rot again — update both together.  Note the two 4-byte alignment
+/// holes (after deepForceCursor and after memoKeyIdx); a new u32 field can
+/// land in either for free.
 struct CallFrame
 {
     const CompilationUnit * cu;        // 8
@@ -115,6 +120,11 @@ struct CallFrame
     /// unwinding the frame simply never inserts (throws are never cached).
     uint32_t  memoKeyIdx = 0;               // 4 (+pad)
 };
+
+/// WS-1 C5: pin the CallFrame size so its doc comment can't silently rot.
+/// If this fires, update BOTH this number and the comment above the struct
+/// (and check whether a new field should reuse one of the two 4-byte holes).
+static_assert(sizeof(CallFrame) == 72, "CallFrame size changed — update the doc comment above and this assert");
 
 /// Per-EvalState VM state.
 ///

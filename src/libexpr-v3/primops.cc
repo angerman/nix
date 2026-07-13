@@ -376,6 +376,45 @@ static void setStringContext(const char * buf, const nix::NixStringContext & ctx
     setStringContextEntries(buf, encodeStringContext(ctx));
 }
 
+/// Realise a v3 string-or-path argument through the tree-walker's
+/// `EvalState::realisePath`, FORWARDING any v3 string context so an
+/// un-realised derivation output referenced by the arg (`"${drv}/f"`) is
+/// BUILT before we touch the filesystem — exactly as TW's realise-bearing
+/// primops do (import at primops.cc:7282, readFile at :4039).
+///
+/// WS-1 (2026-07-13 review, C1/C2/C4): the older hashFile/readFileType
+/// sites used raw `std::filesystem` and never realised at all, while
+/// readFile/pathExists built the TW Value with the 3-arg `mkString(s, mem)`
+/// form that DROPS context — so `realisePath` saw an empty context and never
+/// triggered the build, reading stale content or throwing "does not exist"
+/// where the tree-walker builds.  Centralising the context-forwarding here
+/// (decode + 4-arg `mkString`, mirroring primImport) makes "v3 realises
+/// where TW realises" hold at every IFD-class read site.
+///
+/// `symRes` maps to TW's `realisePath` third argument: `std::nullopt`
+/// requests context-rewrite only (no symlink resolution — the lstat shape
+/// prim_readFileType/prim_findFile rely on); the default resolves symlinks.
+/// The caller MUST have a wired `nixEvalState` (store boundary); standalone
+/// v3-eval has no store and cannot realise.
+static nix::SourcePath v3RealisePathArg(
+    nix::EvalState & ns, const Value & arg,
+    std::optional<nix::SymlinkResolution> symRes = nix::SymlinkResolution::Full)
+{
+    nix::Value tw;
+    if (arg.isString()) {
+        auto * ctxEntries = lookupStringContextEntries(arg.asString());
+        if (ctxEntries && !ctxEntries->empty()) {
+            nix::NixStringContext twCtx = decodeStringContext(*ctxEntries);
+            tw.mkString(arg.asString(), twCtx, ns.mem);
+        } else {
+            tw.mkString(arg.asString(), ns.mem);
+        }
+    } else {
+        tw.mkPath(nix::SourcePath(ns.rootFS, nix::CanonPath(arg.asPath())), ns.mem);
+    }
+    return ns.realisePath(nix::noPos, tw, symRes);
+}
+
 /// Throw `the string '%s' is not allowed to refer to a store path` if the
 /// argument carries any string context.  Mirrors TW's `forceStringNoCtx`
 /// (eval.cc:2826).  Used by primops that take a string and must reject
@@ -3171,7 +3210,21 @@ void primFindFile(EvalState & state, Value * args, Value & out)
             std::string p, prefix;
             if (pV) {
                 Value f = forceValue(*state.vm, *pV);
-                if (f.isString()) p = f.asString();
+                if (f.isString()) {
+                    // WS-1 C3: realise the element path's context so a
+                    // NIX_PATH / search-path entry that is a derivation
+                    // output gets BUILT and rewritten to its store path,
+                    // matching TW's prim_findFile per-element realiseContext
+                    // (libexpr/primops.cc:2308).  std::nullopt = context
+                    // rewrite only (TW does not resolve symlinks here).
+                    // Plain strings (no context) skip the bridge — the
+                    // common literal-path case stays cheap.
+                    auto * ctxEntries = lookupStringContextEntries(f.asString());
+                    if (ctxEntries && !ctxEntries->empty())
+                        p = v3RealisePathArg(*state.nixEvalState, f, std::nullopt).path.abs();
+                    else
+                        p = f.asString();
+                }
                 else if (f.isPath()) p = f.asPath();
             }
             if (prV) {
@@ -3499,21 +3552,19 @@ void primPathExists(EvalState & state, Value * args, Value & out)
     // catches RestrictedPathError and returns false; do the same.
     if (state.nixEvalState) {
         auto & ns = *state.nixEvalState;
+        // mustBeDir mirrors tree-walker (primops.cc:2128) — trailing
+        // slash forces full symlink resolution + dir check.
+        bool mustBeDir =
+            args[0].isString() && (s.ends_with("/") || s.ends_with("/."));
+        auto symRes = mustBeDir
+            ? nix::SymlinkResolution::Full
+            : nix::SymlinkResolution::Ancestors;
         try {
-            // Bridge to a TW Value so realisePath can use its existing
-            // type dispatch (string vs path vs context) without us
-            // duplicating the logic.
-            nix::Value tw;
-            if (args[0].isString()) tw.mkString(s, ns.mem);
-            else                    tw.mkPath(nix::SourcePath(ns.rootFS, nix::CanonPath(s)), ns.mem);
-            // mustBeDir mirrors tree-walker (primops.cc:2128) — trailing
-            // slash forces full symlink resolution + dir check.
-            bool mustBeDir =
-                args[0].isString() && (s.ends_with("/") || s.ends_with("/."));
-            auto symRes = mustBeDir
-                ? nix::SymlinkResolution::Full
-                : nix::SymlinkResolution::Ancestors;
-            auto path = ns.realisePath(nix::noPos, tw, symRes);
+            // WS-1 C4: forward string context (v3RealisePathArg) so a
+            // `pathExists "${drv}/f"` over an un-realised output BUILDS the
+            // derivation — the prior 3-arg mkString dropped context, so no
+            // build fired and the answer was decided by a stale on-disk lstat.
+            auto path = v3RealisePathArg(ns, args[0], symRes);
             auto st = path.maybeLstat();
             bool exists = st && (!mustBeDir || st->type == nix::SourceAccessor::tDirectory);
             // IFD-prov: the existence answer depends on ambient FS state; a store
@@ -3524,16 +3575,16 @@ void primPathExists(EvalState & state, Value * args, Value & out)
             out = exists ? Value::vTrue : Value::vFalse;
             return;
         } catch (const nix::RestrictedPathError &) {
+            // TW's prim_pathExists (libexpr/primops.cc:2137) catches ONLY
+            // RestrictedPathError → false.  Every other error propagates —
+            // crucially a FAILED IFD BUILD, which the prior catch(...) here
+            // swallowed into a raw lstat → a misleading `false` (WS-1 C4).
             out = Value::vFalse;
             return;
-        } catch (...) {
-            // Anything else: fall through to the pre-§1.7 best-effort
-            // direct stat (e.g. when path conversion through TW fails
-            // for a malformed input).
         }
     }
-    // Fallback (no TW state): match tree-walker semantics -- a broken
-    // symlink still "exists" for pathExists (lstat-shaped).
+    // Fallback (standalone v3-eval, no store): match tree-walker semantics --
+    // a broken symlink still "exists" for pathExists (lstat-shaped).
     std::error_code ec;
     auto stat = std::filesystem::symlink_status(s, ec);
     out = (!ec && stat.type() != std::filesystem::file_type::not_found)
@@ -3855,18 +3906,32 @@ void primHashFile(EvalState & state, Value * args, Value & out)
     // The path arg may legitimately carry context (e.g. a CA path), so
     // do not require NoCtx there.
     requireNoStringContext(state, args[0], "hashFile");
-    std::string path;
-    if (args[1].isString())     path = args[1].asString();
-    else if (args[1].isPath())  path = args[1].asPath();
-    else throw std::runtime_error(expectedTypeButFound("a string", args[1]));
+    if (!(args[1].isString() || args[1].isPath()))
+        throw std::runtime_error(expectedTypeButFound("a string", args[1]));
     auto algo = parseHashAlgo(args[0].asString());
-    // #693 — TW raises `path 'X' does not exist` for missing files.
-    if (!std::filesystem::exists(path))
-        throw std::runtime_error("path '" + path + "' does not exist");
-    // IFD-prov: fold the path's content-id (store path → sound; mutable → poison).
-    if (state.nixEvalState) provNoteReadResolved(*state.nixEvalState, path);
-    auto h = nix::hashFile(algo, path);
-    out = mkStringValueOwned(h.to_string(nix::HashFormat::Base16, false));
+    // WS-1 C1: match TW's prim_hashFile (libexpr/primops.cc:2474) — realise
+    // the arg's context so `hashFile "${drv}/f"` BUILDS the derivation and
+    // hashes its real output, instead of hashing stale on-disk content or
+    // throwing "does not exist".  The prior raw `nix::hashFile(algo, path)`
+    // skipped realisation entirely.  Standalone v3-eval (no store) keeps the
+    // on-disk hash — no IFD is possible without a store boundary.
+    std::string hex;
+    if (state.nixEvalState) {
+        auto & ns = *state.nixEvalState;
+        auto sp = v3RealisePathArg(ns, args[1]);
+        // IFD-prov: fold the RESOLVED path's content-id (store path → sound
+        // narHash; mutable working-tree file → poison).
+        provNoteReadResolved(ns, sp.path.abs());
+        hex = nix::hashString(algo, sp.readFile()).to_string(nix::HashFormat::Base16, false);
+    } else {
+        std::string path = args[1].isString() ? std::string(args[1].asString())
+                                              : std::string(args[1].asPath());
+        // #693 — TW raises `path 'X' does not exist` for missing files.
+        if (!std::filesystem::exists(path))
+            throw std::runtime_error("path '" + path + "' does not exist");
+        hex = nix::hashFile(algo, path).to_string(nix::HashFormat::Base16, false);
+    }
+    out = mkStringValueOwned(hex);
 }
 
 void primConvertHash(EvalState & state, Value * args, Value & out)
@@ -4286,21 +4351,41 @@ void primReadFileType(EvalState & state, Value * args, Value & out)
 {
     topLevelTaintBump(TAINT_READFILE);  // A1: reads ambient filesystem state (not in the key)
     provNoteReadEntry(TAINT_READFILE);  // IFD-prov: readFileType fired (resolved below)
-    std::string path;
-    if (args[0].isString()) path = args[0].asString();
-    else if (args[0].isPath()) path = args[0].asPath();
-    else typeError("readFileType", "string or path");
-    std::error_code ec;
-    auto status = std::filesystem::symlink_status(path, ec);
-    // #693 — match TW phrasing for missing-path errors.
-    if (ec) throw std::runtime_error("path '" + path + "' does not exist");
-    // IFD-prov: fold the path's content-id (store path → sound; mutable → poison).
-    if (state.nixEvalState) provNoteReadResolved(*state.nixEvalState, path);
+    if (!(args[0].isString() || args[0].isPath()))
+        typeError("readFileType", "string or path");
+    // WS-1 C2: match TW's prim_readFileType (libexpr/primops.cc:2526) —
+    // realise the arg's context (std::nullopt = lstat shape, no symlink
+    // resolution) so `readFileType "${drv}/f"` BUILDS the derivation instead
+    // of lstat-ing a not-yet-existent output.  Prior code used raw
+    // std::filesystem::symlink_status and never realised.  Standalone
+    // v3-eval (no store) keeps the on-disk lstat.
     const char * t;
-    if      (std::filesystem::is_symlink(status))   t = "symlink";
-    else if (std::filesystem::is_directory(status)) t = "directory";
-    else if (std::filesystem::is_regular_file(status)) t = "regular";
-    else                                            t = "unknown";
+    if (state.nixEvalState) {
+        auto & ns = *state.nixEvalState;
+        auto sp = v3RealisePathArg(ns, args[0], std::nullopt);
+        // IFD-prov: fold the RESOLVED path's content-id.
+        provNoteReadResolved(ns, sp.path.abs());
+        // lstat() throws "does not exist" for a missing path (TW parity).
+        // if/else (not switch) — the build uses -Werror=switch-enum, and
+        // only these three map to named types (mirrors TW fileTypeToString,
+        // libexpr/primops.cc:2512; everything else → "unknown").
+        auto ty = sp.lstat().type;
+        if      (ty == nix::SourceAccessor::tRegular)   t = "regular";
+        else if (ty == nix::SourceAccessor::tDirectory) t = "directory";
+        else if (ty == nix::SourceAccessor::tSymlink)   t = "symlink";
+        else                                            t = "unknown";
+    } else {
+        std::string path = args[0].isString() ? std::string(args[0].asString())
+                                              : std::string(args[0].asPath());
+        std::error_code ec;
+        auto status = std::filesystem::symlink_status(path, ec);
+        // #693 — match TW phrasing for missing-path errors.
+        if (ec) throw std::runtime_error("path '" + path + "' does not exist");
+        if      (std::filesystem::is_symlink(status))      t = "symlink";
+        else if (std::filesystem::is_directory(status))    t = "directory";
+        else if (std::filesystem::is_regular_file(status)) t = "regular";
+        else                                               t = "unknown";
+    }
     out = mkStringValueOwned(t);
 }
 
@@ -9309,8 +9394,14 @@ void primScopedImport(EvalState & state, Value * args, Value & out)
 
     auto & ns = *state.nixEvalState;
 
+    // WS-1 H4 (C6, surfaced by lint-ifd-realise-coverage): realise the path
+    // arg's context (std::nullopt = lstat shape, matching TW's shared
+    // import→realisePath at libexpr/primops.cc:436) so
+    // `scopedImport scope "${drv}/f"` BUILDS the derivation instead of reading
+    // a raw, un-built path.  Prior code built the SourcePath straight from the
+    // coerced string and never realised — same class as C1/C2/C4.
+    nix::SourcePath sp = v3RealisePathArg(ns, args[1], std::nullopt);
     // Resolve path through symlinks + maybe append default.nix.
-    nix::SourcePath sp(ns.rootFS, nix::CanonPath(path));
     sp = nix::resolveExprPath(sp);
 
     // Read file source and synthesize a wrapper that re-binds every
