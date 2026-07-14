@@ -45,6 +45,28 @@ Putting the two together:
 - **M2.2 (MADV_DONTNEED partial-page): still open, but likely page-granularity-density-limited** for scattered dead (a 4 KiB page with any live cell can't be dropped). Measure line/page occupancy on Linux (the F1 Immix probe, run on Linux) before building.
 - **The decisive remaining measurement: M5 (or HNE) on Linux** — the one workload with dead huge blocks + mid-eval GC points. It quantifies the actual peak-RSS win of M2-a. Heavy setup (cardano/haskell.nix x86_64-linux IFDs); not yet run.
 
-## Bottom line
+## Measurement 3 — HNE hello.drvPath (real haskell.nix, on Linux) — THE DECISIVE TEST
 
-M1's mechanism win is **real but conditional**: it converts to a peak-RSS reduction only for workloads with dead *huge* blocks, and only if the gen-major fires mid-eval to reclaim them. For scattered-dead workloads (firefox/most of nixpkgs) the RSS floor is host-independent live representation — the macOS structural-floor conclusion transfers. The fundable M2 lever is the **opportunistic gen-major trigger on Linux**, validated against **M5-on-Linux**. This is a materially better-targeted plan than "wire whole-block-free" (which the data shows is ~0 on the broad workloads).
+The M2-b workload: a real haskell.nix eval, which HAS huge blocks (170k-class Bindings) — the shape M2.0 predicted could win. Built the full `nix` CLI on x86_64-linux (libcmd + CLI, 0 additional port errors) so `getFlake` works; ran `packages.x86_64-linux.hello.drvPath` (IFDs substituted from cache.iog.io):
+
+- drv correct (`…-hello-exe-hello-1.0.0.2.drv`); **peak RSS 1814 MB** (v3 peak_rss=1902 MB).
+- gen-major fired **5 times** (`markedCells=4004925 hugeMarked=204794 markMs=2781`).
+- **`blocksFreed=0 bytesFreed=0` on ALL 5 cycles.** Every huge block is *marked live* (`hugeMarked=204794`).
+- Peak decomposition: **arena 336 MB (live) + CU-bytecode 212 MB (cache) + Boehm 403 MB + ~950 MB (ImportCache result graphs + frag, live/rooted).**
+- (Aside: the D2 IFD summary fired on Linux — "39.3% of 223 s wall blocked in realise" — this was a COLD run, confirming the cold-IFD regime of DECISION INPUT #1.)
+
+**Why blocksFreed=0 on a huge-block workload:** the ImportCache + applied cache are GC ROOTS holding the entire eval graph LIVE for the whole eval. Nothing the imports produced (including the huge Bindings) goes dead mid-eval → the gen-major finds nothing to free. The synthetic's 4752 MB win required transient *death*, which caching structurally prevents in real evals.
+
+## VERDICT — M2 (block reclaim / whole-block-free / opportunistic trigger) is KILLED for peak RSS
+
+The M1 mechanism win (freeing a dead block returns RSS on Linux) is **real but IRRELEVANT to peak RSS on real workloads**: `blocksFreed=0` on BOTH firefox (scattered dead) AND HNE (huge blocks, but rooted-live) across every GC cycle. There is no dead-block garbage to reclaim at peak — the RSS is **live representation + caches**, host-independent. The macOS structural-floor conclusion **fully transfers to Linux for real workloads.** M2-a (opportunistic gen-major trigger) is therefore also KILLED without building it: firing GC more often finds the same blocksFreed=0. Per Rule 0, this is a falsification, not a deferral.
+
+## Where the parallel-CI RSS lever actually is (redirect)
+
+The peak decomposition names the real levers — none is reclaim:
+- **CU-bytecode 212 MB is 100% cold/evictable AND read-only** (`M2.1 cold-CU: 2452/2452 CUs, 212MB, referenced=0`). This is exactly what the **already-shipped AOT mmap file (WS-3 W3, `4e88c25af`) shares across N parallel processes** — the concrete parallel-eval-density win, and it needs no reclaim.
+- **ImportCache result graphs (~700 MB)**: bound via `NIX_V3_IMPORT_CACHE_MAX_ENTRIES` (WS-3 W2) or share read-only.
+- **Boehm 403 MB**: FFI side, separate track.
+- **Live arena 336 MB**: shrink the live representation — the structural representation-rewrite program (1.6–2.0× floor), not reclaim.
+
+**Bottom line:** WS-6 (reclaim) is dead on both OSes for real workloads — not because the mechanism fails on Linux (it doesn't), but because real evals hold their memory *live* via caches. For the CI goal (N parallel evals / box), the RSS lever is **shared read-only pages (WS-3 W3 AOT mmap — shipped; WS-5 COW)**, not reclamation. This is the same convergence as DECISION INPUT #1: the CI wins are cache-sharing + process reuse, not GC.
