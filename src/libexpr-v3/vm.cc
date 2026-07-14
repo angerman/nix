@@ -4040,8 +4040,8 @@ static bool appliedKeyPrecheck(const Value & vIn, int depth) noexcept
             continue;
         }
         // WHNF — accept exactly serializeOne's tag set.
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wswitch-enum"
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wswitch-enum"
         switch (t) {
         case Tag::Int:
         case Tag::Float:
@@ -4071,7 +4071,7 @@ static bool appliedKeyPrecheck(const Value & vIn, int depth) noexcept
         default:
             return false;  // Closure / PrimOp / ... — serialize throws
         }
-#pragma clang diagnostic pop
+#pragma GCC diagnostic pop
     }
     return false;  // chase chain exceeded max hops
 }
@@ -4210,8 +4210,8 @@ static bool appliedShadowCompareOne(const Value & aIn, const Value & bIn,
     ++compared;
     Tag ta = a->tag(), tb = b->tag();
     if (ta != tb) return false;
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wswitch-enum"
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wswitch-enum"
     switch (ta) {
     case Tag::Int:   return a->asInt() == b->asInt();
     case Tag::Float: return a->floatBits() == b->floatBits();
@@ -4261,7 +4261,7 @@ static bool appliedShadowCompareOne(const Value & aIn, const Value & bIn,
         // structurally without forcing — skip (count as compared).
         return true;
     }
-#pragma clang diagnostic pop
+#pragma GCC diagnostic pop
 }
 
 /// Entry point used by OP_RETURN in shadow mode.
@@ -5150,8 +5150,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
         // in the case table -- they hit the default abort below by
         // design.  Previous comments listed them inline; this single
         // pragma block keeps them off the unhandled-enum diagnostic.
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wswitch-enum"
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wswitch-enum"
         switch (op) {
 
         // --- Literals ---
@@ -13752,7 +13752,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 static_cast<int>(op), ip - 1);
             std::abort();
         }
-#pragma clang diagnostic pop
+#pragma GCC diagnostic pop
     }
     } catch (...) {
         // 2026-05-17 exception barrier — see comment at try { above.

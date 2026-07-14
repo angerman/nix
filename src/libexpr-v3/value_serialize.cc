@@ -301,8 +301,8 @@ static void serializeOne(const Value & vIn, std::string & out)
     // unchanged on derivation-result Values).
     const Value & v = chaseToWHNF(vIn);
     Tag t = v.tag();
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wswitch-enum"
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wswitch-enum"
     switch (t) {
     case Tag::Int:
         writeU8(out, kTagInt);
@@ -343,7 +343,7 @@ static void serializeOne(const Value & vIn, std::string & out)
         throw SerializeError(std::string("unsupported tag in serialise: ")
             + std::to_string(static_cast<int>(t)));
     }
-#pragma clang diagnostic pop
+#pragma GCC diagnostic pop
 }
 
 void serialize(const Value & v, std::string & out)
@@ -502,8 +502,8 @@ Value deserialize(std::string_view in)
 bool valuesEqual(const Value & a, const Value & b) noexcept
 {
     if (a.tag() != b.tag()) return false;
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wswitch-enum"
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wswitch-enum"
     switch (a.tag()) {
     case Tag::Int:
         return a.asInt() == b.asInt();
@@ -597,7 +597,7 @@ bool valuesEqual(const Value & a, const Value & b) noexcept
     default:
         return false;  // unsupported tag: never round-trippable
     }
-#pragma clang diagnostic pop
+#pragma GCC diagnostic pop
 }
 
 // ---------------------------------------------------------------------------

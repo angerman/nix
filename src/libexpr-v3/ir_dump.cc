@@ -60,7 +60,11 @@ struct W {
     }
 
     std::string str() && { return std::move(out).str(); }
-    std::string str() const { return out.str(); }
+    // Must be ref-qualified (`const &`) to legally coexist with the `&&`
+    // overload above: C++ forbids mixing ref-qualified and unqualified member
+    // overloads.  libc++/clang accepted the unqualified form; libstdc++/GCC
+    // (correctly) rejects it.
+    std::string str() const & { return out.str(); }
 };
 
 void dumpExprInto(W & w, const Module & m, const Expr & e);

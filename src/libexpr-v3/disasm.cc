@@ -36,8 +36,8 @@ namespace nix::v3 {
 
 const char * opName(Op op)
 {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wswitch-enum"
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wswitch-enum"
     switch (op) {
     case OP_LIT_INT:           return "OP_LIT_INT";
     case OP_LIT_INT_BIG:       return "OP_LIT_INT_BIG";
@@ -133,7 +133,7 @@ const char * opName(Op op)
     case OP_HALT:              return "OP_HALT";
     default:                   return nullptr;
     }
-#pragma clang diagnostic pop
+#pragma GCC diagnostic pop
 }
 
 /// Number of extra Instruction words this op consumes after the opcode
@@ -144,8 +144,8 @@ static uint32_t opExtraWords(Op op, uint32_t operand,
                              const CompilationUnit & cu, uint32_t ip)
 {
     (void)cu; (void)ip;
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wswitch-enum"
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wswitch-enum"
     switch (op) {
     case OP_MAKE_CLOSURE:
     case OP_MAKE_THUNK:
@@ -182,15 +182,15 @@ static uint32_t opExtraWords(Op op, uint32_t operand,
     default:
         return 0;
     }
-#pragma clang diagnostic pop
+#pragma GCC diagnostic pop
 }
 
 namespace {
 
 bool isBranchOp(Op op)
 {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wswitch-enum"
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wswitch-enum"
     switch (op) {
     case OP_JUMP: case OP_BRANCH_FALSE: case OP_BRANCH_TRUE:
     case OP_AND_BRANCH: case OP_OR_BRANCH: case OP_IMPL_BRANCH:
@@ -198,7 +198,7 @@ bool isBranchOp(Op op)
         return true;
     default: return false;
     }
-#pragma clang diagnostic pop
+#pragma GCC diagnostic pop
 }
 
 /// Global SymbolId -> name ("?" when out of range).
@@ -260,8 +260,8 @@ uint32_t disassembleOne(std::FILE * out,
         uint32_t a = ip + 1 + k;
         return a < cu.code.size() ? cu.code[a] : 0;
     };
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wswitch-enum"
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wswitch-enum"
     switch (op) {
     case OP_LIT_INT:
         std::fprintf(out, "   ; = %d", decodeSignedOperand(inst));
@@ -439,7 +439,7 @@ uint32_t disassembleOne(std::FILE * out,
     default:
         break;
     }
-#pragma clang diagnostic pop
+#pragma GCC diagnostic pop
 
     std::fprintf(out, "\n");
     return ip + 1 + extra;

@@ -1,4 +1,13 @@
 #pragma once
+
+// Standard headers this header's declarations need directly.  libc++ (macOS)
+// pulls these in transitively via other <...> includes, but libstdc++ (Linux
+// GCC) correctly does not — so a Linux build fails with "std::string does not
+// name a type" without them.  All no-ops where already included.
+#include <cstddef>   // std::size_t
+#include <cstdint>   // uint8_t..uint64_t, int8_t
+#include <string>    // std::string (LambdaDescriptor::name / contextualName)
+#include <vector>    // std::vector
 /// @file
 /// v3 Closure / Thunk / Env representation.
 ///

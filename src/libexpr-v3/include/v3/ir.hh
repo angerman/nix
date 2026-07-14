@@ -21,6 +21,7 @@
 /// SPDX-License-Identifier: Apache-2.0
 
 #include <cstdint>
+#include <memory>   // std::shared_ptr (libstdc++/Linux needs it explicitly; libc++ pulls it in transitively)
 #include <string>
 #include <string_view>
 #include <variant>
