@@ -4474,6 +4474,61 @@ inline const PosSnapshot * resolvePosSnapshot(uint32_t handle)
     return &p[handle];
 }
 
+/// WS5-D2a — id-preferring pos registration, the PosIdx analogue of
+/// `ir::globalSeedSymbol`.  Used ONLY by serialize::deserializeCUBorrowed
+/// so a BORROWED CU keeps the PosIdx operands embedded in its read-only
+/// bytecode valid WITHOUT rewriting the (shared) code pages.  Prefers to
+/// place snapshot `s` at handle `preferredId` (the writer's PosIdx):
+///   * `s` already pooled                    → returns its existing handle.
+///   * slot `preferredId` free (hole/past end) and `s` unseen
+///                                            → places at `preferredId`,
+///                                              returns preferredId (SEEDED).
+///   * slot `preferredId` occupied by a different pos
+///                                            → records normally, returns a
+///                                              fresh handle (CONFLICT).
+/// Caller detects identity as `result == preferredId`.  A conflict is SAFE:
+/// it just forces that CU to own+remap its code.  PosIdx is diagnostic-only
+/// (not eval-affecting), so even a mismatch would only change an error's
+/// source position, never a result — but we conservatively own on conflict
+/// to keep cold-vs-warm bytecode byte-identical.  Never called off the AOT
+/// path, so normal `recordPosSnapshot` handle assignment is unchanged.
+inline uint32_t seedPosSnapshotAt(uint32_t preferredId, PosSnapshot s)
+{
+    if (preferredId == 0) return 0;  // "no pos" sentinel
+    auto & p = posSnapshotPool();
+    auto & idx = posSnapshotIndex();
+    PosSnapshotKey k{s.file, s.line, s.column};
+    // Already pooled → reuse (identity iff it equals preferredId).
+    auto it = idx.find(k);
+    if (it != idx.end()) return it->second;
+    if (preferredId < p.size()) {
+        const PosSnapshot & cur = p[preferredId];
+        const bool isHole =
+            cur.file.empty() && cur.line == 0 && cur.column == 0;
+        if (!isHole)
+            return recordPosSnapshot(std::move(s));  // slot taken → conflict
+        p[preferredId] = std::move(s);
+        idx.emplace(std::move(k), preferredId);
+        return preferredId;
+    }
+    // Past the end → grow with holes, then seed.
+    p.resize(preferredId + 1);  // default PosSnapshot{} holes
+    p[preferredId] = std::move(s);
+    idx.emplace(std::move(k), preferredId);
+    return preferredId;
+}
+
+/// WS5-D2a — reserve the PosIdx range [0, maxId] so fresh `recordPosSnapshot`
+/// handles append above it (the PosIdx analogue of ir::reserveSymbolCapacity;
+/// see aot_cache::init).  Holes are default PosSnapshot{} (empty file), carry
+/// no dedup-index entry, and resolve as "no pos".  No-op if already larger.
+inline void reservePosCapacity(uint32_t maxId)
+{
+    auto & p = posSnapshotPool();
+    if (static_cast<size_t>(maxId) + 1 > p.size())
+        p.resize(static_cast<size_t>(maxId) + 1);
+}
+
 // ---------------------------------------------------------------------------
 // String-context side-table.
 //

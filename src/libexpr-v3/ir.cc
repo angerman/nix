@@ -99,6 +99,50 @@ SymbolId globalInternSymbol(std::string_view s)
     return id;
 }
 
+SymbolId globalSeedSymbol(SymbolId preferredId, std::string_view name)
+{
+    // WS5-D2a — see ir.hh for the contract.  Only the AOT-borrow
+    // deserialize path calls this; it lets a borrowed CU adopt the
+    // writer's SymbolId for `name` so its read-only bytecode needs no
+    // rewrite (keeping the mmap pages Shared_Clean).
+    if (name.empty()) return 0;  // kInvalidSymbol sentinel
+    auto & t = gst();
+    // Already interned somewhere → must reuse that id (a name maps to
+    // exactly one id per process).  Identity holds iff it equals preferredId.
+    auto it = t.index.find(name);
+    if (it != t.index.end()) return it->second;
+    // `name` is unseen.  Try to place it AT preferredId.
+    if (preferredId < t.table.size()) {
+        if (!t.table[preferredId].empty()) {
+            // Slot taken by a different name → cannot seed here; append.
+            SymbolId nid = static_cast<SymbolId>(t.table.size());
+            t.table.emplace_back(name);
+            t.index.emplace(t.table.back(), nid);
+            return nid;
+        }
+        // Hole at preferredId → seed in place.
+        t.table[preferredId] = std::string(name);
+        t.index.emplace(t.table[preferredId], preferredId);
+        return preferredId;
+    }
+    // preferredId is past the end → grow with empty holes, then seed.
+    t.table.resize(preferredId + 1);
+    t.table[preferredId] = std::string(name);
+    t.index.emplace(t.table[preferredId], preferredId);
+    return preferredId;
+}
+
+void reserveSymbolCapacity(SymbolId maxId)
+{
+    // WS5-D2a — grow the global table to maxId+1 with empty holes so fresh
+    // interns append above the writer's id range.  Holes carry no index
+    // entry (empty string), so globalInternSymbol/globalSeedSymbol behave
+    // exactly as before for any real name; only the "next append id" moves.
+    auto & t = gst();
+    if (static_cast<size_t>(maxId) + 1 > t.table.size())
+        t.table.resize(static_cast<size_t>(maxId) + 1);
+}
+
 SymbolId Module::internSymbol(std::string_view s)
 {
     SymbolId id = globalInternSymbol(s);

@@ -7934,14 +7934,21 @@ void primImport(EvalState & state, Value * args, Value & out)
         CACHE_HOOK_DEFINE_SITE(siteCuLookup, "primImport-cu-disk-lookup");
         CacheHookTimer cuTimer(siteCuLookup);
         auto tLookup = impStamp();
-        auto blob = disk_cache::lookup(diskKey);
+        // WS5-D2a: prefer the AOT mmap BORROW (CU bytecode Shared_Clean
+        // across processes — no copy out of the map); fall back to the
+        // SQLite copy on an AOT miss.
+        auto aotView = disk_cache::lookupCuBorrow(diskKey);
+        std::optional<std::string> blob;
+        if (!aotView) blob = disk_cache::lookup(diskKey);
         impBumpNs(importTimingTotals().diskLookupNs, tLookup);
-        if (blob) {
+        if (aotView || blob) {
             cacheHookHit(siteCuLookup);
             logCacheEvent("HIT", diskKey);
             try {
                 auto tDes = impStamp();
-                cache.cus.push_back(serialize::deserializeCU(*blob));
+                cache.cus.push_back(aotView
+                    ? serialize::deserializeCUBorrowed(*aotView)
+                    : serialize::deserializeCU(*blob));
                 cache.cus.back().fromImportCU = true;  // LEVER-1 memo-hook discriminator
                 impBumpNs(importTimingTotals().deserializeNs, tDes);
 

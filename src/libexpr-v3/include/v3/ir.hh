@@ -658,6 +658,39 @@ struct Function {
 const std::vector<std::string> & globalSymbolTable();
 SymbolId globalInternSymbol(std::string_view s);
 
+/// WS5-D2a — id-preferring intern used ONLY by the AOT-borrow deserialize
+/// path (serialize::deserializeCUBorrowed).  Interns `name` PREFERRING the
+/// slot `preferredId` (the writer process's SymbolId), so that a CU whose
+/// read-only bytecode is BORROWED in place from the AOT mmap keeps its
+/// symbol operands valid WITHOUT rewriting the (read-only, shared) code
+/// pages.  Semantics:
+///   * `name` already interned          → returns its existing id (unchanged).
+///   * slot `preferredId` free (a hole / past the end) and `name` unseen
+///                                       → places `name` at `preferredId`,
+///                                         returns `preferredId` (SEEDED).
+///   * slot `preferredId` occupied by a different name
+///                                       → interns `name` normally (append),
+///                                         returns the fresh id (CONFLICT).
+/// The caller detects identity as `result == preferredId`.  Because both
+/// the writer and reader register builtins/primops deterministically at
+/// startup, and an AOT-hit reader does NOT re-intern the symbols of the
+/// imported files it skips, the writer's ids are almost always free in the
+/// reader → seeding succeeds → the borrow stays clean (Shared_Clean).
+/// A conflict is always SAFE: it just forces that one CU to own+remap its
+/// code (never wrong, only unshared).  Off the AOT path this is never
+/// called, so the normal `globalInternSymbol` id assignment is unchanged.
+SymbolId globalSeedSymbol(SymbolId preferredId, std::string_view name);
+
+/// WS5-D2a — reserve the global symbol-id range [0, maxId] so that subsequent
+/// `globalInternSymbol` calls append ABOVE it.  Called once by
+/// aot_cache::init (with the max SymbolId across all AOT CU blobs) BEFORE any
+/// borrowed CU is loaded: it grows the table with empty holes so the reader's
+/// own fresh interns can't land on a writer id that a later borrowed CU needs
+/// to seed — the collision that otherwise forces `code` to be owned+remapped
+/// instead of borrowed.  A no-op if the table is already larger.  Off the AOT
+/// path this is never called, so normal id assignment is unchanged.
+void reserveSymbolCapacity(SymbolId maxId);
+
 /// Sub-Expr -> (FuncId) entry recorded by the lowerer.  The lower
 /// pre-creates a per-thunk Function for every nontrivial Expr that
 /// would be wrapped in a thunk (let bindings, lazy attrset values,

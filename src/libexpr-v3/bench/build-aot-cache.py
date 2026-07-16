@@ -142,6 +142,18 @@ def write_aot_cache(rows, output: Path):
 
     n = len(rows)
     # Layout: header (16 B) + entries (56 * N) + blobs.
+    # WS5-D2a: each blob is placed at an 8-byte-aligned file offset so the
+    # deserializeCUBorrowed path can `reinterpret_cast` the CU's POD block
+    # (int64/double constants need 8-byte alignment) directly out of the
+    # page-aligned mmap.  Alignment padding is dead space BETWEEN blobs; each
+    # entry's blob_length stays the exact serialized length.  HEADER_SIZE (16)
+    # and ENTRY_SIZE (56) are both multiples of 8, so the first blob is
+    # already aligned; only inter-blob gaps need padding.
+    ALIGN = 8
+
+    def align_up(x):
+        return (x + ALIGN - 1) & ~(ALIGN - 1)
+
     blob_offset_start = HEADER_SIZE + n * ENTRY_SIZE
     offset_cursor = blob_offset_start
 
@@ -149,9 +161,10 @@ def write_aot_cache(rows, output: Path):
         # Magic + format version + entry count.
         f.write(MAGIC)
         f.write(struct.pack("<II", FORMAT_VERSION, n))
-        # Pre-compute offsets so the entry table is written in order.
+        # Pre-compute 8-aligned offsets so the entry table is written in order.
         offsets = []
         for table_id, key, blob in rows:
+            offset_cursor = align_up(offset_cursor)
             offsets.append(offset_cursor)
             offset_cursor += len(blob)
         # Entry table.
@@ -159,9 +172,14 @@ def write_aot_cache(rows, output: Path):
             f.write(key)
             f.write(struct.pack("<II", table_id, 0))
             f.write(struct.pack("<QQ", off, len(blob)))
-        # Blob data.
-        for _table_id, _key, blob in rows:
+        # Blob data, each padded up to its 8-aligned offset.
+        cur = blob_offset_start
+        for (table_id, key, blob), off in zip(rows, offsets):
+            if off > cur:
+                f.write(b"\x00" * (off - cur))
+                cur = off
             f.write(blob)
+            cur += len(blob)
 
     # Content-address: SHA-256 of the whole file.
     h = hashlib.sha256()
@@ -200,12 +218,21 @@ def verify(output: Path):
                       file=sys.stderr)
                 return 1
             prev_key = key
-            if offset != last_offset:
+            # WS5-D2a: blobs are 8-aligned, so an entry's offset is the
+            # previous blob's end rounded UP to 8 (there may be up to 7 pad
+            # bytes of dead space in between).  It must also be 8-aligned.
+            expected = (last_offset + 7) & ~7
+            if offset != expected:
                 print(f"verify FAIL: entry {i} offset {offset} != expected "
-                      f"{last_offset}", file=sys.stderr)
+                      f"(8-aligned) {expected}", file=sys.stderr)
+                return 1
+            if offset % 8 != 0:
+                print(f"verify FAIL: entry {i} offset {offset} not 8-aligned",
+                      file=sys.stderr)
                 return 1
             last_offset = offset + length
-        # File should end exactly at the last blob's end.
+        # File should end at the last blob's end (no trailing pad after the
+        # final blob).
         file_size = output.stat().st_size
         if file_size != last_offset:
             print(f"verify FAIL: trailing junk ({file_size - last_offset} B) "
