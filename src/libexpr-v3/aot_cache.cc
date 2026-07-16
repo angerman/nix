@@ -7,9 +7,9 @@
 /// SPDX-License-Identifier: Apache-2.0
 
 #include "v3/aot_cache.hh"
-#include "v3/serialize.hh"   // WS5-D2a: peekMaxIds for id-range reservation
-#include "v3/ir.hh"          // WS5-D2a: reserveSymbolCapacity
-#include "v3/alloc.hh"       // WS5-D2a: reservePosCapacity
+#include "v3/serialize.hh"   // WS5-B2: readSparseTables for the canonical table
+#include "v3/ir.hh"          // WS5-B2: globalSeedSymbol / reserveSymbolCapacity
+#include "v3/alloc.hh"       // WS5-B2: seedPosSnapshotAt / reservePosCapacity
 
 #include <atomic>
 #include <cerrno>
@@ -22,6 +22,8 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <unordered_map>
+#include <vector>
 
 namespace nix::v3::aot_cache {
 
@@ -206,31 +208,67 @@ bool tryInitLocked()
     r.entries  = base + kHeaderSize;
     r.nEntries = n;
 
-    // WS5-D2a — reserve the writer's SymbolId / PosIdx range so borrowed CU
-    // bytecode can stay un-rewritten (Shared_Clean).  Scan every CU blob's
-    // sparse symbol/pos tables for their max id, take the global max, and
-    // reserve it in this reader's global tables BEFORE any CU is
-    // deserialized.  This makes the reader's own fresh interns append ABOVE
-    // the writer's range, so a later borrowed CU's ids seed into free holes
-    // (identity) instead of colliding — the difference between `code`
-    // borrowing vs falling back to an owned remapped copy.  Cheap (a partial
-    // parse of each blob prefix; pages faulted here are needed anyway).
+    // WS5-B2 — adopt the writer's CANONICAL symbol/pos id assignment WHOLESALE
+    // before any symbol is interned.  D2a only *reserved* the writer's id RANGE
+    // (fresh interns appended above it); it could NOT realign the LOW base ids
+    // (builtins / common attr names) that the reader interns at startup — those
+    // collided with the writer's baked low ids, so most borrowed CUs needed a
+    // per-process `code` remap → owned copy (7.6 % borrow, was the D2a blocker).
+    //
+    // The fix: reconstruct the writer's canonical table from the UNION of every
+    // CU blob's sparse (id→name) / (id→pos) tables — all CU blobs in one AOT
+    // file come from a single writer process, so they agree on every id — and
+    // SEED it into this reader's global symbol table + pos pool right here,
+    // BEFORE the root expr is lowered (aot_cache::init runs eagerly at the top
+    // of runRootExprFromString).  With writer and reader agreeing on ALL ids
+    // (incl. low ones), a borrowed CU's read-only bytecode needs only the
+    // IDENTITY remap → it borrows in place (Shared_Clean) → ~100 % code-borrow.
+    //
+    // Seeding is a pure HINT: `globalSeedSymbol`/`seedPosSnapshotAt` never move
+    // an already-interned symbol, and the per-CU deserializeCUBorrowed path
+    // still independently seeds + verifies identity + falls back to own+remap
+    // on any conflict.  So correctness (byte-identical drvPath) is unconditional
+    // regardless of how completely the seeding succeeds; it only moves the
+    // borrow RATE.
     {
+        std::unordered_map<uint32_t, std::string_view>          symById;
+        std::unordered_map<uint32_t, serialize::BlobPosEntry>   posById;
         uint32_t maxSym = 0, maxPos = 0;
+        std::vector<serialize::BlobSymEntry> syms;
+        std::vector<serialize::BlobPosEntry> poss;
         for (uint32_t i = 0; i < n; ++i) {
             const uint8_t * e = base + kHeaderSize + (size_t)i * kEntrySize;
             if (loadU32(e + 32) != static_cast<uint32_t>(TBL_CU)) continue;
             uint64_t off = loadU64(e + 40);
             uint64_t len = loadU64(e + 48);
             if (off + len > fileSize) continue;
-            auto ids = serialize::peekMaxIds(std::string_view(
-                reinterpret_cast<const char *>(base + off),
-                static_cast<size_t>(len)));
-            if (ids.maxSym > maxSym) maxSym = ids.maxSym;
-            if (ids.maxPos > maxPos) maxPos = ids.maxPos;
+            if (!serialize::readSparseTables(
+                    std::string_view(reinterpret_cast<const char *>(base + off),
+                                     static_cast<size_t>(len)),
+                    syms, poss))
+                continue;
+            // First writer id wins (all blobs agree, so identical anyway).
+            for (const auto & s : syms) {
+                symById.emplace(s.id, s.name);
+                if (s.id > maxSym) maxSym = s.id;
+            }
+            for (const auto & p : poss) {
+                posById.emplace(p.id, p);
+                if (p.id > maxPos) maxPos = p.id;
+            }
         }
+        // Pre-grow both tables to the writer's max id (holes for unreferenced
+        // ids) so each seed below just fills a hole — no repeated resizes if
+        // the map iterates ids out of order.  Fresh interns then append above.
         if (maxSym) ir::reserveSymbolCapacity(maxSym);
         if (maxPos) reservePosCapacity(maxPos);
+        // Seed each canonical entry at the writer's id.  Order-independent: a
+        // name maps to exactly one id in the writer, so there are no intra-map
+        // conflicts; each entry seeds to the identity in the (fresh) reader.
+        for (const auto & [id, name] : symById)
+            ir::globalSeedSymbol(id, name);
+        for (const auto & [id, p] : posById)
+            seedPosSnapshotAt(id, PosSnapshot{std::string(p.file), p.line, p.column});
     }
 
     r.enabled.store(true, std::memory_order_relaxed);

@@ -6444,7 +6444,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 ThunkCreationInfo info{
                     funcIdx,
                     t->suspended.desc ? t->suspended.desc->codeOffset : 0u,
-                    t->suspended.desc ? t->suspended.desc->name : std::string(),
+                    t->suspended.desc ? t->suspended.desc->name.str() : std::string(),
                     t->suspended.desc,
                     cu};
                 thunkCreationMap()[t] = info;
@@ -7580,7 +7580,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                         // so the success path builds no string (audit §3.1).
                         auto lambdaName = [&]() -> std::string {
                             return desc && !desc->contextualName.empty()
-                                ? desc->contextualName
+                                ? desc->contextualName.str()
                                 : std::string("anonymous lambda");
                         };
                         const Bindings * b = forcedArg.asAttrs();
@@ -7642,8 +7642,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                                             CallFrame & cf = vm.frames.back();
                                             if (cf.closure && cf.closure->desc) {
                                                 callerName = cf.closure->desc->name.empty()
-                                                    ? cf.closure->desc->contextualName
-                                                    : cf.closure->desc->name;
+                                                    ? cf.closure->desc->contextualName.str()
+                                                    : cf.closure->desc->name.str();
                                                 callerPs = resolvePosSnapshot(
                                                     cf.closure->desc->posHandle);
                                             }
@@ -8300,7 +8300,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                         // P3.2: lazy — built only in the error branches.
                         auto lambdaName = [&]() -> std::string {
                             return tcDesc && !tcDesc->contextualName.empty()
-                                ? tcDesc->contextualName
+                                ? tcDesc->contextualName.str()
                                 : std::string("anonymous lambda");
                         };
                         const Bindings * b = forcedArg.asAttrs();

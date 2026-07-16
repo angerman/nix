@@ -6,7 +6,10 @@
 // name a type" without them.  All no-ops where already included.
 #include <cstddef>   // std::size_t
 #include <cstdint>   // uint8_t..uint64_t, int8_t
-#include <string>    // std::string (LambdaDescriptor::name / contextualName)
+#include <cstring>   // std::memcmp (FlatStr comparison)
+#include <string>    // std::string (LambdaBuild::name / contextualName)
+#include <string_view>  // FlatStr::operator string_view
+#include <type_traits>  // std::is_trivially_copyable_v (LambdaDescriptor POD assert)
 #include <vector>    // std::vector
 /// @file
 /// v3 Closure / Thunk / Env representation.
@@ -334,6 +337,64 @@ enum : uint8_t {
 }
 
 // ---------------------------------------------------------------------------
+// WS5-B2 (D2b) — flat, self-relative view types embedded in the POD
+// LambdaDescriptor so the whole `lambdas[]` block can be BORROWED in place
+// from the AOT mmap (Shared_Clean across processes) instead of being
+// deserialized into per-process std::string/std::vector heap.
+//
+// SELF-RELATIVE INVARIANT: `rel` is a byte offset from the ADDRESS OF THE VIEW
+// MEMBER ITSELF to its data, which lives later in the SAME contiguous lambda
+// block ([descriptors][formals][chars]).  So `data = (const char*)this + rel`.
+// Because the offset is self-relative, it stays valid when the ENTIRE block is
+// copied as one unit (the owned path) or borrowed from the mmap — but it is
+// INVALID if a single LambdaDescriptor / view is copied in ISOLATION.  The VM
+// only ever accesses descriptors by reference into the block (LambdaTable's
+// operator[]/begin/end return `const LambdaDescriptor&`), never by value, so
+// the invariant holds.  These types are trivially copyable (just two ints),
+// which keeps LambdaDescriptor a POD the block can reinterpret_cast to.
+// ---------------------------------------------------------------------------
+
+/// Self-relative NUL-terminated string embedded in a POD descriptor.
+/// `rel==0 && len==0` ⇒ empty.  All reads are branch-free.
+struct FlatStr
+{
+    int32_t  rel = 0;    ///< byte offset from &this to the char data
+    uint32_t len = 0;    ///< length in bytes (NUL not counted)
+    const char * c_str() const noexcept
+    { return len ? reinterpret_cast<const char *>(this) + rel : ""; }
+    const char * data() const noexcept { return c_str(); }
+    std::size_t  size()  const noexcept { return len; }
+    std::size_t  capacity() const noexcept { return len; }  // accounting
+    bool         empty() const noexcept { return len == 0; }
+    operator std::string_view() const noexcept
+    { return std::string_view(len ? reinterpret_cast<const char *>(this) + rel : "", len); }
+    std::string  str() const { return std::string(std::string_view(*this)); }
+    std::size_t  find(const char * s) const { return std::string_view(*this).find(s); }
+    bool operator==(std::string_view o) const noexcept
+    { return std::string_view(*this) == o; }
+    bool operator!=(std::string_view o) const noexcept
+    { return !(std::string_view(*this) == o); }
+};
+
+/// Self-relative fixed-stride Formal array embedded in a POD descriptor.
+/// Read-only view; mutation happens only on the LambdaBuild staging form.
+template<typename FormalT>
+struct FlatArray
+{
+    int32_t  rel = 0;    ///< byte offset from &this to the first element
+    uint32_t count = 0;
+    const FormalT * data() const noexcept
+    { return reinterpret_cast<const FormalT *>(
+             reinterpret_cast<const char *>(this) + rel); }
+    std::size_t size()     const noexcept { return count; }
+    std::size_t capacity() const noexcept { return count; }
+    bool        empty()    const noexcept { return count == 0; }
+    const FormalT & operator[](std::size_t i) const noexcept { return data()[i]; }
+    const FormalT * begin() const noexcept { return data(); }
+    const FormalT * end()   const noexcept { return data() + count; }
+};
+
+// ---------------------------------------------------------------------------
 // LambdaDescriptor (shared blueprint)
 // ---------------------------------------------------------------------------
 
@@ -368,12 +429,17 @@ struct LambdaDescriptor
         bool     hasDefault;
         uint32_t pos;
     };
-    std::vector<Formal> formals;
+    /// WS5-B2 (D2b): the formals live in the shared lambda block, borrowed in
+    /// place from the AOT mmap.  `FlatArray` is a read-only, self-relative view
+    /// (offset into the block); mutation happens only on the `LambdaBuild`
+    /// staging form used by emit + owned deserialize.
+    FlatArray<Formal> formals;
     /// WC-17.1 diagnostic name (lambda or rec-attrset attr name).
     /// Mirrors ir::Function::name; populated by compile().  Used by
     /// V3_DBG_OPCYCLE / disassembler dumps to map LambdaDescriptor
-    /// pointers back to the original AST scope.
-    std::string name;
+    /// pointers back to the original AST scope.  WS5-B2: FlatStr view into
+    /// the shared block (was std::string).
+    FlatStr name;
     /// #669 follow-up: contextual binding name (set when this lambda
     /// originated from a `let foo = ...` / `{ foo = ...; }` binding).
     /// Empty for anonymous lambdas — `name` may still have an arg-name
@@ -381,7 +447,8 @@ struct LambdaDescriptor
     /// real binding name.  Used by `printNixValueRich` to match TW's
     /// `«lambda <name>? @ pos»` exactly (TW omits the `<name>` slot
     /// unless `ExprLambda::name` was set by the parser via setName).
-    std::string contextualName;
+    /// WS5-B2: FlatStr view into the shared block (was std::string).
+    FlatStr contextualName;
     /// Source position handle for the lambda body (1-based posSnapshotPool
     /// index; 0 = unknown).  Mirrors ir::Function::posHandle so
     /// V3_DBG_FORCE_TRACE can print file:line:col per thunk-force,
@@ -505,24 +572,13 @@ struct LambdaDescriptor
     int8_t intrinsicVar1 = -1;
     int8_t intrinsicVar2 = -1;
 
-    /// #493 / #484 follow-on: the original tree-walker `nix::ExprLambda *`
-    /// this v3 LambdaDescriptor was lowered from, or nullptr if the
-    /// lambda was synthesised internally (e.g., the per-formal default-
-    /// expression thunks lowerLambda emits at line 717-789).
-    ///
-    /// Used by v3ToTreeWalker when bridging a v3 Closure-with-formals
-    /// back to TW: instead of refusing (the pre-#493 behaviour, which
-    /// triggered the by-name-overlay.nix:54 cascade -- see
-    /// project_484_lambda_skip_formals memory), construct a real TW
-    /// Tag::tLambda Value pointing at this `astLambda`.  TW's
-    /// autoCallFunction can then introspect formals via `lambda.fun`;
-    /// the actual call is intercepted by v3CallFunctionEntry which
-    /// dispatches to v3's compiled body via the body_fid path.
-    ///
-    /// Forward-declared type pointer: not all callers include
-    /// libnixexpr's ExprLambda definition.  Held as `void *` to avoid
-    /// pulling the AST header into closure.hh; cast at use sites.
-    void * astLambda = nullptr;
+    // WS5-B2 (D2b, 2026-07-16): the `void * astLambda` field (the original
+    // `nix::ExprLambda *` for the retired v3ToTreeWalker formals bridge) was
+    // REMOVED.  It has no readers left (the TW bridge was retired in the
+    // TW_VALUE_ERADICATION work — the only remaining mention is a stale comment
+    // in primops.cc), and a per-process host pointer cannot live in a
+    // read-only, cross-process-shared descriptor block.  ir::Function still
+    // carries its own `astLambda`; emit simply no longer copies it here.
 
     // WS5-D1 (2026-07-16): the runtime-mutable owning-CU backpointer `cu` was
     // REMOVED from LambdaDescriptor (it was STAMPED at every closure/thunk
@@ -533,6 +589,45 @@ struct LambdaDescriptor
     // cu_registry.hh (registered idempotently at the former stamp sites).  This
     // is byte-identical to the old field: for any descriptor a live closure /
     // thunk points at, its CU's interval has been registered.
+};
+
+static_assert(std::is_trivially_copyable_v<LambdaDescriptor>,
+    "LambdaDescriptor must stay a POD so the lambda block can be borrowed "
+    "(reinterpret_cast) in place from the AOT mmap — WS5-B2 (D2b).");
+static_assert(alignof(LambdaDescriptor) <= 8,
+    "lambda block is 8-aligned in the blob; descriptor alignment must fit.");
+
+/// WS5-B2 (D2b) — heap-owning STAGING form of a LambdaDescriptor.  Used ONLY
+/// by the two BUILD paths — emit (compile) and the owned deserialize (SQLite
+/// disk cache) — to accumulate a descriptor's variable-length parts before
+/// `LambdaTable::finalize()` packs them into the flat, self-relative block.
+/// Mirrors LambdaDescriptor's fields but keeps `name`/`contextualName` as
+/// std::string and `formals` as std::vector so they can be built/mutated
+/// (remapped, re-sorted) freely.  Never lives past finalize().
+struct LambdaBuild
+{
+    uint32_t codeOffset = 0;
+    uint32_t prologueOffset = 0;
+    uint16_t nUpvalues = 0;
+    uint16_t nLocals = 0;
+    uint8_t  arity = 0;
+    uint8_t  hasFormals = 0;
+    uint8_t  ellipsis = 0;
+    uint16_t nWithTargets = 0;
+    std::vector<LambdaDescriptor::Formal> formals;
+    std::string name;
+    std::string contextualName;
+    uint32_t posHandle = 0;
+    uint32_t selectorSym = 0;
+    bool identityLambda = false;
+    bool secondArgIdentityLambda = false;
+    bool isFormalWrapper = false;
+    bool isOrDefault = false;
+    bool isInheritWrapper = false;
+    LambdaDescriptor::Intrinsic intrinsicKind = LambdaDescriptor::Intrinsic::None;
+    int8_t intrinsicVar0 = -1;
+    int8_t intrinsicVar1 = -1;
+    int8_t intrinsicVar2 = -1;
 };
 
 /// A suspended thunk's owning CU.  WS5-D1: derived from its descriptor's address

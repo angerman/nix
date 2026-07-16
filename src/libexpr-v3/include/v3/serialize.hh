@@ -39,6 +39,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace nix::v3::serialize {
 
@@ -206,7 +207,20 @@ namespace nix::v3::serialize {
 /// now raw blocks rather than element loops), so pre-21 blobs are
 /// incompatible — the bump invalidates them.  See
 /// lode/WS5_D2_INPLACE_AOT_DESIGN_2026-07-16.md.
-constexpr uint32_t kSchemaVersion = 21;
+///
+/// 22 (2026-07-16, WS5-B2 D2b): the `lambdas` array is FLATTENED into a single
+/// contiguous, self-relative POD block ([LambdaDescriptor[]][Formal[]][name/
+/// contextualName chars]) written raw + 8-aligned within the blob, so the
+/// AOT-load path BORROWS the whole descriptor array in place from the mmap
+/// (the ~65 % CU footprint chunk per #139) instead of rebuilding per-descriptor
+/// std::string/std::vector heap.  LambdaDescriptor's `name`/`contextualName`
+/// become `FlatStr` and `formals` becomes `FlatArray` (offsets into the block);
+/// the dead `astLambda` field was removed.  The descriptor `posHandle` is now
+/// carried as a raw PosIdx in the block (added to the sparse posTable +
+/// canonical seeding, remapped on the owned path, identity on borrow) rather
+/// than serialized inline as file/line/col.  Pre-22 blobs are incompatible.
+/// See lode/WS5_D2_INPLACE_AOT_DESIGN_2026-07-16.md "D1+D2b" + WS5_INTEGRATION.
+constexpr uint32_t kSchemaVersion = 22;
 
 /// 8-byte magic prefix at the start of every serialized blob.
 /// Includes a discriminator so format mismatches are detected early.
@@ -291,10 +305,12 @@ bool deserializeBreakdownEnabled();
 /// `podBorrowed` counts CUs whose never-remapped int/float/lco sections
 /// borrowed (i.e. the mmap was suitably aligned).  Printed under NIX_VM_STATS.
 struct AotBorrowStats {
-    uint64_t cus          = 0;  ///< CUs loaded via deserializeCUBorrowed
-    uint64_t codeBorrowed = 0;  ///< ... whose `code` was borrowed (shareable)
-    uint64_t codeOwned    = 0;  ///< ... whose `code` was owned+remapped
-    uint64_t podBorrowed  = 0;  ///< ... whose int/float/lco borrowed (aligned)
+    uint64_t cus             = 0;  ///< CUs loaded via deserializeCUBorrowed
+    uint64_t codeBorrowed    = 0;  ///< ... whose `code` was borrowed (shareable)
+    uint64_t codeOwned       = 0;  ///< ... whose `code` was owned+remapped
+    uint64_t podBorrowed     = 0;  ///< ... whose int/float/lco borrowed (aligned)
+    uint64_t lambdasBorrowed = 0;  ///< WS5-B2: ... whose lambda block borrowed
+    uint64_t lambdasOwned    = 0;  ///< WS5-B2: ... whose lambda block owned+remapped
 };
 AotBorrowStats aotBorrowStats() noexcept;
 
@@ -308,5 +324,31 @@ AotBorrowStats aotBorrowStats() noexcept;
 /// {0,0} on any parse error (the caller then simply skips the reservation).
 struct BlobMaxIds { uint32_t maxSym = 0; uint32_t maxPos = 0; };
 BlobMaxIds peekMaxIds(std::string_view blob) noexcept;
+
+/// WS5-B2 — a single sparse symbol-table entry parsed out of a CU blob: the
+/// writer's SymbolId and the symbol name (a `string_view` INTO `blob`, valid
+/// for the AOT mmap's process lifetime — do NOT retain past unmap, but the
+/// AOT region is never unmapped).
+struct BlobSymEntry { uint32_t id = 0; std::string_view name; };
+/// WS5-B2 — a single sparse pos-table entry: the writer's PosIdx + the
+/// resolved file/line/column (`file` views into `blob`).  Only `present`
+/// entries (the writer's `resolvePosSnapshot` returned non-null) are emitted.
+struct BlobPosEntry {
+    uint32_t id = 0; std::string_view file; uint32_t line = 0; uint32_t column = 0;
+};
+
+/// WS5-B2 — parse `blob`'s sparse symbol + pos tables into the caller's
+/// vectors (both CLEARED first).  This is the reader half of the CANONICAL
+/// symbol/pos table: `aot_cache::init` collects the UNION of every CU blob's
+/// (id→name) / (id→pos) entries — the writer's canonical id assignment, since
+/// all CU blobs in one AOT file come from a single writer process and agree —
+/// and seeds it into this reader's global symbol table + pos pool BEFORE any
+/// symbol is interned.  With writer and reader agreeing on ALL ids (incl. the
+/// low base ids), a borrowed CU's read-only bytecode needs only the identity
+/// remap → it borrows in place (Shared_Clean) instead of falling back to an
+/// owned remapped copy.  Returns false on malformed input (vectors emptied).
+bool readSparseTables(std::string_view blob,
+                      std::vector<BlobSymEntry> & syms,
+                      std::vector<BlobPosEntry> & poss) noexcept;
 
 } // namespace nix::v3::serialize

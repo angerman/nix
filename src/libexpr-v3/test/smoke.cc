@@ -685,7 +685,7 @@ static int testCallNPrimOpNoPap()
     CompilationUnit cu;
     cu.primops.push_back(addPo);
     cu.entryOffset = 0;
-    cu.lambdas.push_back(LambdaDescriptor{
+    cu.lambdas.buildAt(0) = LambdaBuild{
         .codeOffset = 0,
         .prologueOffset = 0,
         .nUpvalues = 0,
@@ -693,7 +693,8 @@ static int testCallNPrimOpNoPap()
         .arity = 0,
         .hasFormals = 0,
         .ellipsis = 0,
-    });
+    };
+    cu.lambdas.finalize();
     cu.lambdaCodeOffsets.push_back(0);
     cu.code.push_back(encode(OP_LIT_PRIMOP, 0));
     cu.code.push_back(encode(OP_LIT_INT, 1));
@@ -762,7 +763,7 @@ static int testForceApp3Arity2NoPap()
 {
     CompilationUnit cu;
     cu.entryOffset = 0;
-    cu.lambdas.push_back(LambdaDescriptor{
+    cu.lambdas.buildAt(0) = LambdaBuild{
         .codeOffset = 0,
         .prologueOffset = 0,
         .nUpvalues = 0,
@@ -770,7 +771,8 @@ static int testForceApp3Arity2NoPap()
         .arity = 2,
         .hasFormals = 0,
         .ellipsis = 0,
-    });
+    };
+    cu.lambdas.finalize();
     cu.lambdaCodeOffsets.push_back(0);
     cu.code.push_back(encode(OP_GET_LOCAL, 0));
     cu.code.push_back(encode(OP_GET_LOCAL, 1));
@@ -837,7 +839,7 @@ static int testCallClosureApp3PapSaturates()
 {
     CompilationUnit cu;
     cu.entryOffset = 0;
-    cu.lambdas.push_back(LambdaDescriptor{
+    cu.lambdas.buildAt(0) = LambdaBuild{
         .codeOffset = 0,
         .prologueOffset = 0,
         .nUpvalues = 0,
@@ -845,7 +847,8 @@ static int testCallClosureApp3PapSaturates()
         .arity = 3,
         .hasFormals = 0,
         .ellipsis = 0,
-    });
+    };
+    cu.lambdas.finalize();
     cu.lambdaCodeOffsets.push_back(0);
     cu.code.push_back(encode(OP_GET_LOCAL, 0));
     cu.code.push_back(encode(OP_GET_LOCAL, 1));
@@ -916,7 +919,7 @@ static int testForceAppArity3NoPap()
 {
     CompilationUnit cu;
     cu.entryOffset = 0;
-    cu.lambdas.push_back(LambdaDescriptor{
+    cu.lambdas.buildAt(0) = LambdaBuild{
         .codeOffset = 0,
         .prologueOffset = 0,
         .nUpvalues = 0,
@@ -924,7 +927,8 @@ static int testForceAppArity3NoPap()
         .arity = 3,
         .hasFormals = 0,
         .ellipsis = 0,
-    });
+    };
+    cu.lambdas.finalize();
     cu.lambdaCodeOffsets.push_back(0);
     cu.code.push_back(encode(OP_GET_LOCAL, 0));
     cu.code.push_back(encode(OP_GET_LOCAL, 1));

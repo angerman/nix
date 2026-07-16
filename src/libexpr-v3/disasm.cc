@@ -377,7 +377,7 @@ uint32_t disassembleOne(std::FILE * out,
     case OP_MAKE_CLOSURE:
     case OP_MAKE_THUNK:
         if (operand < cu.lambdas.size()) {
-            const std::string & fn = cu.lambdas[operand].name;
+            const FlatStr & fn = cu.lambdas[operand].name;  // WS5-B2: view into block
             if (!fn.empty()) std::fprintf(out, "   ; func \"%s\"", fn.c_str());
             else             std::fprintf(out, "   ; func %u", operand);
         }

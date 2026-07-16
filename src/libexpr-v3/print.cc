@@ -509,7 +509,7 @@ static void printClosureToken(std::ostream & out, const Closure * c,
     out << "«lambda";
     if (c && c->desc) {
         if (!c->desc->contextualName.empty()) {
-            out << ' ' << c->desc->contextualName;
+            out << ' ' << std::string_view(c->desc->contextualName);  // WS5-B2: FlatStr → sv
         } else if (!nameHint.empty()) {
             out << ' ' << nameHint;
         }

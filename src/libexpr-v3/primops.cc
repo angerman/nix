@@ -1207,7 +1207,7 @@ static std::string toStringCoerceCtx(EvalState & state, Value v,
                    && v.asClosure()->desc) {
             nameInfo = std::string(" closure-name='")
                 + (v.asClosure()->desc->name.empty()
-                       ? "<anon>" : v.asClosure()->desc->name)
+                       ? std::string("<anon>") : v.asClosure()->desc->name.str())
                 + "'";
             extra = nameInfo.c_str();
         }
@@ -6759,12 +6759,12 @@ void importCachePrintFieldBreakdown() noexcept
         strRefs += cu.stringConstants.capacity() * sizeof(const std::string *);
         symTbl  += cu.symbolTable.capacity() * sizeof(std::string);
         for (const auto & s : cu.symbolTable) symBody += s.capacity();
-        lambdas += cu.lambdas.capacity() * sizeof(LambdaDescriptor);
-        for (const auto & ld : cu.lambdas) {
-            lamNames   += ld.name.capacity();
-            lamFormals += ld.formals.capacity() * sizeof(LambdaDescriptor::Formal);
-            ++nLambdas;
-        }
+        // WS5-B2 (D2b): `lambdas` is one flat block whose capacity() is its
+        // total bytes (descriptors + formals + name/ctx chars).  The former
+        // per-descriptor name/formals heap is gone, so lamNames/lamFormals no
+        // longer break out separately — they are folded into `lambdas`.
+        lambdas  += cu.lambdas.capacity();
+        nLambdas += cu.lambdas.size();
         lamOffs += cu.lambdaCodeOffsets.capacity() * sizeof(uint32_t);
         prim    += cu.primops.capacity() * sizeof(const PrimOp *);
         attrIC  += cu.rt.attrSelectCache.capacity() * sizeof(CompilationUnit::AttrSelectIC);
