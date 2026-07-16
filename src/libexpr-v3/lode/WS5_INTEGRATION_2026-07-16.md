@@ -24,6 +24,8 @@ Three subagents implemented D1/D2a/D3 concurrently in isolated worktrees; I merg
 
 ### 1. Linux `--brute` green is blocked by a PRE-EXISTING Linux-port bug (NOT WS-5)
 
+> **CORRECTION (B1, `6e7b047e6`):** the root cause below (a GC/arena/scavenge runaway) was WRONG. gdb on linux-1 showed the arena has ZERO blocks at the failing `refill` — no runaway. The real cause is `NIX_V3_MAX_HEAP` → `setrlimit(RLIMIT_AS, cap)` vs upstream Nix's two 8 GiB `MAP_NORESERVE` virtual arenas reserved in the `EvalState` ctor (2.25 GB `RLIMIT_AS` ≪ 16 GB reserved → ENOMEM). macOS ignores `RLIMIT_AS` (why it passed). Fixed in `limits.cc` by baselining `RLIMIT_AS` on the current VmSize. See `WS5_COMPLETE_2026-07-16.md`. The paragraph below is retained as the (falsified) original hypothesis.
+
 First-ever full `--brute` on x86_64-linux: 34/41. Classified:
 - 3 = unbuilt test binaries (I'd only built v3-eval/nix/v3-smoke; built the rest → resolved).
 - 4 (brute-audit, nonmoving-tenured, 815-cache, r1-verify) = all crash with `v3 fatal: arena block allocation failed (16 MB request) — address space exhausted` (`alloc.hh:2857`, `Arena::refill`) — a **runaway arena-block allocation on a trivial eval under the 1 MB-nursery brute config** (`NIX_V3_NURSERY_SIZE=1`), i.e. the moving-GC/arena under aggressive scavenge.
