@@ -370,6 +370,23 @@ uint64_t approxResidentBytes() noexcept
     return total;
 }
 
+std::optional<std::string_view> lookupCuBorrow(const CacheKey & key)
+{
+    // WS5-D2a — return the AOT mmap view directly (borrowable in place by
+    // deserializeCUBorrowed) so the CU-bytecode pages stay Shared_Clean
+    // across processes.  AOT only: on a miss the caller falls back to the
+    // copying `lookup()` (SQLite).  Bumps the same disk_cache stats an AOT
+    // hit bumps in `lookup()`, so accounting is unchanged.
+    if (key.empty()) return std::nullopt;
+    if (auto sv = aot_cache::lookup(key, aot_cache::TBL_CU)) {
+        auto & st = stats();
+        st.lookups++;
+        st.hits++;
+        return sv;   // view into the process-lifetime mmap — do NOT copy
+    }
+    return std::nullopt;
+}
+
 std::optional<std::string> lookup(const CacheKey & key)
 {
     auto & st = stats();

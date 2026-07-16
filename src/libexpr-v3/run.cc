@@ -948,6 +948,23 @@ RootResult runRootExprModule(nix::EvalState & state, ir::Module module)
                         : 0.0);
             }
         }
+        // WS5-D2a — AOT-borrow share rate.  codeBorrowed/cus is the fraction
+        // of AOT-loaded CUs whose bytecode pages became cross-process
+        // shareable (borrowed un-rewritten); the rest fell back to a private
+        // remapped copy.  Only printed when the AOT-borrow path fired.
+        {
+            const auto bs = serialize::aotBorrowStats();
+            if (bs.cus > 0) {
+                std::fprintf(stderr,
+                    "v3-direct AOT-borrow: cus=%llu codeBorrowed=%llu "
+                    "codeOwned=%llu podBorrowed=%llu codeBorrowRate=%.1f%%\n",
+                    (unsigned long long)bs.cus,
+                    (unsigned long long)bs.codeBorrowed,
+                    (unsigned long long)bs.codeOwned,
+                    (unsigned long long)bs.podBorrowed,
+                    100.0 * (double)bs.codeBorrowed / (double)bs.cus);
+            }
+        }
         // #772 Stage 9 Phase L0 spike: bytecode-level dedup survey.
         // Only printed when NIX_V3_DEDUP_SURVEY=1.  totalFunctions /
         // uniqueHashes is the LOWER BOUND dedup ratio (real IR-level

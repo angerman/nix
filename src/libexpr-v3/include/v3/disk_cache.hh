@@ -54,6 +54,16 @@ CacheKey computeKeyForString(std::string_view content);
 /// hit (one read from disk), `std::nullopt` on miss or read error.
 std::optional<std::string> lookup(const CacheKey & key);
 
+/// WS5-D2a — CompilationUnit lookup that returns a BORROWABLE view into the
+/// process-lifetime AOT mmap (L3), for the AOT-borrow deserialize path.  On
+/// an AOT hit the returned `string_view` points directly into the mmap
+/// (valid until process exit — the AOT region is never unmapped) and is
+/// suitable for `serialize::deserializeCUBorrowed`.  On an AOT miss returns
+/// `std::nullopt`; the caller then falls back to `lookup()` (SQLite, copied +
+/// owned).  This is what makes cross-process CU-bytecode pages Shared_Clean:
+/// no copy out of the mmap.  Bumps the same stats as an AOT hit in lookup().
+std::optional<std::string_view> lookupCuBorrow(const CacheKey & key);
+
 /// Insert a serialized blob under `key`.  Best-effort: on write
 /// failure (full disk, permission denied, etc.) silently noop —
 /// the cache is purely advisory and never the source of truth.

@@ -2816,6 +2816,84 @@ static int testSerializeRoundTrip()
     return 0;
 }
 
+/// WS5-D2a — round-trip a CU through serialize + deserializeCUBorrowed and
+/// confirm that (a) it computes the same result, and (b) the read-only POD
+/// sections are actually BORROWED in place from the external buffer (the
+/// stand-in for the process-lifetime AOT mmap) rather than copied.  This is
+/// the macOS proxy for the Linux Shared_Clean measurement: if the sections
+/// borrow here, their pages would be shared cross-process there.
+static int testSerializeBorrowRoundTrip()
+{
+    // Same IR as testSerializeRoundTrip: `let n=10; f=x:x+n; in f 32` → 42.
+    auto m = ir::makeModule();
+    auto topEntry = m.freshBlock();
+    funcOf(m, 0).entryBlock = topEntry;
+    auto n = addBinding(m, topEntry, ir::LitInt{10});
+    auto innerFid = addFunction(m);
+    auto innerEntry = m.freshBlock();
+    auto argName = m.internSymbol("x");
+    auto innerParam = m.freshVar();
+    {
+        auto & f = funcOf(m, innerFid);
+        f.entryBlock = innerEntry;
+        f.argName = argName;
+        f.paramVar = innerParam;
+        f.name = "f";
+        auto added = addBinding(m, innerEntry, ir::Add{innerParam, n});
+        setReturn(m, innerEntry, added);
+    }
+    auto fv = addBinding(m, topEntry, ir::Lambda{ innerFid, /*freeVars*/ {} });
+    auto av = addBinding(m, topEntry, ir::LitInt{32});
+    auto rv = addBinding(m, topEntry, ir::App{fv, av});
+    setReturn(m, topEntry, rv);
+    ir::computeFreeVars(m);
+    auto cu = compile(m);
+
+    std::string blob = serialize::serializeCU(cu);
+
+    // Copy the blob into an 8-byte-aligned, immutable external buffer.
+    // std::vector<uint64_t>::data() is 8-aligned — the same guarantee the
+    // page-aligned AOT mmap gives.  deserializeCUBorrowed MUST borrow the POD
+    // sections in place from it (never writing through the borrow).
+    std::vector<uint64_t> buf((blob.size() + 7) / 8, 0);
+    std::memcpy(buf.data(), blob.data(), blob.size());
+    std::string_view sv(reinterpret_cast<const char *>(buf.data()), blob.size());
+
+    auto cu2 = serialize::deserializeCUBorrowed(sv);
+
+    Value r = run(cu2);
+    if (!r.isInt() || r.asInt() != 42) {
+        std::fprintf(stderr,
+            "testSerializeBorrowRoundTrip: expected 42, got tag=%d val=%lld\n",
+            (int)r.tag(), (long long)r.asInt());
+        return 1;
+    }
+
+    // In-process the CU's symbols/positions are already interned at their own
+    // ids, so the seeding identity holds → every POD section must borrow.
+    const char * lo = reinterpret_cast<const char *>(buf.data());
+    const char * hi = lo + blob.size();
+    bool codeInBuf = (const char *)cu2.code.data() >= lo
+                  && (const char *)cu2.code.data() <  hi;
+    if (!cu2.code.isBorrowed() || !cu2.intConstants.isBorrowed()
+        || !cu2.floatConstants.isBorrowed()
+        || !cu2.lambdaCodeOffsets.isBorrowed() || !codeInBuf) {
+        std::fprintf(stderr,
+            "testSerializeBorrowRoundTrip: POD sections not borrowed as "
+            "expected (code=%d int=%d float=%d lco=%d codeInBuf=%d "
+            "codeOff=%td blob=%zu codeLen=%zu)\n",
+            cu2.code.isBorrowed(), cu2.intConstants.isBorrowed(),
+            cu2.floatConstants.isBorrowed(), cu2.lambdaCodeOffsets.isBorrowed(),
+            codeInBuf, (const char *)cu2.code.data() - lo, blob.size(),
+            cu2.code.size());
+        return 1;
+    }
+    std::fprintf(stderr,
+        "testSerializeBorrowRoundTrip: OK (f 32 = 42; code+consts BORROWED "
+        "in place, blob=%zu bytes)\n", blob.size());
+    return 0;
+}
+
 /// REVIEW B6 — strictness pass positive test.  Build IR with
 /// `Force{LitInt{42}}`; running elimRedundantForce should rewrite
 /// the Force as a VarRef alias (LitInt is in the WHNF whitelist) and
@@ -4381,6 +4459,7 @@ int main()
     rc |= testStrictnessRewritesForceOverListExpr();
     rc |= testSerializeRoundTrip();
     rc |= testSerializeWithRecAttrset();
+    rc |= testSerializeBorrowRoundTrip();
     rc |= testDiskCacheRoundTrip();
     rc |= testDeserializeRejectsCorruption();
 

@@ -7,6 +7,9 @@
 /// SPDX-License-Identifier: Apache-2.0
 
 #include "v3/aot_cache.hh"
+#include "v3/serialize.hh"   // WS5-D2a: peekMaxIds for id-range reservation
+#include "v3/ir.hh"          // WS5-D2a: reserveSymbolCapacity
+#include "v3/alloc.hh"       // WS5-D2a: reservePosCapacity
 
 #include <atomic>
 #include <cerrno>
@@ -202,6 +205,34 @@ bool tryInitLocked()
     r.fd       = fd;
     r.entries  = base + kHeaderSize;
     r.nEntries = n;
+
+    // WS5-D2a — reserve the writer's SymbolId / PosIdx range so borrowed CU
+    // bytecode can stay un-rewritten (Shared_Clean).  Scan every CU blob's
+    // sparse symbol/pos tables for their max id, take the global max, and
+    // reserve it in this reader's global tables BEFORE any CU is
+    // deserialized.  This makes the reader's own fresh interns append ABOVE
+    // the writer's range, so a later borrowed CU's ids seed into free holes
+    // (identity) instead of colliding — the difference between `code`
+    // borrowing vs falling back to an owned remapped copy.  Cheap (a partial
+    // parse of each blob prefix; pages faulted here are needed anyway).
+    {
+        uint32_t maxSym = 0, maxPos = 0;
+        for (uint32_t i = 0; i < n; ++i) {
+            const uint8_t * e = base + kHeaderSize + (size_t)i * kEntrySize;
+            if (loadU32(e + 32) != static_cast<uint32_t>(TBL_CU)) continue;
+            uint64_t off = loadU64(e + 40);
+            uint64_t len = loadU64(e + 48);
+            if (off + len > fileSize) continue;
+            auto ids = serialize::peekMaxIds(std::string_view(
+                reinterpret_cast<const char *>(base + off),
+                static_cast<size_t>(len)));
+            if (ids.maxSym > maxSym) maxSym = ids.maxSym;
+            if (ids.maxPos > maxPos) maxPos = ids.maxPos;
+        }
+        if (maxSym) ir::reserveSymbolCapacity(maxSym);
+        if (maxPos) reservePosCapacity(maxPos);
+    }
+
     r.enabled.store(true, std::memory_order_relaxed);
     r.ready.store(true, std::memory_order_release);
 

@@ -90,6 +90,15 @@ DeserializeBreakdown & breakdown()
     return bd;
 }
 
+// WS5-D2a — AOT-borrow accounting.  Single-threaded VM; plain counters (like
+// the M-10 pool stats).  Incremented only on the deserializeCUBorrowed path;
+// surfaced via aotBorrowStats() + NIX_VM_STATS so the cross-process share
+// rate is observable without a new env gate.
+uint64_t g_borrowCUs = 0;
+uint64_t g_borrowCodeBorrowed = 0;
+uint64_t g_borrowCodeOwned = 0;
+uint64_t g_borrowPodBorrowed = 0;
+
 bool breakdownEnabled()
 {
     static const bool s_e = std::getenv("V3_DBG_DESERIALIZE") != nullptr;
@@ -147,6 +156,16 @@ struct Reader {
         std::string s(buf.data() + pos, n);
         pos += n;
         return s;
+    }
+    // WS5-D2a: return a pointer to the next `n` bytes and advance WITHOUT
+    // copying.  The borrow path reinterpret_casts this into the mmap; the
+    // owning path memcpy's from it.  Bounds-checked like the other readers.
+    const void * takePtr(size_t n) {
+        if (pos + n > buf.size())
+            throw SerializationError("v3 deserialize: truncated POD section");
+        const void * p = buf.data() + pos;
+        pos += n;
+        return p;
     }
     // #777 (2026-05-23) zero-copy variant: returns a view into the
     // input blob.  Caller MUST consume the view before the blob
@@ -729,17 +748,41 @@ std::string serializeCU(const CompilationUnit & cu)
     w.u32(kSchemaVersion);
     w.u64(opcodeTableFingerprint());
 
-    // Section: code.
+    // WS5-D2a — POD block (schema 21).  The four read-only POD sections
+    // (code, intConstants, floatConstants, lambdaCodeOffsets) are laid out
+    // contiguously and NATURALLY ALIGNED relative to the blob start, so the
+    // AOT-load path can BORROW them in place from the process-lifetime mmap
+    // via reinterpret_cast instead of copying them into private per-process
+    // vectors (which is what makes the pages Shared_Clean across independent
+    // `nix` processes).  The AOT builder pads each blob to an 8-byte file
+    // offset (bench/build-aot-cache.py); combined with the page-aligned mmap
+    // base, every array below lands at its required alignment.
+    //
+    // Layout (offsets relative to blob start):
+    //   [20] podBlockOff : u32 (== 24; lets a future header grow)
+    //   [24] codeCount, intCount, floatCount, lcoCount : u32 x4  (16 B, 8-aligned)
+    //   [40] intConstants   : int64  * intCount   (8-aligned)
+    //        floatConstants : double * floatCount (8-aligned; follows 8*N int)
+    //        code           : u32    * codeCount  (4-aligned; follows 8*N float)
+    //        lambdaCodeOffsets : u32 * lcoCount   (4-aligned; follows 4*N code)
+    // 8-aligned arrays (int64/double) come first so the 4-aligned (u32)
+    // arrays never break the 8-alignment the doubles/ints need.
+    w.u32(24u);  // podBlockOff — POD block starts immediately after this word
     w.u32(static_cast<uint32_t>(cu.code.size()));
-    w.writeBytes(cu.code.data(), cu.code.size() * sizeof(uint32_t));
-
-    // Section: intConstants.
     w.u32(static_cast<uint32_t>(cu.intConstants.size()));
-    for (auto v : cu.intConstants) w.i64(v);
-
-    // Section: floatConstants.
     w.u32(static_cast<uint32_t>(cu.floatConstants.size()));
-    for (auto v : cu.floatConstants) w.f64(v);
+    w.u32(static_cast<uint32_t>(cu.lambdaCodeOffsets.size()));
+    if (cu.intConstants.size())
+        w.writeBytes(cu.intConstants.data(),
+                     cu.intConstants.size() * sizeof(int64_t));
+    if (cu.floatConstants.size())
+        w.writeBytes(cu.floatConstants.data(),
+                     cu.floatConstants.size() * sizeof(double));
+    if (cu.code.size())
+        w.writeBytes(cu.code.data(), cu.code.size() * sizeof(Instruction));
+    if (cu.lambdaCodeOffsets.size())
+        w.writeBytes(cu.lambdaCodeOffsets.data(),
+                     cu.lambdaCodeOffsets.size() * sizeof(uint32_t));
 
     // Section: stringConstants.  M-10: entries are interned pointers; write
     // the literal TEXT (disk format unchanged — deserialize re-interns).
@@ -860,10 +903,7 @@ std::string serializeCU(const CompilationUnit & cu)
         w.u8(l.secondArgIdentityLambda ? 1 : 0);
     }
 
-    // Section: lambdaCodeOffsets.
-    w.u32(static_cast<uint32_t>(cu.lambdaCodeOffsets.size()));
-    w.writeBytes(cu.lambdaCodeOffsets.data(),
-                  cu.lambdaCodeOffsets.size() * sizeof(uint32_t));
+    // (lambdaCodeOffsets moved into the WS5-D2a POD block near the header.)
 
     // Section: primops (resolved by name on load).  PrimOp::name is
     // a string_view referencing the registered name table; copy it
@@ -891,7 +931,18 @@ std::string serializeCU(const CompilationUnit & cu)
     return out;
 }
 
-CompilationUnit deserializeCU(std::string_view blob)
+// WS5-D2a — the shared deserialize core.  `allowBorrow` selects the path:
+//   * false → OWNING (SQLite disk cache, smoke round-trips): copy every
+//             section into private vectors + remap the bytecode in place,
+//             exactly as before schema 21.  `blob` may be a transient.
+//   * true  → AOT-BORROW: `blob.data()` points into the process-lifetime
+//             mmap; borrow the read-only POD sections in place so the pages
+//             are Shared_Clean across processes.  `code` is borrowed iff its
+//             per-process symbol+pos remap is the identity (via id-preferring
+//             seeding); otherwise it is materialised (copied) and remapped.
+//             The never-remapped POD sections (int/float, lambdaCodeOffsets)
+//             are borrowed whenever the mmap is aligned.
+static CompilationUnit deserializeImpl(std::string_view blob, bool allowBorrow)
 {
     Reader r{blob};
     const bool dbg = breakdownEnabled();
@@ -922,29 +973,52 @@ CompilationUnit deserializeCU(std::string_view blob)
     CompilationUnit cu;
     if (dbg) { breakdown().headerNs += nowNs() - t0; t0 = nowNs(); }
 
-    // Section: code.
-    {
-        uint32_t n = r.u32();
-        cu.code.resize(n);
-        r.readBytes(cu.code.data(), n * sizeof(uint32_t));
+    // WS5-D2a — POD block (schema 21).  Read the four counts, then take
+    // (without copying) an in-blob pointer to each contiguous array.  The
+    // borrow/own decision for the never-remapped arrays is made here; the
+    // decision for `code` is deferred until the symbol/pos remap is known.
+    uint32_t podBlockOff = r.u32();
+    if (podBlockOff < r.pos)
+        throw SerializationError("v3 deserialize: bad podBlockOff");
+    r.pos = podBlockOff;  // (== 24 in schema 21; explicit for header growth)
+    const uint32_t codeCount  = r.u32();
+    const uint32_t intCount   = r.u32();
+    const uint32_t floatCount = r.u32();
+    const uint32_t lcoCount   = r.u32();
+    const void * intPtr   = r.takePtr((size_t)intCount   * sizeof(int64_t));
+    const void * floatPtr = r.takePtr((size_t)floatCount * sizeof(double));
+    const void * codePtr  = r.takePtr((size_t)codeCount  * sizeof(Instruction));
+    const void * lcoPtr   = r.takePtr((size_t)lcoCount   * sizeof(uint32_t));
+
+    // The int64/double arrays require 8-byte alignment; by the layout
+    // (8-aligned arrays first) a single check on the data-region start
+    // (== intPtr) covers all four sections.  The AOT builder pads each blob
+    // to an 8-byte file offset so this holds; if it doesn't (e.g. an
+    // unpadded file), we fall back to copying — correctness over sharing.
+    const bool aligned = allowBorrow
+        && (reinterpret_cast<uintptr_t>(intPtr) % alignof(int64_t) == 0);
+
+    auto ownPod = [&](auto & vec, const void * p, uint32_t n) {
+        using Elem = std::decay_t<decltype(vec[0])>;
+        vec.resize(n);
+        if (n) std::memcpy(vec.data(), p, (size_t)n * sizeof(Elem));
+    };
+
+    // intConstants / floatConstants / lambdaCodeOffsets are POD and NEVER
+    // remapped → always safe to borrow when aligned.
+    if (aligned) {
+        cu.intConstants.borrow(
+            reinterpret_cast<const int64_t *>(intPtr), intCount);
+        cu.floatConstants.borrow(
+            reinterpret_cast<const double *>(floatPtr), floatCount);
+        cu.lambdaCodeOffsets.borrow(
+            reinterpret_cast<const uint32_t *>(lcoPtr), lcoCount);
+    } else {
+        ownPod(cu.intConstants,      intPtr,   intCount);
+        ownPod(cu.floatConstants,    floatPtr, floatCount);
+        ownPod(cu.lambdaCodeOffsets, lcoPtr,   lcoCount);
     }
     if (dbg) { breakdown().codeNs += nowNs() - t0; t0 = nowNs(); }
-
-    // Section: intConstants.
-    {
-        uint32_t n = r.u32();
-        cu.intConstants.reserve(n);
-        for (uint32_t i = 0; i < n; ++i) cu.intConstants.push_back(r.i64());
-    }
-    if (dbg) { breakdown().intConstantsNs += nowNs() - t0; t0 = nowNs(); }
-
-    // Section: floatConstants.
-    {
-        uint32_t n = r.u32();
-        cu.floatConstants.reserve(n);
-        for (uint32_t i = 0; i < n; ++i) cu.floatConstants.push_back(r.f64());
-    }
-    if (dbg) { breakdown().floatConstantsNs += nowNs() - t0; t0 = nowNs(); }
 
     // Section: stringConstants.  M-10: re-intern the literal text into the
     // process-wide pool (disk format unchanged — still raw strings on disk).
@@ -971,6 +1045,12 @@ CompilationUnit deserializeCU(std::string_view blob)
     // symbol table got interned for every CU even though most
     // CUs only reference a few hundred symbols.  Schema 9
     // serializes only the referenced subset.
+    //
+    // WS5-D2a: the AOT-borrow path interns via `globalSeedSymbol` (adopt the
+    // writer's id when free) and tracks whether EVERY entry seeded to the
+    // identity — if so the borrowed `code` needs no rewrite.  The owning
+    // path uses `globalInternSymbol` and always rewrites, exactly as before.
+    bool symIdentity = allowBorrow;
     std::vector<uint32_t> remap;
     {
         uint32_t n = r.u32();
@@ -982,18 +1062,26 @@ CompilationUnit deserializeCU(std::string_view blob)
             if (origId > maxId)
                 throw SerializationError(
                     "v3 deserialize: symbolTable entry origId > maxId");
-            remap[origId] = name.empty()
-                ? uint32_t{0}
-                : ir::globalInternSymbol(name);
+            uint32_t rid;
+            if (allowBorrow) {
+                rid = ir::globalSeedSymbol(origId, name);
+                if (rid != origId) symIdentity = false;
+            } else {
+                rid = name.empty() ? uint32_t{0}
+                                   : ir::globalInternSymbol(name);
+            }
+            remap[origId] = rid;
         }
     }
     if (dbg) { breakdown().symbolTableNs += nowNs() - t0; t0 = nowNs(); }
 
     // Schema 14 — Section: sparse posTable.  Mirrors symbolTable.
     // Build a `posRemap[maxId+1]` vector mapping writer-PosIdx →
-    // reader-PosIdx via `recordPosSnapshot`.  Entries with
-    // present=0 (writer's resolvePosSnapshot returned nullptr) map
-    // to 0 (the "no pos" sentinel).
+    // reader-PosIdx.  Entries with present=0 (writer's
+    // resolvePosSnapshot returned nullptr) map to 0 (the "no pos"
+    // sentinel).  WS5-D2a: the borrow path prefers the writer's PosIdx
+    // (seedPosSnapshotAt) and tracks identity for the code-borrow decision.
+    bool posIdentity = allowBorrow;
     std::vector<uint32_t> posRemap;
     {
         uint32_t n = r.u32();
@@ -1010,7 +1098,16 @@ CompilationUnit deserializeCU(std::string_view blob)
                 ps.file = std::string(r.strv());
                 ps.line = r.u32();
                 ps.column = r.u32();
-                posRemap[origId] = recordPosSnapshot(std::move(ps));
+                uint32_t pid = allowBorrow
+                    ? seedPosSnapshotAt(origId, std::move(ps))
+                    : recordPosSnapshot(std::move(ps));
+                posRemap[origId] = pid;
+                if (allowBorrow && pid != origId) posIdentity = false;
+            } else if (allowBorrow && origId != 0) {
+                // Writer had an unresolved pos here; the owning path would
+                // zero it, so a borrowed (un-rewritten) code word would
+                // differ → conservatively force the code to be owned.
+                posIdentity = false;
             }
             // hasPS == 0 leaves posRemap[origId] == 0.
         }
@@ -1066,13 +1163,7 @@ CompilationUnit deserializeCU(std::string_view blob)
     }
     if (dbg) { breakdown().lambdasNs += nowNs() - t0; t0 = nowNs(); }
 
-    // Section: lambdaCodeOffsets.
-    {
-        uint32_t n = r.u32();
-        cu.lambdaCodeOffsets.resize(n);
-        r.readBytes(cu.lambdaCodeOffsets.data(), n * sizeof(uint32_t));
-    }
-    if (dbg) { breakdown().lambdaCodeOffsetsNs += nowNs() - t0; t0 = nowNs(); }
+    // (lambdaCodeOffsets was read from the WS5-D2a POD block above.)
 
     // Section: primops (resolve by name).  #777 (2026-05-23): zero-
     // copy lookup — findPrimOp() accepts string_view, so no need to
@@ -1123,21 +1214,40 @@ CompilationUnit deserializeCU(std::string_view blob)
             "v3 deserialize: trailing bytes after end-of-stream");
     if (dbg) { breakdown().miscNs += nowNs() - t0; t0 = nowNs(); }
 
-    // SymbolId remapping.  At serialize time, the symbolTable was a
-    // snapshot of the global table (entry i == name of global
-    // SymbolId i).  The remap table above was built directly from
-    // string_views into the blob — no intermediate std::strings
-    // materialised.  Walk the bytecode + lambdas to rewrite stale
-    // SymbolIds.
-    remapSymbolsInBytecode(cu, remap);
-    // Schema 14 — apply the PosIdx remap to the in-bytecode trailers
-    // (paired with each name in OP_ATTRS_(LET_)REC_INIT and
-    // OP_ATTRS_INIT-class opcodes) AND to Formal::pos.  Without this
-    // step, cached PosIdx values point into the writer's
-    // posSnapshotPool order — meaningless in the reader process.
-    // Closes the positional-only DIFF class captured by
-    // run-r1-trigger-verify.sh (commit dcfbae871).
-    remapPositionsInBytecode(cu, posRemap);
+    // WS5-D2a — materialise-or-borrow `code`.  The int/float/lco POD
+    // sections were already borrowed/owned above; `code` is the only POD
+    // section carrying per-process ids (SymbolId + PosIdx operands), so it
+    // can be borrowed READ-ONLY only when BOTH remaps are the identity — i.e.
+    // the writer's ids were free in this reader and got seeded in place (see
+    // globalSeedSymbol / seedPosSnapshotAt).  In that case the operands are
+    // already valid and the (shared, read-only) code pages need no rewrite.
+    // Otherwise `code` must be rewritten, so we materialise a private copy
+    // first and then remap it — NEVER writing through a borrowed span.
+    //
+    // SymbolId/PosIdx remapping: at serialize time the ids are the writer's
+    // global ids; the remap tables above translate them to this reader's ids.
+    // remapSymbolsInBytecode also re-sorts OP_ATTRS_REC_INIT trailers +
+    // propagates the permutation to OP_ATTRS_REC_SET (a no-op under identity).
+    const bool borrowCode = aligned && symIdentity && posIdentity;
+    if (allowBorrow) {
+        ++g_borrowCUs;
+        if (borrowCode) ++g_borrowCodeBorrowed; else ++g_borrowCodeOwned;
+        if (aligned) ++g_borrowPodBorrowed;
+    }
+    if (borrowCode) {
+        cu.code.borrow(reinterpret_cast<const Instruction *>(codePtr),
+                       codeCount);
+    } else {
+        ownPod(cu.code, codePtr, codeCount);
+        remapSymbolsInBytecode(cu, remap);
+        // Schema 14 — apply the PosIdx remap to the in-bytecode trailers
+        // (paired with each name in OP_ATTRS_(LET_)REC_INIT and
+        // OP_ATTRS_INIT-class opcodes).  Without this, cached PosIdx values
+        // point into the writer's posSnapshotPool order — meaningless here.
+        remapPositionsInBytecode(cu, posRemap);
+    }
+    // Formals live in the OWNED `lambdas` vector, so they are always
+    // rewritten — a no-op under identity (remap[i]==i, stable re-sort).
     for (auto & l : cu.lambdas) {
         for (auto & f : l.formals) {
             if (f.name < remap.size()) f.name = remap[f.name];
@@ -1178,6 +1288,19 @@ CompilationUnit deserializeCU(std::string_view blob)
     return cu;
 }
 
+CompilationUnit deserializeCU(std::string_view blob)
+{
+    // OWNING path — copy every section; safe for transient blobs (SQLite,
+    // smoke round-trips).
+    return deserializeImpl(blob, /*allowBorrow=*/false);
+}
+
+CompilationUnit deserializeCUBorrowed(std::string_view blob)
+{
+    // AOT-BORROW path — `blob` must live in the process-lifetime mmap.
+    return deserializeImpl(blob, /*allowBorrow=*/true);
+}
+
 DeserializeBreakdownSnapshot deserializeBreakdown()
 {
     const auto & b = breakdown();
@@ -1190,5 +1313,53 @@ DeserializeBreakdownSnapshot deserializeBreakdown()
 }
 
 bool deserializeBreakdownEnabled() { return breakdownEnabled(); }
+
+AotBorrowStats aotBorrowStats() noexcept
+{
+    return { g_borrowCUs, g_borrowCodeBorrowed, g_borrowCodeOwned,
+             g_borrowPodBorrowed };
+}
+
+BlobMaxIds peekMaxIds(std::string_view blob) noexcept
+{
+    // Parse only far enough to read the sparse symbolTable + posTable maxId
+    // fields (schema 21 layout): header, POD block (sized from its counts),
+    // stringConstants (variable — must be walked), then symbolTable and
+    // posTable each start with (count:u32, maxId:u32).  Any malformed input
+    // returns {0,0} so the caller safely skips reservation.
+    try {
+        Reader r{blob};
+        char magic[sizeof(kMagic)];
+        r.readBytes(magic, sizeof(magic));
+        if (std::memcmp(magic, kMagic, sizeof(kMagic)) != 0) return {};
+        if (r.u32() != kSchemaVersion) return {};   // schema
+        r.u64();                                     // fingerprint
+        uint32_t podBlockOff = r.u32();
+        if (podBlockOff < r.pos) return {};
+        r.pos = podBlockOff;
+        uint32_t codeCount  = r.u32();
+        uint32_t intCount   = r.u32();
+        uint32_t floatCount = r.u32();
+        uint32_t lcoCount   = r.u32();
+        // Skip the four POD arrays.
+        r.takePtr((size_t)intCount   * sizeof(int64_t));
+        r.takePtr((size_t)floatCount * sizeof(double));
+        r.takePtr((size_t)codeCount  * sizeof(Instruction));
+        r.takePtr((size_t)lcoCount   * sizeof(uint32_t));
+        // Skip stringConstants (count + (len+bytes)*).
+        uint32_t nStr = r.u32();
+        for (uint32_t i = 0; i < nStr; ++i) (void)r.strv();
+        // symbolTable: count, maxId, then `count` (origId:u32, name:str) pairs.
+        uint32_t nSym = r.u32();
+        uint32_t maxSym = r.u32();
+        for (uint32_t i = 0; i < nSym; ++i) { r.u32(); (void)r.strv(); }
+        // posTable: count, maxId (that's all we need).
+        r.u32();                       // pos count
+        uint32_t maxPos = r.u32();
+        return { maxSym, maxPos };
+    } catch (...) {
+        return {};
+    }
+}
 
 } // namespace nix::v3::serialize

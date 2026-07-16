@@ -22,6 +22,7 @@
 
 #include "v3/value.hh"
 #include "v3/closure.hh"
+#include "v3/owned_or_borrowed.hh"
 
 #include <cstdint>
 #include <string>
@@ -40,6 +41,12 @@ struct PrimOp;
 struct Bindings;
 
 using Instruction = uint32_t;
+
+/// WS5-D2a — the owned-or-borrowed bytecode array (see owned_or_borrowed.hh).
+/// The emitter/SQLite/fresh-compile path OWNS it (backed by std::vector);
+/// the AOT-load path BORROWS a read-only span into the process-lifetime mmap
+/// so the pages become Shared_Clean across independent processes.
+using Bytecode = OwnedOrBorrowed<Instruction>;
 
 enum Op : uint8_t
 {
@@ -597,12 +604,16 @@ struct CompilationUnit
     // former inline `bool fromImportCU`, `attrSelectCache`, and `recSlotCache`
     // members moved into `rt`.
 
-    /// Flat instruction stream.
-    std::vector<Instruction> code;
+    /// Flat instruction stream.  WS5-D2a: owned-or-borrowed (borrowed from
+    /// the AOT mmap when the per-process symbol/pos remap is the identity,
+    /// so the pages stay Shared_Clean; owned otherwise).  The VM only ever
+    /// READS `code[ip]`.
+    Bytecode code;
 
-    /// Constants pools.
-    std::vector<int64_t>     intConstants;
-    std::vector<double>      floatConstants;
+    /// Constants pools.  WS5-D2a: POD, never remapped → always borrowable
+    /// from the AOT mmap.
+    OwnedOrBorrowed<int64_t> intConstants;
+    OwnedOrBorrowed<double>  floatConstants;
     /// M-10 (CODEBASE_REVIEW_2026-06-11): string literals are INTERNED against
     /// a process-wide pool (see internStringConstant) — each entry is a stable
     /// pointer into that pool, NOT an owned std::string.  Compile-time literals
@@ -620,7 +631,8 @@ struct CompilationUnit
 
     /// Lambda descriptors, indexed by IR FuncId.  function 0 = top-level.
     std::vector<LambdaDescriptor> lambdas;
-    std::vector<uint32_t>          lambdaCodeOffsets;
+    /// WS5-D2a: POD, never remapped → always borrowable from the AOT mmap.
+    OwnedOrBorrowed<uint32_t>      lambdaCodeOffsets;
 
     /// Primops referenced by OP_CALL_PRIMOP, indexed by primop-table index.
     std::vector<const PrimOp *> primops;

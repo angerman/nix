@@ -193,7 +193,20 @@ namespace nix::v3::serialize {
 /// would trip the byte-compare verify path); the bump forces recompile so old
 /// lazy and new eager CUs never share a key.  The kGates fingerprint
 /// separately namespaces an A/B `NIX_V3_NO_CONST_EAGER=1` run.
-constexpr uint32_t kSchemaVersion = 20;
+///
+/// 21 (2026-07-16, WS5-D2a): the four read-only POD sections (code,
+/// intConstants, floatConstants, lambdaCodeOffsets) are relocated into a
+/// single contiguous, naturally-aligned POD block immediately after the
+/// header (right after a `podBlockOff` word), laid out 8-aligned-first
+/// (int64/double) then 4-aligned (u32).  This lets the AOT-load path BORROW
+/// them in place from the process-lifetime mmap (a `reinterpret_cast` into
+/// the map) instead of copying them into private per-process vectors, so the
+/// pages become Shared_Clean across independent `nix` processes.  The wire
+/// bytes moved (lambdaCodeOffsets used to trail `lambdas`; the constants are
+/// now raw blocks rather than element loops), so pre-21 blobs are
+/// incompatible — the bump invalidates them.  See
+/// lode/WS5_D2_INPLACE_AOT_DESIGN_2026-07-16.md.
+constexpr uint32_t kSchemaVersion = 21;
 
 /// 8-byte magic prefix at the start of every serialized blob.
 /// Includes a discriminator so format mismatches are detected early.
@@ -225,10 +238,27 @@ bool isCacheable(const CompilationUnit & cu);
 /// cacheable; otherwise throws.
 std::string serializeCU(const CompilationUnit & cu);
 
-/// Deserialize a binary blob into a fresh CompilationUnit.
-/// Primop names in the blob are resolved via findPrimOp() at load
+/// Deserialize a binary blob into a fresh CompilationUnit.  This is the
+/// OWNING path (SQLite disk cache + smoke round-trips): every section is
+/// copied into private per-process vectors and the bytecode is remapped in
+/// place.  Primop names in the blob are resolved via findPrimOp() at load
 /// time; an unknown name throws SerializationError.
 CompilationUnit deserializeCU(std::string_view blob);
+
+/// WS5-D2a — deserialize a blob whose bytes live in the process-lifetime AOT
+/// mmap (aot_cache), BORROWING the read-only POD sections in place instead of
+/// copying them, so the pages are Shared_Clean across processes.  `blob.data()`
+/// MUST point into the mmap and stay valid for the process lifetime (the AOT
+/// region is never unmapped).  The variable-length sections (strings, symbol/
+/// pos tables, lambdas, primops) are still owned/copied.  `code` is borrowed
+/// iff its per-process symbol+pos remap is the identity (achieved via id-
+/// preferring seeding — see ir::globalSeedSymbol); otherwise it is
+/// materialised (copied) and remapped, exactly like deserializeCU.  The three
+/// never-remapped POD sections (int/float constants, lambdaCodeOffsets) are
+/// always borrowed when the mmap is suitably aligned.  On any misalignment the
+/// section is copied (correctness over sharing).  Falls back to a full copy on
+/// a schema/fingerprint/format mismatch (throws, like deserializeCU).
+CompilationUnit deserializeCUBorrowed(std::string_view blob);
 
 /// #777b (2026-05-23) per-section timing breakdown for
 /// deserializeCU.  Only populated when V3_DBG_DESERIALIZE=1 is
@@ -252,5 +282,31 @@ struct DeserializeBreakdownSnapshot {
 
 DeserializeBreakdownSnapshot deserializeBreakdown();
 bool deserializeBreakdownEnabled();
+
+/// WS5-D2a — cross-process borrow accounting for the AOT-load path.  Lets the
+/// Shared_Clean gate (design gate 3) be diagnosed: `codeBorrowed / cus` is the
+/// fraction of loaded CUs whose bytecode pages actually became shareable
+/// (borrowed in place, un-rewritten), vs `codeOwned` (fell back to a private
+/// remapped copy because the writer's symbol/pos ids collided in this reader).
+/// `podBorrowed` counts CUs whose never-remapped int/float/lco sections
+/// borrowed (i.e. the mmap was suitably aligned).  Printed under NIX_VM_STATS.
+struct AotBorrowStats {
+    uint64_t cus          = 0;  ///< CUs loaded via deserializeCUBorrowed
+    uint64_t codeBorrowed = 0;  ///< ... whose `code` was borrowed (shareable)
+    uint64_t codeOwned    = 0;  ///< ... whose `code` was owned+remapped
+    uint64_t podBorrowed  = 0;  ///< ... whose int/float/lco borrowed (aligned)
+};
+AotBorrowStats aotBorrowStats() noexcept;
+
+/// WS5-D2a — the writer's max referenced SymbolId + PosIdx recorded in a
+/// blob's sparse symbol/pos tables.  `aot_cache::init` peeks these across all
+/// CU blobs and reserves that id range in this reader (ir::reserveSymbol
+/// Capacity / reservePosCapacity) BEFORE any borrowed CU is loaded, so the
+/// reader's own fresh interns land ABOVE the writer's range and stop colliding
+/// with not-yet-seeded writer ids — which is what lets `code` actually borrow
+/// (Shared_Clean) instead of falling back to an owned remapped copy.  Returns
+/// {0,0} on any parse error (the caller then simply skips the reservation).
+struct BlobMaxIds { uint32_t maxSym = 0; uint32_t maxPos = 0; };
+BlobMaxIds peekMaxIds(std::string_view blob) noexcept;
 
 } // namespace nix::v3::serialize
