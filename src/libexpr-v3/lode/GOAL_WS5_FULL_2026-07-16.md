@@ -1,0 +1,19 @@
+/goal — WS-5 FULL: parallel-eval-density, complete implementation of ALL items (D1 + D2a + D2b + D3).
+
+LOAD FIRST: src/libexpr-v3/CLAUDE.md (Rule 0, --brute gate, darwin-4/byte-id discipline). Then the WS-5 docs: lode/WS5_COW_BASELINE_2026-07-16.md (measured ~35× density win + the --cow-fork harness) and lode/WS5_D2_INPLACE_AOT_DESIGN_2026-07-16.md (turnkey D2 design: Bytecode owned-or-borrowed wrapper, 270-site map, schema, gates). Memory: project_senior_review_ci_reframe_2026-07-13.
+
+GOAL: ship all four deliverables so N parallel evals/box share the live CU footprint. GOAL MET = D1, D2a, D2b, D3 each committed (Rule-0 body), full `nix develop -c bash src/libexpr-v3/test/all-v3-tests.sh --brute` = 40/40 GREEN on macOS AND x86_64-linux, nixpkgs golden byte-identical both OSes, per-deliverable measurement git-noted. A pre-committed-threshold falsification also = DONE.
+
+USE SUBAGENTS to parallelize — spawn multiple Agent tools in ONE message; the tracks are independent. Integrate results yourself; keep each track's brute/byte-id gate.
+- Track A (D1, in-memory, no schema change): side-array LambdaDescriptor mutables (forceCount/allocCount/callCount/cachedSingletonClosure + the cu back-ptr + fromImportCU) AND CU inline caches (attrSelectCache/recSlotCache) into per-process arrays keyed (cu,funcId). Leaves descriptors+ICs OFF the read-only CU pages. Fix GC walks that touch these. Gate: byte-id + brute + CPU ≤+1% darwin-4.
+- Track B (D2a): the Bytecode owned-or-borrowed wrapper (design doc) — borrow code + int/float consts + lambdaCodeOffsets from a page-aligned AOT-mmap section; bump serialize.hh kSchemaVersion; AOT-path deserialize BORROWS, SQLite/fresh path OWNS. 270 `.code` sites (186 emitter-owned) → wrapper mimics vector API (operator[] const+mutable, push_back/resize/back/data/size). Gate: byte-id + brute + CPU ≤+1% (confirm the hot code[ip] fetch disasm is unchanged) + Linux 2-process smaps Shared_Clean ≥60% of the POD slice.
+- Track C (D3): productionise `--cow-fork` into a fork-server worker — warm parent (AOT + prelude), fork per request, concurrent COW children, result via pipe. Boehm GC_atfork hardening + request protocol. Gate: child result byte-id vs fresh + brute + Linux smaps per-child ≤70% fresh (KPI-5; WS5.0 measured 27 MB same-expr).
+- D2b (AFTER A+B land): borrow the now-read-only `lambdas` array from the mmap. Gate: Linux 2-proc smaps Shared_Clean ≥60% of the FULL CU (212 MB → ≥127 MB shared).
+
+Also delegate to subagents: the 270-site `.code` sweep (Track B), --brute on both OSes, the Linux smaps runs, and an ADVERSARIAL review of D1 GC-walk completeness + D3 fork-safety before each merge (missed-root/UAF under the moving nursery + Boehm is the risk).
+
+SEQUENCING: A, B, C concurrently now; D2b after A+B merge; final integration commit + whole-program re-measure (--cow-fork same-expr 27 MB check + 2-proc Shared_Clean) proving the N-parallel density end to end.
+
+OPERATIONAL (real, will bite): Linux host `linux-1` (x86_64-linux) already builds v3-eval + the nix CLI (the D3 port, commit 3a5b6a438). rsync source with excludes ANCHORED (`/build` NOT `build` — bare `build` nukes src/libstore/build/); ssh `-o IdentityAgent=none -i ~/.ssh/id_rsa`; ninja is incremental, re-invoke across ~10-min ssh timeouts; linux-1 has cache.iog.io so IFDs substitute. CPU perf ONLY on darwin-4; smaps ONLY on Linux (smaps_rollup). Any LambdaDescriptor/CompilationUnit layout change → rebuild v3-smoke before brute + bump serialize kSchemaVersion. Use `#pragma GCC diagnostic` not `clang`. Descriptors ~65% of CU → do A before D2b. No new env gate without an inline retirement criterion. Every number commit-stamped + git-noted.
+
+STOP when D1/D2a/D2b/D3 are all DONE; present per-deliverable byte-id + brute (both OSes) + Linux smaps Shared_Clean + the final N-parallel per-box density figure.
