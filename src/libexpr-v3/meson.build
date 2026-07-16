@@ -128,6 +128,10 @@ lib_sources = files(
   # cached-bool load per primDerivationStrict call.
   'value_serialize.cc',
   'fiber.cc',
+  # WS5-D1: process-global desc→CompilationUnit reverse map (interval registry).
+  # Holds the runtime `cu` back-pointer that was moved OUT of LambdaDescriptor so
+  # the compiled `lambdas[]` array is read-only-after-load (cross-process sharing).
+  'cu_registry.cc',
   'gc.cc',
   # Phase D write-barriers (Stage 3 prereq): NURSERY_PHASE_D_DECISION_2026-05-21.md
   'barrier.cc',
@@ -256,6 +260,7 @@ install_headers(
     'include/v3/alloc.hh',
     'include/v3/bytecode.hh',
     'include/v3/closure.hh',
+    'include/v3/cu_registry.hh',
     'include/v3/install.hh',
     'include/v3/ir.hh',
     'include/v3/disk_cache.hh',

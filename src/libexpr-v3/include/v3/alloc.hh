@@ -3015,17 +3015,18 @@ struct Alloc
     /// memory, but the tenured holder would still hold the stale
     /// pointer.  Next deref → SIGSEGV.
     ///
-    /// Concrete known case: `LambdaDescriptor::cachedSingletonClosure`
-    /// is mutated in-place by `OP_MAKE_CLOSURE` to memoize a
-    /// nUp==0 / nWiths==0 lambda's Closure.  The LambdaDescriptor
-    /// lives in `cu->lambdas` (tenured) and is NOT a scavenge root.
+    /// Concrete known case: `CompilationUnit::rt.lambdaState[funcId].
+    /// cachedSingletonClosure` (WS5-D1: moved off LambdaDescriptor) is
+    /// mutated in-place by `OP_MAKE_CLOSURE` to memoize a
+    /// nUp==0 / nWiths==0 lambda's Closure.  That side array lives
+    /// alongside `cu` (tenured/libc) and is NOT a scavenge root.
     /// Routing the underlying Closure to the nursery caused SIGSEGV
     /// on hello.drvPath at the first scavenge.
     ///
     /// Audit: any future caller adding a tenured cache for
     /// Closure* / Thunk* / ListVec* MUST use a tenured-only
     /// allocator and add itself to this list:
-    ///   - LambdaDescriptor::cachedSingletonClosure  (this fix)
+    ///   - CompilationUnit::rt.lambdaState[].cachedSingletonClosure  (this fix)
     ///
     /// Safety: identical layout to `allocClosure`; only the alloc
     /// backend differs.  No nursery slack lost (the singleton path

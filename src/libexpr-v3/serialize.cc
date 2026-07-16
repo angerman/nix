@@ -880,10 +880,10 @@ std::string serializeCU(const CompilationUnit & cu)
     }
 
     // Section: attrSelectCache size (entries are zeroed on load).
-    w.u32(static_cast<uint32_t>(cu.attrSelectCache.size()));
+    w.u32(static_cast<uint32_t>(cu.rt.attrSelectCache.size()));
 
     // Section: recSlotCache size (#779 Schema 10; entries zeroed on load).
-    w.u32(static_cast<uint32_t>(cu.recSlotCache.size()));
+    w.u32(static_cast<uint32_t>(cu.rt.recSlotCache.size()));
 
     // Section: entryOffset.
     w.u32(cu.entryOffset);
@@ -1097,16 +1097,22 @@ CompilationUnit deserializeCU(std::string_view blob)
     }
     if (dbg) { breakdown().primopsNs += nowNs() - t0; t0 = nowNs(); }
 
+    // CACHE-COHERENCE-EXEMPT: WS5-D1 pure refactor — the attrSelectCache /
+    // recSlotCache vectors moved from `CompilationUnit` to `CompilationUnit::rt`
+    // (per-process runtime side state), but the ON-DISK format is byte-identical:
+    // the same u32 IC *sizes* are written/read and the entries are still zeroed
+    // on load (never serialized).  No field added/removed/reordered in the disk
+    // stream → no kSchemaVersion bump.
     // Section: attrSelectCache size (zeroed entries on load).
     {
         uint32_t n = r.u32();
-        cu.attrSelectCache.resize(n);
+        cu.rt.attrSelectCache.resize(n);
     }
 
     // Section: recSlotCache size (#779 Schema 10; zeroed on load).
     {
         uint32_t n = r.u32();
-        cu.recSlotCache.resize(n);
+        cu.rt.recSlotCache.resize(n);
     }
 
     // Section: entryOffset.

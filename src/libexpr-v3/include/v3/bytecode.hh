@@ -590,14 +590,12 @@ StringConstPoolStats stringConstantPoolStats() noexcept;
 
 struct CompilationUnit
 {
-    /// LEVER-1 applied-import cache (NIX_V3_APPLIED_CACHE, lode/NEXT_LEVERS
-    /// _2026-07-04.md): true iff this CU was inserted into importCache().cus —
-    /// i.e. it is the compiled body of an `import`ed file.  The OP_CALL memo
-    /// hook keys on "callee closure's CU is an import CU" and needs an O(1)
-    /// discriminator (an importCache().cus deque scan per call would sink the
-    /// hot path).  In-memory only, NOT serialized (deserializeCU leaves it
-    /// false; the insertion site sets it).
-    bool fromImportCU = false;
+    // WS5-D1 (2026-07-16): all runtime-MUTABLE per-CU state lives in the nested
+    // `Runtime rt` member below (see `struct Runtime`), keeping the compiled
+    // sections that follow (`code`, POD constants, `lambdas`, ...) read-only
+    // after load so their pages can be shared across processes (WS5-D2).  The
+    // former inline `bool fromImportCU`, `attrSelectCache`, and `recSlotCache`
+    // members moved into `rt`.
 
     /// Flat instruction stream.
     std::vector<Instruction> code;
@@ -651,7 +649,7 @@ struct CompilationUnit
         /// a few percent on adversarial workloads but adds complexity.
         uint8_t evictIdx = 0;
     };
-    mutable std::vector<AttrSelectIC> attrSelectCache;
+    // WS5-D1: the `attrSelectCache` vector moved to `Runtime::attrSelectCache`.
 
     /// #779 (2026-05-23) per-call-site IC for OP_REC_BINDING_SLOT_REF.
     /// Monomorphic 1-way: LetRec sites are shape-stable (the same
@@ -666,7 +664,61 @@ struct CompilationUnit
         const Bindings * bindings = nullptr;
         uint32_t slot = 0;
     };
-    mutable std::vector<RecSlotIC> recSlotCache;
+    // WS5-D1: the `recSlotCache` vector moved to `Runtime::recSlotCache`.
+
+    // -----------------------------------------------------------------------
+    // WS5-D1 (2026-07-16): per-process RUNTIME-MUTABLE side state.
+    //
+    // Everything the VM writes at runtime lives here, physically separated from
+    // the read-only compiled sections above so those can be borrowed in place
+    // from a shared AOT mmap (WS5-D2).  This sub-object is NOT serialized (only
+    // the IC *sizes* are, to size the vectors on load) and NOT borrowed — it is
+    // always per-process heap, moved with the CU (never copied; the CU is only
+    // ever moved into its stable home — deque / unique_ptr — before first use).
+    // -----------------------------------------------------------------------
+    struct Runtime {
+        /// Per-funcId diagnostic counters + the Phase-D lambda-lift singleton
+        /// interning slot.  Indexed by IR FuncId (parallel to CU::lambdas).
+        /// Was `LambdaDescriptor::{forceCount,allocCount,callCount,
+        /// cachedSingletonClosure}`.  Sized to `lambdas.size()` on first touch
+        /// and NEVER resized after: `singletonClosureRegistry` holds the address
+        /// `&lambdaState[funcId].cachedSingletonClosure`, which must stay stable
+        /// for the whole eval (the moving GC forwards the Closure* through it).
+        struct LambdaState {
+            uint64_t  forceCount = 0;             ///< OP_FORCE (debug-gated)
+            uint64_t  allocCount = 0;             ///< OP_MAKE_THUNK (debug-gated)
+            uint64_t  callCount  = 0;             ///< OP_CALL (debug-gated)
+            Closure * cachedSingletonClosure = nullptr;  ///< IR Phase-D lift
+        };
+        std::vector<LambdaState> lambdaState;
+
+        /// OP_ATTRS_SELECT inline caches (was `CompilationUnit::attrSelectCache`).
+        std::vector<AttrSelectIC> attrSelectCache;
+        /// OP_REC_BINDING_SLOT_REF inline caches (was `recSlotCache`).
+        std::vector<RecSlotIC>    recSlotCache;
+
+        /// LEVER-1 applied-import discriminator: true iff this CU is the compiled
+        /// body of an `import`ed file (set at importCache insertion).  The OP_CALL
+        /// memo hook reads it as an O(1) "is an import CU" test.  In-memory only,
+        /// NOT serialized.  Was `CompilationUnit::fromImportCU`.
+        bool fromImportCU = false;
+    };
+    mutable Runtime rt;
+
+    /// Ensure `rt.lambdaState` is sized to hold `funcId` (== lambdas.size()).
+    /// Idempotent; sizes exactly once so the counter / singleton-Closure slot
+    /// addresses stay stable for the singletonClosureRegistry GC walk.
+    void ensureLambdaState() const {
+        if (rt.lambdaState.size() < lambdas.size())
+            rt.lambdaState.resize(lambdas.size());
+    }
+
+    /// Read a funcId's runtime counters (zeros if `lambdaState` was never sized,
+    /// i.e. no counter was ever bumped for this CU).  For diagnostic dumps.
+    Runtime::LambdaState lambdaStateAt(std::size_t funcId) const {
+        return funcId < rt.lambdaState.size() ? rt.lambdaState[funcId]
+                                              : Runtime::LambdaState{};
+    }
 
     /// Top-level entry offset.
     uint32_t entryOffset = 0;
@@ -720,12 +772,27 @@ struct CompilationUnit
         b += lambdas.capacity()           * sizeof(LambdaDescriptor);
         b += lambdaCodeOffsets.capacity() * sizeof(uint32_t);
         b += primops.capacity()           * sizeof(const PrimOp *);
-        b += attrSelectCache.capacity()   * sizeof(AttrSelectIC);
-        b += recSlotCache.capacity()      * sizeof(RecSlotIC);
+        // WS5-D1: runtime side state (ICs + per-funcId counters) moved to `rt`.
+        b += rt.attrSelectCache.capacity() * sizeof(AttrSelectIC);
+        b += rt.recSlotCache.capacity()    * sizeof(RecSlotIC);
+        b += rt.lambdaState.capacity()     * sizeof(Runtime::LambdaState);
         b += forceEmitSites.capacity()
              * sizeof(std::pair<uint32_t, const char *>);
         return b;
     }
 };
+
+/// WS5-D1: read a descriptor's runtime counters via the desc→CU interval
+/// registry (for debug-gated diagnostics that only hold a `desc`).  Returns
+/// zeros when the descriptor's CU / funcId has no counter state (never bumped).
+inline CompilationUnit::Runtime::LambdaState
+descRuntimeState(const LambdaDescriptor * desc) noexcept
+{
+    if (const CompilationUnit * cu = cuForDesc(desc)) {
+        return cu->lambdaStateAt(
+            static_cast<std::size_t>(desc - cu->lambdas.data()));
+    }
+    return {};
+}
 
 } // namespace nix::v3
