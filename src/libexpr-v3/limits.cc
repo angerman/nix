@@ -95,6 +95,11 @@ uint64_t currentRssBytes()
         return info.resident_size;
     return 0;
 }
+// macOS ignores RLIMIT_AS (the belt below is a no-op there), so the
+// virtual-size baseline is only needed on Linux.  Return 0 → the
+// RLIMIT_AS computation degrades to the historic `cap + headroom`
+// value, which the macOS kernel ignores anyway (byte-id-neutral).
+uint64_t currentVirtBytes() { return 0; }
 #else
 uint64_t currentRssBytes()
 {
@@ -107,6 +112,22 @@ uint64_t currentRssBytes()
     if (rc < 2 || pages <= 0) return 0;
     long pgsize = sysconf(_SC_PAGESIZE);
     return static_cast<uint64_t>(pages) * static_cast<uint64_t>(pgsize);
+}
+// #B1 (WS-5): current VIRTUAL size (VmSize) — the FIRST /proc/self/statm
+// column ("total program size" in pages).  Needed to baseline RLIMIT_AS:
+// upstream Nix's BumpMemoryResource arenas reserve 16 GiB of MAP_NORESERVE
+// virtual address space up-front, which must not be charged against the
+// heap budget (see the RLIMIT_AS block in initLimits).
+uint64_t currentVirtBytes()
+{
+    long sizePages = 0;
+    std::FILE * f = std::fopen("/proc/self/statm", "r");
+    if (!f) return 0;
+    int rc = std::fscanf(f, "%ld", &sizePages);
+    std::fclose(f);
+    if (rc < 1 || sizePages <= 0) return 0;
+    long pgsize = sysconf(_SC_PAGESIZE);
+    return static_cast<uint64_t>(sizePages) * static_cast<uint64_t>(pgsize);
 }
 #endif
 
@@ -515,10 +536,51 @@ void initLimits()
             // macOS silently ignores (setrlimit returns 0 but the
             // kernel doesn't act on RLIMIT_AS).  When this fires
             // on Linux, malloc/mmap returns ENOMEM cleanly.
+            //
+            // #B1 (WS-5, 2026-07-16) — LINUX-PORT FIX.  RLIMIT_AS caps
+            // VIRTUAL address space, so it MUST be baselined against the
+            // process's CURRENT virtual size, not set to an absolute
+            // `cap + headroom`.  Root cause of the pre-existing Linux
+            // `arena block allocation failed` abort under NIX_V3_MAX_HEAP:
+            // upstream Nix's `BumpMemoryResource` (SymbolTable + Exprs /
+            // EvalMemory arenas, constructed in EvalState's ctor BEFORE the
+            // first eval, i.e. before initLimits runs) each reserve 8 GiB of
+            // virtual address space up-front via mmap(MAP_NORESERVE) —
+            // 16 GiB total, resident only on demand.  Their own checkRlimit
+            // guard (reserve iff 8 GiB ≤ RLIMIT_AS/16) passes because
+            // RLIMIT_AS is still RLIM_INFINITY at ctor time.  Setting
+            // RLIMIT_AS = 2 GiB + 256 MiB afterwards is FAR below the 16 GiB
+            // already reserved, so the very next allocation (the first v3
+            // arena block) returns ENOMEM → the abort.  macOS never hit this
+            // because its kernel ignores RLIMIT_AS.
+            //
+            // Those 16 GiB are reserved-but-lazy (MAP_NORESERVE, never
+            // resident) and are NOT heap the user asked us to cap, so we add
+            // the current VmSize to the ceiling.  This still bounds
+            // ADDITIONAL virtual growth to `cap` — a runaway malloc/mmap
+            // grows VmSize past the baseline and trips the limit cleanly —
+            // while leaving the legitimate lazy arena reservations intact.
+            // (currentVirtBytes() returns 0 on macOS, so the value there is
+            // unchanged from the historic `cap + headroom` — which the macOS
+            // kernel ignores regardless.)  RSS — the metric users actually
+            // care about on constrained systems — stays hard-capped by
+            // installRssWatchdog() below.
             const uint64_t headroom = uint64_t(256) * 1024 * 1024;
+            const uint64_t baseVirt = currentVirtBytes();
+            uint64_t want = baseVirt + *bytes + headroom;
             struct rlimit rl{};
-            rl.rlim_cur = static_cast<rlim_t>(*bytes + headroom);
-            rl.rlim_max = rl.rlim_cur;
+            // Preserve the inherited HARD limit — only LOWER the soft
+            // limit.  Raising rlim_max needs privilege (EPERM otherwise),
+            // and if a constrained env (container) already caps RLIMIT_AS
+            // the huge BumpMemoryResource reservation never happened (its
+            // checkRlimit refused it), so baseVirt is small and `want`
+            // still fits.  Clamp `want` to the hard limit defensively.
+            if (::getrlimit(RLIMIT_AS, &rl) != 0)
+                rl.rlim_max = static_cast<rlim_t>(want);  // unreadable → both to want
+            if (rl.rlim_max != RLIM_INFINITY
+                && want > static_cast<uint64_t>(rl.rlim_max))
+                want = static_cast<uint64_t>(rl.rlim_max);
+            rl.rlim_cur = static_cast<rlim_t>(want);
             if (setrlimit(RLIMIT_AS, &rl) != 0) {
                 // Not fatal — macOS often returns success but
                 // doesn't enforce, or may return EPERM if the
