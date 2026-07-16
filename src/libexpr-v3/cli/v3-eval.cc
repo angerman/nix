@@ -76,6 +76,9 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
+#include <unistd.h>     // WS-5: fork() for the --cow-fork zygote measurement
+#include <sys/wait.h>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -99,6 +102,23 @@ using nix::v3::Tag;
 using nix::v3::forceDeep;
 using nix::v3::printNixValue;
 using nix::v3::toJsonValue;
+
+// WS-5 (2026-07-16): read a summed field (kB) from /proc/self/smaps_rollup.
+// Linux-only; returns -1 if unavailable. Used by --cow-fork to measure how
+// much of a warmed parent a forked child actually shares (Shared_Clean) vs
+// re-dirties (Private_Dirty) — the parallel-eval-density question.
+static long smapsRollupKB(const char * field)
+{
+    std::ifstream f("/proc/self/smaps_rollup");
+    if (!f) return -1;
+    std::string line;
+    size_t flen = std::strlen(field);
+    while (std::getline(f, line)) {
+        if (line.size() > flen && line.compare(0, flen, field) == 0 && line[flen] == ':')
+            return std::strtol(line.c_str() + flen + 1, nullptr, 10);
+    }
+    return -1;
+}
 
 static int printValue(nix::v3::VMState & vm, Value r, bool jsonOut,
                       const std::vector<std::string> & symTab)
@@ -139,7 +159,10 @@ static void usage(const char * argv0)
         "       NIX_VM_STATS / V3_TIMING; default --expr skips optimise)\n"
         "  --worker   : persistent mode — read one expression per stdin line,\n"
         "       print each result + a blank delimiter line; caches persist so\n"
-        "       repeated evals reuse prior work (WS-3 CI throughput)\n",
+        "       repeated evals reuse prior work (WS-3 CI throughput)\n"
+        "  --cow-fork [--child-expr E] : warm caches with --expr, fork, re-eval\n"
+        "       (E or --expr) in the child; report child Private_Dirty vs\n"
+        "       Shared_Clean from smaps (WS-5 zygote density; Linux)\n",
         argv0, argv0);
 }
 
@@ -198,6 +221,15 @@ int main(int argc, char ** argv)
     // work — the cross-process pointer-keyed applied cache is worthless to a
     // fresh `nix` per run, but a worker converts it to its designed win.
     bool worker = false;
+    // WS-5 (2026-07-16): COW zygote measurement. `--cow-fork` warms the caches
+    // by evaluating --expr, then fork()s and re-evaluates (--child-expr, or
+    // --expr again) in the child, reporting the child's Private_Dirty (what
+    // each concurrent eval privately costs) vs Shared_Clean (what it shares
+    // with the warm parent) from /proc/self/smaps_rollup. Quantifies the
+    // current COW sharing + the ceiling that side-arraying CU/descriptor
+    // mutables (WS5-D1) would recover. Linux-only.
+    bool cowFork = false;
+    std::string childExpr;
     // Extra search-path entries (each is either "PATH" or "NAME=PATH").
     // Mirrors `nix-instantiate -I` so the lang test runner's per-test
     // .flags files (which reference `-I lang/dir1` etc.) work.
@@ -221,6 +253,8 @@ int main(int argc, char ** argv)
         else if (a == "--strict")   strict = true;
         else if (a == "--parse" || a == "--parse-only") parseOnly = true;
         else if (a == "--worker")   worker = true;
+        else if (a == "--cow-fork") cowFork = true;
+        else if (a == "--child-expr" && i + 1 < argc) childExpr = argv[++i];
         else if (a == "--help" || a == "-h") { usage(argv[0]); return 0; }
         else if (a == "-I" && i + 1 < argc)
             extraSearchPath.emplace_back(argv[++i]);
@@ -336,10 +370,10 @@ int main(int argc, char ** argv)
         // Always v3-native: parse → v3 AST → lowerV3Ast (no nix::Expr).
         // --parse shows the v3 AST directly (below).  Relative/`~` path
         // literals resolve against the file dir / $HOME (as TW does).
-        // Worker mode parses per-request inside the loop below, so skip the
-        // one-shot parse of --expr/--file here.
-        if (worker) {
-            /* no upfront expression */
+        // Worker / cow-fork mode parses per-request via runRootExprFromString
+        // below, so skip the one-shot low-level parse of --expr/--file here.
+        if (worker || cowFork) {
+            /* parsed per-request below */
         } else if (!path.empty() && path != "-") {
             std::filesystem::path abs = std::filesystem::absolute(path);
             nix::SourcePath sp(state.rootFS, nix::CanonPath(abs.string()));
@@ -420,6 +454,65 @@ int main(int argc, char ** argv)
         // Protocol: read a line → print the value → print a blank delimiter
         // line → flush.  An eval error prints `<error>` as the value and the
         // worker continues (one bad request must not kill the process).
+        // WS-5 COW zygote measurement.  Warm the process caches by evaluating
+        // --expr, then fork; the child re-evaluates (--child-expr or --expr)
+        // reusing the parent's now-warm CU bytecode / descriptors / import
+        // cache via copy-on-write.  We report, from /proc/self/smaps_rollup,
+        // how much the child re-DIRTIES (Private_Dirty = its private per-eval
+        // cost) vs SHARES (Shared_Clean).  Single-threaded here (no heap-trace
+        // sampler) so the fork is safe; we fork at a quiescent post-eval point.
+        if (cowFork) {
+            std::string cwd = std::filesystem::current_path().string();
+            auto evalForce = [&](const std::string & e) {
+                nix::v3::initLimits();
+                auto rr = nix::v3::runRootExprFromString(state, e, cwd, homePath, nullptr);
+                nix::v3::VMState vm;
+                vm.frames.push_back(nix::v3::CallFrame{
+                    .cu = rr.cu.get(), .closure = nullptr, .thunk = nullptr,
+                    .ip = rr.cu->entryOffset, .stackBaseOffset = 0,
+                    .withStackBase = 0, .flags = 0,
+                });
+                Value r = nix::v3::forceValue(vm, rr.value);
+                if (strict) r = nix::v3::forceDeep(vm, r);
+                return r;
+            };
+            // 1. Warm the parent (populate CU cache, descriptors, import cache).
+            evalForce(expr);
+            std::fprintf(stderr,
+                "COW parent (warm): Rss=%ldMB Private_Dirty=%ldMB Shared_Clean=%ldMB\n",
+                smapsRollupKB("Rss") / 1024, smapsRollupKB("Private_Dirty") / 1024,
+                smapsRollupKB("Shared_Clean") / 1024);
+            std::fflush(stderr);
+            // 2. Fork; the child re-evaluates against the shared warm image.
+            pid_t pid = fork();
+            if (pid == 0) {
+                long preDirty = smapsRollupKB("Private_Dirty");   // ~0: pure COW at fork
+                const std::string & ce = childExpr.empty() ? expr : childExpr;
+                try { evalForce(ce); }
+                catch (const std::exception & e) {
+                    std::fprintf(stderr, "cow-child eval error: %s\n", e.what());
+                    _exit(1);
+                }
+                long postDirty  = smapsRollupKB("Private_Dirty");
+                long sharedClean = smapsRollupKB("Shared_Clean");
+                long rss = smapsRollupKB("Rss");
+                std::fprintf(stderr,
+                    "COW child: Private_Dirty %ldMB->%ldMB (delta=%ldMB)  "
+                    "Shared_Clean=%ldMB  Rss=%ldMB\n"
+                    "  per-child PRIVATE cost = %ldMB  (each of N concurrent evals adds this)\n",
+                    preDirty / 1024, postDirty / 1024, (postDirty - preDirty) / 1024,
+                    sharedClean / 1024, rss / 1024, postDirty / 1024);
+                std::fflush(stderr);
+                _exit(0);
+            } else if (pid > 0) {
+                int st = 0; waitpid(pid, &st, 0);
+                return 0;
+            } else {
+                std::fprintf(stderr, "cow-fork: fork() failed\n");
+                return 1;
+            }
+        }
+
         if (worker) {
             std::string cwd = std::filesystem::current_path().string();
             std::string line;
