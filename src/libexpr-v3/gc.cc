@@ -650,7 +650,7 @@ void Scavenger::walkClosure(Closure * c)
     recordLiveTenured(c, closureScanSize(c), CellType::Closure);
     const CompilationUnit * ccu = closureCU(c);  // P1b: was c->cu
     if (ccu && walkedCUs.insert(ccu).second) {
-        for (const auto & ic : ccu->attrSelectCache) {
+        for (const auto & ic : ccu->rt.attrSelectCache) {
             for (int w = 0; w < CompilationUnit::AttrSelectIC::kWays; ++w) {
                 if (Bindings * b = const_cast<Bindings *>(ic.entries[w].bindings))
                     fwdBindings(b);
@@ -710,7 +710,7 @@ void Scavenger::walkThunk(Thunk * t)
     switch (t->state) {
     case ThunkState::Suspended:
         if (const CompilationUnit * tcu = thunkCU(t); tcu && walkedCUs.insert(tcu).second) {  // FP-2a
-            for (const auto & ic : tcu->attrSelectCache) {
+            for (const auto & ic : tcu->rt.attrSelectCache) {
                 for (int w = 0; w < CompilationUnit::AttrSelectIC::kWays; ++w) {
                     if (Bindings * b = const_cast<Bindings *>(ic.entries[w].bindings))
                         fwdBindings(b);
@@ -742,7 +742,7 @@ void Scavenger::walkThunk(Thunk * t)
     case ThunkState::Blackhole:
         // Mirror Suspended: walk CU's AttrSelectIC (R9) too.
         if (const CompilationUnit * tcu = thunkCU(t); tcu && walkedCUs.insert(tcu).second) {  // FP-2a
-            for (const auto & ic : tcu->attrSelectCache) {
+            for (const auto & ic : tcu->rt.attrSelectCache) {
                 for (int w = 0; w < CompilationUnit::AttrSelectIC::kWays; ++w) {
                     if (Bindings * b = const_cast<Bindings *>(ic.entries[w].bindings))
                         fwdBindings(b);
@@ -993,7 +993,7 @@ void Scavenger::run()
         auto walkOneCU = [&](const CompilationUnit * cu) {
             if (!cu) return;
             if (!walkedCUs.insert(cu).second) return;
-            for (const auto & ic : cu->attrSelectCache) {
+            for (const auto & ic : cu->rt.attrSelectCache) {
                 for (int w = 0; w < CompilationUnit::AttrSelectIC::kWays; ++w) {
                     if (Bindings * b = const_cast<Bindings *>(ic.entries[w].bindings))
                         fwdBindings(b);
@@ -1257,7 +1257,7 @@ struct Auditor {
     void walkCUAttrSelectCache(const CompilationUnit * cu)
     {
         if (!cu || !walkedCUs.insert(cu).second) return;
-        for (const auto & ic : cu->attrSelectCache) {
+        for (const auto & ic : cu->rt.attrSelectCache) {
             for (int w = 0; w < CompilationUnit::AttrSelectIC::kWays; ++w) {
                 if (const Bindings * b = ic.entries[w].bindings)
                     visitBindings(b, "CU.attrSelectCache");

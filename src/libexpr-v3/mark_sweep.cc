@@ -636,7 +636,7 @@ public:
 private:
     void walkCuIC(const CompilationUnit * cu) noexcept {
         if (!nursery_ || !cu || !walkedCUs_.insert(cu).second) return;
-        for (const auto & ic : cu->attrSelectCache)
+        for (const auto & ic : cu->rt.attrSelectCache)
             for (int w = 0; w < CompilationUnit::AttrSelectIC::kWays; ++w)
                 if (Bindings * b = const_cast<Bindings *>(ic.entries[w].bindings))
                     visitBindings(b);
@@ -1500,7 +1500,7 @@ private:
     void clearCU(const CompilationUnit * cu) noexcept
     {
         if (!cu || !clearedCUs_.insert(cu).second) return;
-        for (auto & ic : cu->attrSelectCache)
+        for (auto & ic : cu->rt.attrSelectCache)
             for (auto & e : ic.entries)
                 e.bindings = nullptr;
     }

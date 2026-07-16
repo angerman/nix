@@ -6767,8 +6767,8 @@ void importCachePrintFieldBreakdown() noexcept
         }
         lamOffs += cu.lambdaCodeOffsets.capacity() * sizeof(uint32_t);
         prim    += cu.primops.capacity() * sizeof(const PrimOp *);
-        attrIC  += cu.attrSelectCache.capacity() * sizeof(CompilationUnit::AttrSelectIC);
-        recIC   += cu.recSlotCache.capacity() * sizeof(CompilationUnit::RecSlotIC);
+        attrIC  += cu.rt.attrSelectCache.capacity() * sizeof(CompilationUnit::AttrSelectIC);
+        recIC   += cu.rt.recSlotCache.capacity() * sizeof(CompilationUnit::RecSlotIC);
         forceSites += cu.forceEmitSites.capacity()
                       * sizeof(std::pair<uint32_t, const char *>);
         nForceSites += cu.forceEmitSites.size();
@@ -7942,7 +7942,7 @@ void primImport(EvalState & state, Value * args, Value & out)
             try {
                 auto tDes = impStamp();
                 cache.cus.push_back(serialize::deserializeCU(*blob));
-                cache.cus.back().fromImportCU = true;  // LEVER-1 memo-hook discriminator
+                cache.cus.back().rt.fromImportCU = true;  // LEVER-1 memo-hook discriminator
                 impBumpNs(importTimingTotals().deserializeNs, tDes);
 
                 // B1 (cross-file IR-fragment dedup measurement): warm imports
@@ -8599,7 +8599,7 @@ skipDiskCacheLookup:
         }
         auto tCompile = impStamp();
         cache.cus.push_back(compile(module));
-        cache.cus.back().fromImportCU = true;  // LEVER-1 memo-hook discriminator
+        cache.cus.back().rt.fromImportCU = true;  // LEVER-1 memo-hook discriminator
         impBumpNs(importTimingTotals().compileNs, tCompile);
         // #772 spike: survey bytecode dedup ratio (zero-cost when
         // NIX_V3_DEDUP_SURVEY is unset).  Captures the LOWER BOUND
@@ -8645,7 +8645,7 @@ skipDiskCacheLookup:
             "V3_DBG_APPLIED primImport(fresh): path=%s tag=%d cloCu=%p flag=%d "
             "nUp=%d withs=%p formals=%d arity=%d name=%s\n",
             path.c_str(), (int)out.tag(), dc ? (const void *)closureCU(dc) : nullptr,
-            (dc && closureCU(dc)) ? (int)closureCU(dc)->fromImportCU : -1,
+            (dc && closureCU(dc)) ? (int)closureCU(dc)->rt.fromImportCU : -1,
             dc ? (int)dc->nUpvalues : -1,
             dc ? (const void *)dc->capturedWiths : nullptr,
             (dc && dc->desc) ? (int)dc->desc->hasFormals : -1,
@@ -9479,7 +9479,7 @@ void primScopedImport(EvalState & state, Value * args, Value & out)
     nix::v3::ir::computeFreeVars(module);
     auto & cache = importCache();
     cache.cus.push_back(compile(module));
-    cache.cus.back().fromImportCU = true;  // LEVER-1 memo-hook discriminator
+    cache.cus.back().rt.fromImportCU = true;  // LEVER-1 memo-hook discriminator
     Value fn = run(cache.cus.back());
     appliedCacheRecordImportResult(fn);  // LEVER-1 provenance
 
@@ -10212,20 +10212,23 @@ void dumpFormalWrapperStats(std::FILE * out, const CompilationUnit * entryCu)
     uint64_t odAlloc = 0, odForce = 0, ihAlloc = 0, ihForce = 0;
     size_t odDescs = 0, ihDescs = 0;
     auto walk = [&](const CompilationUnit & cu) {
-        for (const auto & d : cu.lambdas) {
+        // WS5-D1: per-descriptor alloc/force counters moved to cu.rt.lambdaState.
+        for (size_t fid = 0; fid < cu.lambdas.size(); ++fid) {
+            const auto & d  = cu.lambdas[fid];
+            const auto   ls = cu.lambdaStateAt(fid);
             ++totDescs;
-            totAlloc += d.allocCount;
-            totForce += d.forceCount;
+            totAlloc += ls.allocCount;
+            totForce += ls.forceCount;
             if (d.isFormalWrapper) {
                 ++wrapDescs;
-                wrapAlloc += d.allocCount;
-                wrapForce += d.forceCount;
+                wrapAlloc += ls.allocCount;
+                wrapForce += ls.forceCount;
             }
             if (d.isOrDefault) {
-                ++odDescs; odAlloc += d.allocCount; odForce += d.forceCount;
+                ++odDescs; odAlloc += ls.allocCount; odForce += ls.forceCount;
             }
             if (d.isInheritWrapper) {
-                ++ihDescs; ihAlloc += d.allocCount; ihForce += d.forceCount;
+                ++ihDescs; ihAlloc += ls.allocCount; ihForce += ls.forceCount;
             }
         }
     };
@@ -10267,9 +10270,11 @@ void dumpHotDescriptors(std::FILE * out, size_t limit,
     };
     std::vector<Row> rows;
     auto walk = [&](const CompilationUnit & cu) {
-        for (const auto & d : cu.lambdas) {
-            if (d.forceCount > 0)
-                rows.push_back({d.forceCount, &d, &cu});
+        // WS5-D1: forceCount moved to cu.rt.lambdaState.
+        for (size_t fid = 0; fid < cu.lambdas.size(); ++fid) {
+            const auto ls = cu.lambdaStateAt(fid);
+            if (ls.forceCount > 0)
+                rows.push_back({ls.forceCount, &cu.lambdas[fid], &cu});
         }
     };
     auto & cache = importCache();

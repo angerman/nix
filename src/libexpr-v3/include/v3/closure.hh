@@ -34,6 +34,7 @@
 /// SPDX-License-Identifier: Apache-2.0
 
 #include "v3/value.hh"
+#include "v3/cu_registry.hh"  // WS5-D1: desc→CU reverse map (closureCU/thunkCU)
 
 #include <cstdint>
 #include <cstddef>
@@ -386,66 +387,18 @@ struct LambdaDescriptor
     /// V3_DBG_FORCE_TRACE can print file:line:col per thunk-force,
     /// matching tree-walker's TW_DBG_FORCE format.
     uint32_t posHandle = 0;
-    /// Phase 13 instrumentation: total Suspended → Blackhole
-    /// transitions of any thunk whose `suspended.desc` points at
-    /// this descriptor.  Bumped from OP_FORCE.  Marked `mutable`
-    /// because OP_FORCE only sees a `const LambdaDescriptor *` —
-    /// the field is statistical, not part of the descriptor's
-    /// logical identity.  Single-threaded VM, no atomics needed.
-    mutable uint64_t forceCount = 0;
-
-    /// #548c diagnostic (2026-05-10): bumped at every OP_MAKE_THUNK
-    /// whose funcIdx points at this descriptor.  When dumped at
-    /// process exit (atexit), allocCount reveals descriptors that
-    /// are re-instantiated many times — i.e., `let x = E` bindings
-    /// where the surrounding scope is entered many times despite
-    /// `x` being conceptually a fix-point.  A high allocCount with
-    /// high forceCount but allocCount > forceCount indicates a
-    /// sharing failure: the binding is being re-instantiated more
-    /// times than its results are used.  When allocCount ≈ forceCount
-    /// AND both are huge, the surrounding scope is hot-looped (the
-    /// real failure to investigate).
-    ///
-    /// `mutable` for the same reason as forceCount: only OP_MAKE_THUNK
-    /// has a `LambdaDescriptor *` (not `const`); other sites see it
-    /// as `const` so the field is statistical only.
-    mutable uint64_t allocCount = 0;
-
-    /// #583 (2026-05-15): bumped at every OP_CALL whose callee is a
-    /// Closure pointing at this descriptor.  Reveals which lambdas are
-    /// repeatedly invoked — the hello.name re-evaluation loop suspects
-    /// matchAttrs/matchAnyAttrs/elaborate's `final` builder.  Statistical
-    /// only; gated behind V3_DBG_ALLOC_DUMP for zero cost otherwise.
-    mutable uint64_t callCount = 0;
-
-    /// IR Phase D (2026-05-18): closure-free lambda lifting.
-    ///
-    /// When `nUpvalues == 0` AND `nWithTargets == 0`, every
-    /// OP_MAKE_CLOSURE invocation for this descriptor produces a
-    /// semantically identical Closure: same `desc`, same `cu`,
-    /// `nUpvalues=0`, no upvalues, and `capturedWiths=nullptr` (the
-    /// body has no lexically captured `with` to look up — guaranteed
-    /// by the lowerer's `ir::Lambda::lexicalWiths.empty()` check).
-    ///
-    /// We intern by caching the FIRST allocated Closure here; every
-    /// subsequent OP_MAKE_CLOSURE returns the cached pointer.  Skips
-    /// one `Alloc::allocClosure(0)` + `snapshotCurrentWiths(vm)`
-    /// per creation site, which adds up under loop-heavy patterns
-    /// like `map (x: x * 2) ...` or `foldl' (a: b: a + b) ...` where
-    /// the inner lambda's outer captureless layer re-allocates per
-    /// element under broken sharing.
-    ///
-    /// `mutable` for the same reason as the other instrumentation
-    /// fields below: OP_MAKE_CLOSURE sees `cu` as `const` so reaches
-    /// the descriptor as `const &`; the cache slot is runtime state,
-    /// not part of the descriptor's logical identity.  Single-threaded
-    /// VM — no atomics needed.  Lifetime is bounded by the
-    /// CompilationUnit: when the CU is dropped, the descriptor goes
-    /// with it and the cached Closure becomes unreachable (Boehm GC
-    /// collects it on the next sweep).
-    ///
-    /// Disabled via NIX_V3_NO_LAMBDA_LIFT=1 (A/B gate).
-    mutable Closure * cachedSingletonClosure = nullptr;
+    // WS5-D1 (2026-07-16): the runtime-mutable per-descriptor fields
+    // `forceCount`, `allocCount`, `callCount` (diagnostic counters) and
+    // `cachedSingletonClosure` (IR Phase D closure-free lambda-lift interning
+    // slot) were MOVED OUT of LambdaDescriptor into the per-process side array
+    // `CompilationUnit::Runtime::lambdaState[funcId]` (bytecode.hh).  They are
+    // runtime state, not part of the descriptor's logical (compiled) identity;
+    // removing them lets the `lambdas[]` array become read-only-after-load so
+    // its pages can be shared across processes (WS5-D2b).  Write sites all have
+    // (cu, funcIdx) in hand; the two debug-gated sites that only hold `desc`
+    // recover funcId via cuForDesc + pointer subtraction.  The lambda-lift
+    // singleton's Closure* still lives at an address-stable side-array slot so
+    // the singletonClosureRegistry GC walk is unchanged.
 
     /// #424: selector lambda specialisation.  When non-zero, the
     /// lambda body is exactly `paramVar.<selectorSym>` -- the emit-
@@ -571,43 +524,34 @@ struct LambdaDescriptor
     /// pulling the AST header into closure.hh; cast at use sites.
     void * astLambda = nullptr;
 
-    /// FP-2a (2026-06-14): owning-CompilationUnit backpointer.  Replaces the
-    /// former per-thunk `Thunk::suspended.cu` field (8 B × every suspended
-    /// thunk — millions on real evals).  A suspended thunk's CU is always its
-    /// descriptor's owning CU: OP_MAKE_THUNK is the SOLE creator of suspended
-    /// thunks (vm.cc:4773/4777 are the only `allocThunkSuspended` caller and
-    /// the only `suspended.desc =` writer), and it sets `desc = &cu->lambdas[i]`
-    /// — so the descriptor LIVES IN that cu's `lambdas` vector and `desc->cu`
-    /// is well-defined and equals the `cu` the thunk would have stored.  Set
-    /// at OP_MAKE_THUNK (idempotently — always the same authoritative value),
-    /// so `thunkCU()` returns each thunk's exact former `cu` (byte-identical).
-    ///
-    /// TRANSIENT: NOT serialized (a raw pointer is meaningless cross-process);
-    /// stays nullptr after a disk-cache load and is re-established at the first
-    /// runtime OP_MAKE_THUNK for the descriptor.  `mutable` for the same reason
-    /// as forceCount/allocCount above — OP_MAKE_THUNK reaches the descriptor
-    /// through a `const CompilationUnit *`; single-threaded VM, no atomics.
-    mutable const CompilationUnit * cu = nullptr;
+    // WS5-D1 (2026-07-16): the runtime-mutable owning-CU backpointer `cu` was
+    // REMOVED from LambdaDescriptor (it was STAMPED at every closure/thunk
+    // creation, dirtying the descriptor page and blocking cross-process sharing
+    // of the `lambdas[]` array — WS5-D2b).  A descriptor always lives inside its
+    // owning CU's `lambdas` vector, so the CU is recovered STRUCTURALLY from the
+    // descriptor's address via the process-global interval registry in
+    // cu_registry.hh (registered idempotently at the former stamp sites).  This
+    // is byte-identical to the old field: for any descriptor a live closure /
+    // thunk points at, its CU's interval has been registered.
 };
 
-/// FP-2a accessor: a suspended thunk's owning CU, derived from its descriptor's
-/// backpointer (see LambdaDescriptor::cu).  Returns nullptr when the thunk has
-/// no descriptor (no CU) — callers that previously fell back to the executing
-/// frame's `cu` when `suspended.cu` was null keep that `?: cu` fallback.
+/// A suspended thunk's owning CU.  WS5-D1: derived from its descriptor's address
+/// via the desc→CU interval registry (was `t->suspended.desc->cu`).  Returns
+/// nullptr when the thunk has no descriptor (no CU) — callers that previously
+/// fell back to the executing frame's `cu` keep that `?: cu` fallback.
 [[gnu::always_inline]] inline const CompilationUnit * thunkCU(const Thunk * t) noexcept
 {
-    return t->suspended.desc ? t->suspended.desc->cu : nullptr;
+    return cuForDesc(t->suspended.desc);
 }
 
-/// P1b accessor: a closure's owning CU, derived from its descriptor's
-/// backpointer (LambdaDescriptor::cu).  Replaces the former per-closure
-/// `Closure::cu` field.  Returns nullptr when the closure has no descriptor;
-/// callers that fell back to the executing frame's `cu` when `cu` was null
-/// keep that `?: cu` fallback (closureCU(c) is null iff the old cu was null,
-/// since desc->cu is set to the same authoritative value at closure creation).
+/// A closure's owning CU.  WS5-D1: derived from its descriptor's address via the
+/// desc→CU interval registry (was `c->desc->cu`).  Returns nullptr when the
+/// closure has no descriptor; callers that fell back to the executing frame's
+/// `cu` keep that `?: cu` fallback (closureCU(c) is null iff the old cu was
+/// null, since the CU interval is registered at closure creation).
 [[gnu::always_inline]] inline const CompilationUnit * closureCU(const Closure * c) noexcept
 {
-    return c->desc ? c->desc->cu : nullptr;
+    return cuForDesc(c->desc);
 }
 
 // `struct ThunkDescriptor` removed -- was a placeholder type only ever

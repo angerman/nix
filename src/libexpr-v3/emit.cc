@@ -598,8 +598,8 @@ struct Emitter
         if (uit == ctx->upvalue.end()) return false;
         uint32_t dst = getOrAssignSlot(bd.var);
         flushAllDeferred();                                // match emitVarRef discipline
-        uint32_t icIdx = static_cast<uint32_t>(unit.recSlotCache.size());
-        unit.recSlotCache.emplace_back();
+        uint32_t icIdx = static_cast<uint32_t>(unit.rt.recSlotCache.size());
+        unit.rt.recSlotCache.emplace_back();
         unit.code.push_back(encode(OP_GET_UPVALUE_REC_BINDING_SLOT, e->name));
         unit.code.push_back(dst);            // dst slot (process-independent)
         unit.code.push_back(uit->second);    // upvalIdx
@@ -1627,8 +1627,8 @@ struct Emitter
         // the most recently seen (Bindings*, slot) tuple here so a
         // repeat access on the same attrset shape skips the binary
         // search.  Slot index is stored as the next code word.
-        uint32_t icIdx = static_cast<uint32_t>(unit.attrSelectCache.size());
-        unit.attrSelectCache.emplace_back();
+        uint32_t icIdx = static_cast<uint32_t>(unit.rt.attrSelectCache.size());
+        unit.rt.attrSelectCache.emplace_back();
         unit.code.push_back(icIdx);
     }
     void emitOne(const ir::AttrSelectDyn & e)
@@ -1675,8 +1675,8 @@ struct Emitter
             && ctx->slot.find(e.attrs) == ctx->slot.end()) {
             if (auto uit = ctx->upvalue.find(e.attrs); uit != ctx->upvalue.end()) {
                 flushAllDeferred();  // match emitVarRef discipline
-                uint32_t icIdx = static_cast<uint32_t>(unit.recSlotCache.size());
-                unit.recSlotCache.emplace_back();
+                uint32_t icIdx = static_cast<uint32_t>(unit.rt.recSlotCache.size());
+                unit.rt.recSlotCache.emplace_back();
                 unit.code.push_back(encode(OP_GET_UPVALUE_REC_BINDING, e.name));
                 unit.code.push_back(uit->second);   // upvalIdx
                 unit.code.push_back(icIdx);
@@ -1690,11 +1690,11 @@ struct Emitter
         unit.code.push_back(encode(OP_REC_BINDING_SLOT_REF, e.name));
         // #779 (2026-05-23) Schema 10: 1-word IC follow-up.  Each
         // OP_REC_BINDING_SLOT_REF instance gets a fresh slot in
-        // unit.recSlotCache, indexed by the icIdx that we emit
+        // unit.rt.recSlotCache, indexed by the icIdx that we emit
         // here.  Entries default-initialize to (bindings=null,
         // slot=0); first miss installs.
-        uint32_t icIdx = static_cast<uint32_t>(unit.recSlotCache.size());
-        unit.recSlotCache.emplace_back();
+        uint32_t icIdx = static_cast<uint32_t>(unit.rt.recSlotCache.size());
+        unit.rt.recSlotCache.emplace_back();
         unit.code.push_back(icIdx);
     }
     void emitOne(const ir::HasAttr & e)
@@ -2090,8 +2090,8 @@ struct Emitter
             unit.code.push_back(encode(OP_REC_BINDING_SLOT_REF, e.recAttrsName));
             // #779 Schema 10 IC follow-up (see emitOne(RecBindingSlotRef)).
             {
-                uint32_t icIdx = static_cast<uint32_t>(unit.recSlotCache.size());
-                unit.recSlotCache.emplace_back();
+                uint32_t icIdx = static_cast<uint32_t>(unit.rt.recSlotCache.size());
+                unit.rt.recSlotCache.emplace_back();
                 unit.code.push_back(icIdx);
             }
             unit.code.push_back(encode(OP_WITH_PUSH));

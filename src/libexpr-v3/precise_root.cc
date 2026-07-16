@@ -142,9 +142,10 @@ void walkAllV3Roots(VMState & vm, RootVisitor & visitor) noexcept
     }
 
     // -- Singleton closure registry (Phase 3.7, 2026-05-28) ---------
-    // Each entry is the address of a LambdaDescriptor::
-    // cachedSingletonClosure field (libc-resident slot holding an
-    // arena Closure pointer).  Mark walks each slot so the cached
+    // Each entry is the address of a per-CU side-array slot
+    // `rt.lambdaState[funcId].cachedSingletonClosure` (WS5-D1: moved off
+    // LambdaDescriptor; libc-resident slot holding an arena Closure
+    // pointer).  Mark walks each slot so the cached
     // closure survives Phase 3 mark+sweep cycles.  Without this, the
     // libc→arena cross-boundary pointer is invisible to the walker;
     // the closure gets swept; subsequent lambda calls dereference a

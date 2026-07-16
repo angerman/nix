@@ -753,10 +753,12 @@ struct AllocDumpInstaller {
                 std::vector<Row> rows;
                 for (auto * cu : cuRegistry()) {
                     if (!cu) continue;
-                    for (const auto & ld : cu->lambdas) {
-                        if (ld.allocCount == 0 && ld.forceCount == 0)
+                    for (size_t fid = 0; fid < cu->lambdas.size(); ++fid) {
+                        const auto ls = cu->lambdaStateAt(fid);  // WS5-D1
+                        if (ls.allocCount == 0 && ls.forceCount == 0)
                             continue;
-                        rows.push_back({ld.allocCount, ld.forceCount, &ld});
+                        rows.push_back({ls.allocCount, ls.forceCount,
+                                        &cu->lambdas[fid]});
                     }
                 }
                 std::sort(rows.begin(), rows.end(),
@@ -957,7 +959,7 @@ inline void dbgLogForceSite(const CompilationUnit * cu, uint32_t instrIp,
             auto * d = t->suspended.desc;
             codeOff = d->codeOffset;
             if (!d->name.empty()) tname = d->name.c_str();
-            thunkCu = (const void *)d->cu;  // FP-2a: was t->suspended.cu
+            thunkCu = (const void *)cuForDesc(d);  // WS5-D1: was d->cu
         }
         std::fprintf(stderr,
             "OP_FORCE@ip=%u site=%s thunk=%p name=%s codeOff=%u state=%d cu=%p caller_cu=%p\n",
@@ -4772,9 +4774,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     // works through the registry's `const CompilationUnit*`.)
                     for (const CompilationUnit * icu : cuRegistry()) {
                         if (!icu) continue;
-                        for (auto & ic : icu->attrSelectCache)
+                        for (auto & ic : icu->rt.attrSelectCache)
                             for (auto & e : ic.entries) e.bindings = nullptr;
-                        for (auto & rc : icu->recSlotCache) rc.bindings = nullptr;
+                        for (auto & rc : icu->rt.recSlotCache) rc.bindings = nullptr;
                     }
                     // M-1 (CODEBASE_REVIEW_2026-06-11): the Bindings::materialize
                     // memo is another raw-Bindings* side table that
@@ -4913,9 +4915,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 static const bool s_midEvalEvac = std::getenv("NIX_V3_EVAC") != nullptr;
                 for (const CompilationUnit * icu : cuRegistry()) {
                     if (!icu) continue;
-                    for (auto & rc : icu->recSlotCache) rc.bindings = nullptr;
+                    for (auto & rc : icu->rt.recSlotCache) rc.bindings = nullptr;
                     if (s_midEvalEvac)
-                        for (auto & ic : icu->attrSelectCache)
+                        for (auto & ic : icu->rt.attrSelectCache)
                             for (auto & e : ic.entries) e.bindings = nullptr;
                 }
                 Bindings::clearMaterializeMemo();
@@ -5910,9 +5912,14 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 std::getenv("NIX_V3_NO_LAMBDA_LIFT") != nullptr;
             if (__builtin_expect(nUp == 0 && nWiths == 0 && !s_noLift, 0)) {
                 const LambdaDescriptor & desc = cu->lambdas[funcIdx];
-                if (desc.cachedSingletonClosure) {
+                // WS5-D1: the lambda-lift singleton slot moved from
+                // `desc.cachedSingletonClosure` to the address-stable side array
+                // `cu->rt.lambdaState[funcIdx].cachedSingletonClosure`.
+                cu->ensureLambdaState();
+                auto & lst = cu->rt.lambdaState[funcIdx];
+                if (lst.cachedSingletonClosure) {
                     Value v;
-                    v.mkClosure(desc.cachedSingletonClosure);
+                    v.mkClosure(lst.cachedSingletonClosure);
                     push(vm, v);
                     break;
                 }
@@ -5925,7 +5932,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 Closure * c = Alloc::allocClosureTenured(0);
                 V3_STATS_INC(closuresAllocated);
                 c->desc = &desc;
-                c->desc->cu = cu;   // P1b: authoritative CU on the descriptor (was c->cu)
+                registerCuLambdaRange(cu);   // WS5-D1: was c->desc->cu = cu
                 c->nUpvalues = 0;
                 // No upvalues to pop (nUp==0); no withs to pop (nWiths==0).
                 // The body cannot reach any enclosing `with` (lowerer
@@ -5938,14 +5945,16 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 // lambdas with nWiths==0 are guaranteed by the
                 // lowerer to be with-independent.
                 c->capturedWiths = nullptr;
-                desc.cachedSingletonClosure = c;
+                lst.cachedSingletonClosure = c;
                 // Phase 3.7 (2026-05-28): register the cached pointer
                 // so v3 mark phase keeps the closure alive across
                 // arena sweeps.  Without this, the libc-resident
-                // LambdaDescriptor field is invisible to the v3
-                // walker; the closure gets freed; the next call to
-                // this lambda reads a stale cached pointer → SIGSEGV.
-                singletonClosureRegistry().push_back(&desc.cachedSingletonClosure);
+                // slot is invisible to the v3 walker; the closure gets
+                // freed; the next call to this lambda reads a stale
+                // cached pointer → SIGSEGV.  WS5-D1: the slot now lives in
+                // the address-stable side array `rt.lambdaState` (sized once,
+                // never resized), so this address stays valid for the walk.
+                singletonClosureRegistry().push_back(&lst.cachedSingletonClosure);
 
                 static const bool s_dbg =
                     std::getenv("V3_DBG_LAMBDA_LIFT") != nullptr;
@@ -5975,7 +5984,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             Closure * c = Alloc::allocClosure(shareUpvalues ? 0 : nUp);
             V3_STATS_INC(closuresAllocated);
             c->desc = &cu->lambdas[funcIdx];
-            c->desc->cu = cu;   // P1b: authoritative CU on the descriptor (was c->cu)
+            registerCuLambdaRange(cu);   // WS5-D1: was c->desc->cu = cu
             c->nUpvalues = nUp;
             // Pop upvalues first (they sit on TOP of stack), then pop
             // the with-target block beneath.  Build capturedWiths
@@ -6348,7 +6357,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // ~1-2 ns per alloc on hot paths).
             if (__builtin_expect(dbgForceStatsActive(), 0)) {
                 V3_STATS_INC(thunksAllocated);
-                ++cu->lambdas[funcIdx].allocCount;
+                cu->ensureLambdaState();  // WS5-D1: counter moved to rt
+                ++cu->rt.lambdaState[funcIdx].allocCount;
             }
             if (__builtin_expect(g_dbgAllocDump, 0)) {
                 cuRegistry().insert(cu);
@@ -6365,11 +6375,12 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     std::vector<Row> rows;
                     for (auto * cu2 : cuRegistry()) {
                         if (!cu2) continue;
-                        for (const auto & ld : cu2->lambdas) {
-                            if (ld.allocCount + ld.forceCount + ld.callCount < 100)
+                        for (size_t fid = 0; fid < cu2->lambdas.size(); ++fid) {
+                            const auto ls = cu2->lambdaStateAt(fid);  // WS5-D1
+                            if (ls.allocCount + ls.forceCount + ls.callCount < 100)
                                 continue;
-                            rows.push_back({ld.allocCount, ld.forceCount,
-                                            ld.callCount, &ld});
+                            rows.push_back({ls.allocCount, ls.forceCount,
+                                            ls.callCount, &cu2->lambdas[fid]});
                         }
                     }
                     auto emitTop = [&](const char * heading,
@@ -6421,7 +6432,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // in THIS cu's lambdas vector and `desc->cu = cu` is authoritative;
             // the store is idempotent (always the same value for a given desc).
             // thunkCU(t) reads it back == the exact former `suspended.cu`.
-            t->suspended.desc->cu = cu;
+            registerCuLambdaRange(cu);   // WS5-D1: was t->suspended.desc->cu = cu
             // V3_DBG_TRACE_THUNK_X -- track creation of every thunk into
             // a process-wide map (thunk_ptr -> (funcIdx, codeOff,
             // name, descPtr, cu)).  Consumed by the cycle-dump
@@ -7038,7 +7049,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 return e && (std::strcmp(e, "probe") == 0 || std::strcmp(e, "count") == 0);
             }();
             if (__builtin_expect(s_appliedCacheProbe, 0)
-                && closureCU(callee) && closureCU(callee)->fromImportCU)
+                && closureCU(callee) && closureCU(callee)->rt.fromImportCU)
                 appliedCacheProbeObserve(vm, callee, arg, 0, desc->hasFormals);
 
             // LEVER-1 applied-import cache (NIX_V3_APPLIED_CACHE=1): memoize
@@ -7054,7 +7065,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // graph, skip the call.  MISS: arm the capture (OP_RETURN inserts;
             // throw ⇒ no insert).
             if (__builtin_expect(appliedCacheOn(), 0)
-                && closureCU(callee) && closureCU(callee)->fromImportCU
+                && closureCU(callee) && closureCU(callee)->rt.fromImportCU
                 && desc->hasFormals && desc->arity <= 1
                 && callee->capturedWiths == nullptr
                 && appliedCacheIsImportResultDesc(desc)) {
@@ -7802,7 +7813,14 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // Gated behind g_dbgAllocDump so the bump (and the dependent
             // register read) only fires when diagnostic mode is on.
             if (__builtin_expect(g_dbgAllocDump, 0) && desc) {
-                uint64_t cnt = ++desc->callCount;
+                // WS5-D1: callCount moved to rt.lambdaState; recover funcId from
+                // desc's address via the interval registry (debug-gated path).
+                uint64_t cnt = 0;
+                if (const CompilationUnit * dcu = cuForDesc(desc)) {
+                    dcu->ensureLambdaState();
+                    cnt = ++dcu->rt.lambdaState[
+                        static_cast<size_t>(desc - dcu->lambdas.data())].callCount;
+                }
                 // V3_DBG_HOT_CALLEE=<name>:<every_n>:<max_dumps>
                 // dumps the frame stack each time the named callee's
                 // callCount hits a multiple of every_n.  Used to find
@@ -8429,7 +8447,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     return e && (std::strcmp(e, "probe") == 0 || std::strcmp(e, "count") == 0);
                 }();
                 if (__builtin_expect(s_probeTC, 0)
-                    && closureCU(tcCallee) && closureCU(tcCallee)->fromImportCU)
+                    && closureCU(tcCallee) && closureCU(tcCallee)->rt.fromImportCU)
                     appliedCacheProbeObserve(vm, tcCallee, arg, 1, tcDesc->hasFormals);
             }
             // stackBaseOffset is unchanged: we reuse the same
@@ -9702,7 +9720,13 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // allocStats().thunksForced are the contended writes.
             if (__builtin_expect(dbgForceStatsActive(), 0)) {
                 ++t->forces;
-                ++desc->forceCount;
+                // WS5-D1: forceCount moved to rt.lambdaState; recover funcId
+                // from desc's address (debug-gated path).
+                if (const CompilationUnit * dcu = cuForDesc(desc)) {
+                    dcu->ensureLambdaState();
+                    ++dcu->rt.lambdaState[
+                        static_cast<size_t>(desc - dcu->lambdas.data())].forceCount;
+                }
                 ++allocStats().thunksForced;
             }
             // #558 (2026-05-11) Focused trace: log when a thunk with a
@@ -9735,7 +9759,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     }
                 }
                 if (__builtin_expect((nameMatch || posMatch)
-                                     && desc && desc->forceCount == 1, 0)) {
+                                     && desc && descRuntimeState(desc).forceCount == 1, 0)) {
                     if (true)
                     {
                         const PosSnapshot * ps =
@@ -9803,7 +9827,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                             vm.frames.size(),
                             (unsigned long long)(threadArena().bytesAllocated() >> 20),
                             !desc->name.empty() ? desc->name.c_str() : "<anon>",
-                            (unsigned long long)desc->forceCount,
+                            (unsigned long long)descRuntimeState(desc).forceCount,
                             posBuf);
                         // #548c (2026-05-10): if V3_DBG_ALLOC_DUMP is
                         // also set, list the top-10 descriptors by
@@ -9816,10 +9840,12 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                             std::vector<R> rows;
                             for (auto * cui : cuRegistry()) {
                                 if (!cui) continue;
-                                for (const auto & ld : cui->lambdas) {
-                                    if (ld.allocCount + ld.forceCount < 1000)
+                                for (size_t fid = 0; fid < cui->lambdas.size(); ++fid) {
+                                    const auto ls = cui->lambdaStateAt(fid);  // WS5-D1
+                                    if (ls.allocCount + ls.forceCount < 1000)
                                         continue;
-                                    rows.push_back({ld.allocCount, ld.forceCount, &ld});
+                                    rows.push_back({ls.allocCount, ls.forceCount,
+                                                    &cui->lambdas[fid]});
                                 }
                             }
                             std::sort(rows.begin(), rows.end(),
@@ -10710,7 +10736,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // mutate an existing Bindings in-place (resize entries[]),
             // every cached entry pointer would dangle -- update this
             // comment to add the assertion.
-            auto & ic = cu->attrSelectCache[icIdx];
+            auto & ic = cu->rt.attrSelectCache[icIdx];
             // Phase 13.3: non-const so we can write back the resolved
             // value of a Tag::App entry — mapAttrs et al. install lazy
             // App(App(fn,name),val) entries that, without memoization,
@@ -10994,7 +11020,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             static const bool s_no_ic = std::getenv("V3_DBG_NO_IC") != nullptr;
             uint32_t hitSlot = UINT32_MAX;
             if (!s_no_ic) {
-                for (int w = 0; w < cu->attrSelectCache[icIdx].kWays; ++w) {
+                for (int w = 0; w < cu->rt.attrSelectCache[icIdx].kWays; ++w) {
                     auto & e = ic.entries[w];
                     if (e.bindings == b
                         && e.slot < b->size
@@ -12009,7 +12035,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             }
             SymbolId sym = static_cast<SymbolId>(operand);
             // #779 Schema 10: per-call-site IC.  The icIdx follow-up
-            // word indexes cu->recSlotCache.  Bindings* identity is
+            // word indexes cu->rt.recSlotCache.  Bindings* identity is
             // sufficient (entries[] is allocated as a FAM alongside
             // Bindings; the pointer doesn't move).  Mutations come
             // via OP_APPLY_OVERRIDES which produces a NEW Bindings*,
@@ -12018,7 +12044,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             Bindings * b = attrs.asAttrs();
             Value * found = nullptr;
             {
-                auto & ic = cu->recSlotCache[icIdx];
+                auto & ic = cu->rt.recSlotCache[icIdx];
                 if (__builtin_expect(ic.bindings == b
                         && ic.slot < b->size
                         && b->entries[ic.slot].name == sym, 1)) {
@@ -12273,7 +12299,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             Bindings * b = attrs.asAttrs();
             Value * found = nullptr;
             {
-                auto & ic = cu->recSlotCache[icIdx];
+                auto & ic = cu->rt.recSlotCache[icIdx];
                 // C-3: name + bounds check, not just Bindings* identity —
                 // guards against a freed+reused address aliasing the IC under
                 // default-ON GC.
@@ -12337,7 +12363,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             Bindings * b = attrs.asAttrs();
             Value * found = nullptr;
             {
-                auto & ic = cu->recSlotCache[icIdx];
+                auto & ic = cu->rt.recSlotCache[icIdx];
                 // C-3: name + bounds check, not just Bindings* identity —
                 // guards against a freed+reused address aliasing the IC under
                 // default-ON GC.
@@ -14046,7 +14072,7 @@ inline Value runOnExistingVm(VMState & vm,
         // EXIT_GC_SPIRAL Day 6-8: use pool.
         fakeClo = Alloc::allocFakeClo(static_cast<uint16_t>(nUpvalues));
         fakeClo->desc = &desc;
-        fakeClo->desc->cu = &cu;   // P1b: authoritative CU on the descriptor (was fakeClo->cu)
+        registerCuLambdaRange(&cu);   // WS5-D1: was fakeClo->desc->cu = &cu
         fakeClo->capturedWiths = capturedWiths;
         fakeClo->nUpvalues = static_cast<uint16_t>(nUpvalues);
         for (uint32_t i = 0; i < nUpvalues; ++i)
@@ -14204,7 +14230,7 @@ Value runFunctionWithUpvalues(const CompilationUnit & cu, uint32_t funcIdx,
 
     Closure * fakeClo = Alloc::allocFakeClo(static_cast<uint16_t>(nUpvalues));
     fakeClo->desc = &desc;
-    fakeClo->desc->cu = &cu;   // P1b: authoritative CU on the descriptor (was fakeClo->cu)
+    registerCuLambdaRange(&cu);   // WS5-D1: was fakeClo->desc->cu = &cu
     // #416: also publish the captured chain on the closure so any
     // sub-call that re-uses fakeClo (e.g. via tail calls in the body)
     // sees the outer withs through pushCapturedWiths().
@@ -14331,7 +14357,7 @@ Value runLambda(const CompilationUnit & cu, uint32_t funcIdx,
 
     Closure * fakeClo = Alloc::allocFakeClo(static_cast<uint16_t>(nUpvalues));
     fakeClo->desc = &desc;
-    fakeClo->desc->cu = &cu;   // P1b: authoritative CU on the descriptor (was fakeClo->cu)
+    registerCuLambdaRange(&cu);   // WS5-D1: was fakeClo->desc->cu = &cu
     fakeClo->capturedWiths = capturedWiths;
     fakeClo->nUpvalues = static_cast<uint16_t>(nUpvalues);
     for (uint32_t i = 0; i < nUpvalues; ++i)
@@ -15900,7 +15926,7 @@ Value callClosure(VMState & vm, Value fun, Value arg)
         && fun.isClosure() && fun.asClosure()) {
         const Closure * c0 = fun.asClosure();
         const LambdaDescriptor * d0 = c0->desc;
-        if (d0 && closureCU(c0) && closureCU(c0)->fromImportCU
+        if (d0 && closureCU(c0) && closureCU(c0)->rt.fromImportCU
             && d0->hasFormals && d0->arity <= 1
             && c0->capturedWiths == nullptr
             && appliedCacheIsImportResultDesc(d0)) {
@@ -16124,7 +16150,7 @@ Value callClosure(VMState & vm, Value fun, Value arg)
         return e && (std::strcmp(e, "probe") == 0 || std::strcmp(e, "count") == 0);
     }();
     if (__builtin_expect(s_appliedCacheProbeCC, 0)
-        && closureCU(callee) && closureCU(callee)->fromImportCU)
+        && closureCU(callee) && closureCU(callee)->rt.fromImportCU)
         appliedCacheProbeObserve(vm, callee, arg, 2, desc->hasFormals);
 
     // (LEVER-1 memo hook moved ABOVE the callee/desc derivation — the hook

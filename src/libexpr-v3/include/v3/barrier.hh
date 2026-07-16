@@ -110,9 +110,10 @@ std::vector<DirtyEntry> & dirtyContainers() noexcept;
 /// drain.
 std::vector<Value *> & standaloneCellRoots() noexcept;
 
-/// Stage 6 Phase 3.7: registry of LambdaDescriptor::cachedSingletonClosure
-/// pointers (libc-resident locations holding arena Closure pointers).
-/// Mark phase walks this to keep cached singleton closures alive
+/// Stage 6 Phase 3.7: registry of cached lifted-singleton Closure pointers.
+/// Each entry addresses a `CompilationUnit::rt.lambdaState[funcId].
+/// cachedSingletonClosure` slot (WS5-D1; libc-resident, holds an arena Closure
+/// pointer).  Mark phase walks this to keep cached singleton closures alive
 /// across arena sweeps.
 std::vector<Closure **> & singletonClosureRegistry() noexcept;
 

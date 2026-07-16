@@ -779,7 +779,7 @@ static int testForceApp3Arity2NoPap()
 
     Closure * c = Alloc::allocClosure(0);
     c->desc = &cu.lambdas[0];
-    c->desc->cu = &cu;   // P1b: cu now on the descriptor (closureCU)
+    registerCuLambdaRange(&cu);   // WS5-D1: was ->desc->cu = &cu
     c->nUpvalues = 0;
     c->capturedWiths = nullptr;
     closurePostConstructBarrier(c);
@@ -856,7 +856,7 @@ static int testCallClosureApp3PapSaturates()
 
     Closure * c = Alloc::allocClosure(0);
     c->desc = &cu.lambdas[0];
-    c->desc->cu = &cu;   // P1b: cu now on the descriptor (closureCU)
+    registerCuLambdaRange(&cu);   // WS5-D1: was ->desc->cu = &cu
     c->nUpvalues = 0;
     c->capturedWiths = nullptr;
     closurePostConstructBarrier(c);
@@ -935,7 +935,7 @@ static int testForceAppArity3NoPap()
 
     Closure * clo = Alloc::allocClosure(0);
     clo->desc = &cu.lambdas[0];
-    clo->desc->cu = &cu;   // P1b: cu now on the descriptor (closureCU)
+    registerCuLambdaRange(&cu);   // WS5-D1: was ->desc->cu = &cu
     clo->nUpvalues = 0;
     clo->capturedWiths = nullptr;
     closurePostConstructBarrier(clo);
