@@ -141,6 +141,7 @@ SUITES+=( "chain-bindings-parity|Lever A ChainBindings pure-refactor (chain-off 
 SUITES+=( "ws1-realise-parity|WS-1 C1-C6 hashFile/readFileType/findFile/pathExists/scopedImport realise arg context (build unbuilt IFD output) byte-equal vs TW; C4 failed-build must not become false|NIX=$NIX $TEST_DIR/run-ws1-realise-parity-tests.sh" )
 SUITES+=( "lint-ifd-realise-coverage|WS-1 H4: every read-class IFD-probe primop realises its argument (source lint guarding the C1/C2 regression)|$TEST_DIR/lint-ifd-realise-coverage.sh" )
 SUITES+=( "worker-mode|WS-3 W1 v3-eval --worker: streaming eval + error-isolation + eval#1==eval#2==fresh triple byte-identity (persistent caches must not leak across requests)|V3EVAL=$ROOT/build/src/libexpr-v3/v3-eval $TEST_DIR/run-worker-mode-tests.sh" )
+SUITES+=( "fork-worker-mode|WS-5 D3 v3-eval --fork-worker: warm-parent fork-server; per-request child result byte-identical to --worker + to fresh --expr, ordered under --fork-jobs>1 concurrency, error-isolated (one bad request must not kill the server)|V3EVAL=$ROOT/build/src/libexpr-v3/v3-eval $TEST_DIR/run-fork-worker-mode-tests.sh" )
 
 # Brute mode (~2 min) — purpose-built BRUTE / AUDIT harness.  Runs
 # a curated battery of allocating workloads, captures stderr

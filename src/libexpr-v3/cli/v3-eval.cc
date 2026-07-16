@@ -77,10 +77,12 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
-#include <unistd.h>     // WS-5: fork() for the --cow-fork zygote measurement
+#include <cerrno>       // WS-5 D3: errno for pipe()/fork()/read()/write()
+#include <unistd.h>     // WS-5: fork()/pipe()/read()/write() for the zygote
 #include <sys/wait.h>
 #include <cstdlib>
 #include <cstring>
+#include <deque>        // WS-5 D3: in-flight children FIFO (fork-server)
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -120,17 +122,23 @@ static long smapsRollupKB(const char * field)
     return -1;
 }
 
-static int printValue(nix::v3::VMState & vm, Value r, bool jsonOut,
+// Print the WHNF result `r` to `os` in the canonical v3-eval surface form
+// (value + trailing newline).  Parameterised on the ostream so the fork-
+// server child (WS-5 D3) can render into an in-memory buffer destined for
+// the result pipe, while the one-shot + --worker paths pass std::cout — the
+// bytes are identical either way, which is what makes the fork-worker result
+// byte-identical to a fresh `v3-eval --expr E` and to `--worker`.
+static int printValue(std::ostream & os, nix::v3::VMState & vm, Value r, bool jsonOut,
                       const std::vector<std::string> & symTab)
 {
     if (jsonOut) {
         // #675: toJsonValue lazy-forces + short-circuits on derivations
         // (outPath / __toString).  vm is required.
-        std::cout << toJsonValue(vm, r, symTab).dump() << "\n";
+        os << toJsonValue(vm, r, symTab).dump() << "\n";
         return 0;
     }
-    printNixValue(std::cout, r, symTab);
-    std::cout << "\n";
+    printNixValue(os, r, symTab);
+    os << "\n";
     return 0;
 }
 
@@ -160,6 +168,12 @@ static void usage(const char * argv0)
         "  --worker   : persistent mode — read one expression per stdin line,\n"
         "       print each result + a blank delimiter line; caches persist so\n"
         "       repeated evals reuse prior work (WS-3 CI throughput)\n"
+        "  --fork-worker [--fork-jobs N] : fork-server — warm ONE parent with\n"
+        "       --expr, then fork a child per stdin request; child evals against\n"
+        "       the parent's warm caches (inherited copy-on-write) and returns\n"
+        "       the result over a pipe.  Same line protocol as --worker; results\n"
+        "       relayed in submission order.  --fork-jobs N (default 1) caps\n"
+        "       concurrent children (the WS-5 parallel-eval-density knob)\n"
         "  --cow-fork [--child-expr E] : warm caches with --expr, fork, re-eval\n"
         "       (E or --expr) in the child; report child Private_Dirty vs\n"
         "       Shared_Clean from smaps (WS-5 zygote density; Linux)\n",
@@ -230,6 +244,22 @@ int main(int argc, char ** argv)
     // mutables (WS5-D1) would recover. Linux-only.
     bool cowFork = false;
     std::string childExpr;
+    // WS-5 D3 (2026-07-16): productionised fork-server. `--fork-worker` warms
+    // ONE long-lived parent (evaluate the optional --expr once to populate the
+    // CU cache + import cache + applied cache), then serves a stream of eval
+    // requests (one expr per stdin line, same protocol as --worker) by
+    // FORKING a child per request.  The child evaluates against the parent's
+    // warm caches — inherited copy-on-write, so each concurrent eval pays only
+    // its private per-request delta (~27 MB same-expr; WS5.0 baseline) — writes
+    // the result back over a pipe, and _exit()s without ever returning into the
+    // parent loop (so it cannot corrupt the parent's warm image).  The parent
+    // relays each result to stdout in submission order and reaps the child.
+    // `--fork-jobs N` caps concurrent children (default 1 = sequential); N>1 is
+    // the parallel-eval-density knob (N children resident at once, all sharing
+    // the one warm parent image).  Linux is the KPI-5 host (per-child smaps);
+    // the correctness contract (byte-id vs fresh + vs --worker) holds on macOS.
+    bool forkWorker = false;
+    size_t forkJobs = 1;
     // Extra search-path entries (each is either "PATH" or "NAME=PATH").
     // Mirrors `nix-instantiate -I` so the lang test runner's per-test
     // .flags files (which reference `-I lang/dir1` etc.) work.
@@ -254,6 +284,9 @@ int main(int argc, char ** argv)
         else if (a == "--parse" || a == "--parse-only") parseOnly = true;
         else if (a == "--worker")   worker = true;
         else if (a == "--cow-fork") cowFork = true;
+        else if (a == "--fork-worker") forkWorker = true;
+        else if (a == "--fork-jobs" && i + 1 < argc)
+            forkJobs = std::max<size_t>(1, std::strtoul(argv[++i], nullptr, 10));
         else if (a == "--child-expr" && i + 1 < argc) childExpr = argv[++i];
         else if (a == "--help" || a == "-h") { usage(argv[0]); return 0; }
         else if (a == "-I" && i + 1 < argc)
@@ -300,9 +333,22 @@ int main(int argc, char ** argv)
         else { expr = argv[i]; }
     }
 
-    if (expr.empty() && path.empty() && !worker) { usage(argv[0]); return 2; }
+    // --fork-worker (like --worker) reads requests from stdin; --expr is an
+    // optional cache warm-up, so neither expr nor path is required for it.
+    if (expr.empty() && path.empty() && !worker && !forkWorker) { usage(argv[0]); return 2; }
 
     try {
+#if NIX_USE_BOEHMGC
+        // WS-5 D3 fork-safety hardening (--fork-worker / --cow-fork both
+        // fork()).  Per gc/gc.h: passing -1 tells Boehm NOT to auto-install
+        // pthread_atfork handlers (their installation can fail — or abort —
+        // on some targets, notably Darwin threads); instead we bracket every
+        // fork() manually with GC_atfork_prepare/parent/child (see the
+        // --fork-worker loop below).  Must be called before GC_INIT (which
+        // initGC() runs) to take effect — hence here, before initNix()/initGC().
+        // Harmless for the non-forking modes (they simply never bracket a fork).
+        GC_set_handle_fork(-1);
+#endif
         nix::initNix();
         nix::initGC();
 
@@ -311,7 +357,15 @@ int main(int argc, char ** argv)
         // Pthread runs daemon-detached; emits "v3 heap-trace" lines
         // to stderr at the cadence set by NIX_V3_HEAP_TRACE_INTERVAL_MS
         // (default 50 ms).
-        nix::v3::startHeapTrace();
+        //
+        // WS-5 D3: NOT started in the forking modes.  fork() only clones the
+        // calling thread; a live sampler pthread would leave the child with a
+        // half-cloned thread reading GC/heap state (and the GC_atfork brackets
+        // only cover Boehm's own threads, not this v3 sampler).  Keeping the
+        // parent single-threaded is exactly what makes the post-eval fork safe
+        // (the assumption the WS5.0 baseline was measured under).
+        if (!forkWorker && !cowFork)
+            nix::v3::startHeapTrace();
 
         // Apply experimental-feature flags collected from the CLI.
         // Has to happen *after* initNix so the Config setter takes
@@ -370,9 +424,11 @@ int main(int argc, char ** argv)
         // Always v3-native: parse → v3 AST → lowerV3Ast (no nix::Expr).
         // --parse shows the v3 AST directly (below).  Relative/`~` path
         // literals resolve against the file dir / $HOME (as TW does).
-        // Worker / cow-fork mode parses per-request via runRootExprFromString
-        // below, so skip the one-shot low-level parse of --expr/--file here.
-        if (worker || cowFork) {
+        // Worker / fork-worker / cow-fork mode parses per-request via
+        // runRootExprFromString below, so skip the one-shot low-level parse
+        // of --expr/--file here.  (--expr, if given, is the fork-worker /
+        // cow-fork cache warm-up, evaluated inside those branches.)
+        if (worker || cowFork || forkWorker) {
             /* parsed per-request below */
         } else if (!path.empty() && path != "-") {
             std::filesystem::path abs = std::filesystem::absolute(path);
@@ -513,30 +569,175 @@ int main(int argc, char ** argv)
             }
         }
 
+        // Shared per-request evaluator for --worker and --fork-worker.
+        // Evaluates ONE expression `line` in THIS process and writes its
+        // printed value form — byte-identical to `v3-eval --expr line` — to
+        // `os`.  Re-arms the per-request resource-limit deadline (initLimits).
+        // NEVER throws: on an eval error it logs the detail to stderr and
+        // writes the sentinel "<error>\n" to `os`, so one bad request can
+        // neither desync the response stream nor kill the server.  Because
+        // both worker modes route through this one function, a fork-worker
+        // response is byte-identical to the corresponding --worker response
+        // by construction.
+        std::string cwd = std::filesystem::current_path().string();
+        auto evalToStream = [&](const std::string & line, std::ostream & os) -> int {
+            nix::v3::initLimits();  // re-arm the per-request deadline
+            try {
+                auto rr = nix::v3::runRootExprFromString(
+                    state, line, cwd, homePath, nullptr);
+                nix::v3::VMState vm;
+                vm.frames.push_back(nix::v3::CallFrame{
+                    .cu = rr.cu.get(), .closure = nullptr, .thunk = nullptr,
+                    .ip = rr.cu->entryOffset, .stackBaseOffset = 0,
+                    .withStackBase = 0, .flags = 0,
+                });
+                Value r = nix::v3::forceValue(vm, rr.value);
+                if (strict) r = nix::v3::forceDeep(vm, r);
+                // rr.cu must outlive this print (the result Value points into
+                // its stringConstants) — it does: rr is alive to end of scope.
+                printValue(os, vm, r, jsonOut, nix::v3::ir::globalSymbolTable());
+                return 0;
+            } catch (const std::exception & e) {
+                std::fprintf(stderr, "v3-worker error: %s\n", e.what());
+                os << "<error>\n";
+                return 1;
+            }
+        };
+
+        // WS-5 D3: the productionised fork-server.  See the flag declaration
+        // for the model.  This block owns the process from here (returns 0).
+        if (forkWorker) {
+            // 1. Warm the parent ONCE (populate CU cache / import cache /
+            //    applied cache).  Runs in the PARENT so every forked child
+            //    inherits the warm image copy-on-write.  Output discarded —
+            //    the warm-up is priming, not a request.
+            if (!expr.empty()) {
+                std::ostringstream warm;
+                evalToStream(expr, warm);
+                std::fprintf(stderr,
+                    "v3-fork-worker: parent warmed via --expr (%zu jobs)\n", forkJobs);
+                std::fflush(stderr);
+            }
+
+            // One in-flight child: its pid + the read end of its result pipe.
+            struct InFlight { pid_t pid; int readFd; };
+            std::deque<InFlight> inflight;
+
+            // Drain the OLDEST in-flight child: read its result to EOF, reap
+            // it, then relay the bytes verbatim to stdout + the blank
+            // delimiter.  Draining FRONT-first guarantees responses appear in
+            // submission order even with forkJobs > 1 (children run
+            // concurrently; only the relay is serialised).
+            auto drainFront = [&]() {
+                InFlight fc = inflight.front();
+                inflight.pop_front();
+                std::string out;
+                char buf[4096];
+                for (;;) {
+                    ssize_t n = read(fc.readFd, buf, sizeof buf);
+                    if (n > 0) { out.append(buf, static_cast<size_t>(n)); continue; }
+                    if (n < 0 && errno == EINTR) continue;  // retry
+                    break;                                  // EOF (0) or error
+                }
+                close(fc.readFd);
+                int status = 0;
+                while (waitpid(fc.pid, &status, 0) < 0 && errno == EINTR) {}
+                // A child that crashed on a signal (or exited before writing)
+                // produces no bytes — emit the sentinel so the 1:1
+                // request:response framing holds and the server survives.
+                if (out.empty()) {
+                    std::fprintf(stderr,
+                        "v3-fork-worker: child %d produced no output (status=0x%x)\n",
+                        static_cast<int>(fc.pid), status);
+                    out = "<error>\n";
+                }
+                std::cout << out << "\n";  // blank line = end-of-response delimiter
+                std::cout.flush();
+            };
+
+            std::string line;
+            while (std::getline(std::cin, line)) {
+                if (!line.empty() && line.back() == '\r') line.pop_back();
+                if (line.empty()) continue;
+
+                int pipefd[2];
+                if (pipe(pipefd) != 0) {
+                    std::fprintf(stderr, "v3-fork-worker: pipe() failed: %s\n",
+                                 std::strerror(errno));
+                    std::cout << "<error>\n\n"; std::cout.flush();
+                    continue;
+                }
+
+                // Bracket the fork for Boehm.  GC_set_handle_fork(-1) above
+                // disabled auto atfork handlers, so we do it here: prepare
+                // acquires the GC/marker locks BEFORE fork; the child calls
+                // GC_atfork_child FIRST (before any allocation) to reset lock
+                // state + drop the parent's marker threads; the parent calls
+                // GC_atfork_parent to release.  Balanced on every path.
+#if NIX_USE_BOEHMGC
+                GC_atfork_prepare();
+#endif
+                pid_t pid = fork();
+                if (pid == 0) {
+                    // ---------- CHILD ----------
+#if NIX_USE_BOEHMGC
+                    GC_atfork_child();
+#endif
+                    close(pipefd[0]);              // child does not read
+                    std::ostringstream os;
+                    evalToStream(line, os);        // re-arms limits; never throws
+                    const std::string s = os.str();
+                    // Write the full result to the pipe (loop over short writes).
+                    size_t off = 0;
+                    while (off < s.size()) {
+                        ssize_t w = write(pipefd[1], s.data() + off, s.size() - off);
+                        if (w < 0) { if (errno == EINTR) continue; break; }
+                        off += static_cast<size_t>(w);
+                    }
+                    close(pipefd[1]);
+                    // _exit (NOT exit / return): skip stdio flush + atexit so
+                    // the child never double-flushes the parent's inherited
+                    // std::cout buffer nor fires the NIX_VM_STATS / partrace
+                    // atexit dumps.  The child only READ the shared warm caches
+                    // and wrote its OWN (COW-private) arena + result — it never
+                    // mutates the parent, which keeps serving.
+                    _exit(0);
+                } else if (pid > 0) {
+                    // ---------- PARENT ----------
+#if NIX_USE_BOEHMGC
+                    GC_atfork_parent();
+#endif
+                    close(pipefd[1]);              // parent does not write
+                    inflight.push_back({pid, pipefd[0]});
+                    // Cap concurrency at forkJobs; drain the oldest when full so
+                    // at most forkJobs children are resident at once (the
+                    // parallel-eval-density knob).
+                    if (inflight.size() >= forkJobs)
+                        drainFront();
+                } else {
+                    // fork() failed — still must release the GC lock we took.
+#if NIX_USE_BOEHMGC
+                    GC_atfork_parent();
+#endif
+                    close(pipefd[0]); close(pipefd[1]);
+                    std::fprintf(stderr, "v3-fork-worker: fork() failed: %s\n",
+                                 std::strerror(errno));
+                    std::cout << "<error>\n\n"; std::cout.flush();
+                }
+            }
+            // stdin EOF: drain any children still in flight (submission order).
+            while (!inflight.empty())
+                drainFront();
+            return 0;
+        }
+
         if (worker) {
-            std::string cwd = std::filesystem::current_path().string();
             std::string line;
             while (std::getline(std::cin, line)) {
                 // Trim trailing CR (CRLF-safe) and skip blank lines.
                 if (!line.empty() && line.back() == '\r') line.pop_back();
                 if (line.empty()) continue;
-                nix::v3::initLimits();  // re-arm the per-request deadline
-                try {
-                    auto rr = nix::v3::runRootExprFromString(
-                        state, line, cwd, homePath, nullptr);
-                    nix::v3::VMState vm;
-                    vm.frames.push_back(nix::v3::CallFrame{
-                        .cu = rr.cu.get(), .closure = nullptr, .thunk = nullptr,
-                        .ip = rr.cu->entryOffset, .stackBaseOffset = 0,
-                        .withStackBase = 0, .flags = 0,
-                    });
-                    Value r = nix::v3::forceValue(vm, rr.value);
-                    if (strict) r = nix::v3::forceDeep(vm, r);
-                    printValue(vm, r, jsonOut, nix::v3::ir::globalSymbolTable());
-                } catch (const std::exception & e) {
-                    std::fprintf(stderr, "v3-worker error: %s\n", e.what());
-                    std::cout << "<error>\n";
-                }
+                evalToStream(line, std::cout);
                 std::cout << "\n";  // blank line = end-of-response delimiter
                 std::cout.flush();
             }
@@ -706,7 +907,7 @@ int main(int argc, char ** argv)
         // and a superset of every per-CU table, so it always covers
         // attribute names from imported CUs that the top-level CU's
         // (frozen-at-compile-time) snapshot wouldn't see.
-        int rc = printValue(vm, r, jsonOut, nix::v3::ir::globalSymbolTable());
+        int rc = printValue(std::cout, vm, r, jsonOut, nix::v3::ir::globalSymbolTable());
         // Parallel-potential trace (NIX_V3_PAR_TRACE): v3-eval runs the
         // workload via run() directly (not runRootExpr), so the run.cc
         // dumpReport is never hit here — fire it after all forcing (eval
