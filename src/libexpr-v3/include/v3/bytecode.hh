@@ -48,6 +48,69 @@ using Instruction = uint32_t;
 /// so the pages become Shared_Clean across independent processes.
 using Bytecode = OwnedOrBorrowed<Instruction>;
 
+// ---------------------------------------------------------------------------
+// WS5-B2 (D2b) — LambdaTable: the CU's `lambdas` array as a single contiguous,
+// borrowable POD block.
+//
+// Layout of the block (one 8-aligned buffer):
+//   [ LambdaDescriptor[count] ]              // fixed-stride POD descriptors
+//   [ LambdaDescriptor::Formal[totalFormals] ]  // all formals, 4-aligned
+//   [ char bytes ]                           // NUL-terminated name/ctx strings
+// Each descriptor's FlatStr/FlatArray members hold SELF-RELATIVE offsets into
+// the formals/char regions, so the whole block is position-independent: the
+// owned path copies it as one unit, the AOT path borrows it in place from the
+// mmap (Shared_Clean).  The former `std::vector<LambdaDescriptor>` (with
+// per-descriptor std::string/std::vector heap — the ~65 % CU footprint chunk
+// per #139) is gone.
+//
+// BUILD vs READ: emit + the owned deserialize accumulate `LambdaBuild` staging
+// entries (heap-owning, mutable) via `buildAt`, then `finalize()` packs them
+// into `block_`.  Post-finalize (and on the borrow path) reads go through the
+// std::vector-like READ API (operator[]/size/data/begin/end), which
+// reinterpret_casts the block — the ~30 read sites (vm/print/primops/disasm)
+// and the desc→CU registry (`desc - lambdas.data()`) compile unchanged.
+// ---------------------------------------------------------------------------
+struct LambdaTable
+{
+    OwnedOrBorrowed<uint8_t> block_;      ///< packed [descs][formals][chars]
+    uint32_t                 count_ = 0;  ///< number of descriptors
+    std::vector<LambdaBuild> build_;      ///< transient staging (emit/deser)
+
+    // ---- build API (emit + owned deserialize) ----
+    /// Grow the staging vector to hold `fid` and return its entry (mutable).
+    LambdaBuild & buildAt(uint32_t fid)
+    {
+        if (build_.size() <= fid) build_.resize(fid + 1);
+        return build_[fid];
+    }
+    /// Pack `build_` into the self-relative flat block (OWNED); clears build_.
+    void finalize();
+
+    // ---- borrow / own-from-wire (deserialize) ----
+    /// Borrow `count` descriptors from a `nbytes` block living in the AOT mmap
+    /// (must be alignof(LambdaDescriptor)-aligned + process-lifetime).
+    void borrowBlock(const uint8_t * p, std::size_t nbytes, uint32_t count)
+    { build_.clear(); block_.borrow(p, nbytes); count_ = count; }
+    /// Parse a raw wire block (`nbytes` bytes, `count` descriptors) into
+    /// `build_` for the owned-path remap; caller then remaps build_ and calls
+    /// finalize().  Copies into an aligned buffer first (the SQLite wire bytes
+    /// may be unaligned) so the descriptors' self-relative views resolve.
+    void loadBuildFromBlock(const uint8_t * p, std::size_t nbytes, uint32_t count);
+
+    // ---- read API (post-finalize / borrowed) ----
+    std::size_t size() const noexcept
+    { return build_.empty() ? count_ : build_.size(); }
+    bool empty() const noexcept { return size() == 0; }
+    const LambdaDescriptor * data() const noexcept
+    { return reinterpret_cast<const LambdaDescriptor *>(block_.data()); }
+    const LambdaDescriptor & operator[](std::size_t i) const noexcept
+    { return data()[i]; }
+    const LambdaDescriptor * begin() const noexcept { return data(); }
+    const LambdaDescriptor * end()   const noexcept { return data() + count_; }
+    std::size_t capacity() const noexcept { return block_.capacity(); }  // bytes
+    bool isBorrowed() const noexcept { return block_.isBorrowed(); }
+};
+
 enum Op : uint8_t
 {
     // 0x00 was OP_NOP — never emitted, removed in the review-cleanup
@@ -630,7 +693,10 @@ struct CompilationUnit
     std::vector<std::string> symbolTable;
 
     /// Lambda descriptors, indexed by IR FuncId.  function 0 = top-level.
-    std::vector<LambdaDescriptor> lambdas;
+    /// WS5-B2 (D2b): a single contiguous, borrowable POD block (was
+    /// std::vector<LambdaDescriptor> with per-descriptor heap).  Borrowed in
+    /// place from the AOT mmap when the symbol/pos remap is the identity.
+    LambdaTable lambdas;
     /// WS5-D2a: POD, never remapped → always borrowable from the AOT mmap.
     OwnedOrBorrowed<uint32_t>      lambdaCodeOffsets;
 
@@ -781,7 +847,10 @@ struct CompilationUnit
         b += stringConstants.capacity() * sizeof(const std::string *);
         b += symbolTable.capacity()    * sizeof(std::string);
         for (const auto & s : symbolTable) b += s.capacity();
-        b += lambdas.capacity()           * sizeof(LambdaDescriptor);
+        // WS5-B2: `lambdas` is now one flat block whose capacity() is its
+        // total byte size (descriptors + formals + name/ctx chars) — no
+        // separate per-descriptor heap to add.
+        b += lambdas.capacity();
         b += lambdaCodeOffsets.capacity() * sizeof(uint32_t);
         b += primops.capacity()           * sizeof(const PrimOp *);
         // WS5-D1: runtime side state (ICs + per-funcId counters) moved to `rt`.

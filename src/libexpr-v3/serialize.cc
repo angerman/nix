@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstddef>   // offsetof (LambdaTable flatten)
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -57,6 +58,123 @@ StringConstPoolStats stringConstantPoolStats() noexcept
     return { g_poolEntries, g_poolCharBytes };
 }
 
+// ---------------------------------------------------------------------------
+// WS5-B2 (D2b) — LambdaTable flatten/unflatten (see bytecode.hh).
+// ---------------------------------------------------------------------------
+
+void LambdaTable::finalize()
+{
+    const uint32_t count = static_cast<uint32_t>(build_.size());
+    const std::size_t descBytes = (std::size_t)count * sizeof(LambdaDescriptor);
+    // sizeof(LambdaDescriptor) is a multiple of alignof(Formal)=4, so the
+    // formals region right after the descriptor array is 4-aligned; chars need
+    // only 1-alignment.  The whole block starts alignof(LambdaDescriptor)-
+    // aligned (owned: 16-aligned vector buffer; borrowed: 8-aligned blob).
+    std::size_t formalsCount = 0, charBytes = 0;
+    for (const auto & b : build_) {
+        formalsCount += b.formals.size();
+        if (!b.name.empty())           charBytes += b.name.size() + 1;   // + NUL
+        if (!b.contextualName.empty()) charBytes += b.contextualName.size() + 1;
+    }
+    const std::size_t formalsOff = descBytes;
+    const std::size_t charsOff =
+        formalsOff + formalsCount * sizeof(LambdaDescriptor::Formal);
+    const std::size_t blockSize = charsOff + charBytes;
+
+    std::vector<uint8_t> buf(blockSize, 0);
+    auto * descs = reinterpret_cast<LambdaDescriptor *>(buf.data());
+    std::size_t fCur = formalsOff;   // running formals byte cursor
+    std::size_t cCur = charsOff;     // running char byte cursor
+    for (uint32_t i = 0; i < count; ++i) {
+        const LambdaBuild & b = build_[i];
+        const std::size_t descOff = (std::size_t)i * sizeof(LambdaDescriptor);
+        LambdaDescriptor & d = descs[i];   // aligned lvalue inside buf
+        d = LambdaDescriptor{};            // zero-init POD (rel/len = 0)
+        d.codeOffset              = b.codeOffset;
+        d.prologueOffset          = b.prologueOffset;
+        d.nUpvalues               = b.nUpvalues;
+        d.nLocals                 = b.nLocals;
+        d.arity                   = b.arity;
+        d.hasFormals              = b.hasFormals;
+        d.ellipsis                = b.ellipsis;
+        d.nWithTargets            = b.nWithTargets;
+        d.posHandle               = b.posHandle;
+        d.selectorSym             = b.selectorSym;
+        d.identityLambda          = b.identityLambda;
+        d.secondArgIdentityLambda = b.secondArgIdentityLambda;
+        d.isFormalWrapper         = b.isFormalWrapper;
+        d.isOrDefault             = b.isOrDefault;
+        d.isInheritWrapper        = b.isInheritWrapper;
+        d.intrinsicKind           = b.intrinsicKind;
+        d.intrinsicVar0           = b.intrinsicVar0;
+        d.intrinsicVar1           = b.intrinsicVar1;
+        d.intrinsicVar2           = b.intrinsicVar2;
+        // formals: copy into the block, store self-relative offset.
+        d.formals.count = static_cast<uint32_t>(b.formals.size());
+        if (!b.formals.empty()) {
+            std::memcpy(buf.data() + fCur, b.formals.data(),
+                        b.formals.size() * sizeof(LambdaDescriptor::Formal));
+            d.formals.rel = static_cast<int32_t>(
+                (std::ptrdiff_t)fCur
+                - (std::ptrdiff_t)(descOff + offsetof(LambdaDescriptor, formals)));
+            fCur += b.formals.size() * sizeof(LambdaDescriptor::Formal);
+        }
+        // name / contextualName: copy chars + NUL, store self-relative offset.
+        auto packStr = [&](const std::string & s, FlatStr & fs, std::size_t memOff) {
+            if (s.empty()) return;
+            std::memcpy(buf.data() + cCur, s.data(), s.size());
+            buf[cCur + s.size()] = 0;   // NUL terminator for c_str()
+            fs.len = static_cast<uint32_t>(s.size());
+            fs.rel = static_cast<int32_t>(
+                (std::ptrdiff_t)cCur - (std::ptrdiff_t)(descOff + memOff));
+            cCur += s.size() + 1;
+        };
+        packStr(b.name,           d.name,           offsetof(LambdaDescriptor, name));
+        packStr(b.contextualName, d.contextualName, offsetof(LambdaDescriptor, contextualName));
+    }
+    block_.adopt(std::move(buf));
+    count_ = count;
+    build_.clear();
+    build_.shrink_to_fit();
+}
+
+void LambdaTable::loadBuildFromBlock(const uint8_t * p, std::size_t nbytes,
+                                     uint32_t count)
+{
+    // The wire bytes may be unaligned (SQLite blob) → copy into an aligned
+    // buffer so each descriptor's self-relative FlatStr/FlatArray resolve.
+    std::vector<uint8_t> tmp(p, p + nbytes);
+    const auto * descs = reinterpret_cast<const LambdaDescriptor *>(tmp.data());
+    build_.clear();
+    build_.resize(count);
+    for (uint32_t i = 0; i < count; ++i) {
+        const LambdaDescriptor & d = descs[i];   // self-relative views valid in tmp
+        LambdaBuild & b = build_[i];
+        b.codeOffset              = d.codeOffset;
+        b.prologueOffset          = d.prologueOffset;
+        b.nUpvalues               = d.nUpvalues;
+        b.nLocals                 = d.nLocals;
+        b.arity                   = d.arity;
+        b.hasFormals              = d.hasFormals;
+        b.ellipsis                = d.ellipsis;
+        b.nWithTargets            = d.nWithTargets;
+        b.posHandle               = d.posHandle;
+        b.selectorSym             = d.selectorSym;
+        b.identityLambda          = d.identityLambda;
+        b.secondArgIdentityLambda = d.secondArgIdentityLambda;
+        b.isFormalWrapper         = d.isFormalWrapper;
+        b.isOrDefault             = d.isOrDefault;
+        b.isInheritWrapper        = d.isInheritWrapper;
+        b.intrinsicKind           = d.intrinsicKind;
+        b.intrinsicVar0           = d.intrinsicVar0;
+        b.intrinsicVar1           = d.intrinsicVar1;
+        b.intrinsicVar2           = d.intrinsicVar2;
+        b.name           = d.name.str();
+        b.contextualName = d.contextualName.str();
+        b.formals.assign(d.formals.begin(), d.formals.end());
+    }
+}
+
 } // namespace nix::v3
 
 namespace nix::v3::serialize {
@@ -98,6 +216,8 @@ uint64_t g_borrowCUs = 0;
 uint64_t g_borrowCodeBorrowed = 0;
 uint64_t g_borrowCodeOwned = 0;
 uint64_t g_borrowPodBorrowed = 0;
+uint64_t g_borrowLambdasBorrowed = 0;   // WS5-B2 (D2b)
+uint64_t g_borrowLambdasOwned = 0;
 
 bool breakdownEnabled()
 {
@@ -126,6 +246,10 @@ struct Writer {
         u32(static_cast<uint32_t>(s.size()));
         writeBytes(s.data(), s.size());
     }
+    // WS5-B2 — pad the stream to an 8-byte multiple so the next section (the
+    // flat lambda block) starts at an 8-aligned blob offset → 8-aligned in the
+    // page-aligned AOT mmap → borrowable in place.
+    void pad8() { while (out.size() % 8 != 0) out.push_back('\0'); }
 };
 
 /// Tiny streaming reader from a string_view.  Throws on
@@ -157,6 +281,9 @@ struct Reader {
         pos += n;
         return s;
     }
+    // WS5-B2 — advance `pos` to the next 8-byte multiple (mirrors Writer::pad8
+    // before the flat lambda block).  Keeps the block 8-aligned in the blob.
+    void pad8() { pos = (pos + 7u) & ~size_t{7}; if (pos > buf.size()) pos = buf.size(); }
     // WS5-D2a: return a pointer to the next `n` bytes and advance WITHOUT
     // copying.  The borrow path reinterpret_casts this into the mmap; the
     // owning path memcpy's from it.  Bounds-checked like the other readers.
@@ -356,9 +483,15 @@ collectReferencedPositions(const CompilationUnit & cu)
         }
     }
 
-    // Formals carry PosIdx per parameter.
+    // Formals carry PosIdx per parameter; the descriptor itself carries a
+    // body PosIdx (`posHandle`).  WS5-B2 (D2b): posHandle is now a raw PosIdx
+    // baked into the borrowable lambda block, so it MUST be in the sparse pos
+    // table (→ canonical seeding) for the borrow to be identity + for the
+    // owned-path remap to translate it.  (Pre-22 it was serialized inline as
+    // file/line/col and rebuilt; that path is gone.)
     for (const auto & l : cu.lambdas) {
         for (const auto & f : l.formals) bump(f.pos);
+        bump(l.posHandle);
     }
 
     std::sort(refs.begin(), refs.end());
@@ -850,57 +983,28 @@ std::string serializeCU(const CompilationUnit & cu)
         }
     }
 
-    // Section: lambdas (LambdaDescriptor with Formal vector).
-    w.u32(static_cast<uint32_t>(cu.lambdas.size()));
-    for (auto & l : cu.lambdas) {
-        w.u32(l.codeOffset);
-        w.u32(l.prologueOffset);
-        w.u32(l.nUpvalues);
-        w.u32(l.nLocals);
-        w.u8(l.arity);
-        w.u8(l.hasFormals);
-        w.u8(l.ellipsis);
-        w.u8(0);  // _pad
-        // Schema 5 (#530): per-descriptor with-target count.
-        w.u32(l.nWithTargets);
-        w.u32(static_cast<uint32_t>(l.formals.size()));
-        for (auto & f : l.formals) {
-            w.u32(f.name);
-            w.u8(f.hasDefault ? 1 : 0);
-            w.u8(0); w.u8(0); w.u8(0);  // pad to align pos
-            w.u32(f.pos);
-        }
-        // Schema 4 (#495/#509 STG-13d): native-intrinsic metadata.
-        // Carries kind + upvalue indices for ExtendsBody / ComposeBody
-        // dispatch through the disk cache so cache-loaded CUs participate
-        // in native dispatch instead of running the bytecode body.
-        w.u8(static_cast<uint8_t>(l.intrinsicKind));
-        w.u8(static_cast<uint8_t>(l.intrinsicVar0));  // signed int8 reinterpreted
-        w.u8(static_cast<uint8_t>(l.intrinsicVar1));
-        w.u8(static_cast<uint8_t>(l.intrinsicVar2));
-        // Schema 11 (#803): diagnostic metadata.  Without these, cache-
-        // loaded CUs show "anonymous lambda" + src=?:0:0 in error
-        // messages, hiding which source file the lambda came from.
-        // Required for the H10 RCA on haskell.nix-class workloads.
-        w.str(l.name);
-        w.str(l.contextualName);
-        // posHandle is an index into the process-static posSnapshotPool;
-        // we serialise the RESOLVED file/line/column so the load-time
-        // process can rebuild a fresh posHandle from its own pool.
-        const PosSnapshot * ps = resolvePosSnapshot(l.posHandle);
-        if (ps) {
-            w.u8(1);
-            w.str(ps->file);
-            w.u32(ps->line);
-            w.u32(ps->column);
-        } else {
-            w.u8(0);
-        }
-        // Schema 12 (#814): emit-time peephole flags.  See
-        // serialize.hh kSchemaVersion comment for rationale.
-        w.u32(l.selectorSym);
-        w.u8(l.identityLambda ? 1 : 0);
-        w.u8(l.secondArgIdentityLambda ? 1 : 0);
+    // Section: lambdas (schema 22, WS5-B2 D2b).  The `lambdas` array is a
+    // single self-relative POD block — [LambdaDescriptor[]][Formal[]][name/
+    // contextualName chars] — built by emit's LambdaTable::finalize().  Write
+    // it RAW (count + block length + 8-aligned block bytes) so the AOT-load
+    // path can BORROW the whole descriptor array in place from the mmap
+    // (Shared_Clean) instead of rebuilding per-descriptor heap.  All the
+    // per-descriptor ids the block carries (formals name/pos, selectorSym,
+    // posHandle) are the writer's global ids, translated on the owned path via
+    // the sparse symbol/pos remap (identity on borrow — the canonical table).
+    //
+    // Layout of these two words + block:
+    //   count : u32, blockLen : u32, <pad to 8>, block bytes[blockLen]
+    // The blob is 8-aligned in the AOT file + the mmap is page-aligned, so the
+    // padded block starts 8-aligned in memory (alignof(LambdaDescriptor)≤8).
+    {
+        const uint32_t count = static_cast<uint32_t>(cu.lambdas.size());
+        const uint8_t * blk = cu.lambdas.block_.data();
+        const size_t blkLen = cu.lambdas.block_.size();
+        w.u32(count);
+        w.u32(static_cast<uint32_t>(blkLen));
+        w.pad8();
+        if (blkLen) w.writeBytes(blk, blkLen);
     }
 
     // (lambdaCodeOffsets moved into the WS5-D2a POD block near the header.)
@@ -1113,54 +1217,14 @@ static CompilationUnit deserializeImpl(std::string_view blob, bool allowBorrow)
         }
     }
 
-    // Section: lambdas.
-    {
-        uint32_t n = r.u32();
-        cu.lambdas.reserve(n);
-        for (uint32_t i = 0; i < n; ++i) {
-            LambdaDescriptor l;
-            l.codeOffset    = r.u32();
-            l.prologueOffset = r.u32();
-            l.nUpvalues     = static_cast<uint16_t>(r.u32());
-            l.nLocals       = static_cast<uint16_t>(r.u32());
-            l.arity         = r.u8();
-            l.hasFormals    = r.u8();
-            l.ellipsis      = r.u8();
-            r.u8();  // _pad
-            // Schema 5 (#530): per-descriptor with-target count.
-            l.nWithTargets  = static_cast<uint16_t>(r.u32());
-            uint32_t nFormals = r.u32();
-            l.formals.reserve(nFormals);
-            for (uint32_t j = 0; j < nFormals; ++j) {
-                LambdaDescriptor::Formal f;
-                f.name       = r.u32();
-                f.hasDefault = r.u8() != 0;
-                r.u8(); r.u8(); r.u8();  // pad
-                f.pos        = r.u32();
-                l.formals.push_back(f);
-            }
-            // Schema 4 (#495/#509 STG-13d): native-intrinsic metadata.
-            l.intrinsicKind = static_cast<LambdaDescriptor::Intrinsic>(r.u8());
-            l.intrinsicVar0 = static_cast<int8_t>(r.u8());
-            l.intrinsicVar1 = static_cast<int8_t>(r.u8());
-            l.intrinsicVar2 = static_cast<int8_t>(r.u8());
-            // Schema 11 (#803): diagnostic metadata.
-            l.name           = std::string(r.strv());
-            l.contextualName = std::string(r.strv());
-            if (r.u8()) {
-                PosSnapshot ps;
-                ps.file   = std::string(r.strv());
-                ps.line   = r.u32();
-                ps.column = r.u32();
-                l.posHandle = recordPosSnapshot(std::move(ps));
-            }
-            // Schema 12 (#814): emit-time peephole flags.
-            l.selectorSym    = r.u32();
-            l.identityLambda = (r.u8() != 0);
-            l.secondArgIdentityLambda = (r.u8() != 0);
-            cu.lambdas.push_back(std::move(l));
-        }
-    }
+    // Section: lambdas (schema 22, WS5-B2 D2b) — the self-relative POD block.
+    // Read count + block length, 8-align, and TAKE (no copy) an in-blob
+    // pointer to the block.  The borrow-vs-own decision is deferred to the end
+    // (alongside `code`) since it shares the symbol/pos identity gate.
+    uint32_t lamCount = r.u32();
+    uint32_t lamBlockLen = r.u32();
+    r.pad8();  // block starts at an 8-aligned blob offset (mirrors the writer)
+    const void * lamPtr = r.takePtr(lamBlockLen);
     if (dbg) { breakdown().lambdasNs += nowNs() - t0; t0 = nowNs(); }
 
     // (lambdaCodeOffsets was read from the WS5-D2a POD block above.)
@@ -1229,10 +1293,19 @@ static CompilationUnit deserializeImpl(std::string_view blob, bool allowBorrow)
     // remapSymbolsInBytecode also re-sorts OP_ATTRS_REC_INIT trailers +
     // propagates the permutation to OP_ATTRS_REC_SET (a no-op under identity).
     const bool borrowCode = aligned && symIdentity && posIdentity;
+    // WS5-B2 (D2b) — the lambda block borrows under the SAME symbol/pos
+    // identity gate as `code` (all its ids — formals name/pos, selectorSym,
+    // posHandle — are covered by the same remap tables), plus its own
+    // alignment check (it lives at an 8-aligned blob offset; on the mmap that
+    // is alignof(LambdaDescriptor)-aligned).
+    const bool lamAligned = allowBorrow
+        && (reinterpret_cast<uintptr_t>(lamPtr) % alignof(LambdaDescriptor) == 0);
+    const bool borrowLambdas = lamAligned && symIdentity && posIdentity;
     if (allowBorrow) {
         ++g_borrowCUs;
         if (borrowCode) ++g_borrowCodeBorrowed; else ++g_borrowCodeOwned;
         if (aligned) ++g_borrowPodBorrowed;
+        if (borrowLambdas) ++g_borrowLambdasBorrowed; else ++g_borrowLambdasOwned;
     }
     if (borrowCode) {
         cu.code.borrow(reinterpret_cast<const Instruction *>(codePtr),
@@ -1246,36 +1319,38 @@ static CompilationUnit deserializeImpl(std::string_view blob, bool allowBorrow)
         // point into the writer's posSnapshotPool order — meaningless here.
         remapPositionsInBytecode(cu, posRemap);
     }
-    // Formals live in the OWNED `lambdas` vector, so they are always
-    // rewritten — a no-op under identity (remap[i]==i, stable re-sort).
-    for (auto & l : cu.lambdas) {
-        for (auto & f : l.formals) {
-            if (f.name < remap.size()) f.name = remap[f.name];
-            if (f.pos < posRemap.size()) f.pos = posRemap[f.pos];
+    // WS5-B2 (D2b) — materialise-or-borrow the lambda block.  On borrow
+    // (identity) the writer's baked ids are already valid → the read-only
+    // descriptor pages stay Shared_Clean.  Otherwise unflatten into staging,
+    // remap every per-descriptor id (formals name/pos, selectorSym, posHandle),
+    // re-sort formals by (remapped) SymbolId for the OP_CALL validation pass,
+    // and re-pack the owned block.  Under identity the remap is a no-op and the
+    // re-packed block is byte-for-byte the writer's — so the RESULT is the same
+    // whether borrowed or owned (only sharing differs).
+    if (borrowLambdas) {
+        cu.lambdas.borrowBlock(reinterpret_cast<const uint8_t *>(lamPtr),
+                               lamBlockLen, lamCount);
+    } else {
+        cu.lambdas.loadBuildFromBlock(
+            reinterpret_cast<const uint8_t *>(lamPtr), lamBlockLen, lamCount);
+        for (auto & b : cu.lambdas.build_) {
+            for (auto & f : b.formals) {
+                if (f.name < remap.size())    f.name = remap[f.name];
+                if (f.pos  < posRemap.size()) f.pos  = posRemap[f.pos];
+            }
+            if (b.formals.size() > 1) {
+                std::sort(b.formals.begin(), b.formals.end(),
+                    [](const LambdaDescriptor::Formal & a,
+                       const LambdaDescriptor::Formal & c) {
+                        return a.name < c.name;
+                    });
+            }
+            if (b.selectorSym != 0 && b.selectorSym < remap.size())
+                b.selectorSym = remap[b.selectorSym];
+            if (b.posHandle < posRemap.size())
+                b.posHandle = posRemap[b.posHandle];
         }
-        // Schema 12 (#814): formals are sorted by SymbolId for the
-        // OP_CALL formals validation pass.  After cross-process
-        // remap the SymbolIds change, so the original sort may be
-        // invalidated.  Re-sort here to restore the invariant.
-        // hasDefault + pos travel with name; std::sort with a
-        // lambda comparing names handles the permutation.  In-
-        // process remap is identity, so this is a no-op cost on
-        // the common path.
-        if (l.formals.size() > 1) {
-            std::sort(l.formals.begin(), l.formals.end(),
-                [](const LambdaDescriptor::Formal & a,
-                   const LambdaDescriptor::Formal & b) {
-                    return a.name < b.name;
-                });
-        }
-        // Schema 12 (#814): selectorSym is a SymbolId stored on
-        // LambdaDescriptor (not in the bytecode), referenced by the
-        // emit-time peephole fast path in OP_CALL.  Without remap, a
-        // cross-process cache hit looks up the writer's SymbolId in
-        // the reader's attrset, producing "missing attr" errors on
-        // the firefox-class overlay workload.
-        if (l.selectorSym != 0 && l.selectorSym < remap.size())
-            l.selectorSym = remap[l.selectorSym];
+        cu.lambdas.finalize();
     }
     if (dbg) { breakdown().remapNs += nowNs() - t0; }
     // #770b/#770c (2026-05-22): cu.symbolTable was already kept
@@ -1317,7 +1392,7 @@ bool deserializeBreakdownEnabled() { return breakdownEnabled(); }
 AotBorrowStats aotBorrowStats() noexcept
 {
     return { g_borrowCUs, g_borrowCodeBorrowed, g_borrowCodeOwned,
-             g_borrowPodBorrowed };
+             g_borrowPodBorrowed, g_borrowLambdasBorrowed, g_borrowLambdasOwned };
 }
 
 BlobMaxIds peekMaxIds(std::string_view blob) noexcept
@@ -1359,6 +1434,70 @@ BlobMaxIds peekMaxIds(std::string_view blob) noexcept
         return { maxSym, maxPos };
     } catch (...) {
         return {};
+    }
+}
+
+bool readSparseTables(std::string_view blob,
+                      std::vector<BlobSymEntry> & syms,
+                      std::vector<BlobPosEntry> & poss) noexcept
+{
+    // WS5-B2 — walk the same schema-21 prefix as peekMaxIds, but emit EVERY
+    // sparse symbol/pos entry (not just the maxId).  `name`/`file` are views
+    // into `blob` (AOT mmap lifetime).  Mirrors the writer sections in
+    // serializeCU (symbolTable then posTable) and the reader in
+    // deserializeImpl.  Best-effort: any malformed input → false + empty out.
+    syms.clear();
+    poss.clear();
+    try {
+        Reader r{blob};
+        char magic[sizeof(kMagic)];
+        r.readBytes(magic, sizeof(magic));
+        if (std::memcmp(magic, kMagic, sizeof(kMagic)) != 0) return false;
+        if (r.u32() != kSchemaVersion) return false;   // schema
+        r.u64();                                        // fingerprint
+        uint32_t podBlockOff = r.u32();
+        if (podBlockOff < r.pos) return false;
+        r.pos = podBlockOff;
+        uint32_t codeCount  = r.u32();
+        uint32_t intCount   = r.u32();
+        uint32_t floatCount = r.u32();
+        uint32_t lcoCount   = r.u32();
+        r.takePtr((size_t)intCount   * sizeof(int64_t));
+        r.takePtr((size_t)floatCount * sizeof(double));
+        r.takePtr((size_t)codeCount  * sizeof(Instruction));
+        r.takePtr((size_t)lcoCount   * sizeof(uint32_t));
+        // stringConstants (skip).
+        uint32_t nStr = r.u32();
+        for (uint32_t i = 0; i < nStr; ++i) (void)r.strv();
+        // symbolTable: count, maxId, then `count` (origId:u32, name:str) pairs.
+        uint32_t nSym = r.u32();
+        r.u32();                       // maxSym (unused here)
+        syms.reserve(nSym);
+        for (uint32_t i = 0; i < nSym; ++i) {
+            uint32_t id = r.u32();
+            std::string_view name = r.strv();
+            syms.push_back({ id, name });
+        }
+        // posTable: count, maxId, then `count`
+        //   (origId:u32, present:u8, [file:str, line:u32, col:u32]) entries.
+        uint32_t nPos = r.u32();
+        r.u32();                       // maxPos (unused here)
+        poss.reserve(nPos);
+        for (uint32_t i = 0; i < nPos; ++i) {
+            uint32_t id = r.u32();
+            uint8_t present = r.u8();
+            if (present) {
+                std::string_view file = r.strv();
+                uint32_t line = r.u32();
+                uint32_t col  = r.u32();
+                poss.push_back({ id, file, line, col });
+            }
+        }
+        return true;
+    } catch (...) {
+        syms.clear();
+        poss.clear();
+        return false;
     }
 }
 

@@ -16,6 +16,7 @@
 #include "v3/bytecode_primops.hh"
 #include "v3/import_timing.hh"  // #769 per-import phase totals
 #include "v3/disk_cache.hh"     // #770 cache-hit/miss stats dump
+#include "v3/aot_cache.hh"      // WS5-B2 eager canonical-table adoption
 #include "v3/cache_probe.hh"    // #827 / A3 per-call-site cache-hook dump
 #include "v3/precise_root.hh"   // 2026-05-27 Stage 3: dumpAllV3Roots diagnostic
 #include "v3/live_trace.hh"     // 2026-05-27 Stage 6 SPIKE: live-fraction trace
@@ -957,12 +958,17 @@ RootResult runRootExprModule(nix::EvalState & state, ir::Module module)
             if (bs.cus > 0) {
                 std::fprintf(stderr,
                     "v3-direct AOT-borrow: cus=%llu codeBorrowed=%llu "
-                    "codeOwned=%llu podBorrowed=%llu codeBorrowRate=%.1f%%\n",
+                    "codeOwned=%llu podBorrowed=%llu lambdasBorrowed=%llu "
+                    "lambdasOwned=%llu codeBorrowRate=%.1f%% "
+                    "lambdasBorrowRate=%.1f%%\n",
                     (unsigned long long)bs.cus,
                     (unsigned long long)bs.codeBorrowed,
                     (unsigned long long)bs.codeOwned,
                     (unsigned long long)bs.podBorrowed,
-                    100.0 * (double)bs.codeBorrowed / (double)bs.cus);
+                    (unsigned long long)bs.lambdasBorrowed,
+                    (unsigned long long)bs.lambdasOwned,
+                    100.0 * (double)bs.codeBorrowed / (double)bs.cus,
+                    100.0 * (double)bs.lambdasBorrowed / (double)bs.cus);
             }
         }
         // #772 Stage 9 Phase L0 spike: bytecode-level dedup survey.
@@ -2382,6 +2388,14 @@ RootResult runRootExprFromString(nix::EvalState & state, const std::string & sou
                                  const nix::SourcePath * originPath)
 {
     registerBuiltinPrimOps();  // before lowering (lower-time findPrimOp)
+    // WS5-B2 — adopt the AOT canonical symbol/pos id assignment NOW, before the
+    // root expr is lowered below (the first symbol-interning event).  init() is
+    // idempotent (does its work once, on the first call) and a near-no-op when
+    // NIX_V3_AOT_CACHE_FILE is unset, so calling it at every (incl. nested)
+    // entry is free.  Placing it here — ahead of lowerV3Ast — is what lets the
+    // reader's own interns land on the writer's canonical ids, so borrowed CU
+    // code stays un-rewritten (Shared_Clean).  See aot_cache::init.
+    aot_cache::init();
     // Re-entry depth: runRootExprModule installs bytecode primops via NESTED
     // runRootExprFromString calls; the top-level cache acts ONLY on the
     // outermost (the user's actual expr), never the installer sub-evals.

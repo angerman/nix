@@ -134,6 +134,12 @@ struct OwnedOrBorrowed
     T & back()  noexcept { return const_cast<T &>(ptr_[len_ - 1]); }
     std::size_t capacity() const noexcept { return borrowed_ ? len_ : owned_.capacity(); }
 
+    /// WS5-B2 — adopt a fully-built vector as the OWNED backing store (moves,
+    /// no copy).  Used by LambdaTable::finalize to install the packed lambda
+    /// block.  After this the object is OWNED.
+    void adopt(std::vector<T> && v) noexcept
+    { borrowed_ = false; owned_ = std::move(v); resync(); }
+
     void push_back(T v) { owned_.push_back(v); resync(); }
     void pop_back()     { owned_.pop_back();   resync(); }
     void resize(std::size_t n) { owned_.resize(n); resync(); }

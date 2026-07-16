@@ -2459,55 +2459,45 @@ struct Emitter
             }
         }
 
-        if (unit.lambdas.size() <= fid)         unit.lambdas.resize(fid + 1);
+        // WS5-B2 (D2b): build into the LambdaTable's heap-owning STAGING form
+        // (`LambdaBuild`).  `compile()` calls `unit.lambdas.finalize()` after
+        // emitAll to pack all staging entries into the flat, borrowable block.
+        // `lb` is stable for this emitFunction call (only this fid is built
+        // here; other fids resize build_ in their own calls).
+        LambdaBuild & lb = unit.lambdas.buildAt(fid);
         if (unit.lambdaCodeOffsets.size() <= fid) unit.lambdaCodeOffsets.resize(fid + 1);
-        unit.lambdas[fid] = LambdaDescriptor{
-            .codeOffset     = codeStart,
-            .prologueOffset = codeStart,
-            .nUpvalues      = static_cast<uint16_t>(f.freeVars.size()),
-            .nLocals        = fc.nLocals,
-            .arity          = static_cast<uint8_t>((f.argName != ir::kInvalidSymbol ? 1 : (f.hasFormals ? 1 : 0)) + f.extraParams.size()),
-            .hasFormals     = static_cast<uint8_t>(f.hasFormals ? 1 : 0),
-            .ellipsis       = static_cast<uint8_t>(f.ellipsis ? 1 : 0),
-            // #530 lexical-with chain — mirror the count from
-            // ir::Function (populated by the lowerer).  Runtime uses
-            // this to consume the with-target block before the
-            // upvalue block at OP_MAKE_CLOSURE / OP_MAKE_THUNK.
-            .nWithTargets   = f.nWithTargets,
-            .formals        = {},
-            .name           = f.name,
-            .contextualName = f.contextualName,
-            .posHandle      = f.posHandle,
-            // #495: native-intrinsic kind (0=None, 1=Fix, 2=Extends, ...)
-            // -- when set, OP_CALL on a closure with this descriptor
-            // dispatches to a v3-native impl that evaluates the entire
-            // fix-point machinery without TW round-trips.  Carried
-            // through from ir::Function which lower.cc structurally-
-            // matched at lower-time.  (Ordered before .astLambda to
-            // match LambdaDescriptor's field declaration order --
-            // designated-initializer requirement under -Wreorder-init-list.)
-            .intrinsicKind  = static_cast<LambdaDescriptor::Intrinsic>(f.intrinsicKind),
-            // STG-13b (#509/#511): upvalue indices for ExtendsBody /
-            // ComposeBody native dispatch -- populated below after the
-            // designated initializer (depend on freeVars search).
-            .intrinsicVar0  = -1,
-            .intrinsicVar1  = -1,
-            .intrinsicVar2  = -1,
-            // #493: original ExprLambda* (or nullptr for synthesised
-            // thunks).  Used by v3ToTreeWalker to construct TW Tag::tLambda
-            // when bridging a formals closure back -- preserves
-            // autoCallFunction's formals introspection through the bridge.
-            // Disk-cache-loaded descriptors get nullptr (AST is gone after
-            // lowering); the bridge falls back to refusal in that case.
-            .astLambda      = f.astLambda,
-        };
+        lb.codeOffset     = codeStart;
+        lb.prologueOffset = codeStart;
+        lb.nUpvalues      = static_cast<uint16_t>(f.freeVars.size());
+        lb.nLocals        = fc.nLocals;
+        lb.arity          = static_cast<uint8_t>((f.argName != ir::kInvalidSymbol ? 1 : (f.hasFormals ? 1 : 0)) + f.extraParams.size());
+        lb.hasFormals     = static_cast<uint8_t>(f.hasFormals ? 1 : 0);
+        lb.ellipsis       = static_cast<uint8_t>(f.ellipsis ? 1 : 0);
+        // #530 lexical-with chain — mirror the count from ir::Function
+        // (populated by the lowerer).  Runtime uses this to consume the
+        // with-target block before the upvalue block at OP_MAKE_CLOSURE /
+        // OP_MAKE_THUNK.
+        lb.nWithTargets   = f.nWithTargets;
+        lb.name           = f.name;
+        lb.contextualName = f.contextualName;
+        lb.posHandle      = f.posHandle;
+        // #495: native-intrinsic kind (0=None, 1=Fix, 2=Extends, ...) -- when
+        // set, OP_CALL on a closure with this descriptor dispatches to a
+        // v3-native impl.  Carried through from ir::Function which lower.cc
+        // structurally-matched at lower-time.  (WS5-B2: the retired
+        // `astLambda` field is no longer copied — it has no readers.)
+        lb.intrinsicKind  = static_cast<LambdaDescriptor::Intrinsic>(f.intrinsicKind);
+        // STG-13b (#509/#511): upvalue indices for ExtendsBody / ComposeBody
+        // native dispatch -- populated below (depend on freeVars search).
+        lb.intrinsicVar0  = -1;
+        lb.intrinsicVar1  = -1;
+        lb.intrinsicVar2  = -1;
         // P2.1 step-0 measure (2026-07-02, TEMPORARY): carry the formal-
-        // wrapper tag from ir::Function into the descriptor (set post-init
-        // like identityLambda below to avoid the -Wreorder-init-list order).
-        unit.lambdas[fid].isFormalWrapper = f.isFormalWrapper;
+        // wrapper tag from ir::Function into the descriptor.
+        lb.isFormalWrapper = f.isFormalWrapper;
         // P2.3 step-0 measure (2026-07-02, TEMPORARY): same for the §4.3 classes.
-        unit.lambdas[fid].isOrDefault = f.isOrDefault;
-        unit.lambdas[fid].isInheritWrapper = f.isInheritWrapper;
+        lb.isOrDefault = f.isOrDefault;
+        lb.isInheritWrapper = f.isInheritWrapper;
         // STG-13b (#509/#511): for ExtendsBody / ComposeBody dispatch,
         // find the upvalue index of each captured VarId by searching
         // freeVars.  Linear search is fine -- freeVars typically has 2
@@ -2520,7 +2510,7 @@ struct Emitter
                     if (f.freeVars[i] == v) return static_cast<int8_t>(i);
                 return -1;
             };
-            auto & desc = unit.lambdas[fid];
+            auto & desc = lb;
             desc.intrinsicVar0 = findIdx(f.intrinsicVar0);
             desc.intrinsicVar1 = findIdx(f.intrinsicVar1);
             desc.intrinsicVar2 = findIdx(f.intrinsicVar2);
@@ -2548,7 +2538,7 @@ struct Emitter
             }
         }
         if (f.hasFormals) {
-            auto & desc = unit.lambdas[fid];
+            auto & desc = lb;
             desc.formals.reserve(f.formals.size());
             for (auto & fm : f.formals)
                 desc.formals.push_back({fm.name, fm.hasDefault, fm.pos});
@@ -2612,7 +2602,7 @@ struct Emitter
                 // SymbolId 0 is kInvalidSymbol -- never a real attr
                 // name, so reserved as the "not a selector" sentinel.
                 if (sym != 0)
-                    unit.lambdas[fid].selectorSym = sym;
+                    lb.selectorSym = sym;
             }
         }
 
@@ -2638,7 +2628,7 @@ struct Emitter
                 && decodeOperand(i0) == 0
                 && decodeOp(i1) == OP_RETURN)
             {
-                unit.lambdas[fid].identityLambda = true;
+                lb.identityLambda = true;
             }
         }
 
@@ -2664,7 +2654,7 @@ struct Emitter
         {
             const Instruction i0 = unit.code[codeStart];
             if (decodeOp(i0) == OP_R_RETURN && decodeOperand(i0) == 0)
-                unit.lambdas[fid].identityLambda = true;
+                lb.identityLambda = true;
         }
 
         // mapAttrs identity-value callback detection.  The common
@@ -2685,7 +2675,7 @@ struct Emitter
                 && decodeOperand(i0) == 1
                 && decodeOp(i1) == OP_RETURN)
             {
-                unit.lambdas[fid].secondArgIdentityLambda = true;
+                lb.secondArgIdentityLambda = true;
             }
         }
         if (fid != 0
@@ -2697,7 +2687,7 @@ struct Emitter
         {
             const Instruction i0 = unit.code[codeStart];
             if (decodeOp(i0) == OP_R_RETURN && decodeOperand(i0) == 1)
-                unit.lambdas[fid].secondArgIdentityLambda = true;
+                lb.secondArgIdentityLambda = true;
         }
 
         unit.lambdaCodeOffsets[fid] = codeStart;
@@ -2737,6 +2727,10 @@ CompilationUnit compile(const ir::Module & m)
 {
     Emitter e(m);
     e.emitAll();
+    // WS5-B2 (D2b): pack the per-function LambdaBuild staging into the flat,
+    // borrowable descriptor block.  Must run before any read of e.unit.lambdas
+    // (the disasm dump below + serialize + the VM).
+    e.unit.lambdas.finalize();
 
     // Observability: full-CU bytecode disassembly dump for STATIC opcode /
     // n-gram analysis (consumed by `bench/analyze-bytecode.py`).  Gated by
