@@ -82,8 +82,10 @@ WS-2's default-on end-of-eval IFD summary + per-realise line goes to each worker
 
 ### 3.1 The nix build (flake inputs)
 
-**Option A — backport onto 2.34 (recommended shadow vehicle, lowest blast radius).**
-Create `input-output-hk/nix#angerman/2.34-v3` = the v3 subsystem rebased onto the same 2.34.6 base the infra already ships. Then:
+**Option A — backport onto 2.34 (recommended shadow vehicle, lowest blast radius). BUILT + VERIFIED 2026-07-17 → GO.**
+Branch `angerman/2.34-v3` (committed `36bcbda12`, not pushed) = the v3 subsystem rebased onto the `angerman/2.34-ifd-profiling` (2.34.6) base. Gates on aarch64-darwin: `v3-eval` + `nix` + all 187 targets build OK; `all-v3-tests.sh --brute` **41/41 GREEN**; byte-id `hello.drvPath` v3-direct == TW == golden. **The feared 2.34↔2.35 Value/EvalState/forceValue signature problem did not materialize** — v3 touches TW only at FFI leaves (store/paths/realisePath/SourcePath/derivation/flake), which are identical across 2.34.6↔2.35.0, so `libnixexprv3` compiled against 2.34 headers with only `-Wunused`. The one real delta was cosmetic (`using namespace nix;` at file scope on 2.34 vs `namespace nix { … }` on 2.35 in `eval.cc`). Full conflict map + reproduce steps: `lode/BACKPORT_2_34_2026-07-17.md` (on the `angerman/2.34-v3` branch). **Two operational flags:** (1) the CI artifact MUST be built optimized — a `-O0` debug build ~2×'d eval wall-time and timed out the `iterative-force` brute suite; `debugoptimized`/`-O2` → 41/41 (the nixpkgs-packaged `nix` builds optimized, so this bites only local dev builds). (2) **x86_64-linux — the real Hydra target — is not yet validated on this branch** (backport was built on darwin); it inherits the pre-existing v3 Linux bring-up debt (the rebase introduced none, since the hook deltas are API-clean), so greening Linux CI ≈ the already-scoped v3 Linux bring-up, not the 2.34 rebase.
+
+To wire into the infra:
 
 ```nix
 # ops/flake.nix
