@@ -1841,11 +1841,6 @@ void primAny(EvalState & state, Value * args, Value & out)
 
 void primGetEnv(EvalState & state, Value * args, Value & out)
 {
-    // Top-level cache taint: getEnv reads the ambient environment, which is
-    // NOT in the cache key.  Under pureEval it returns "" (deterministic), but
-    // conservatively taint always — the shadow's getEnv-mismatch probe proved
-    // an untainted getEnv serves a stale result across processes.
-    topLevelTaintBump(TAINT_GETENV);   // perturbable
     if (!args[0].isString()) typeError("getEnv", "string");
     // #674: TW's prim_getEnv uses forceStringNoCtx; mirror it so
     // contexted strings can't be used as env-var names (would mask
@@ -3135,10 +3130,6 @@ void primNixPath(EvalState & state, Value *, Value & out)
 /// SourcePath.  Throws if no entry matches.
 void primFindFile(EvalState & state, Value * args, Value & out)
 {
-    // A5-fix (taint-mask completion): resolves a path against the ambient
-    // LookupPath / NIX_PATH search state — was un-tainted (cross-process stale
-    // hole).
-    topLevelTaintBump(TAINT_READFILE);
     if (!state.nixEvalState)
         throw std::runtime_error("v3 primop findFile: no nix EvalState wired");
     if (!args[0].isList()) typeError("findFile", "list of {path, prefix}");
@@ -3400,8 +3391,6 @@ void primDirOf(EvalState &, Value * args, Value & out)
 
 void primPathExists(EvalState & state, Value * args, Value & out)
 {
-    topLevelTaintBump(TAINT_READFILE);  // A1: reads ambient filesystem state (not in the key)
-                                        // any exit that does not resolve → poison)
     std::string s;
     if (args[0].isString()) {
         // #741 Phase 4 measurement: path with non-empty context →
@@ -3836,7 +3825,6 @@ void primHashString(EvalState & state, Value * args, Value & out)
 
 void primHashFile(EvalState & state, Value * args, Value & out)
 {
-    topLevelTaintBump(TAINT_READFILE);  // A1: reads ambient file content (not in the key)
     // #693 — match TW's forceStringNoCtx-style phrasings.
     if (!args[0].isString())
         throw std::runtime_error(expectedTypeButFound("a string", args[0]));
@@ -3941,7 +3929,6 @@ void primCurrentSystem(EvalState & state, Value *, Value & out)
 
 void primCurrentTime(EvalState &, Value *, Value & out)
 {
-    topLevelTaintBump(TAINT_CURRENTTIME);  // wall clock — not in the top-level cache key
     // A1 perturbation hook: NIX_V3_FAKE_CURRENTTIME=<int> forces a fixed value so
     // the empirical-corpus harness can perturb the clock and detect whether it
     // reaches the serialized result (a result byte-stable across two fake clocks
@@ -3999,7 +3986,6 @@ void primStoreDir(EvalState & state, Value *, Value & out)
 /// and rejects NUL bytes in the file content.
 void primReadFile(EvalState & state, Value * args, Value & out)
 {
-    topLevelTaintBump(TAINT_READFILE);  // A1: reads ambient file content (not in the key)
     std::string path;
     bool hadCtx = false;  // WS-2 V2: context-bearing read → potential IFD build
     if (args[0].isString()) {
@@ -4046,8 +4032,7 @@ void primReadFile(EvalState & state, Value * args, Value & out)
         std::stringstream ss;
         ss << f.rdbuf();
         content = ss.str();
-        // No TW EvalState (v3-eval standalone): no store to hash against, so the
-        // pending read is left UNRESOLVED → poison at frame pop (fail closed).
+        // No TW EvalState (v3-eval standalone): no store to hash against.
         // (The IFD disk cache never fires without a TW store anyway.)
     }
 
@@ -4089,7 +4074,6 @@ void primReadFile(EvalState & state, Value * args, Value & out)
 /// builtins.readDir path -> attrset of name -> "regular"|"directory"|"symlink"|"unknown".
 void primReadDir(EvalState & state, Value * args, Value & out)
 {
-    topLevelTaintBump(TAINT_READFILE);  // A1: reads ambient directory listing (not in the key)
     std::string path;
     if (args[0].isString()) {
         // #793 (2026-05-24): mirror TW's prim_readDir (libexpr/primops.cc:2542),
@@ -4278,7 +4262,6 @@ void primGroupBy(EvalState & state, Value * args, Value & out)
 
 void primReadFileType(EvalState & state, Value * args, Value & out)
 {
-    topLevelTaintBump(TAINT_READFILE);  // A1: reads ambient filesystem state (not in the key)
     if (!(args[0].isString() || args[0].isPath()))
         typeError("readFileType", "string or path");
     // WS-1 C2: match TW's prim_readFileType (libexpr/primops.cc:2526) —
@@ -6588,15 +6571,6 @@ void appliedCacheNoteTryKeyException() noexcept
     appliedCache().keyExceptionBail++;
 }
 
-// Top-level result cache impurity taint (TOPLEVEL_RESULT_CACHE_2026-07-05).
-// Thread-local per-eval flag; accessors so impure primops (this TU) bump it and
-// run.cc's top-level cache reads it.  Reset at the outermost eval entry.
-namespace { thread_local uint32_t g_topLevelTaintMask = 0; }
-void     topLevelTaintBump(uint32_t axis) noexcept { g_topLevelTaintMask |= axis; }
-void     topLevelTaintReset() noexcept             { g_topLevelTaintMask = 0; }
-bool     topLevelTainted() noexcept                { return g_topLevelTaintMask != 0; }
-uint32_t topLevelTaintMask() noexcept              { return g_topLevelTaintMask; }
-
 /// Non-mutating lookup for SHADOW compare: no LRU bump, no hit/miss stats
 /// (the shadow HIT was already counted by the arming lookup).
 bool appliedCacheLookupPeek(const std::string & key, Value & out) noexcept
@@ -6777,9 +6751,6 @@ namespace {  // reopen: restore file-local linkage for the helpers below
 /// set (the host EvalState providing parser + symbol table).
 void primImport(EvalState & state, Value * args, Value & out)
 {
-    // A5-fix (taint-mask completion): reads+parses an arbitrary .nix file (incl.
-    // IFD via realisePath) — was un-tainted (cross-process stale hole).
-    topLevelTaintBump(TAINT_READFILE);
     if (!state.nixEvalState)
         throw std::runtime_error("v3 primop import: no nix EvalState wired (run via v3-eval)");
 
@@ -8473,11 +8444,6 @@ static void primPathFilteredNative(EvalState & state, Value * args, Value & out)
 /// VM on every fs entry — left to a follow-up).
 void primPath(EvalState & state, Value * args, Value & out)
 {
-    // A5-fix (taint-mask completion): reads a filesystem path into the store —
-    // was un-tainted (cross-process stale hole).
-    topLevelTaintBump(TAINT_READFILE);
-        // copies to store; a resolved store-path narHash is not cheaply available
-        // here, so an in-fragment use leaves this pending → poison at pop (fail closed).
     if (!args[0].isAttrs() || !args[0].asAttrs())
         typeError("path", "attrset");
     // V3-NATIVE builtins.path (TW_VALUE_ERADICATION F3/F4): primPathNative /
@@ -8547,12 +8513,6 @@ void primPath(EvalState & state, Value * args, Value & out)
 // see primPath).
 static void primPathNative(EvalState & state, Value * args, Value & out)
 {
-    // A5-fix (taint-mask completion): reads a filesystem path into the store —
-    // was un-tainted (cross-process stale hole).  (Idempotent with primPath's
-    // bump — this is the only caller, but bumping here guards any future
-    // direct call site too.)
-    topLevelTaintBump(TAINT_READFILE);
-        // tree + copies to store; no cheap resolved narHash → in-fragment use → poison.
     auto & ns = *state.nixEvalState;
     auto * src = args[0].asAttrs();
 
@@ -8624,11 +8584,6 @@ static void primPathNative(EvalState & state, Value * args, Value & out)
 // 20034-dispatch builtins.path bridge feeder on cardano-node.
 static void primPathFilteredNative(EvalState & state, Value * args, Value & out)
 {
-    // A5-fix (taint-mask completion): reads a filesystem tree (with filter) into
-    // the store — was un-tainted (cross-process stale hole).  (Idempotent with
-    // primPath's bump — this is the only caller.)
-    topLevelTaintBump(TAINT_READFILE);
-        // tree + copies to store; no cheap resolved narHash → in-fragment use → poison.
     auto & ns = *state.nixEvalState;
     auto * src = args[0].asAttrs();
 
@@ -8720,10 +8675,6 @@ static void primPathFilteredNative(EvalState & state, Value * args, Value & out)
 /// closure is then applied to the scope value.
 void primScopedImport(EvalState & state, Value * args, Value & out)
 {
-    // A5-fix (taint-mask completion): reads+parses an arbitrary .nix file — was
-    // un-tainted (cross-process stale hole).
-    topLevelTaintBump(TAINT_READFILE);
-                                        // (resolved below)
     if (!state.nixEvalState)
         throw std::runtime_error("v3 primop scopedImport: no nix EvalState wired");
     Value scope = forceValue(*state.vm, args[0]);
@@ -9713,7 +9664,6 @@ void primBreak(EvalState &, Value * args, Value & out)
 /// (prim_storePath).  Requires tree-walker store (state.nixEvalState).
 void primStorePath(EvalState & state, Value * args, Value & out)
 {
-    topLevelTaintBump(TAINT_STORE);  // A1: reads ambient store state (not in the key)
     if (!state.nixEvalState)
         throw std::runtime_error("v3 storePath: no tree-walker state available");
     auto * ns = state.nixEvalState;
@@ -9957,10 +9907,6 @@ static void v3FetchTree(EvalState & s, Value * a, Value & o,
                         bool allowNameArgument, bool emptyRevFallback,
                         bool isFinal = false)
 {
-    // A5-fix (taint-mask completion): fetchTree/fetchGit/fetchFinalTree touch
-    // network/mutable inputs not in the key — was un-tainted (cross-process
-    // stale hole).  Mirrors the v3Fetch sibling which already bumps FETCH.
-    topLevelTaintBump(TAINT_FETCH);
     if (!s.nixEvalState)
         throw std::runtime_error(std::string("v3 ") + fetcher + ": no tree-walker state available");
     auto & ns = *s.nixEvalState;
@@ -9990,8 +9936,6 @@ static std::string v3ForceStringNoCtx(EvalState & state, const Value & vIn, cons
 static void v3Fetch(EvalState & s, Value * a, Value & o,
                     const char * who, bool unpack, const char * defaultName)
 {
-    topLevelTaintBump(TAINT_FETCH);  // A1: fetch touches network/mutable inputs not in the
-                          // cache key → taint (policy P recovers pinned-stable ones)
     if (!s.nixEvalState)
         throw std::runtime_error(std::string("v3 ") + who + ": no tree-walker state available");
     auto & ns = *s.nixEvalState;
@@ -10056,9 +10000,6 @@ void primFetchGit    (EvalState & s, Value * a, Value & o) {
 // Note: fetchMercurial's result shape ≠ emitTreeAttrs (branch + 12-char
 // shortRev, no narHash/lastModified), so it has its own builder.
 void primFetchMercurial(EvalState & s, Value * a, Value & o) {
-    // A5-fix (taint-mask completion): fetches a mercurial repo (network/mutable
-    // input not in the key) — was un-tainted (cross-process stale hole).
-    topLevelTaintBump(TAINT_FETCH);
     if (!s.nixEvalState)
         throw std::runtime_error("v3 fetchMercurial: no tree-walker state available");
     auto & ns = *s.nixEvalState;
@@ -10126,7 +10067,6 @@ void primFetchMercurial(EvalState & s, Value * a, Value & o) {
 // ffi::fetchClosure (openStore + copyClosure/makeContentAddressed dispatch),
 // build the result store-path string v3-native with Opaque context.
 void primFetchClosure(EvalState & s, Value * a, Value & o) {
-    topLevelTaintBump(TAINT_FETCH);  // A1: fetches store content not in the key → taint
     if (!s.nixEvalState)
         throw std::runtime_error("v3 fetchClosure: no tree-walker state available");
     auto & ns = *s.nixEvalState;
@@ -10181,10 +10121,6 @@ void primFetchClosure(EvalState & s, Value * a, Value & o) {
 // bridge: the filter stays a v3 closure; ffi::addPathFiltered drives the
 // libstore copy + calls back via the v3filter lambda below.
 void primFilterSource(EvalState & s, Value * a, Value & o) {
-    // A5-fix (taint-mask completion): reads a filesystem tree into the store —
-    // was un-tainted (cross-process stale hole).
-    topLevelTaintBump(TAINT_READFILE);
-        // the store; no cheap resolved narHash here → in-fragment use → poison (fail closed).
     if (!s.nixEvalState)
         throw std::runtime_error("v3 filterSource: no tree-walker state available");
     auto & ns = *s.nixEvalState;
@@ -10242,14 +10178,6 @@ void primFilterSource(EvalState & s, Value * a, Value & o) {
 Value callFlakeV3(EvalState & state, const ffi::LockedFlakeInfo & flakeInfo);
 
 void primGetFlake(EvalState & s, Value * a, Value & o) {
-    topLevelTaintBump(TAINT_GETFLAKE);  // A3: getFlake's own axis — the top-level
-                          // cache DEMOTES it from reject IFF the flake.lock text
-                          // was resolved into the key body (run.cc computeTopLevel-
-                          // KeyInputs); a non-statically-extractable getFlake stays
-                          // a reject bit.  (A3 resolved-pin key recovers locked
-                          // flakes; fetch*/fetchClosure/storePath stay TAINT_FETCH/
-                          // TAINT_STORE = hard-reject, never demoted.)
-                                        // resolved below)
     // History:
     //   - 88199c4a0 / 511074ff6: first default-on attempt — REVERTED
     //     by 6cb4ecdb7 (over-forcing on haskell.nix flakes).

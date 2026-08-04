@@ -128,45 +128,11 @@ void appliedCacheNoteTryKey(bool hashable) noexcept;
 /// drift).  Expected 0; regression-tested.
 void appliedCacheNoteTryKeyException() noexcept;
 
-/// Top-level result cache (TOPLEVEL_RESULT_CACHE_2026-07-05) impurity taint.
-/// An eval whose result is NOT a pure function of the cache key
-/// (source ‖ NIX_PATH ‖ currentSystem ‖ schema) must NOT be persisted.
-/// Impure primops (getEnv, currentTime, non-store FS reads, …) bump the taint;
-/// the top-level shadow/active cache checks it before insert/reuse.  Per-eval
-/// (reset at the outermost runRootExprFromString entry).  The shadow's
-/// getEnv-mismatch probe (2026-07-05) proved this is required for soundness.
-/// A1 (2026-07-06): per-AXIS taint bitmask (was a single bool). Policy needs to
-/// know WHICH impurity fired: {getEnv,currentTime} are PERTURBABLE (recoverable
-/// via the offline clock/env-stability manifest); readFile/fetch/store are NOT
-/// perturbable in-process → must hard-reject. A single bool could not
-/// distinguish these → served a wrong drvPath (see the review verdict in
-/// lode/TOPLEVEL_TAINT_DESIGN_2026-07-06.md).
-enum TaintAxis : uint32_t {
-    TAINT_GETENV      = 1u << 0,  // perturbable (getEnv sentinel)
-    TAINT_CURRENTTIME = 1u << 1,  // perturbable (fake clock)
-    TAINT_READFILE    = 1u << 2,  // NOT perturbable: readFile/readDir/pathExists/readFileType/hashFile
-    TAINT_FETCH       = 1u << 3,  // NOT perturbable: fetch*/fetchClosure/fetchGit/fetchTarball
-    TAINT_STORE       = 1u << 4,  // NOT perturbable: storePath
-    // A3 (2026-07-06): getFlake is its own axis so the top-level cache can
-    // KEY-then-DEMOTE it (fetch* stay hard-reject).  A getFlake ref is always a
-    // literal string in the source (the cache fires only for --expr/--file), so
-    // its exact flake.lock text can be pre-eval resolved into the key body; then
-    // GETFLAKE taint is cleared from the reject-set (a lock change → different
-    // key → MISS-not-stale).  NOT perturbable, NOT demoted unless keyed — see the
-    // "demote IFF keyed" invariant at the run.cc Q4 gate.
-    TAINT_GETFLAKE    = 1u << 5,  // NOT perturbable: getFlake (demotable IFF the flake.lock is in the key)
-    TAINT_PERTURBABLE = TAINT_GETENV | TAINT_CURRENTTIME,
-};
-void     topLevelTaintBump(uint32_t axis) noexcept;  // an impure primop ran (set its axis bit)
-void     topLevelTaintReset() noexcept;              // outermost eval entry
-bool     topLevelTainted() noexcept;                 // any axis set (reject-all-tainted today)
-uint32_t topLevelTaintMask() noexcept;               // which axes fired (for the reject-set + manifest)
-
-/// A1 (top-level cache key hardening, R4): the codegen/optimizer env-gate
-/// fingerprint (EMPTY in production; non-empty iff a NIX_V3_* codegen gate is
-/// set) — must be folded into the top-level cache key so a differently-compiled
-/// binary never serves a differently-compiled result.  Defined in primops.cc
-/// (kGates list there; test/lint-cache-coherence.sh keeps it in sync).
+/// T-1 (CODEBASE_REVIEW_2026-06-11): the codegen/optimizer env-gate fingerprint
+/// (EMPTY in production; non-empty iff a NIX_V3_* codegen gate is set) — folded
+/// into the CU disk-cache key + the applied-import cache key so a differently-
+/// compiled binary never serves a differently-compiled result.  Defined in
+/// primops.cc (kGates list there; test/lint-cache-coherence.sh keeps it in sync).
 const std::string & codegenGateFingerprint();
 
 /// SHADOW mode (#16a) support: non-mutating entry peek + compare accounting.

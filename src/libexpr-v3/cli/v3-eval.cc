@@ -501,8 +501,7 @@ int main(int argc, char ** argv)
         // the import + applied-import caches (process-lifetime statics, never
         // cleared here) persist and eval #2..N hit them.
         //
-        // Between-evals reset (the correctness core): runRootExprFromString
-        // calls topLevelTaintReset() itself right before run(); we re-arm the
+        // Between-evals reset (the correctness core): we re-arm the
         // resource-limit deadline per request (initLimits); and each request's
         // VMState fully unwinds before the next (tlActiveVMStack is empty at
         // the top level).  The caches deliberately STAY — that is the point.
