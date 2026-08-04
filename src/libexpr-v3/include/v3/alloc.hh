@@ -603,53 +603,6 @@ struct AllocStats
     /// driving where to focus VM-level optimisation work.
     uint64_t opcodeCounts[256] = {};
 
-    /// REG-VM MEASUREMENT (2026-06-29): dynamically-weighted histogram of per-
-    /// instruction frame occupancy = valueStack.size() − frame.stackBaseOffset =
-    /// (live locals + live temporaries) = the register-window pressure a Lua-style
-    /// REGISTER VM would need.  Bucket i = #executed instructions at occupancy i
-    /// (clamped to 63).  From it: for a register file of K, the fraction of dynamic
-    /// instructions with occupancy ≤ K run WITHOUT spill — i.e. the ceiling on how
-    /// much of the GET/SET/PUSH stack traffic a K-register VM collapses into operands.
-    /// Gated by NIX_VM_OPCOUNTS=1 (the existing analysis mode; one subtract + array
-    /// bump per dispatch, only under the gate). Retire when the register-VM go/no-go
-    /// is decided (the #780 question this answers).
-    uint64_t regPressureHist[64] = {};
-
-    /// REG-VM MEASUREMENT companion: split the histogram by whether the current op is
-    /// a "collapsible" pure data-move (GET_LOCAL/GET_LOCAL2/GET_UPVALUE/SET_LOCAL/
-    /// SET_LOCAL_KEEP/GET_UPVALUE_REC_BINDING_SLOT) — these are the ops a register VM
-    /// folds into operands.  collapsibleAtDepth[i] = #collapsible ops at occupancy i.
-    /// Lets the dump compute the NET op reduction at register count K (collapse the
-    /// data-moves whose body fits in K; the rest stay).  Same gate.
-    uint64_t regCollapsibleHist[64] = {};
-
-    /// #782 (2026-05-23) bigram (prev_op, current_op) counts.  Gated
-    /// by NIX_VM_OPCOUNTS=1 with NIX_VM_BIGRAMS=1 to add the second
-    /// counter increment (~1 ns extra dispatch when both are on).
-    /// 256×256 × 8 B = 524 KB of zero-init memory; acceptable for
-    /// diagnostic-only.  Reports top-N bigrams to identify
-    /// super-instruction candidates before committing to #780
-    /// register-VM rewrite.
-    uint64_t bigramCounts[256][256] = {};
-
-    /// Step-1 (2026-06-04, BYTECODE_NGRAM_ANALYSIS §7) trigram
-    /// (prevPrev, prev, curr) counts.  Gated by NIX_VM_OPCOUNTS=1 with
-    /// NIX_VM_TRIGRAMS=1.  A dense [256]³ array would be 256³×8 = 134 MB
-    /// of zero-init memory; instead use a SPARSE map keyed by the packed
-    /// 24-bit triple (pp<<16)|(p<<8)|c.  The distinct trigrams that
-    /// actually occur number in the low thousands, so the map stays
-    /// small; per-dispatch cost is one hash probe+increment UNDER THE
-    /// GATE ONLY (the default path is untouched).  This is the
-    /// execution-weighted confirmation of the STATIC n-gram candidates
-    /// (BYTECODE_NGRAM_ANALYSIS §4) — the Step-1 gate before any
-    /// super-instruction / register-VM work.
-    /// RETIREMENT: delete alongside bigramCounts when the #780
-    /// register-VM decision (BYTECODE_NGRAM_ANALYSIS §7 Step 3) is
-    /// reached — either the register-VM arc opens (the counter has
-    /// served its purpose) or the dispatch lever is falsified (Rule-0
-    /// doc written).  Until then it stays diagnostic-only, default-off.
-    std::unordered_map<uint32_t, uint64_t> trigramCounts;
-
     /// #786 (2026-05-23) per-opcode cycle accumulator.  Gated by
     /// NIX_VM_OPCYCLES=1.  Records total CPU time spent dispatched
     /// in each opcode's case body, divided by its count, to give
@@ -679,14 +632,6 @@ struct AllocStats
     uint64_t opReturnPostEvalNs  = 0;
     uint64_t opReturnThunkCalls  = 0;
     uint64_t opReturnCallCalls   = 0;
-
-    /// #783-measure (2026-05-23) refined bigram subcounters.  The
-    /// bigramCounts above are pair-of-opcode counts; for fusion
-    /// design we need to know what FRACTION are same-operand.
-    /// Currently tracking only the top-1 bigram (SET_LOCAL ->
-    /// GET_LOCAL) since that's the fusion candidate; if we widen
-    /// later, add more counters.
-    uint64_t bigramSetGetSameSlot = 0;
 
     /// Bindings allocation histogram by size.  Buckets:
     /// [0]=0, [1]=1, [2]=2, [3]=3-4, [4]=5-8, [5]=9-16, [6]=17-32,
