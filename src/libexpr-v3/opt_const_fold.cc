@@ -437,12 +437,15 @@ void optimise(Module & m)
     OPT_RUN(constantFold(m));
     OPT_RUN(inlineTrivialBindings(m));
 
-    // 2026-05-18 IR Phase C: stream fusion.  Recognises
-    // `foldl'(op, init, map(f, xs))` and rewrites to a single
-    // __foldlMap PrimOpCall.  Runs AFTER Phase B so any Phase-B
-    // folding of `map` (none today, but future) doesn't break the
-    // pattern match.
-    OPT_RUN(streamFusion(m));
+    // 2026-08-04: the IR Phase-C stream-fusion pass (opt_stream_fusion.cc,
+    // `foldl'(op,init,map(f,xs))` → `__foldlMap`) was RETIRED.  It was
+    // FALSIFIED as a perf lever (measured 2026-06-05: NEUTRAL-to-regressing —
+    // the intermediate-eliminating rewrite costs more than the cheap C-built
+    // genList spine) and had been default-OFF (opt-in `NIX_V3_STREAM_FUSION`)
+    // ever since, so it was a dead 802-line no-op in every real eval.  The
+    // falsified-candidate registry it documented lives in git history.  The
+    // `__foldlMap` primop it targeted is now unproduced by any pass (a
+    // registered orphan; retire with the bytecode-primop cleanup).
 
     // RETAINED DIAGNOSTIC (detection-only, no rewrite): count the
     // `foldl' (acc: x: acc ++ G) [] xs` O(n²) accumulation idiom.  Gated

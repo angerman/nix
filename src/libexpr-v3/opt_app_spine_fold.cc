@@ -551,7 +551,7 @@ size_t deThunkForcedStrictArgs(Module & m)
                 // (to keep SSA unique).  The body references its captured outer
                 // vars DIRECTLY (v3's lowerer doesn't rebind upvalues), and
                 // those vars are in scope wherever this use-once thunk sits —
-                // so they are left untouched (mirrors streamFusion's hoist).
+                // so they are left untouched.
                 std::unordered_map<VarId, VarId> sub;
                 for (const auto & bb : body.bindings)
                     sub[bb.var] = m.freshVar();

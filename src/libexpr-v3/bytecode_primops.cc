@@ -366,8 +366,10 @@ void installAllBytecodePrimops(nix::EvalState & state)
         // pass — no intermediate list allocation, no per-element
         // C-recursion via callClosure.  Body mirrors the foldl'
         // bytecode above but inlines the `f` application per element.
-        // The opt_stream_fusion pass rewrites detected foldl'+map
-        // patterns to PrimOpCall(__foldlMap, [op, nul, f, xs]).
+        // ORPHAN (2026-08-04): the stream-fusion pass that produced
+        // PrimOpCall(__foldlMap, …) was retired (FALSIFIED 2026-06-05), so
+        // nothing emits __foldlMap now; this opt-in install is dead pending
+        // the bytecode-primop cleanup.
         if (std::getenv("NIX_V3_BC_FOLDLMAP"))  // default-off: loses to C++ (bc-vs-cpp); opt-in
             installBytecodePrimop(state, "__foldlMap",
                 "op: nul: f: list: "

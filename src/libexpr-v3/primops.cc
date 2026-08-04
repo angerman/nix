@@ -1766,12 +1766,11 @@ void primFoldl(EvalState & state, Value * args, Value & out)
 ///     __foldlMap op init f xs
 ///       = foldl' (acc: x: op acc (f x)) init xs
 ///
-/// Recognised by opt_stream_fusion.cc, which rewrites the
-/// `foldl'(op, init, PrimOpCall(map, [f, xs]))` IR pattern to
-/// `PrimOpCall(__foldlMap, [op, init, f, xs])`.  The fused primop
-/// eliminates the intermediate map result list (saving N
-/// ValuePair allocations for N-element lists) and avoids one
-/// traversal (map walks then foldl' walks — fused walks once).
+/// ORPHAN (2026-08-04): this was the rewrite target of the stream-fusion
+/// pass (retired — FALSIFIED as a perf lever 2026-06-05), which rewrote
+/// `foldl'(op, init, map(f, xs))` to `__foldlMap(op, init, f, xs)`.  No pass
+/// produces `__foldlMap` any more; the primop stays registered (a hidden,
+/// TW-less v3-only builtin) pending the bytecode-primop cleanup.
 ///
 /// All four args are STRICT (no lazy-arg bitmask).  The bytecode
 /// wrapper in bytecode_primops.cc may override this with an
@@ -7285,7 +7284,7 @@ const std::string & codegenGateFingerprint()
             "NIX_V3_OCCUR_DCE", "NIX_V3_OCCUR_DCE_VALIDATE",
             "NIX_V3_OPT_PHASE_LIMIT", "NIX_V3_RAW_FORMALS",
             "NIX_V3_SKIP_FORCE_LINES",
-            "NIX_V3_STAGE4_ALL_MODULES", "NIX_V3_STREAM_FUSION",
+            "NIX_V3_STAGE4_ALL_MODULES",
         };
         std::string s;
         for (const char * g : kGates) {

@@ -947,15 +947,10 @@ size_t betaReduce(Module & m);
 /// PrimOpCall bindings folded.
 size_t primOpFold(Module & m);
 
-/// IR Phase C (2026-05-18): stream fusion.  Recognises
-/// `foldl'(op, init, map(f, xs))` IR patterns and rewrites to
-/// `__foldlMap(op, init, f, xs)` — a single-pass FFI leaf primop.
-/// Eliminates the intermediate map result list + N callClosure
-/// invocations + one list traversal.  Use-once safety check on the
-/// map's result VarId prevents work duplication.
-/// Gate: NIX_V3_NO_STREAM_FUSION=1 disables.  Returns the number of
-/// foldl' bindings rewritten.
-size_t streamFusion(Module & m);
+// streamFusion (IR Phase-C stream fusion, `foldl'∘map` → `__foldlMap`) was
+// RETIRED 2026-08-04 — FALSIFIED as a perf lever (2026-06-05), default-off
+// since, dead no-op removed.  See git history for the pass + its
+// falsified-candidate registry.
 
 /// Detection-only probe (measure-twice gate) for the
 /// `foldl' (acc: x: acc ++ G) [] xs` O(n²) accumulation idiom + the

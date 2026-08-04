@@ -48,9 +48,8 @@ namespace nix::v3::ir {
 
 namespace {
 
-/// Same-block VarRef chase — duplicated from opt_stream_fusion.cc
-/// (the helpers are tiny and per-pass local; consolidating into a
-/// shared header is a deferrable cleanup).
+/// Same-block VarRef chase — a tiny per-pass-local helper (a shared
+/// header for the handful of passes that use it is a deferrable cleanup).
 const Expr * chaseInBlock(VarId v,
                           const std::unordered_map<VarId, const Expr *> & defs)
 {
