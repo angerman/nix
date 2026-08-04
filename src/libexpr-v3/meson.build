@@ -90,6 +90,7 @@ lib_sources = files(
   'ir_dump.cc',
   'emit.cc',
   'vm.cc',
+  'vm_debug.cc',
   'primops.cc',
   'bytecode_primops.cc',
   'limits.cc',
