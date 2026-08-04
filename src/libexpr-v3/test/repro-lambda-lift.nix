@@ -8,7 +8,7 @@
 # Lambda IR node has empty freeVars AND empty lexicalWiths, every
 # OP_MAKE_CLOSURE produces a semantically identical Closure (same
 # desc, no upvalues, no captured withs).  Intern by descriptor in
-# vm.cc OP_MAKE_CLOSURE; gate NIX_V3_NO_LAMBDA_LIFT=1.
+# vm.cc OP_MAKE_CLOSURE (unconditional).
 #
 # Coverage:
 #   1. Plain capture-free lambda: f = x: x + 1.

@@ -2,8 +2,8 @@
 #
 # Positive: a map-produced lazy entry is forced twice; the second
 # force must return the SAME WHNF result without re-running the lambda
-# body.  Negative-mode (with NIX_V3_NO_APP_MEMO=1) must yield the same
-# VALUE — semantic parity holds with or without memoization.
+# body.  The memo only affects WHEN the lambda runs, not WHAT the value
+# is (it is now unconditional).
 #
 # Pre-fix (before commit d3e41c13d): hello.drvPath was forcing the
 # extendDerivation outputsList lambda 64k+ times because Tag::App
@@ -12,16 +12,11 @@
 # on first force; short-circuit on subsequent forces of the same App
 # pointer.
 #
-# Run (positive):
-#   NIX_V3_DIRECT_EVAL=1 NIX_V3_SKIP_INSTALLABLE_PREEVAL=1 \
+# Run:
+#   NIX_V3_DIRECT_EVAL=1 \
 #     nix eval --impure -f repro-app-memo-regression.nix
 #
-# Run (negative — opt-out gate):
-#   NIX_V3_NO_APP_MEMO=1 NIX_V3_DIRECT_EVAL=1 NIX_V3_SKIP_INSTALLABLE_PREEVAL=1 \
-#     nix eval --impure -f repro-app-memo-regression.nix
-#
-# Both runs must produce the same output (parity is the invariant);
-# the memo only affects WHEN we run the lambda, not WHAT the value is.
+# The memo only affects WHEN we run the lambda, not WHAT the value is.
 #
 # Expected output (both modes, TW and v3):
 #   42

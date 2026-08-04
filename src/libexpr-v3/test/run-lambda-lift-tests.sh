@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # Phase D lambda-lift regression driver.
 #
-# 1. Semantic parity: TW vs v3-direct (with Phase D ON and OFF)
-#    produce identical results on the 6-pattern fixture.
-# 2. Alloc-reduction guard: at N=100 capture-free lambda creations
-#    in a chain, Phase D ON produces NOTICEABLY fewer Closure
-#    allocations than Phase D OFF — confirms the singleton intern
-#    actually fires.  We use v3-smoke-style alloc dump comparison.
+# The capture-free lambda-lift singleton intern is now UNCONDITIONAL (the
+# NIX_V3_NO_LAMBDA_LIFT A/B opt-out was retired), so this driver checks:
+# 1. Semantic parity: TW vs v3-direct produce identical results on the
+#    6-pattern fixture.
+# 2. Alloc-reduction guard: at N=100 capture-free lambda creations in a
+#    chain, the singleton intern collapses them to a handful of Closure
+#    allocations (an ABSOLUTE bound well below the ~100 an un-lifted run
+#    would allocate) — confirms the intern actually fires.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
@@ -45,11 +47,9 @@ run_attr() {
 
 fail=0
 
-# Semantic parity across three modes: TW, v3-direct Phase D ON,
-# v3-direct Phase D OFF.
+# Semantic parity: TW vs v3-direct (lambda-lift unconditional).
 for mode in "TW:" \
-            "v3-D-ON:NIX_V3_DIRECT_EVAL=1" \
-            "v3-D-OFF:NIX_V3_DIRECT_EVAL=1 NIX_V3_NO_LAMBDA_LIFT=1"; do
+            "v3-D:NIX_V3_DIRECT_EVAL=1"; do
     label="${mode%%:*}"
     env_part="${mode##*:}"
 
@@ -67,13 +67,9 @@ done
 
 # Alloc-reduction guard: build a chain of 100 capture-free lambdas
 # (a factory that yields a fresh capture-free lambda per call), and
-# compare Closure alloc counts via V3_DBG_ALLOC_STATS.  Phase D ON
-# should produce noticeably fewer Closures than OFF.
-#
-# We use V3_DBG_ALLOC_DUMP=1 (already plumbed in vm.cc) to print the
-# "v3 alloc stats: closures=N thunks=M lists=L attrsets=A" line.
-# Each invocation of `mkConst null` creates the same descriptor's
-# inner lambda — Phase D interns 1 across all 100, OFF allocates 100.
+# assert the Closure alloc count stays well below 100.  The singleton
+# intern collapses all 100 identical descriptors to a handful; an
+# un-lifted run would allocate one Closure per call (~100).
 if env NIX_V3_DIRECT_EVAL=1 "$NIX" $NIX_FLAGS eval --impure \
        --expr "1+1" >/dev/null 2>&1; then
     # Use `(x: x + 1)` not `(x: x)` for the inner lambda.  The
@@ -96,25 +92,22 @@ if env NIX_V3_DIRECT_EVAL=1 "$NIX" $NIX_FLAGS eval --impure \
     on_closures=$(env NIX_V3_DIRECT_EVAL=1 NIX_VM_STATS=1 \
         "$NIX" $NIX_FLAGS eval --impure --expr "$expr" 2>&1 \
         | grep -oE 'closures=[0-9]+ ' | tail -1 | sed 's/closures=//')
-    off_closures=$(env NIX_V3_DIRECT_EVAL=1 NIX_V3_NO_LAMBDA_LIFT=1 \
-        NIX_VM_STATS=1 \
-        "$NIX" $NIX_FLAGS eval --impure --expr "$expr" 2>&1 \
-        | grep -oE 'closures=[0-9]+ ' | tail -1 | sed 's/closures=//')
 
-    if [ -z "$on_closures" ] || [ -z "$off_closures" ]; then
-        echo "WARN: could not parse closures= from V3_DBG_ALLOC_DUMP output"
-        echo "  on='$on_closures' off='$off_closures'"
+    if [ -z "$on_closures" ]; then
+        echo "WARN: could not parse closures= from NIX_VM_STATS output"
+        echo "  on='$on_closures'"
     else
-        # Phase D ON must allocate strictly fewer closures than OFF.
-        # The diff should be ~100 (one per intern site).  Allow some
-        # noise budget: require ON < OFF.
-        if [ "$on_closures" -ge "$off_closures" ]; then
-            echo "FAIL [alloc-guard]: Phase D ON closures=$on_closures " \
-                 ">= OFF closures=$off_closures (intern not firing)"
+        # With the singleton intern firing, the 100-lambda chain
+        # allocates only a handful of Closures (~7); an un-lifted run
+        # would allocate ~100.  Assert an absolute upper bound of 50 —
+        # a wide margin below the un-lifted count, comfortably above
+        # the lifted count.
+        if [ "$on_closures" -ge 50 ]; then
+            echo "FAIL [alloc-guard]: closures=$on_closures >= 50 " \
+                 "(intern not firing; un-lifted allocates ~100)"
             fail=1
         else
-            echo "  alloc-guard: ON=$on_closures < OFF=$off_closures " \
-                 "(saved $((off_closures - on_closures)))"
+            echo "  alloc-guard: closures=$on_closures < 50 (intern firing)"
         fi
     fi
 fi

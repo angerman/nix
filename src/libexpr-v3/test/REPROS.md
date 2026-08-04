@@ -28,12 +28,12 @@ on the bisect → fixture → permanent-guard workflow.
 | `repro-genericClosure-bytecode-filter.nix` | genericClosure callClosure WHNF-on-return | `b0a0ff2e1` (2026-05-17) | TW + v3-direct must match |
 | `repro-removeAttrs-lazy-elements.nix` | removeAttrs element-WHNF force | within `7adc7e61f` | TW + v3-direct must match |
 | `repro-isTrueValue-slot.nix` | Tag::Slot reaching OP_NOT via CFF_FORCE_WB_PTR_KEEP | within `7adc7e61f` | TW + v3-direct must match |
-| `repro-app-memo-regression.nix` | Tag::App `evaluated`-field memo (pos + neg via gate) | `d3e41c13d` (2026-05-18) | both with + without `NIX_V3_NO_APP_MEMO=1` |
+| `repro-app-memo-regression.nix` | Tag::App `evaluated`-field memo (unconditional) | `d3e41c13d` (2026-05-18) | value parity (memo affects timing, not value) |
 | `repro-hello-name-real.nix` | Real-nixpkgs hello.name smoke (Option 4 hybrid guard) | (session 2026-05-17/18) | v3-direct vs TW oracle |
 | `repro-beta-reduce.nix` | IR Phase A semantic guard (8 patterns) | (session 2026-05-18) | TW + v3 match (beta-reduce unconditional) |
 | `repro-beta-reduce-perf.nix` | IR Phase A alloc-reduction guard | (session 2026-05-18) | v3 with beta-reduce (unconditional): ~10 closures vs ~19 pre-feature (47% reduction) |
 | `repro-primop-fold.nix` | IR Phase B semantic guard (11 patterns) | (session 2026-05-18) | TW + v3 match (primop-fold unconditional); on static `length [1..10]`: insns 56→23, lists 1→0 |
-| `repro-lambda-lift.nix` | IR Phase D semantic + alloc guard (closure-free intern) | (session 2026-05-18) | TW + v3 ON + v3 OFF (NIX_V3_NO_LAMBDA_LIFT=1) all match; N=100 alloc guard: ON saves ~99 closure allocs vs OFF (224 vs 323) |
+| `repro-lambda-lift.nix` | IR Phase D semantic + alloc guard (closure-free intern, unconditional) | (session 2026-05-18) | TW + v3 match; N=100 alloc guard: intern collapses to ~7 closures (absolute bound < 50; un-lifted ~100) |
 | `repro-path-with-context-coerce.nix` | Tag::Path coerceToString → /nix/store + `__structuredAttrs` env emission | `78fa43631` (2026-05-19) | TW + v3-direct must match |
 | `repro-665-tostring-vs-derivcoerce.nix` | `toString` non-copying vs new `__derivCoerce` copying; bash bootstrap cascade fix | `7b2535fc9` (2026-05-19, #665) | TW + v3-direct must match |
 | `repro-666-derivation-equality.nix` | `primops.cc` `valueEqual` derivation outPath special-case (was diverging from `vm.cc` `valueEqual`) — `builtins.elem` + `lib.unique` on derivations | `45da225c6` (2026-05-19, #666) | TW + v3-direct must match |

@@ -3375,9 +3375,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // through op_force_slow.
             //
             // Profile-guided ordering: the diagnostic env-var checks
-            // (V3_DBG_FORCE_SITE / V3_DBG_GETFORCE_TAG /
-            //  NIX_V3_NO_GETFORCE_SUPER) are statically false in
-            // production, so we only consult them after the hot
+            // (V3_DBG_FORCE_SITE / V3_DBG_GETFORCE_TAG) are statically
+            // false in production, so we only consult them after the hot
             // fast-path bails out.
             const Value & v = vm.valueStack[stackBase + operand];
             Tag t = v.tag();
@@ -3386,17 +3385,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 push(vm, v);
                 break;
             }
-            // Slow path (cold): diagnostics + the slow force.  Static
-            // env-var checks live here so the fast path doesn't pay
-            // the load + branch on every iteration.
+            // Slow path (cold): diagnostics + the slow force.
             dbgLogForceSite(cu, ip - 1, &vm.valueStack[stackBase + operand]);
             dbgLogForceInsideX(vm, &vm.valueStack[stackBase + operand]);
-            static const bool s_skipForce =
-                std::getenv("NIX_V3_NO_GETFORCE_SUPER") != nullptr;
-            if (__builtin_expect(s_skipForce, 0)) [[unlikely]] {
-                push(vm, v);
-                break;
-            }
             {
                 static const char * s_dbg_gflog =
                     std::getenv("V3_DBG_GETFORCE_TAG");
@@ -3590,9 +3581,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             const CallFrame & curFrame = vm.frames.back();
             if (!frameHasUpvalues(closure, curFrame))
                 throw std::runtime_error("v3 OP_GET_UPVALUE_FORCE: no closure context");
-            // Hot path: tag != Thunk/App/Slot.  Diagnostics and the
-            // NIX_V3_NO_GETFORCE_SUPER gate live below the bail-out so
-            // they don't pay the load + branch on every iteration.
+            // Hot path: tag != Thunk/App/Slot.  Diagnostics live below
+            // the bail-out so they don't pay the load + branch on every
+            // iteration.
             const uint32_t nUpvalues = frameNUpvalues(closure, curFrame);
             if (operand >= nUpvalues)
                 throw std::runtime_error("v3 OP_GET_UPVALUE_FORCE: index out of range");
@@ -3606,13 +3597,6 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // V3_DBG_FORCE_SITE trace; see OP_GET_LOCAL_FORCE.
             dbgLogForceSite(cu, ip - 1,
                 operand < nUpvalues ? frameUpvaluePtr(closure, curFrame, operand) : nullptr);
-            // See OP_GET_LOCAL_FORCE — same NIX_V3_NO_GETFORCE_SUPER gate.
-            static const bool s_skipForceUv =
-                std::getenv("NIX_V3_NO_GETFORCE_SUPER") != nullptr;
-            if (__builtin_expect(s_skipForceUv, 0)) [[unlikely]] {
-                push(vm, v);
-                break;
-            }
             push(vm, v);
             goto op_force_slow;
         }
@@ -4069,14 +4053,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // doesn't reach any enclosing with).  Every invocation
             // would produce a semantically identical Closure; intern
             // a singleton in the descriptor and reuse it.
-            //
-            // Gate: NIX_V3_NO_LAMBDA_LIFT=1 disables the fast path
-            // (falls through to plain Alloc::allocClosure for A/B).
-            // Cached static so the env lookup happens once per
-            // process.  Single-threaded VM — no atomics needed.
-            static const bool s_noLift =
-                std::getenv("NIX_V3_NO_LAMBDA_LIFT") != nullptr;
-            if (__builtin_expect(nUp == 0 && nWiths == 0 && !s_noLift, 0)) {
+            if (__builtin_expect(nUp == 0 && nWiths == 0, 0)) {
                 const LambdaDescriptor & desc = cu->lambdas[funcIdx];
                 // WS5-D1: the lambda-lift singleton slot moved from
                 // `desc.cachedSingletonClosure` to the address-stable side array
@@ -6901,10 +6878,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // OP_FORCE chase loop — mirror of forceValue's chase.
             // Records up to kCompressMax Evaluated thunks; after the
             // chase resolves to a stable WHNF, write that value into
-            // each recorded `t->evaluated` so future forces hit in
-            // O(1).  Opt-out: NIX_V3_NO_PATH_COMPRESS=1.
-            static const bool s_opForceNoCompress =
-                std::getenv("NIX_V3_NO_PATH_COMPRESS") != nullptr;
+            // each recorded `t->evaluated` so future forces hit in O(1).
             constexpr int kOpForceCompressMax = 16;
             Thunk * opForceCompressChain[kOpForceCompressMax];
             int opForceCompressCount = 0;
@@ -7112,8 +7086,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                         nix::v3::partrace::memoHit();
                         opfMemoCounted = true;
                     }
-                    if (!s_opForceNoCompress
-                        && opForceCompressCount < kOpForceCompressMax)
+                    if (opForceCompressCount < kOpForceCompressMax)
                         opForceCompressChain[opForceCompressCount++] =
                             v.asThunk();
                     v = v.asThunk()->evaluated;
@@ -12260,10 +12233,7 @@ Value forceValue(VMState & vm, Value v)
     // FIRST thunk pays the full chase cost on every force.  Record up
     // to kCompressMax thunks and, after resolution, write the final
     // WHNF back to each so future forces resolve in one hop.  Cheap:
-    // 16 pointers on the C-stack, written only on success.  Opt-out
-    // via NIX_V3_NO_PATH_COMPRESS=1.
-    static const bool s_noPathCompress =
-        std::getenv("NIX_V3_NO_PATH_COMPRESS") != nullptr;
+    // 16 pointers on the C-stack, written only on success.
     constexpr int kCompressMax = 16;
     Thunk * compressChain[kCompressMax];
     int compressCount = 0;
@@ -12391,12 +12361,6 @@ Value forceValue(VMState & vm, Value v)
             // (single-shot pattern by construction in mapAttrs /
             // zipAttrsWith — no re-entry); only Tag::App memoizes.
             //
-            // gate: NIX_V3_NO_APP_MEMO — disables the App-result memo
-            // for A/B measurement.  Retire when the memo is stable
-            // (parity + non-regression demonstrated across the bench
-            // corpus + cardano-node nixpkgs eval).
-            static const bool s_noAppMemo =
-                std::getenv("NIX_V3_NO_APP_MEMO") != nullptr;
             bool outerIsAppLike = v.isAppLike();
             ValuePair * outerPair = outerIsAppLike ? v.asPair() : nullptr;
             // Memo-hit fast path: outerPair->evaluated holds the
@@ -12405,8 +12369,7 @@ Value forceValue(VMState & vm, Value v)
             // Tag::App3 also memoizes — it now uses `pair->third` for
             // arg2 (separate from `evaluated`), so the memo slot is
             // available for both pair tags.
-            if (__builtin_expect(!s_noAppMemo
-                && outerIsAppLike
+            if (__builtin_expect(outerIsAppLike
                 && outerPair
                 && outerPair->evaluated.tag() != Tag::Uninitialized, 1))
             {
@@ -12467,7 +12430,7 @@ Value forceValue(VMState & vm, Value v)
             // Memoize: store the result in the outermost App / App3
             // pair's evaluated field so the next force short-circuits.
             // Defensive: avoid writing back a non-WHNF result.
-            if (!s_noAppMemo && outerIsAppLike && outerPair) {
+            if (outerIsAppLike && outerPair) {
                 Tag rt = v.tag();
                 if (rt != Tag::Thunk && rt != Tag::App && rt != Tag::App3
                     && rt != Tag::Slot
@@ -12494,7 +12457,7 @@ Value forceValue(VMState & vm, Value v)
             // chain again.  Cap at kCompressMax to bound the chain
             // memory; longer chains are rare and the cap is well above
             // any observed depth (≤4 in practice for nested let-rec).
-            if (!s_noPathCompress && compressCount < kCompressMax)
+            if (compressCount < kCompressMax)
                 compressChain[compressCount++] = t;
             v = t->evaluated;
             continue;
@@ -13268,9 +13231,7 @@ static bool callClosureNExact(
     // App-spine force can collect all source-order args at once.  When that
     // count exactly saturates a closure/primop, enter it directly instead of
     // building transient PAPs through repeated callClosure().
-    static const bool s_saturatedCall =
-        std::getenv("NIX_V3_NO_SATURATED_CALL") == nullptr;
-    if (!s_saturatedCall || nArgs == 0 || nArgs > 16) return false;
+    if (nArgs == 0 || nArgs > 16) return false;
 
     {
         Tag ft = fun.tag();
@@ -13324,9 +13285,7 @@ static bool callClosureNExact(
     });
     pushCapturedWiths(vm, c->capturedWiths);
 
-    static const bool s_leafCallFast =
-        std::getenv("NIX_V3_NO_LEAFCALL_FAST") == nullptr;
-    const bool reuseScope = s_leafCallFast && currentDispatchVM() == &vm;
+    const bool reuseScope = currentDispatchVM() == &vm;
     out = dispatchLoop(vm, exitDepth, reuseScope);
     return true;
 }
@@ -13350,15 +13309,11 @@ static bool callClosureNExact(
 // so the result is byte-identical to `callClosure ∘ callClosure`.
 Value callClosure2(VMState & vm, Value fun, Value arg1, Value arg2)
 {
-    // Default-ON; opt-out NIX_V3_NO_SATURATED_CALL=1 is the A/B + bisect
-    // handle.  Retirement: remove the gate + the curried-fallback duplication
-    // once it has soaked on the cutover-parity corpus + M5/HNE (mirrors the
-    // eval/apply gate it depends on).  Result-preserving by construction (same
-    // body, same args, fewer allocs) — the gate measures magnitude, not sign.
-    static const bool s_saturatedCall =
-        std::getenv("NIX_V3_NO_SATURATED_CALL") == nullptr;
-
-    if (__builtin_expect(s_saturatedCall, 1)) {
+    // The saturated arity-2 fast path is unconditional (the
+    // NIX_V3_NO_SATURATED_CALL A/B opt-out was retired).  Result-preserving by
+    // construction (same body, same args, fewer allocs); any non-arity-2 /
+    // non-primop callee falls through to the curried form below.
+    {
         // Resolve callee to WHNF (mirror callClosure's entry fast-path).
         {
             Tag ft = fun.tag();
@@ -13405,12 +13360,9 @@ Value callClosure2(VMState & vm, Value fun, Value arg1, Value arg2)
             // Stage 2: callClosure2's only callers (primFoldl/primFoldlMap)
             // run UNDER the outer OP_CALL_PRIMOP dispatch, so `vm` is already
             // current + active — pass reuseScope to skip the redundant
-            // per-element active-VM re-push.  Default-ON; opt-out
-            // NIX_V3_NO_LEAFCALL_FAST=1 (A/B + bisect handle).  Retire with
-            // the saturated-call gate once soaked on cutover-parity + M5/HNE.
-            static const bool s_leafCallFast =
-                std::getenv("NIX_V3_NO_LEAFCALL_FAST") == nullptr;
-            return dispatchLoop(vm, exitDepth, /*reuseScope=*/s_leafCallFast);
+            // per-element active-VM re-push (unconditional; the
+            // NIX_V3_NO_LEAFCALL_FAST A/B opt-out was retired).
+            return dispatchLoop(vm, exitDepth, /*reuseScope=*/true);
         }
         // Fall through with the already-WHNF `fun` to the curried form.
     }
