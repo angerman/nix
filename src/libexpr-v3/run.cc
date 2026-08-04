@@ -418,8 +418,6 @@ RootResult runRootExprModule(nix::EvalState & state, ir::Module module)
     // the `nix` binary.  Cumulative; the LAST line per process is authoritative.
     dumpAppliedCacheProbeStats();
     appliedCacheStatsDump();   // LEVER-1 real-cache counters (self-gates on activity)
-    ifdProvStatsDump();        // IFD provenance cache shadow counters (self-gates: off unless
-                               // NIX_V3_IFD_PROV_CACHE=shadow)
     // Parallel-potential trace (NIX_V3_PAR_TRACE): work/span ceiling on
     // intra-eval parallelism — the measure-first input for the
     // parallel-eval candidate (PARALLEL_EVAL_CAPABILITIES §8/§9).  Placed

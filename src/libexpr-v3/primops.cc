@@ -1846,10 +1846,6 @@ void primGetEnv(EvalState & state, Value * args, Value & out)
     // conservatively taint always — the shadow's getEnv-mismatch probe proved
     // an untainted getEnv serves a stale result across processes.
     topLevelTaintBump(TAINT_GETENV);   // perturbable
-    // IFD-prov: getEnv has NO content-id → an IFD fragment that reads the env is
-    // not cacheable → this pending read never resolves → poison at pop (fail
-    // closed).  (Under pure-eval getEnv is "" but poisoning is still sound.)
-    provNoteReadEntry(TAINT_GETENV);
     if (!args[0].isString()) typeError("getEnv", "string");
     // #674: TW's prim_getEnv uses forceStringNoCtx; mirror it so
     // contexted strings can't be used as env-var names (would mask
@@ -3143,7 +3139,6 @@ void primFindFile(EvalState & state, Value * args, Value & out)
     // LookupPath / NIX_PATH search state — was un-tainted (cross-process stale
     // hole).
     topLevelTaintBump(TAINT_READFILE);
-    provNoteReadEntry(TAINT_READFILE);  // IFD-prov: a NIX_PATH resolve fired
     if (!state.nixEvalState)
         throw std::runtime_error("v3 primop findFile: no nix EvalState wired");
     if (!args[0].isList()) typeError("findFile", "list of {path, prefix}");
@@ -3193,10 +3188,6 @@ void primFindFile(EvalState & state, Value * args, Value & out)
     auto sp = state.nixEvalState->findFile(lp, args[1].asString());
     // CRIT-4: arena allocation.
     const std::string & abs = sp.path.abs();
-    // IFD-prov: fold the resolved lookup target's content-id (a channel entry
-    // resolves to a store path → sound narHash; a working-tree dir → nullopt →
-    // poison, so a NIX_PATH-derived IFD fragment over a mutable tree fails closed).
-    provNoteReadResolved(*state.nixEvalState, abs);
     char * buf = Alloc::allocChars(abs.size() + 1);
     std::memcpy(buf, abs.data(), abs.size());
     buf[abs.size()] = '\0';
@@ -3410,7 +3401,6 @@ void primDirOf(EvalState &, Value * args, Value & out)
 void primPathExists(EvalState & state, Value * args, Value & out)
 {
     topLevelTaintBump(TAINT_READFILE);  // A1: reads ambient filesystem state (not in the key)
-    provNoteReadEntry(TAINT_READFILE);  // IFD-prov: a pathExists fired (resolved below;
                                         // any exit that does not resolve → poison)
     std::string s;
     if (args[0].isString()) {
@@ -3521,11 +3511,6 @@ void primPathExists(EvalState & state, Value * args, Value & out)
             auto path = v3RealisePathArg(ns, args[0], symRes);
             auto st = path.maybeLstat();
             bool exists = st && (!mustBeDir || st->type == nix::SourceAccessor::tDirectory);
-            // IFD-prov: the existence answer depends on ambient FS state; a store
-            // path resolves to a sound narHash, else nullopt → poison.  If the
-            // path does NOT exist we cannot key it (no content) → poison.
-            if (exists) provNoteReadResolved(ns, path.path.abs());
-            // (else: leave the pending read unresolved → poison at pop)
             out = exists ? Value::vTrue : Value::vFalse;
             return;
         } catch (const nix::RestrictedPathError &) {
@@ -3852,7 +3837,6 @@ void primHashString(EvalState & state, Value * args, Value & out)
 void primHashFile(EvalState & state, Value * args, Value & out)
 {
     topLevelTaintBump(TAINT_READFILE);  // A1: reads ambient file content (not in the key)
-    provNoteReadEntry(TAINT_READFILE);  // IFD-prov: hashFile fired (resolved below)
     // #693 — match TW's forceStringNoCtx-style phrasings.
     if (!args[0].isString())
         throw std::runtime_error(expectedTypeButFound("a string", args[0]));
@@ -3873,9 +3857,6 @@ void primHashFile(EvalState & state, Value * args, Value & out)
     if (state.nixEvalState) {
         auto & ns = *state.nixEvalState;
         auto sp = v3RealisePathArg(ns, args[1]);
-        // IFD-prov: fold the RESOLVED path's content-id (store path → sound
-        // narHash; mutable working-tree file → poison).
-        provNoteReadResolved(ns, sp.path.abs());
         hex = nix::hashString(algo, sp.readFile()).to_string(nix::HashFormat::Base16, false);
     } else {
         std::string path = args[1].isString() ? std::string(args[1].asString())
@@ -3961,9 +3942,6 @@ void primCurrentSystem(EvalState & state, Value *, Value & out)
 void primCurrentTime(EvalState &, Value *, Value & out)
 {
     topLevelTaintBump(TAINT_CURRENTTIME);  // wall clock — not in the top-level cache key
-    // IFD-prov: currentTime has NO content-id → an IFD fragment that reads the
-    // clock is not cacheable → pending read never resolves → poison (fail closed).
-    provNoteReadEntry(TAINT_CURRENTTIME);
     // A1 perturbation hook: NIX_V3_FAKE_CURRENTTIME=<int> forces a fixed value so
     // the empirical-corpus harness can perturb the clock and detect whether it
     // reaches the serialized result (a result byte-stable across two fake clocks
@@ -4022,7 +4000,6 @@ void primStoreDir(EvalState & state, Value *, Value & out)
 void primReadFile(EvalState & state, Value * args, Value & out)
 {
     topLevelTaintBump(TAINT_READFILE);  // A1: reads ambient file content (not in the key)
-    provNoteReadEntry(TAINT_READFILE);  // IFD-prov: a readFile fired (resolved below)
     std::string path;
     bool hadCtx = false;  // WS-2 V2: context-bearing read → potential IFD build
     if (args[0].isString()) {
@@ -4063,12 +4040,6 @@ void primReadFile(EvalState & state, Value * args, Value & out)
         if (hadCtx) _ifdT.emplace();
         auto sp = ns.realisePath(nix::noPos, tw);
         content = sp.readFile();
-        // IFD-prov (N1 CRUX): the imported fragment `readFile`s a store path A
-        // whose content is NOT in the shipped IFD key — fold A's narHash so a
-        // content change under the same A path → different key → miss-not-stale.
-        // `sp.path.abs()` is the RESOLVED (post-realise) path (a store path for
-        // a `"${drv}/…"` read; a mutable working-tree file → nullopt → poison).
-        provNoteReadResolved(ns, sp.path.abs());
     } else {
         std::ifstream f(path);
         if (!f) throw std::runtime_error("v3 primop readFile: cannot open " + path);
@@ -4119,7 +4090,6 @@ void primReadFile(EvalState & state, Value * args, Value & out)
 void primReadDir(EvalState & state, Value * args, Value & out)
 {
     topLevelTaintBump(TAINT_READFILE);  // A1: reads ambient directory listing (not in the key)
-    provNoteReadEntry(TAINT_READFILE);  // IFD-prov: a readDir fired (resolved below)
     std::string path;
     if (args[0].isString()) {
         // #793 (2026-05-24): mirror TW's prim_readDir (libexpr/primops.cc:2542),
@@ -4194,9 +4164,6 @@ void primReadDir(EvalState & state, Value * args, Value & out)
     // libc++ error; mirror TW's `path 'X' does not exist`.
     if (!std::filesystem::exists(path))
         throw std::runtime_error("path '" + path + "' does not exist");
-    // IFD-prov: fold the resolved directory's content-id (a store-dir narHash is
-    // sound — R3; a mutable dir → nullopt → poison).
-    if (state.nixEvalState) provNoteReadResolved(*state.nixEvalState, path);
     for (auto & ent : std::filesystem::directory_iterator(path)) {
         std::string name = ent.path().filename().string();
         // is_symlink must be checked first: is_directory()/is_regular_file()
@@ -4312,7 +4279,6 @@ void primGroupBy(EvalState & state, Value * args, Value & out)
 void primReadFileType(EvalState & state, Value * args, Value & out)
 {
     topLevelTaintBump(TAINT_READFILE);  // A1: reads ambient filesystem state (not in the key)
-    provNoteReadEntry(TAINT_READFILE);  // IFD-prov: readFileType fired (resolved below)
     if (!(args[0].isString() || args[0].isPath()))
         typeError("readFileType", "string or path");
     // WS-1 C2: match TW's prim_readFileType (libexpr/primops.cc:2526) —
@@ -4325,8 +4291,6 @@ void primReadFileType(EvalState & state, Value * args, Value & out)
     if (state.nixEvalState) {
         auto & ns = *state.nixEvalState;
         auto sp = v3RealisePathArg(ns, args[0], std::nullopt);
-        // IFD-prov: fold the RESOLVED path's content-id.
-        provNoteReadResolved(ns, sp.path.abs());
         // lstat() throws "does not exist" for a missing path (TW parity).
         // if/else (not switch) — the build uses -Werror=switch-enum, and
         // only these three map to named types (mirrors TW fileTypeToString,
@@ -6633,159 +6597,6 @@ void     topLevelTaintReset() noexcept             { g_topLevelTaintMask = 0; }
 bool     topLevelTainted() noexcept                { return g_topLevelTaintMask != 0; }
 uint32_t topLevelTaintMask() noexcept              { return g_topLevelTaintMask; }
 
-// -------------------------------------------------------------------------
-// IFD provenance accumulator (IFD_PROVENANCE_CACHE_SPEC_2026-07-07, Phase 1).
-// See include/v3/primop.hh for the soundness rationale + retirement criterion.
-// The accumulator is a thread_local stack of frames alongside
-// g_topLevelTaintMask.  It is INERT unless a frame is pushed (provFramePush,
-// called only from primImport's IFD boundary when the gate is on) — a non-IFD
-// import pays only provActive()'s empty-vector check.
-// -------------------------------------------------------------------------
-namespace { thread_local std::vector<ProvenanceFrame> g_provStack; }
-
-bool provActive() noexcept { return !g_provStack.empty(); }
-
-void provFramePush() noexcept { g_provStack.emplace_back(); }
-
-ProvenanceFrame provFramePop() noexcept
-{
-    if (g_provStack.empty()) return ProvenanceFrame{};  // defensive (never expected)
-    ProvenanceFrame f = std::move(g_provStack.back());
-    g_provStack.pop_back();
-    // N5 (append-only, fail-closed): a read that fired but never resolved its
-    // content-id (threw / tryEval-swallowed) leaves pendingReads>0 → the frame
-    // is POISONED.  Over-capture is safe; under-capture is impossible.
-    if (f.pendingReads != 0) f.poisoned = true;
-    // NEST: fold the child into the parent so a transitive IFD folds the inner
-    // file's inputs into the outer key (append-only OR-merge).
-    if (!g_provStack.empty()) {
-        auto & p = g_provStack.back();
-        p.axisMask |= f.axisMask;
-        p.poisoned = p.poisoned || f.poisoned;
-        for (auto & id : f.contentIds) p.contentIds.push_back(std::move(id));
-        // pendingReads are NOT propagated: they were reconciled into f.poisoned
-        // above, so the parent inherits the poison bit, not the count.
-    }
-    return f;
-}
-
-void provNoteReadEntry(uint32_t axis) noexcept
-{
-    if (g_provStack.empty()) return;
-    auto & top = g_provStack.back();
-    top.axisMask |= axis;
-    ++top.pendingReads;
-}
-
-void provNoteReadResolved(nix::EvalState & state, const std::string & path) noexcept
-{
-    if (g_provStack.empty()) return;
-    auto & top = g_provStack.back();
-    if (top.pendingReads > 0) --top.pendingReads;
-    // storePathNarHash returns nullopt for a mutable non-store path → no
-    // computable content-id → POISON (fail closed, R3).  It reads the ACTUAL
-    // NAR (R4/N2): an input-addressed output's content change under the same
-    // path yields a different narHash → different key → miss-not-stale.
-    try {
-        auto id = ffi::storePathNarHash(state, path);
-        if (id) top.contentIds.push_back(*id);
-        else    top.poisoned = true;
-    } catch (...) {
-        top.poisoned = true;  // any FFI failure → fail closed
-    }
-}
-
-void provNoteReadId(const std::string & id) noexcept
-{
-    if (g_provStack.empty()) return;
-    auto & top = g_provStack.back();
-    if (top.pendingReads > 0) --top.pendingReads;
-    if (id.empty()) top.poisoned = true;   // no resolvable identity → poison
-    else            top.contentIds.push_back(id);
-}
-
-void provNoteSelfId(const std::string & id) noexcept
-{
-    if (g_provStack.empty()) return;
-    auto & top = g_provStack.back();
-    if (id.empty()) top.poisoned = true;   // defensive (never expected — caller
-                                           // passes *ifdNarHash, always present)
-    else            top.contentIds.push_back(id);
-}
-
-void provDebugDump(const std::string & path, const ProvenanceFrame & f) noexcept
-{
-    static const bool s_dbg = std::getenv("V3_DBG_IFD_PROV") != nullptr;
-    if (!s_dbg) return;
-    std::string ids;
-    for (const auto & id : f.contentIds) { ids += id; ids += ' '; }
-    std::fprintf(stderr,
-        "V3_DBG_IFD_PROV path=%s poison=%d axisMask=0x%x pending=%u ids=[ %s]\n",
-        path.c_str(), f.poisoned ? 1 : 0, f.axisMask, f.pendingReads, ids.c_str());
-}
-
-// NIX_V3_IFD_PROV_CACHE gate.
-//   =shadow  → Shadow (Phase 1: accumulate + v2-key + compare-not-serve).
-//   =active  → Active (Phase 2: on a v2 HIT, deserialize + serve in place of the
-//              freshly-evaluated result — perf-gated; see the serve site).
-//   anything else (incl. unset) → Off (inert; the --brute default path is
-//              unchanged + production is a per-primop null-check).
-// Retirement criterion (Rule 4): Active is retired to Shadow if the darwin-4
-// perf gate (T_hit/T_eval ≤ 0.50 on HNE.drvPath) FAILS — the v2 key is POST-EVAL
-// so a HIT cannot skip the fragment body, only replace its result; whether the
-// deserialize-in-place amortizes below re-eval is exactly what the gate decides.
-IfdProvMode ifdProvMode() noexcept
-{
-    static const IfdProvMode m = [] {
-        const char * e = std::getenv("NIX_V3_IFD_PROV_CACHE");
-        if (e && std::strcmp(e, "active") == 0) return IfdProvMode::Active;
-        if (e && std::strcmp(e, "shadow") == 0) return IfdProvMode::Shadow;
-        return IfdProvMode::Off;
-    }();
-    return m;
-}
-
-namespace {
-struct IfdProvStats {
-    std::atomic<uint64_t> shadowInserts{0};
-    std::atomic<uint64_t> shadowHits{0};      // would-HITs (Shadow: re-eval+compare;
-                                              //             Active: hits that were served)
-    std::atomic<uint64_t> shadowMismatch{0};  // byte-differing would-HITs (Shadow only)
-    std::atomic<uint64_t> activeServes{0};    // Active: v2 HITs deserialized + served
-    std::atomic<uint64_t> poisonSkips{0};     // fail-closed (frame poisoned)
-};
-IfdProvStats & ifdProvStats() { static IfdProvStats s; return s; }
-}  // namespace
-
-void ifdProvNoteShadowInsert() noexcept { ifdProvStats().shadowInserts.fetch_add(1); }
-void ifdProvNoteShadowHit(bool byteIdentical) noexcept
-{
-    ifdProvStats().shadowHits.fetch_add(1);
-    if (!byteIdentical) ifdProvStats().shadowMismatch.fetch_add(1);
-}
-void ifdProvNoteActiveServe() noexcept
-{
-    // Active: a v2-key HIT was deserialized + served.  Also counts as a would-HIT
-    // so the wouldHits counter is comparable across Shadow/Active runs.
-    ifdProvStats().shadowHits.fetch_add(1);
-    ifdProvStats().activeServes.fetch_add(1);
-}
-void ifdProvNotePoisonSkip() noexcept { ifdProvStats().poisonSkips.fetch_add(1); }
-void ifdProvStatsDump() noexcept
-{
-    if (ifdProvMode() == IfdProvMode::Off) return;
-    const auto & s = ifdProvStats();
-    std::fprintf(stderr,
-        "v3 IFD-PROV-CACHE (%s): inserts=%llu wouldHits=%llu mismatchHits=%llu "
-        "activeServes=%llu poisonSkips=%llu\n",
-        ifdProvMode() == IfdProvMode::Active ? "active" : "shadow",
-        (unsigned long long)s.shadowInserts.load(),
-        (unsigned long long)s.shadowHits.load(),
-        (unsigned long long)s.shadowMismatch.load(),
-        (unsigned long long)s.activeServes.load(),
-        (unsigned long long)s.poisonSkips.load());
-}
-
 /// Non-mutating lookup for SHADOW compare: no LRU bump, no hit/miss stats
 /// (the shadow HIT was already counted by the arming lookup).
 bool appliedCacheLookupPeek(const std::string & key, Value & out) noexcept
@@ -7208,130 +7019,8 @@ void primImport(EvalState & state, Value * args, Value & out)
     std::optional<std::string> ifdNarHash;
     if (s_ifdImportDiskCache && isIfdImport)
         ifdNarHash = ffi::storePathNarHash(*state.nixEvalState, path);
-    // IFD provenance cache (IFD_PROVENANCE_CACHE_SPEC_2026-07-07).
-    //   Phase 1 SHADOW: accumulate + v2-key + compare-not-serve.
-    //   Phase 2 ACTIVE: on a v2 HIT, deserialize + serve in place of `out`.
-    // PUSH a provenance frame at the IFD fragment boundary — BEFORE the eval that
-    // triggers the transitive reads (readFile/import/fetch/…) whose content-ids
-    // must fold into the v2 key.  An RAII guard guarantees the frame is popped on
-    // EVERY exit (incl. a thrown parse/eval error) — popping folds the frame INTO
-    // the parent (transitive IFD), so an exception mid-fragment still folds its
-    // partial provenance up (append-only, N5).  The NORMAL exit path calls
-    // commit() to capture the folded frame for the v2 fold logic.  BOTH modes arm
-    // the accumulator identically (`ifdProvArm`); they diverge only on a HIT.
-    const IfdProvMode ifdProvM = ifdProvMode();
-    const bool ifdProvArm =
-        ifdProvArmed(ifdProvM) && isIfdImport && ifdNarHash.has_value();
-    struct ProvFrameGuard {
-        bool active;
-        bool committed = false;
-        ProvenanceFrame folded;             // populated by commit()
-        explicit ProvFrameGuard(bool a) : active(a) { if (active) provFramePush(); }
-        void commit() { if (active && !committed) { folded = provFramePop(); committed = true; } }
-        ~ProvFrameGuard() { if (active && !committed) (void)provFramePop(); }
-    } provGuard(ifdProvArm);
-    // Fold THIS fragment's OWN file-identity (the imported module's narHash) into
-    // the frame, so a TRANSITIVE import (outer M importing inner MID) folds MID's
-    // narHash up into M's outer key — otherwise a change to MID's content that
-    // did not change MID's transitive reads would not change M's key (a
-    // transitive stale-hit hole).  R1 (transitive-under-capture) is resolved by
-    // this + the child-into-parent fold in provFramePop.
-    if (ifdProvArm) provNoteSelfId(*ifdNarHash);
-    // The v2 fold — POP the frame + build the v2 key + insert-or-compare (SHADOW)
-    // or insert-or-serve (ACTIVE).  Defined as a lambda because primImport has TWO
-    // exits after `out` is produced: (1) the CU-disk-cache HIT `return;` (a warm-
-    // CU process, where the imported bytecode is restored from disk but the body
-    // STILL runs — so the transitive reads still populate the frame) and (2) the
-    // normal miss/insert path.  Both MUST run the fold or a warm-CU process
-    // silently skips the soundness cache (the LEVER-1 disk-HIT-exit hazard, comment
-    // at the appliedCacheRecordImportResult call).  Idempotent via provGuard.committed.
-    auto ifdProvFold = [&]() {
-        if (!ifdProvArm) return;
-        provGuard.commit();
-        ProvenanceFrame & f = provGuard.folded;
-        provDebugDump(path, f);  // V3_DBG_IFD_PROV (N4 fuzz assertion hook)
-        if (f.poisoned) {
-            ifdProvNotePoisonSkip();  // fail closed — never key-with-missing-input
-            return;
-        }
-        try {
-            // The rejectAxes list makes the key self-describing: the sorted
-            // decimal axis bits that fired (READFILE/FETCH/STORE/GETFLAKE).
-            // Every fired axis MUST have contributed a content-id (else the frame
-            // would be poisoned) — the enumerable-obligation invariant.
-            std::vector<std::string> ids = f.contentIds;  // copy (sort below)
-            std::sort(ids.begin(), ids.end());
-            std::vector<std::string> rejectAxes;
-            for (uint32_t bit = 1; bit; bit <<= 1)
-                if (f.axisMask & bit) rejectAxes.push_back(std::to_string(bit));
-            std::sort(rejectAxes.begin(), rejectAxes.end());
-
-            std::string sys = ffi::currentSystem(*state.nixEvalState);
-            std::string keyBytes;
-            keyBytes.append("ifd-import-v2");           keyBytes.push_back('\0');
-            keyBytes.append(codegenGateFingerprint());  keyBytes.push_back('\0');
-            keyBytes.append(sys);                       keyBytes.push_back('\0');
-            keyBytes.append(path);                      keyBytes.push_back('\0');
-            keyBytes.append(*ifdNarHash);               keyBytes.push_back('\0');
-            for (const auto & id : ids) { keyBytes.append(id); keyBytes.push_back('\x1e'); }
-            keyBytes.push_back('\0');
-            for (const auto & ax : rejectAxes) { keyBytes.append(ax); keyBytes.push_back('\x1e'); }
-            auto v2Key = disk_cache::computeKeyForString(keyBytes);
-
-            auto existing = disk_cache::lookupEvalResult(v2Key);
-            if (existing) {
-                if (ifdProvM == IfdProvMode::Active) {
-                    // ACTIVE — SERVE the cached result.  The v2 key encodes the
-                    // full transitive input set (path+narHash + every content-id +
-                    // the fired axes), so a HIT means same key = same inputs =>
-                    // same result.  Soundness is what Shadow proved (mismatch==0
-                    // on M5/HNE); here we deserialize + replace `out`.  BELT (spec
-                    // §4): if the deserialize itself fails, we DO NOT serve — we
-                    // keep the freshly-evaluated `out` (correctness over reuse).
-                    try {
-                        out = value_serialize::deserialize(*existing);
-                        ifdProvNoteActiveServe();
-                    } catch (...) {
-                        // Deserialize failed — keep the fresh `out` (never serve a
-                        // value we can't reconstruct).  Not a mismatch, just a
-                        // bypass; the fresh result stands.
-                    }
-                } else {
-                    // SHADOW — byte-compare fresh-vs-cached (serialize is
-                    // deterministic: sorted attrs + sorted context).  A mismatch
-                    // means the v2 key MISSES an input → the soundness signal.
-                    // We NEVER serve `*existing` in Shadow.
-                    std::string blob;
-                    value_serialize::serialize(out, blob);
-                    bool same = (*existing == blob);
-                    ifdProvNoteShadowHit(same);
-                    if (!same)
-                        std::fprintf(stderr,
-                            "v3 IFD-PROV-CACHE SHADOW MISMATCH: differing result under a "
-                            "matching v2 key (path: %s)\n", path.c_str());
-                }
-            } else {
-                // MISS (both modes) — serialize the fresh result + insert (natural
-                // bypass on non-serializable via the catch below).
-                std::string blob;
-                value_serialize::serialize(out, blob);
-                disk_cache::insertEvalResult(v2Key, blob);
-                ifdProvNoteShadowInsert();
-            }
-        } catch (...) {
-            // Non-serializable result (closure/function/…) → natural bypass.
-            // (Under-capture is impossible: an unserializable result simply
-            // never enters the cache — sound.)
-        }
-    };
-    // When the prov cache is ARMED (Shadow OR Active), skip the shipped v1 active
-    // lookup so the fragment ALWAYS re-evaluates (the v2 key needs the transitive
-    // reads that only fire during eval; and serving the UNSOUND v1 key here would
-    // reintroduce the N1 stale-HIT bug the v2 key fixes).  So the fragment runs to
-    // completion, THEN ifdProvFold either compares (Shadow) or deserialize-serves
-    // (Active) under the sound v2 key.  With the cache Off this v1 lookup is the
-    // shipped production path, unchanged.
-    if (s_ifdImportDiskCache && isIfdImport && ifdNarHash && !ifdProvArm) {
+    // Shipped v1 IFD-import disk cache: content-keyed (path ‖ narHash) lookup.
+    if (s_ifdImportDiskCache && isIfdImport && ifdNarHash) {
         CACHE_HOOK_DEFINE_SITE(siteImportIfdLookup,
             "primImport-ifd-disk-lookup");
         CacheHookTimer timer(siteImportIfdLookup);
@@ -8148,19 +7837,6 @@ void primImport(EvalState & state, Value * args, Value & out)
                     if (inserted) bumpImportEntry(iter->second, cache);  // Phase 4b LRU
                 }
                 maybeEvictOldImportEntries(cache);  // Phase 4b LRU
-                // IFD-prov: the WARM-CU exit.  The imported body STILL ran (line
-                // above), so the frame is populated with the transitive reads —
-                // run the fold here too (else a warm-CU process silently skips
-                // the soundness cache).  forceDeep first so `out` serializes to
-                // the SAME bytes as the cold path's forceDeep'd result (a
-                // byte-identical would-HIT across cold/warm-CU processes).  In
-                // ACTIVE mode a v2 HIT sets `out` to the served value; since the
-                // served value is byte-identical to the fresh one (shadow proof),
-                // the in-memory cache above (fresh `out`) stays consistent.
-                if (ifdProvArm) {
-                    try { out = forceDeep(*state.vm, out); } catch (...) {}
-                    ifdProvFold();  // may set out = served value (Active)
-                }
                 return;
             }
         } else {
@@ -8385,13 +8061,6 @@ skipDiskCacheLookup:
             // this process.
         }
     }
-    // IFD provenance cache fold — SHADOW (compare) or ACTIVE (serve).  Run on the
-    // normal miss/insert exit (the CU-disk-HIT exit runs it before its own
-    // `return;`).  In ACTIVE mode a v2 HIT replaces `out` with the served value
-    // here (byte-identical to the fresh `out` by the shadow proof, so the v1 disk
-    // insert above stays consistent); the served `out` is primImport's result.
-    // See the lambda definition above for the full rationale.
-    ifdProvFold();
     if (s_dbg_import) {
         std::fprintf(stderr, "v3 IMPORT-DONE RSS=%lluMB: %s\n",
             (unsigned long long)rssMBImp(), path.c_str());
@@ -8807,7 +8476,6 @@ void primPath(EvalState & state, Value * args, Value & out)
     // A5-fix (taint-mask completion): reads a filesystem path into the store —
     // was un-tainted (cross-process stale hole).
     topLevelTaintBump(TAINT_READFILE);
-    provNoteReadEntry(TAINT_READFILE);  // IFD-prov: builtins.path reads a FS tree +
         // copies to store; a resolved store-path narHash is not cheaply available
         // here, so an in-fragment use leaves this pending → poison at pop (fail closed).
     if (!args[0].isAttrs() || !args[0].asAttrs())
@@ -8884,7 +8552,6 @@ static void primPathNative(EvalState & state, Value * args, Value & out)
     // bump — this is the only caller, but bumping here guards any future
     // direct call site too.)
     topLevelTaintBump(TAINT_READFILE);
-    provNoteReadEntry(TAINT_READFILE);  // IFD-prov: builtins.path (native) reads a FS
         // tree + copies to store; no cheap resolved narHash → in-fragment use → poison.
     auto & ns = *state.nixEvalState;
     auto * src = args[0].asAttrs();
@@ -8961,7 +8628,6 @@ static void primPathFilteredNative(EvalState & state, Value * args, Value & out)
     // the store — was un-tainted (cross-process stale hole).  (Idempotent with
     // primPath's bump — this is the only caller.)
     topLevelTaintBump(TAINT_READFILE);
-    provNoteReadEntry(TAINT_READFILE);  // IFD-prov: builtins.path (filtered) reads a FS
         // tree + copies to store; no cheap resolved narHash → in-fragment use → poison.
     auto & ns = *state.nixEvalState;
     auto * src = args[0].asAttrs();
@@ -9057,7 +8723,6 @@ void primScopedImport(EvalState & state, Value * args, Value & out)
     // A5-fix (taint-mask completion): reads+parses an arbitrary .nix file — was
     // un-tainted (cross-process stale hole).
     topLevelTaintBump(TAINT_READFILE);
-    provNoteReadEntry(TAINT_READFILE);  // IFD-prov: scopedImport reads+parses a file
                                         // (resolved below)
     if (!state.nixEvalState)
         throw std::runtime_error("v3 primop scopedImport: no nix EvalState wired");
@@ -9089,9 +8754,6 @@ void primScopedImport(EvalState & state, Value * args, Value & out)
     // tree-walker's scopedImport which adds the scope to a staticEnv
     // *above* staticBaseEnv.
     std::string src = sp.resolveSymlinks().readFile();
-    // IFD-prov: fold the resolved file's content-id (store path → sound narHash;
-    // mutable working-tree file → nullopt → poison).
-    provNoteReadResolved(*state.nixEvalState, sp.resolveSymlinks().path.abs());
     std::string wrapped;
     wrapped += "__scope__: let ";
     auto * sb = scope.asAttrs();
@@ -10052,7 +9714,6 @@ void primBreak(EvalState &, Value * args, Value & out)
 void primStorePath(EvalState & state, Value * args, Value & out)
 {
     topLevelTaintBump(TAINT_STORE);  // A1: reads ambient store state (not in the key)
-    provNoteReadEntry(TAINT_STORE);  // IFD-prov: storePath fired (resolved below)
     if (!state.nixEvalState)
         throw std::runtime_error("v3 storePath: no tree-walker state available");
     auto * ns = state.nixEvalState;
@@ -10075,8 +9736,6 @@ void primStorePath(EvalState & state, Value * args, Value & out)
     auto path2 = ns->store->toStorePath(path.abs()).first;
     if (!ffi::readOnlyMode())
         ns->store->ensurePath(path2);
-    // IFD-prov: fold the store path's narHash (always a store object here → sound).
-    provNoteReadResolved(*ns, path.abs());
     // Build the result string V3-NATIVE (path string + Opaque context) — no
     // treeWalkerToV3 bridge (toward F4).
     out = mkStringValueOwned(path.abs());
@@ -10302,15 +9961,11 @@ static void v3FetchTree(EvalState & s, Value * a, Value & o,
     // network/mutable inputs not in the key — was un-tainted (cross-process
     // stale hole).  Mirrors the v3Fetch sibling which already bumps FETCH.
     topLevelTaintBump(TAINT_FETCH);
-    provNoteReadEntry(TAINT_FETCH);  // IFD-prov: a fetchTree fired (resolved below)
     if (!s.nixEvalState)
         throw std::runtime_error(std::string("v3 ") + fetcher + ": no tree-walker state available");
     auto & ns = *s.nixEvalState;
     auto in = extractFetchTreeInput(s, a[0], fetcher, isFetchGit, allowNameArgument);
     ffi::TreeAttrsInfo info = ffi::fetchTree(ns, in, emptyRevFallback, isFinal);
-    // IFD-prov: fold the fetched narHash (the content-addressed identity of the
-    // fetched tree).  Absent narHash → no resolvable identity → poison (fail closed).
-    provNoteReadId(info.narHash.value_or(std::string{}));
     o = v3EmitTreeAttrs(info);
 }
 
@@ -10337,7 +9992,6 @@ static void v3Fetch(EvalState & s, Value * a, Value & o,
 {
     topLevelTaintBump(TAINT_FETCH);  // A1: fetch touches network/mutable inputs not in the
                           // cache key → taint (policy P recovers pinned-stable ones)
-    provNoteReadEntry(TAINT_FETCH);  // IFD-prov: a fetch fired (resolved below)
     if (!s.nixEvalState)
         throw std::runtime_error(std::string("v3 ") + who + ": no tree-walker state available");
     auto & ns = *s.nixEvalState;
@@ -10368,8 +10022,6 @@ static void v3Fetch(EvalState & s, Value * a, Value & o,
     }
 
     ffi::FetchUrlResult r = ffi::fetchUrl(ns, *url, sha256, name, unpack, who);
-    // IFD-prov: fold the fetched store path's narHash (content-addressed identity).
-    provNoteReadResolved(ns, r.printedStorePath);
     o = mkStringValueOwned(r.printedStorePath);
     std::vector<std::string> ctx{ r.opaqueContextElem };
     setStringContextEntries(o.asString(), std::move(ctx));
@@ -10407,7 +10059,6 @@ void primFetchMercurial(EvalState & s, Value * a, Value & o) {
     // A5-fix (taint-mask completion): fetches a mercurial repo (network/mutable
     // input not in the key) — was un-tainted (cross-process stale hole).
     topLevelTaintBump(TAINT_FETCH);
-    provNoteReadEntry(TAINT_FETCH);  // IFD-prov: a fetchMercurial fired (resolved below)
     if (!s.nixEvalState)
         throw std::runtime_error("v3 fetchMercurial: no tree-walker state available");
     auto & ns = *s.nixEvalState;
@@ -10447,8 +10098,6 @@ void primFetchMercurial(EvalState & s, Value * a, Value & o) {
     }
 
     ffi::FetchMercurialResult r = ffi::fetchMercurial(ns, url, revOrRef, name);
-    // IFD-prov: fold the fetched store path's narHash (content-addressed identity).
-    provNoteReadResolved(ns, r.outPath);
 
     std::vector<std::pair<SymbolId, Value>> entries;
     {
@@ -10478,7 +10127,6 @@ void primFetchMercurial(EvalState & s, Value * a, Value & o) {
 // build the result store-path string v3-native with Opaque context.
 void primFetchClosure(EvalState & s, Value * a, Value & o) {
     topLevelTaintBump(TAINT_FETCH);  // A1: fetches store content not in the key → taint
-    provNoteReadEntry(TAINT_FETCH);  // IFD-prov: a fetchClosure fired (resolved below)
     if (!s.nixEvalState)
         throw std::runtime_error("v3 fetchClosure: no tree-walker state available");
     auto & ns = *s.nixEvalState;
@@ -10524,8 +10172,6 @@ void primFetchClosure(EvalState & s, Value * a, Value & o) {
 
     ffi::FetchUrlResult r = ffi::fetchClosure(ns, *fromStore, *fromPath, toPath,
                                               inputAddressed.value_or(false));
-    // IFD-prov: fold the fetched store path's narHash (content-addressed identity).
-    provNoteReadResolved(ns, r.printedStorePath);
     o = mkStringValueOwned(r.printedStorePath);
     std::vector<std::string> ctx{ r.opaqueContextElem };
     setStringContextEntries(o.asString(), std::move(ctx));
@@ -10538,7 +10184,6 @@ void primFilterSource(EvalState & s, Value * a, Value & o) {
     // A5-fix (taint-mask completion): reads a filesystem tree into the store —
     // was un-tainted (cross-process stale hole).
     topLevelTaintBump(TAINT_READFILE);
-    provNoteReadEntry(TAINT_READFILE);  // IFD-prov: filterSource reads a FS tree into
         // the store; no cheap resolved narHash here → in-fragment use → poison (fail closed).
     if (!s.nixEvalState)
         throw std::runtime_error("v3 filterSource: no tree-walker state available");
@@ -10604,7 +10249,6 @@ void primGetFlake(EvalState & s, Value * a, Value & o) {
                           // a reject bit.  (A3 resolved-pin key recovers locked
                           // flakes; fetch*/fetchClosure/storePath stay TAINT_FETCH/
                           // TAINT_STORE = hard-reject, never demoted.)
-    provNoteReadEntry(TAINT_GETFLAKE);  // IFD-prov: a getFlake fired (id = lockFileStr,
                                         // resolved below)
     // History:
     //   - 88199c4a0 / 511074ff6: first default-on attempt — REVERTED
@@ -10640,9 +10284,6 @@ void primGetFlake(EvalState & s, Value * a, Value & o) {
     //     ffi::lockFlakeAndRead (audit Phase 4: keeps FlakeRef / LockFlags /
     //     lockFlake / flake::Settings out of this TU).
     auto flakeInfo = ffi::lockFlakeAndRead(ns, flakeRefS, ffi::pureEval(ns));
-    // IFD-prov: the flake.lock text is the pinned identity of every flake input
-    // (A4).  Fold it as the content-id; an empty lock (unlocked/dirty) → poison.
-    provNoteReadId(flakeInfo.lockFileStr);
 
     // (2) v3-native call-flake.nix evaluation: callFlakeV3 builds the args
     //     V3-NATIVE from the plain data + applies the cached closure × 3.
