@@ -534,17 +534,7 @@ public:
             {
                 const uintptr_t word = *reinterpret_cast<const uintptr_t *>(
                     cellStart + off);
-                // MIDEVAL_GC_DESIGN_2026-06-22: de-box the v8nan tag under the
-                // mid-eval gate.  This untyped byte-scan handles Value/Env/Chars
-                // cells; a Value cell holds a BOXED pointer (box(tag,ptr)), so the
-                // raw word is out of arena range → the pointee (a tenured Closure/
-                // Bindings reachable ONLY via this conservatively-marked Value
-                // cell) would be missed → swept → UAF.  gen-major marks such cells
-                // precisely so it never relied on this; the mid-eval nursery scan
-                // marks them conservatively, so the byte-scan MUST de-box.  Gated
-                // ⇒ default (raw `word`) is byte-and-behaviour-identical.
-                const uintptr_t val = nix::v3::detail::g_midEvalGcEnabled
-                    ? (word & 0x0000FFFFFFFFFFFFull) : word;
+                const uintptr_t val = word;
                 if (val < arenaMin || val >= arenaMax) continue;
                 // Range check passed; precise check + mark.
                 void * candidate = reinterpret_cast<void *>(val);
@@ -622,9 +612,10 @@ private:
     // reachable ONLY via the IC (transient attrsets cached by an attr-select).
     // The moving scavenger FORWARDS those entries; the non-moving mid-eval mark
     // must MARK them, else they're swept + reused = UAF (the apply-overrides
-    // divergence: an override Bindings zeroed → empty attrset).  Mid-eval only
-    // (nursery_ is set solely under g_midEvalGcEnabled); gen-major clears the IC
-    // before its mark, so it never relied on this.  Dedup CUs via walkedCUs_.
+    // divergence: an override Bindings zeroed → empty attrset).  Runs only when
+    // `nursery_` is set — no longer set since the mid-eval GC was retired, so
+    // walkCuIC is inert; gen-major/Phase-S clear the IC before their mark, so
+    // they never relied on this.  Dedup CUs via walkedCUs_.
     std::unordered_set<const CompilationUnit *> walkedCUs_;
 public:
     /// M2.1 (BOUNDED_MEMORY_PLAN): the set of CUs referenced by a live thunk/closure
@@ -667,8 +658,8 @@ private:
             // That holds for the P0.A-4 loops in isolation, but an Env can be
             // mark-bit-set WITHOUT a precise values-walk via the interior
             // Tag::Slot→Env conservative-mark path (visitSlot → CellType::Env
-            // markConservative), and the gen-major byte-scan does NOT de-box
-            // (gated on g_midEvalGcEnabled).  So once real Env chains exist
+            // markConservative), and the conservative byte-scan does NOT de-box
+            // boxed Values.  So once real Env chains exist
             // (any future Env-chain producer; the env-capture experiment that
             // motivated this was deleted 2026-07-04), a `break` here could skip
             // an ancestor Env's boxed values[] → missed tenured root.  INERT
@@ -820,27 +811,15 @@ private:
 ///   * Conservative byte-walk of marked cells handles transitive
 ///     reachability via X.upvalues[0] → Y where Y's pointer might
 ///     not be on the stack.
-/// MIDEVAL_GC_DESIGN_2026-06-22: classify one scanned word as a conservative
-/// root, DE-BOXING the v8nan tag.  A pointer to a v3 cell living inside a Value
-/// (a C-local, a nursery cell, a fiber stack) is stored as box(tag,ptr) =
-/// (tag<<48)|ptr — the raw word is out of arena range, so a non-de-boxing scan
-/// MISSES it → swept live cell → UAF (the mid-eval-GC bug this fixes).  On
-/// aarch64 a raw 48-bit arena pointer has zero top bits, so masking the low 48
-/// covers BOTH raw pointers and boxed Values.  Over-approximate ⇒ safe (a
-/// non-pointer word whose low 48 bits land in arena range only over-retains).
+/// Classify one scanned word as a conservative root: if it points into the
+/// active arena, mark the cell it references.  Over-approximate ⇒ safe (a
+/// non-pointer word whose value lands in arena range only over-retains).
 static inline void conservativeMarkWord(
     MarkVisitor & v, Arena & arena, uintptr_t word,
     uintptr_t arenaMin, uintptr_t arenaMax) noexcept
 {
-    constexpr uintptr_t kV8NanPay = 0x0000FFFFFFFFFFFFull;
-    // De-box ONLY under the mid-eval gate so the default gen-major path is
-    // byte-and-behaviour-identical (g_midEvalGcEnabled=false → val=word, the
-    // exact prior raw-pointer scan).  Under mid-eval, masking the low 48 bits
-    // catches boxed-Value pointers the raw scan would miss.
-    const uintptr_t val =
-        nix::v3::detail::g_midEvalGcEnabled ? (word & kV8NanPay) : word;
-    if (val < arenaMin || val >= arenaMax) return;
-    void * candidate = reinterpret_cast<void *>(val);
+    if (word < arenaMin || word >= arenaMax) return;
+    void * candidate = reinterpret_cast<void *>(word);
     if (arena.inActive(candidate)) v.markConservative(candidate);
 }
 
@@ -1089,20 +1068,12 @@ static bool sweepOneBlock(
             // gate (GC_DECISION_2026-05-29 §6).  clearCellStartBitFor stays
             // unconditional — it is bitmap-only (no growth) and keeps the
             // sweep-iteration semantics identical to before this change.
-            if ((nix::v3::detail::g_freeListReuseEnabled
-                 || nix::v3::detail::g_midEvalGcEnabled)
+            if (nix::v3::detail::g_freeListReuseEnabled
                 && !nix::v3::detail::g_immixAllocEnabled) {
                 arena.freeListAdd(
                     const_cast<void *>(cellAddr), cellSize);
             }
-            // MIDEVAL_GC reuse-SEGV fix (2026-06-23): under mid-eval the bins are
-            // rebuilt fresh each sweep (clearFreeListBins), so dead cells must KEEP
-            // their cell-start bit to be re-found + re-binned next sweep — and
-            // keeping it stable also stops the cross-sweep config change that let a
-            // big free entry span a now-live neighbour.  The legacy major-GC path
-            // keeps the original clear-on-bin (re-set on pop) behaviour.
-            if (!nix::v3::detail::g_midEvalGcEnabled)
-                arena.clearCellStartBitFor(cellAddr);
+            arena.clearCellStartBitFor(cellAddr);
         }
     }
     // R2.1: bin this block's live-byte density (evacuation opportunity).
@@ -1244,13 +1215,6 @@ MajorGcResult runMajorMarkSweep(VMState & vm) noexcept
     MarkVisitor visitor(marker);
     visitor.setArena(arena);  // for visitSlot interior-owner discovery
     visitor.setTypedInteriorOwners(true);  // Lever 3: fast mark (not verify)
-    // MIDEVAL_GC_DESIGN_2026-06-22: when the mid-eval non-moving sweep runs with a
-    // RESIDENT nursery, give the visitor the nursery so it traverses nursery cells
-    // PRECISELY (typed walkX → visitValue decode the box) — covering tenured cells
-    // reachable only through the nursery, which a flat byte-scan leaks.  Off on the
-    // gen-major path (post-forceScavenge nursery empty) and by default.
-    if (nix::v3::detail::g_midEvalGcEnabled)
-        visitor.setNursery(&threadNursery());
     const auto tm0 = clock::now();
     walkAllV3Roots(vm, visitor);
     visitor.drain();
@@ -1327,50 +1291,6 @@ MajorGcResult runMajorMarkSweep(VMState & vm) noexcept
             walkCStackConservative(visitor, arena, sp);
     }
 
-    // MIDEVAL_GC (RCA + fix, 2026-06-23): walk the inter-gen DIRTY LIST
-    // (remembered set) as roots.  walkAllV3Roots does NOT walk it — but the
-    // scavenger does, because it is a genuine root source: a tenured cell written
-    // to point into the nursery is recorded here, and may be reachable ONLY via
-    // the remembered set, not the direct value-stack roots.  The non-moving
-    // mid-eval mark would otherwise miss it → swept → reused → UAF (the wild
-    // Value* deref).  Walking it marks those cells + (transitively) their nursery
-    // and tenured pointees.  Safe: over-marking a dead-but-dirty cell only
-    // over-retains.  Under NIX_V3_MIDEVAL_AUDIT, COUNT the cells this newly marks
-    // (mark MISSED them) to CONFIRM the gap rather than assume it.
-    if (nix::v3::detail::g_midEvalGcEnabled) {
-        const size_t before = marker.markedCells();
-        for (const DirtyEntry & e : dirtyContainers()) {
-            void * ptr = e.ptr();
-            if (!ptr) continue;
-            switch (e.kind()) {
-            case DirtyKind::Bindings: { Bindings * b = static_cast<Bindings *>(ptr); visitor.visitBindings(b); break; }
-            case DirtyKind::Pair:     { ValuePair * p = static_cast<ValuePair *>(ptr); visitor.visitPair(p); break; }
-            case DirtyKind::Thunk:    { Thunk * t = static_cast<Thunk *>(ptr); visitor.visitThunk(t); break; }
-            case DirtyKind::Closure:  { Closure * c = static_cast<Closure *>(ptr); visitor.visitClosure(c); break; }
-            case DirtyKind::List:     { ListVec * l = static_cast<ListVec *>(ptr); visitor.visitList(l); break; }
-            case DirtyKind::Env: {
-                Env * en = static_cast<Env *>(ptr);
-                if (marker.tryMark(en))
-                    for (uint16_t i = 0; i < en->nValues; ++i) visitor.visitValue(en->values[i]);
-                break;
-            }
-            }
-        }
-        visitor.drain();
-        {
-            uintptr_t aMin, aMax; arena.activeBounds(aMin, aMax);
-            visitor.drainConservative(arena, aMin, aMax);
-        }
-        static const bool s_midEvalAudit = std::getenv("NIX_V3_MIDEVAL_AUDIT") != nullptr;
-        if (__builtin_expect(s_midEvalAudit, 0)) {
-            const size_t newly = marker.markedCells() - before;
-            std::fprintf(stderr,
-                "[mideval-audit] dirty-list walk: %zu entries, marked %zu NEW cells "
-                "(mark MISSED them → remembered set %s a needed root)\n",
-                dirtyContainers().size(), newly, newly ? "IS" : "is NOT");
-        }
-    }
-
     const size_t conservativeOnlyCells =
         marker.markedCells() - preciseMarkedCells;
 
@@ -1391,9 +1311,10 @@ MajorGcResult runMajorMarkSweep(VMState & vm) noexcept
                 ms(tm0, tm1), ms(tm1, tm2), ms(tm2, tMarkEnd));
             // M2.1 (BOUNDED_MEMORY_PLAN): size the CU-eviction win at THIS safepoint.
             // A cached CU absent from the mark's referenced-CU set (visitor.walkedCUs())
-            // has no live thunk/closure → COLD = evictable now.  Mid-eval, the mark fires
-            // near peak, so this is the realizable peak-reducing win (the M2 GO/NO-GO).
-            // walkedCUs() is only populated under mid-eval (NIX_V3_MIDEVAL_GC=1).
+            // has no live thunk/closure → COLD = evictable now.
+            // walkedCUs() is populated by walkCuIC, which gates on `nursery_`; since
+            // the mid-eval GC was retired `nursery_` is never set, so this reports
+            // all CUs cold (the M2.1 sizing is inert on the surviving paths).
             {
                 size_t coldCount = 0;
                 const size_t cuCount  = importCacheCuCount();
@@ -1412,13 +1333,6 @@ MajorGcResult runMajorMarkSweep(VMState & vm) noexcept
     }
 
     // -- Phase 2 step 2: sweep (measurement-only; no free yet) ------
-    // MIDEVAL_GC reuse-SEGV fix (2026-06-23): rebuild the free-list bins FRESH
-    // each sweep so no stale cross-sweep entry survives (the overlapping-entry
-    // corruption).  Live cells are never in the bins; dead cells keep their
-    // cell-start bits (sweep no longer clears them under mid-eval) so this sweep
-    // re-bins every current dead cell below.
-    if (nix::v3::detail::g_midEvalGcEnabled)
-        arena.clearFreeListBins();
     SweepStats sweep;
     const auto & cellStarts = arena.cellStartBitmaps();
     const auto & cellTypes  = arena.cellTypeArrays();  // R2.1′

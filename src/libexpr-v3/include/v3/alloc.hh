@@ -926,38 +926,6 @@ inline const bool g_immixAllocEnabled =
 inline const bool g_freeListReuseEnabled =
     std::getenv("V3_DBG_FREELIST_REUSE") != nullptr;
 
-/// MIDEVAL_GC_DESIGN_2026-06-22 — non-moving mid-eval tenured mark-sweep gate.
-/// When set, a non-moving runMajorMarkSweep fires at exitDepth>0 on arena
-/// pressure (vm.cc), reclaiming scattered dead tenured cells into the free-list
-/// bins, AND this allocator consumes them (the pop in alloc()).  Default-OFF.
-/// The measured fix for v3 peak RSS 1.9× TW: the arena grows monotonically
-/// because ALL prior GC is gated to exitDepth==0, which deep nixpkgs eval never
-/// reaches (project_v3_vs_tw_rss_rootcause_2026-06-22).
-/// Retirement (Rule 0): flip default-on once darwin-4 shows firefox/M5 RSS drops
-/// toward TW + --brute clean on a full nixpkgs sweep; or delete if Immix
-/// (GC_DECISION_2026-05-29) lands and subsumes it.
-inline const bool g_midEvalGcEnabled =
-    std::getenv("NIX_V3_MIDEVAL_GC") != nullptr;
-
-/// MIDEVAL_GC_DESIGN_2026-06-22 — free-list REUSE opt-in, SPLIT from the gate
-/// above.  `NIX_V3_MIDEVAL_GC=1` alone runs the correct mark + sweep + bin-build
-/// (validated byte-id + --brute) but does NOT pop/reuse — so it does not reclaim
-/// RSS yet.  Reuse (the pop below) is GATED SEPARATELY behind NIX_V3_MIDEVAL_REUSE
-/// because it currently SEGVs: popping a swept cell that is still live (a residual
-/// mark-completeness gap) or wrong-sized.  Isolated here so the correct sweep+bin
-/// path stays committable while the reuse-safety is debugged (next: a differential
-/// mark audit / poison-on-bin + check-on-pop to identify the live-but-binned cell).
-inline const bool g_midEvalReuseEnabled =
-    std::getenv("NIX_V3_MIDEVAL_REUSE") != nullptr;
-
-/// MIDEVAL_GC_DESIGN_2026-06-22 — reuse-safety diagnostic.  When set, freeListAdd
-/// stamps a sentinel into each binned cell and freeListTryPop verifies it survived
-/// to pop time; if the mutator overwrote it (the cell was actually LIVE when the
-/// sweep classified it dead → a missed root), abort with the cell's type.  Pins
-/// the SEGV's cause.
-inline const bool g_midEvalPoison =
-    std::getenv("NIX_V3_MIDEVAL_POISON") != nullptr;
-
 } // namespace detail
 
 struct FreeListStats
@@ -1231,8 +1199,8 @@ inline const bool g_majorGcEnabled = false;
 // rebuilds free-spans from the post-mark line-marks (in-place reclaim, NO
 // move).  It does NOT touch `g_majorGcEnabled` (which must stay false — that
 // re-enables the per-op legacy major trigger = the M-3 UAF trap) and does NOT
-// enable the free-list pop/reuse path (NIX_V3_MIDEVAL_REUSE — a live SEGV,
-// plan §6 hazard #1); reclaim is safepoint span-only.
+// enable the free-list pop/reuse path (a live SEGV, plan §6 hazard #1);
+// reclaim is safepoint span-only.
 //
 // RETIREMENT (Rule 4/5): this gate is deleted when Phase A routes the tenured
 // allocation into the non-moving region as the default (it supersedes this
@@ -1317,21 +1285,15 @@ public:
     /// the `static const bool` initialised at startup; the call
     /// inlines to a load + branch that the predictor optimises away.
     static bool majorGcEnabled() noexcept { return detail::g_majorGcEnabled; }
-    /// MIDEVAL_GC_DESIGN_2026-06-22: the cell-start/type bitmap is needed by BOTH
-    /// the legacy major GC AND the non-moving mid-eval sweep (to find + classify
-    /// cells for in-block free-list reuse).  Maintain it whenever EITHER is on
-    /// (both default-off → zero cost).  NOTE: this gates METADATA ONLY (cell-start
-    /// + cell-type bitmaps) — NOT the block alloc/free method.  Under mid-eval
-    /// blocks stay calloc'd (majorGcEnabled() still false), so whole-block-free
-    /// (munmap) MUST stay off (skipped in runMajorMarkSweep); the mid-eval win is
-    /// in-block free-list reuse, which needs no munmap.  Keeping the block method
-    /// unchanged avoids the munmap-on-calloc hazard.
+    /// The cell-start/type bitmap is needed by the legacy major GC (hard-false)
+    /// and the Phase-S non-moving tenured region.  Maintain it whenever EITHER is
+    /// on (both off by default → zero cost).  NOTE: this gates METADATA ONLY
+    /// (cell-start + cell-type bitmaps) — NOT the block alloc/free method.
     static bool cellMetaEnabled() noexcept {
         // Phase-S spike: the non-moving tenured region needs cell-start +
         // CellType + lineMarks maintained so the safepoint mark can set line
         // marks and rebuildFreeSpansFromLineMarks can reclaim in place.
-        return detail::g_majorGcEnabled || detail::g_midEvalGcEnabled
-            || detail::nonmovingTenured();
+        return detail::g_majorGcEnabled || detail::nonmovingTenured();
     }
 
     /// Are arena blocks mmap'd (vs calloc'd)?  mmap'd blocks can be munmap'd by
@@ -1616,21 +1578,15 @@ public:
         // line-region state).  See GC_DECISION §6 — this entire
         // section retires when Step 14′ SHIP gate clears.
         //
-        // MIDEVAL_GC_DESIGN_2026-06-22: the pop was gated on majorGcEnabled()
-        // (the legacy non-moving major GC), hard-false since the nursery shipped
-        // (M-3) → reuse was dead code → the tenured arena never reused dead cells
-        // → it grew monotonically (v3 RSS 1.9× TW).  The bins are BUILT by the
-        // sweep (mark_sweep.cc, gated g_freeListReuseEnabled||g_midEvalGcEnabled);
-        // let the allocator CONSUME them under EITHER opt-in.  Default-OFF (both
-        // gates) → byte-for-byte the old default path.  Correctness: bins hold
-        // cells the precise+conservative non-moving mark proved dead.
-        // Phase-S spike NEVER pops the free-list bins: the pop/reuse path has
-        // a live SEGV (NIX_V3_MIDEVAL_REUSE — plan §6 hazard #1: hands back a
-        // still-C-stack-live cell).  The spike reclaims ONLY via the safepoint
-        // line-region span path above.  Exclude nonmovingTenured() here even
-        // if a reuse env gate is co-set, so the span path is the sole consumer.
-        if (__builtin_expect((detail::g_freeListReuseEnabled
-                              || (detail::g_midEvalGcEnabled && detail::g_midEvalReuseEnabled))
+        // The bins are BUILT by the sweep (mark_sweep.cc, gated
+        // g_freeListReuseEnabled); let the allocator CONSUME them under the same
+        // opt-in.  Default-OFF → byte-for-byte the old default path.  Correctness:
+        // bins hold cells the precise+conservative non-moving mark proved dead.
+        // Phase-S spike NEVER pops the free-list bins (the pop/reuse path is a live
+        // SEGV — plan §6 hazard #1: hands back a still-C-stack-live cell); it
+        // reclaims ONLY via the safepoint line-region span path above, so exclude
+        // nonmovingTenured() here.
+        if (__builtin_expect(detail::g_freeListReuseEnabled
                              && !detail::g_immixAllocEnabled
                              && !detail::nonmovingTenured(), 0)) {
             if (void * p = freeListTryPop(bytes)) {
@@ -2309,37 +2265,8 @@ public:
     ///
     /// Lifetime: persistent across GC cycles.  Each sweep adds dead
     /// cells; each alloc that hits the free list removes them.
-    /// MIDEVAL_GC_DESIGN_2026-06-22 (reuse-SEGV fix, 2026-06-23): drop ALL
-    /// free-list entries.  Called at the start of each mid-eval sweep so the bins
-    /// are REBUILT fresh from the current cell-start bitmap — never carrying a
-    /// stale entry from a prior sweep whose cell-start configuration differed (the
-    /// overlapping-entry corruption: a region binned as one big cell in sweep N,
-    /// then sub-divided by sweep N+1, leaving sweep N's oversized entry spanning a
-    /// now-live neighbour).  Safe: live cells are never in the bins; dead cells
-    /// keep their start bits (the sweep no longer clears them) so the next sweep
-    /// re-bins them — nothing is lost.
-    void clearFreeListBins() noexcept
-    {
-        freeListBins_.clear();
-        freeListEntries_ = 0;
-        binnedDbg_.clear();
-    }
     void freeListAdd(void * p, size_t bytes) noexcept
     {
-        if (__builtin_expect(detail::g_midEvalPoison, 0)) {
-            // RCA: detect DOUBLE-BIN (same address added to a bin twice without an
-            // intervening pop) + record the size to spot cross-size staleness.
-            auto dit = binnedDbg_.find(p);
-            if (dit != binnedDbg_.end()) {
-                std::fprintf(stderr,
-                    "[mideval-rca] DOUBLE-BIN: p=%p already in bin[%zu], re-added to "
-                    "bin[%zu] type=%d — stale free-list entry (bins never cleared)\n",
-                    p, dit->second, bytes, (int)cellTypeAt(p));
-                std::abort();
-            }
-            binnedDbg_[p] = bytes;
-            *reinterpret_cast<uint64_t *>(p) = 0xDEADBEEFCAFEF00DULL;  // sentinel
-        }
         freeListBins_[bytes].push_back(p);
         ++freeListEntries_;
     }
@@ -2350,26 +2277,6 @@ public:
         void * p = it->second.back();
         it->second.pop_back();
         --freeListEntries_;
-        if (__builtin_expect(detail::g_midEvalPoison, 0)) {
-            binnedDbg_.erase(p);
-            if (*reinterpret_cast<uint64_t *>(p) != 0xDEADBEEFCAFEF00DULL) {
-            // RCA: find the nearest SET cell-start at/below p-16.  If it's a
-            // nearby cell (esp. a string) that p falls inside, p is INTERIOR to a
-            // live cell (spurious-bit split); if it's p itself / far, p is a
-            // standalone MISSED live cell.
-            const char * below =
-                findContainingCellStart(static_cast<const char *>(p) - 16);
-            long dist = below ? (long)((const char *)p - below) : -1;
-            std::fprintf(stderr,
-                "[mideval-poison] binned-then-mutated: p=%p type=%d size=%zu "
-                "word0=0x%016llx | nearest-start-below=%p dist=%ld belowType=%d\n",
-                p, (int)cellTypeAt(p), bytes,
-                (unsigned long long)*reinterpret_cast<uint64_t *>(p),
-                (const void *)below, dist,
-                below ? (int)cellTypeAt(below) : -1);
-            std::abort();
-            }
-        }
         // Re-set the cell-start bit at this address (sweep cleared
         // it when adding to free list).  Slow path: linear-scan
         // blocks to find owner.  Only called on free-list pop,
@@ -2672,10 +2579,6 @@ private:
     /// Kept for one validation cycle so V3_DBG_IMMIX_ALLOC=0 falls
     /// back gracefully.
     std::unordered_map<size_t, std::vector<void *>> freeListBins_;
-    // RCA only (NIX_V3_MIDEVAL_POISON): address → bin-size of currently-binned
-    // cells, to detect double-bin / cross-size staleness.  Never touched when the
-    // poison gate is off.
-    std::unordered_map<void *, size_t> binnedDbg_;
     size_t freeListEntries_ = 0;
 
     /// Step 12′ (Immix, 2026-05-29) — line-region allocator state.
