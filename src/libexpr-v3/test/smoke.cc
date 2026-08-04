@@ -3728,41 +3728,6 @@ static int testDeferFibCondShape()
     return 0;
 }
 
-// Negative case: with NIX_V3_NO_DEFER=1, the same shape must emit the
-// full SET/GET ladder.  Validates the kill-switch.
-static int testDeferKillSwitch()
-{
-    setenv("NIX_V3_NO_DEFER", "1", 1);
-    // analyseOccurrence + tryDefer caches the env var lookup as
-    // function-local static, so each test would normally see the
-    // first call's value.  But Emitter is constructed fresh per
-    // compile(), and tryDefer uses `static const bool`.  The static
-    // cache means we have to set the env BEFORE the first compile in
-    // this process — which is hard to guarantee.  Instead: this test
-    // documents the intent.  In practice, NIX_V3_NO_DEFER must be
-    // set before nix-direct or v3-eval starts.
-
-    // Actually run it to verify no crash + correct value.
-    auto m = ir::makeModule();
-    auto entry = m.freshBlock();
-    funcOf(m, 0).entryBlock = entry;
-    auto a = addBinding(m, entry, ir::LitInt{2});
-    auto b = addBinding(m, entry, ir::LitInt{3});
-    auto sum = addBinding(m, entry, ir::Add{a, b});
-    setReturn(m, entry, sum);
-    ir::computeFreeVars(m);
-    auto cu = compile(m);
-    auto v = run(cu);
-    unsetenv("NIX_V3_NO_DEFER");
-    if (!v.isInt() || v.asInt() != 5) {
-        std::fprintf(stderr, "testDeferKillSwitch: expected 5, got tag=%d\n",
-            (int)v.tag());
-        return 1;
-    }
-    std::fprintf(stderr, "testDeferKillSwitch: OK\n");
-    return 0;
-}
-
 // Positive correctness: 1 + 2 with deferring active, returns 3.
 static int testDeferAddCorrectness()
 {
@@ -4491,7 +4456,6 @@ int main()
     rc |= testDeferIfOnLessShape();
     rc |= testDeferSkipsManyUseBinding();
     rc |= testDeferLetRecCorrect();
-    rc |= testDeferKillSwitch();
 
     // OPT_OCCUR Phase B — deadBindingElimViaOccur (Phase 0.3/0.4)
     rc |= testOccurDceRemovesChainedDeadBinding();

@@ -23,8 +23,8 @@ let fib = n: if n < 2 then n else fib (n - 1) + fib (n - 2); in fib 5
 # The recursive lambda's body (func "n") must contain NO OP_MAKE_THUNK before
 # its final `+`: the strict (n-1)/(n-2) args are computed inline because
 # strictness de-thunked them.  CHECK-NOT is bounded by the `+` op — which is
-# OP_R_STR_CONCAT2 with the register VM on (the default) or OP_STR_CONCAT under
-# NIX_V3_NO_R_STRCONCAT2=1; the regex matches either, present either way.  If
+# OP_R_STR_CONCAT2 for a 2-part concat or OP_STR_CONCAT otherwise; the regex
+# matches either, present either way.  If
 # strictness is skipped, the args reappear as OP_MAKE_THUNK before the `+`,
 # tripping CHECK-NOT.
 # CHECK-LABEL: ; func {{[0-9]+}} "n"

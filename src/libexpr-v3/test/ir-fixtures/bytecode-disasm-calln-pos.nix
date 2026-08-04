@@ -4,7 +4,7 @@
 # in the bytecode disassembler (disasm.cc::disassembleOne).
 #
 # A saturated multi-argument application lowers to OP_CALL_N <argcount>
-# (eval/apply; NIX_V3_NO_CALL_N off by default).  Its operand is the arg
+# (eval/apply; App-spine coalescing is unconditional).  Its operand is the arg
 # count, not a slot/constant index, so the disassembler annotates it as
 # "; N args" — otherwise a bare `operand=2` is ambiguous.  This fixture
 # pins that annotation (and the binary lambda's arity framing).

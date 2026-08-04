@@ -1,6 +1,6 @@
 # Repro for #668 — `with`+interpolated-If under #542 emit-time deferring
 #
-# Before fix (`NIX_V3_NO_DEFER` unset, default-on deferring): v3 emits
+# Before fix (with #542 emit-time deferring active): v3 emits
 # OP_SET_LOCAL for a deferred literal "_" INSIDE the then-branch of the
 # If via flushAllDeferred-on-emitBlock-entry, but emits NO matching SET
 # in the else-branch.  At runtime the else path leaves the deferred

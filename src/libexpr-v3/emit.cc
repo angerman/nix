@@ -301,13 +301,6 @@ struct Emitter
     /// Returns true iff deferred (caller skipped SET).
     bool tryDefer(ir::VarId var)
     {
-        // NIX_V3_NO_DEFER=1: A/B switch.  Disables deferring entirely
-        // so a regression can be bisected to "v3 emit deferring
-        // optimisation" vs "everything else."
-        static const bool disabled =
-            std::getenv("NIX_V3_NO_DEFER") != nullptr;
-        if (disabled) return false;
-
         // Only OnceLinear bindings are safe to defer: by definition a
         // single use exists and the consumer pops the value off the
         // runtime stack.  Many / OnceCaptured / Param: not safe (the
@@ -334,17 +327,9 @@ struct Emitter
     /// the previous instruction is a same-slot SET_LOCAL (reserved local).
     /// Elision is deferred to compactFuseSetGet() at function end, where
     /// the complete jump-target set is known.  See BYTECODE_NGRAM_ANALYSIS §7.
-    ///
-    /// NIX_V3_NO_FUSE_SETGET=1 disables the fusion (mirrors NIX_V3_NO_DEFER):
-    /// a regression-bisection / A-B switch, default-ON.  RETIREMENT: drop the
-    /// switch once the fusion is subsumed by a future register-VM operand-fold
-    /// pass, or if it is ever shown net-negative on wall (revert the whole
-    /// peephole, not just the switch).
     void emitGetLocal(uint16_t slot)
     {
-        static const bool noFuse =
-            std::getenv("NIX_V3_NO_FUSE_SETGET") != nullptr;
-        if (!noFuse && !unit.code.empty()
+        if (!unit.code.empty()
             && unit.code.back() == encode(OP_SET_LOCAL, slot)
             && slot < ctx->nLocals)
         {
@@ -428,9 +413,6 @@ struct Emitter
     /// caller then skips the normal expr-emit + SET for this binding).
     bool tryEmitRPrimop2(const ir::Binding & bd, int32_t dstOverride = -1)
     {
-        static const bool s_noRegPrimop2 =
-            std::getenv("NIX_V3_NO_REG_PRIMOP2") != nullptr;
-        if (s_noRegPrimop2) return false;
         auto * pc = std::get_if<ir::PrimOpCall>(&bd.expr);
         if (!pc || pc->args.size() != 2) return false;
         if (!pc->primop || pc->primop->deepForceList != 0) return false;
@@ -467,7 +449,7 @@ struct Emitter
     /// OP_R_CALL writing vF's slot — dropping the arg GET, the result
     /// operand-stack round-trip, and the separate FORCE.  This is the call
     /// analogue of tryEmitRPrimop2.  Returns the number of bindings consumed
-    /// (0 = no match, 2 = the App + its Force).  Gate NIX_V3_NO_R_CALL.
+    /// (0 = no match, 2 = the App + its Force).
     ///
     /// Each operand must be either slot-resident or the deferred operand-stack
     /// TOP (at most one can be the top in the canonical `RecBindingSlotRef; App`
@@ -484,8 +466,6 @@ struct Emitter
                         bool tailLast, const SpineHeadMap & spineHead,
                         int32_t dstOverride = -1)
     {
-        static const bool s_no = std::getenv("NIX_V3_NO_R_CALL") != nullptr;
-        if (s_no) return 0;
         const auto & bd = b.bindings[i];
         auto * app = std::get_if<ir::App>(&bd.expr);
         if (!app) return 0;
@@ -544,12 +524,8 @@ struct Emitter
     /// OP_R_STR_CONCAT2 (no GET_LOCAL2 + STR_CONCAT operand-stack round-trip).
     /// `dstOverride >= 0` writes that slot instead of the binding's own (used by
     /// register-mode If to land the branch result directly in the merge slot).
-    /// Gate NIX_V3_NO_R_STRCONCAT2.
     bool tryEmitRStrConcat2(const ir::Binding & bd, int32_t dstOverride = -1)
     {
-        static const bool s_no =
-            std::getenv("NIX_V3_NO_R_STRCONCAT2") != nullptr;
-        if (s_no) return false;
         auto * cs = std::get_if<ir::ConcatStrings>(&bd.expr);
         if (!cs || cs->parts.size() != 2) return false;
         uint16_t slots[2];
@@ -579,13 +555,11 @@ struct Emitter
     /// is a captured rec-attrset upvalue, resolve straight into the binding's
     /// slot with OP_GET_UPVALUE_REC_BINDING_SLOT — dropping the GET_UPVALUE
     /// push + the materialising SET that tryEmitRCall would otherwise emit.
-    /// Gate NIX_V3_NO_RBSR_SLOT.  Returns true iff emitted (caller skips the
+    /// Returns true iff emitted (caller skips the
     /// generic emit + defer/SET; the value is now slot-resident).
     bool tryEmitRecBindToSlot(const ir::Binding & bd,
                               const std::unordered_set<ir::VarId> & appFunVars)
     {
-        static const bool s_no = std::getenv("NIX_V3_NO_RBSR_SLOT") != nullptr;
-        if (s_no) return false;
         auto * e = std::get_if<ir::RecBindingSlotRef>(&bd.expr);
         if (!e) return false;
         if (!appFunVars.count(bd.var)) return false;       // only call-callee uses
@@ -624,11 +598,9 @@ struct Emitter
     /// tail If becomes `… ; GET R ; RETURN` → `R_RETURN R` and the function
     /// runs with the operand stack dropped.  `resultHint >= 0` (this If is
     /// itself a branch tail) writes that slot directly instead of the binding's
-    /// own.  Gate NIX_V3_NO_R_IF.  Returns true iff emitted.
+    /// own.  Returns true iff emitted.
     bool tryEmitRegisterIf(const ir::Binding & bd, bool isTail, int32_t resultHint)
     {
-        static const bool s_no = std::getenv("NIX_V3_NO_R_IF") != nullptr;
-        if (s_no) return false;
         auto * e = std::get_if<ir::If>(&bd.expr);
         if (!e) return false;
         // cond must be slot-resident + not deferred (same gate as the
@@ -834,10 +806,7 @@ struct Emitter
         // (Tag::App) pair per inner application, the dominant per-iteration
         // allocation in every bytecode fold/loop.  Inner nodes are skipped;
         // the head binding emits the whole spine via emitVarRef (base then
-        // args), which OP_CALL_N pops in order.  NIX_V3_NO_CALL_N=1 disables
-        // it (bisect handle; retire once shipped byte-identical on --core +
-        // a nixpkgs sample across ≥10 runs).
-        static const bool s_noCallN = std::getenv("NIX_V3_NO_CALL_N") != nullptr;
+        // args), which OP_CALL_N pops in order.
         std::unordered_map<ir::VarId, const ir::App *> appOf;
         std::unordered_set<ir::VarId> spineInner;
         std::unordered_map<ir::VarId,
@@ -851,47 +820,45 @@ struct Emitter
         for (auto & bd : b.bindings)
             if (auto * a = std::get_if<ir::App>(&bd.expr))
                 appFunVars.insert(a->fun);
-        if (!s_noCallN) {
-            for (auto & bd : b.bindings)
-                if (auto * a = std::get_if<ir::App>(&bd.expr))
-                    appOf.emplace(bd.var, a);
-            // v is an inner spine node iff it is an App binding that is
-            // OnceLinear (single use) — that single use being as some App's
-            // .fun is what makes it part of a spine; we confirm the fun-use
-            // by only ever reaching it while walking down from a head.
-            auto innerApp = [&](ir::VarId v) -> bool {
-                auto it = appOf.find(v);
-                return it != appOf.end()
-                    && occ.lookup(v).kind == ir::OccKind::OnceLinear;
-            };
-            for (auto & bd : b.bindings) {
-                auto * a = std::get_if<ir::App>(&bd.expr);
-                if (!a) continue;
-                // A coalescable HEAD is an App whose .fun is itself an inner
-                // App node (so the spine has ≥ 2 args).  A head that is ALSO
-                // some longer spine's inner node is subsumed: it is reached
-                // (and recorded in spineInner) while walking the outer head,
-                // so by the time the loop emits it we skip it.
-                if (!innerApp(a->fun)) continue;
-                std::vector<ir::VarId> revArgs;
-                std::vector<ir::VarId> walkedInner;
-                const ir::App * cur = a;
-                ir::VarId base = ir::kInvalid;
-                while (true) {
-                    revArgs.push_back(cur->arg);
-                    ir::VarId f = cur->fun;
-                    if (innerApp(f)) {
-                        walkedInner.push_back(f);
-                        cur = appOf[f];
-                    } else { base = f; break; }
-                }
-                // Cap at the runtime argbuf (16); skip pathological spines.
-                if (revArgs.size() < 2 || revArgs.size() > 16) continue;
-                std::vector<ir::VarId> args(revArgs.rbegin(), revArgs.rend());
-                spineHead.emplace(bd.var,
-                    std::make_pair(base, std::move(args)));
-                for (ir::VarId iv : walkedInner) spineInner.insert(iv);
+        for (auto & bd : b.bindings)
+            if (auto * a = std::get_if<ir::App>(&bd.expr))
+                appOf.emplace(bd.var, a);
+        // v is an inner spine node iff it is an App binding that is
+        // OnceLinear (single use) — that single use being as some App's
+        // .fun is what makes it part of a spine; we confirm the fun-use
+        // by only ever reaching it while walking down from a head.
+        auto innerApp = [&](ir::VarId v) -> bool {
+            auto it = appOf.find(v);
+            return it != appOf.end()
+                && occ.lookup(v).kind == ir::OccKind::OnceLinear;
+        };
+        for (auto & bd : b.bindings) {
+            auto * a = std::get_if<ir::App>(&bd.expr);
+            if (!a) continue;
+            // A coalescable HEAD is an App whose .fun is itself an inner
+            // App node (so the spine has ≥ 2 args).  A head that is ALSO
+            // some longer spine's inner node is subsumed: it is reached
+            // (and recorded in spineInner) while walking the outer head,
+            // so by the time the loop emits it we skip it.
+            if (!innerApp(a->fun)) continue;
+            std::vector<ir::VarId> revArgs;
+            std::vector<ir::VarId> walkedInner;
+            const ir::App * cur = a;
+            ir::VarId base = ir::kInvalid;
+            while (true) {
+                revArgs.push_back(cur->arg);
+                ir::VarId f = cur->fun;
+                if (innerApp(f)) {
+                    walkedInner.push_back(f);
+                    cur = appOf[f];
+                } else { base = f; break; }
             }
+            // Cap at the runtime argbuf (16); skip pathological spines.
+            if (revArgs.size() < 2 || revArgs.size() > 16) continue;
+            std::vector<ir::VarId> args(revArgs.rbegin(), revArgs.rend());
+            spineHead.emplace(bd.var,
+                std::make_pair(base, std::move(args)));
+            for (ir::VarId iv : walkedInner) spineInner.insert(iv);
         }
 
         for (size_t i = 0; i < nBd; ++i) {
@@ -1304,10 +1271,8 @@ struct Emitter
         // so flushAllDeferred (commit pending to slots for branch consistency)
         // replaces flushBelowBranchCond's stash-the-cond dance.  This is what
         // makes a branch's condition register-addressed (e.g. fib's R_PRIMOP2
-        // `n < 2` result feeding the If).  Gate NIX_V3_NO_R_BRANCH.
-        static const bool s_noRBranch =
-            std::getenv("NIX_V3_NO_R_BRANCH") != nullptr;
-        if (!s_noRBranch) {
+        // `n < 2` result feeding the If).
+        {
             auto sit = ctx->slot.find(e.cond);
             if (sit != ctx->slot.end() && sit->second <= 0xFFFFFFu
                 && std::find(ctx->pendingDefer.begin(),
@@ -1393,16 +1358,11 @@ struct Emitter
         // removes the 2 REC_SET + 2 slot stores per record.  Values are pushed
         // BEFORE the opcode (like OP_LIST_INIT) so no deferred-flush dance is
         // needed (unlike REC_INIT which pushes the Bindings first).
-        // DEFAULT-ON 2026-06-16 (opt-out NIX_V3_NO_NONREC_ATTRS_INIT=1).
         // Validated byte-identical: --core lang 21/21, hello/git/firefox
         // drvPath, and a 59-package laptop drvPath sweep (demote-diverge=0,
         // tw-diverge=0) — plus the semantic argument (a non-rec literal can't
         // self-ref/with-self, so ATTRS_INIT ≡ REC_INIT modulo the value-
-        // irrelevant cell-update).  The opt-out is the A/B baseline + emergency
-        // mitigation.  RETIREMENT: drop the opt-out (hard-true) after a full
-        // darwin-4 nixpkgs byte-equality sweep, mirroring the nursery-flip gate.
-        static const bool s_nonRecAttrsInit =
-            std::getenv("NIX_V3_NO_NONREC_ATTRS_INIT") == nullptr;
+        // irrelevant cell-update).  Unconditional.
         // `!e.isFunctionReturn`: the demotion must NOT win over the
         // isFunctionReturn → OP_ATTRS_REC_INIT_TAIL selection below (emit.cc:1465),
         // which publishes the partial Bindings to outer mid-force thunks (the
@@ -1410,7 +1370,7 @@ struct Emitter
         // on a non-rec set (markTailReturnAttrSets is retired), so this is a no-op
         // today — kept as a guard so reviving tail-return tagging can't silently
         // drop the TAIL publish for a demoted set with no compile error.
-        if (s_nonRecAttrsInit && e.nonRecursive && !e.isFunctionReturn) {
+        if (e.nonRecursive && !e.isFunctionReturn) {
             const size_t nn = e.entries.size();
             if (nn == 0) {
                 unit.code.push_back(encode(OP_ATTRS_INIT, 0));
@@ -1665,13 +1625,7 @@ struct Emitter
         // Only fires when the source is a plain upvalue that the #542 defer
         // pipeline didn't capture (pending top) — upvalues are never deferred
         // (defer is for OnceLinear bindings), so this is the steady case.
-        // NIX_V3_NO_FUSE_RECBIND=1 disables it (default-ON A/B bisect switch,
-        // mirrors NO_DEFER/NO_CALL_N; retire once shipped byte-identical on
-        // --core + a nixpkgs sample, or revert the feature if net-negative).
-        static const bool s_noFuseRecBind =
-            std::getenv("NIX_V3_NO_FUSE_RECBIND") != nullptr;
-        if (!s_noFuseRecBind
-            && (ctx->pendingDefer.empty() || ctx->pendingDefer.back() != e.attrs)
+        if ((ctx->pendingDefer.empty() || ctx->pendingDefer.back() != e.attrs)
             && ctx->slot.find(e.attrs) == ctx->slot.end()) {
             if (auto uit = ctx->upvalue.find(e.attrs); uit != ctx->upvalue.end()) {
                 flushAllDeferred();  // match emitVarRef discipline
@@ -2125,16 +2079,6 @@ struct Emitter
     void preassignSlotsInBlock(FuncCtx & fc, ir::BlockId bid,
                                std::unordered_set<ir::BlockId> & visited)
     {
-        // §2(a) A/B bisect switch — default-ON.  NIX_V3_NO_CONST_REMAT=1
-        // disables constant rematerialization so a regression can be
-        // bisected to "v3 const-remat" vs everything else (mirrors
-        // NIX_V3_NO_DEFER / NIX_V3_NO_CALL_N / NIX_V3_NO_FUSE_SETGET).
-        // RETIREMENT: drop the switch once const-remat ships byte-identical
-        // on --core + a nixpkgs sample over ≥10 runs, or if it is ever shown
-        // net-negative on wall (then revert the whole feature, not the gate).
-        static const bool s_noConstRemat =
-            std::getenv("NIX_V3_NO_CONST_REMAT") != nullptr;
-
         if (!visited.insert(bid).second) return;
         const ir::Block & b = m.blocks[bid];
         for (auto & bd : b.bindings) {
@@ -2145,7 +2089,7 @@ struct Emitter
             // win (all hot recursion/loop literals are single-use) is kept.
             // Vars captured by a nested closure are excluded (they must live
             // in a parent slot for MAKE_CLOSURE) and fall through to a slot.
-            if (!s_noConstRemat && isRematConst(bd.expr)
+            if (isRematConst(bd.expr)
                 && !capturedFreeVars_.count(bd.var)
                 && occ.lookup(bd.var).kind == ir::OccKind::OnceLinear)
                 constRemat_[bd.var] = &bd.expr;
@@ -2196,9 +2140,6 @@ struct Emitter
         // all dropped positions and one rebase fixes jump operands.  Only the
         // DROPPED position may not be a jump target (a jump to the kept first
         // op still executes identically).
-        static const bool s_noGet2 =
-            std::getenv("NIX_V3_NO_GET_LOCAL2") != nullptr;
-
         std::vector<uint32_t> rem;
         std::unordered_set<uint32_t> keepInvolved;  // positions (A) touches
         rem.reserve(fuseGetPositions_.size());
@@ -2223,7 +2164,7 @@ struct Emitter
         // pair and skip the second (so `GL GL GL` fuses one pair).  The second
         // (removed) GET must not be a jump target; neither may overlap an (A)
         // site.
-        if (!s_noGet2 && getLocalPositions_.size() >= 2) {
+        if (getLocalPositions_.size() >= 2) {
             std::unordered_set<uint32_t> getSet(getLocalPositions_.begin(),
                                                 getLocalPositions_.end());
             std::vector<uint32_t> gp(getLocalPositions_.begin(),
@@ -2412,12 +2353,10 @@ struct Emitter
         // OP_R_RETURN s.  A straight-line function then runs with NO operand-
         // stack traffic.  A branch to the GET_LOCAL is fine (R_RETURN s returns
         // slot s identically); only a branch to the RETURN (a path that left
-        // its value on the stack) blocks the rewrite.  Gate NIX_V3_NO_R_RETURN.
+        // its value on the stack) blocks the rewrite.
         {
-            static const bool s_noRReturn =
-                std::getenv("NIX_V3_NO_R_RETURN") != nullptr;
             uint32_t retPos = static_cast<uint32_t>(unit.code.size()) - 1;
-            if (!s_noRReturn && fid != 0 && retPos >= codeStart + 1
+            if (fid != 0 && retPos >= codeStart + 1
                 && decodeOp(unit.code[retPos]) == OP_RETURN
                 && decodeOp(unit.code[retPos - 1]) == OP_GET_LOCAL) {
                 bool retIsTarget = false;
@@ -2548,19 +2487,15 @@ struct Emitter
         // when the IR has an explicit Force around the paramVar (rare
         // but possible if the lowerer adds it for some path).
         //
-        // IR Phase E (2026-05-18): default-on selector-lambda
-        // recognition.  Previously gated by NIX_V3_SELECTOR_LAMBDA=1
-        // ("Once stable, flip default ON" — the recognition has now
-        // soaked through the full v3 test matrix without false
-        // positives).  The opt-out gate `NIX_V3_NO_SELECTOR_LAMBDA=1`
-        // exists for A/B perf measurement only; correctness is
-        // guaranteed by the structural peephole (4-instruction body:
-        // OP_GET_LOCAL[_FORCE] 0, OP_ATTRS_SELECT [sym], [icIdx],
-        // OP_RETURN — no nested control flow, no captures).
-        static const bool noSelectorLambda =
-            std::getenv("NIX_V3_NO_SELECTOR_LAMBDA") != nullptr;
-        if (!noSelectorLambda
-            && fid != 0
+        // IR Phase E (2026-05-18): unconditional selector-lambda
+        // recognition (the NIX_V3_SELECTOR_LAMBDA opt-in and the
+        // NIX_V3_NO_SELECTOR_LAMBDA A/B opt-out were both retired after
+        // the recognition soaked through the full v3 test matrix without
+        // false positives).  Correctness is guaranteed by the structural
+        // peephole (4-instruction body: OP_GET_LOCAL[_FORCE] 0,
+        // OP_ATTRS_SELECT [sym], [icIdx], OP_RETURN — no nested control
+        // flow, no captures).
+        if (fid != 0
             && f.argName != ir::kInvalidSymbol
             && !f.hasFormals
             && f.freeVars.empty()

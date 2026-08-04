@@ -16,9 +16,8 @@
 #
 # Plan reference: IR_OPTIMIZATION_PLAN_2026-05-18.md §2.5 Phase E
 # exit criterion: "x: x.foo lambda has selectorSym = foo set."
-# The peephole was previously gated by NIX_V3_SELECTOR_LAMBDA=1;
-# this commit makes it default-ON, opt-out via
-# NIX_V3_NO_SELECTOR_LAMBDA=1.
+# The peephole is unconditional (the NIX_V3_SELECTOR_LAMBDA opt-in and
+# the NIX_V3_NO_SELECTOR_LAMBDA opt-out were both retired).
 
 map (p: p.name) [ { name = "alice"; } { name = "bob"; } ]
 
