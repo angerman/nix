@@ -444,8 +444,8 @@ void optimise(Module & m)
     // genList spine) and had been default-OFF (opt-in `NIX_V3_STREAM_FUSION`)
     // ever since, so it was a dead 802-line no-op in every real eval.  The
     // falsified-candidate registry it documented lives in git history.  The
-    // `__foldlMap` primop it targeted is now unproduced by any pass (a
-    // registered orphan; retire with the bytecode-primop cleanup).
+    // `__foldlMap` primop it targeted has now been removed too (it was an
+    // unproduced orphan — no pass emitted it after the fusion pass went).
 
     // RETAINED DIAGNOSTIC (detection-only, no rewrite): count the
     // `foldl' (acc: x: acc ++ G) [] xs` O(n²) accumulation idiom.  Gated

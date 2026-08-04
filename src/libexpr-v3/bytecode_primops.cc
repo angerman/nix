@@ -361,36 +361,17 @@ void installAllBytecodePrimops(nix::EvalState & state)
                 "          in builtins.seq next (go (i + 1) next); "
                 "  in go 0 nul");
 
-        // 2026-05-18: IR Phase C stream-fusion target.  __foldlMap
-        // implements `foldl' op nul (map f xs)` in a single iterative
-        // pass — no intermediate list allocation, no per-element
-        // C-recursion via callClosure.  Body mirrors the foldl'
-        // bytecode above but inlines the `f` application per element.
-        // ORPHAN (2026-08-04): the stream-fusion pass that produced
-        // PrimOpCall(__foldlMap, …) was retired (FALSIFIED 2026-06-05), so
-        // nothing emits __foldlMap now; this opt-in install is dead pending
-        // the bytecode-primop cleanup.
-        if (std::getenv("NIX_V3_BC_FOLDLMAP"))  // default-off: loses to C++ (bc-vs-cpp); opt-in
-            installBytecodePrimop(state, "__foldlMap",
-                "op: nul: f: list: "
-                "  let n = builtins.length list; "
-                "      go = i: acc: "
-                "        if i >= n then acc "
-                "        else "
-                "          let fx = f (builtins.elemAt list i); "
-                "              next = op acc fx; "
-                "          in builtins.seq next (go (i + 1) next); "
-                "  in go 0 nul");
-
         // NOTE: a __mapMap (map∘map) fusion target was prototyped here and
         // FALSIFIED 2026-06-05 — measured NEUTRAL (insns 54000117 vs
         // 54000115; peak RSS 791 vs 791 MB on a 1M chain).  map∘map
         // eliminates only the transient intermediate spine; lazy elements
         // are forced exactly once either way and the intermediate ListVec is
         // GC-reclaimed as forcing proceeds, so there is no win at peak.  The
-        // winning fusion shape eliminates the OUTPUT list too (foldl'∘map →
-        // __foldlMap above).  Candidate registry + verdicts live in the
-        // kRules table comment in opt_stream_fusion.cc.
+        // winning fusion shape eliminated the OUTPUT list too (foldl'∘map →
+        // __foldlMap), but that whole stream-fusion track was retired
+        // 2026-06-05 (FALSIFIED — regressed vs the C-built genList spine);
+        // the __foldlMap primop + its opt-in install were removed with it.
+        // See git history for the pass + its falsified-candidate registry.
 
         // T2 — map: lazy list mapping.  Preserves TW's primMap
         // laziness (each result entry is forced on demand) by

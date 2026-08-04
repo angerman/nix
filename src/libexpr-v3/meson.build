@@ -605,7 +605,6 @@ if python3.found()
     ['v3-direct-eval',       'test/run-direct-eval-tests.sh',       60],
     ['v3-lazy-bridge-arg',   'test/run-lazy-bridge-arg-tests.sh',   60],
     ['v3-cutover-parity',    'test/run-cutover-parity-tests.sh',    60],
-    ['v3-stream-fusion',     'test/run-stream-fusion-tests.sh',     60],
     ['v3-lambda-lift',       'test/run-lambda-lift-tests.sh',       60],
     ['v3-resource-limits',   'test/run-resource-limits-tests.sh',   60],
     ['v3-eval-bytecode-primops-installed',

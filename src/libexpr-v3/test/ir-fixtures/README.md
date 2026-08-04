@@ -147,9 +147,6 @@ Phase B — const-fold + primop-fold:
 - `constantFold-arith-pos.nix` — `2 * 3 → LitInt 6`.
 - `primOpFold-length-pos.nix` — `length [1..5] → LitInt 5`.
 
-Phase C — stream fusion:
-- `streamFusion-foldlMap-pos.nix` — `foldl' op nul (map f xs) → __foldlMap` App-chain.
-
 Phase D — lambda lift precondition:
 - `lambdaLift-capture-free-pos.nix` — capture-free lambda has no freeVars.
 - `lambdaLift-capturing-neg.nix` — capturing lambda has freeVars + nUp=1.

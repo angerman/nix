@@ -1759,55 +1759,6 @@ void primFoldl(EvalState & state, Value * args, Value & out)
     out = acc;
 }
 
-/// IR Phase C fused-loop FFI leaf (2026-05-18).
-///
-/// Semantically equivalent to `foldl' op init (map f xs)`:
-///
-///     __foldlMap op init f xs
-///       = foldl' (acc: x: op acc (f x)) init xs
-///
-/// ORPHAN (2026-08-04): this was the rewrite target of the stream-fusion
-/// pass (retired — FALSIFIED as a perf lever 2026-06-05), which rewrote
-/// `foldl'(op, init, map(f, xs))` to `__foldlMap(op, init, f, xs)`.  No pass
-/// produces `__foldlMap` any more; the primop stays registered (a hidden,
-/// TW-less v3-only builtin) pending the bytecode-primop cleanup.
-///
-/// All four args are STRICT (no lazy-arg bitmask).  The bytecode
-/// wrapper in bytecode_primops.cc may override this with an
-/// installBytecodePrimop call; this C body is the correctness
-/// fallback.
-void primFoldlMap(EvalState & state, Value * args, Value & out)
-{
-    if (!args[3].isList()) typeError("__foldlMap", "list as fourth arg");
-    Value op   = args[0];
-    Value acc  = args[1];
-    Value f    = args[2];
-    // S1.2 (template Rules 1-3): op/acc/f and the list Value are live across the
-    // re-entrant callClosure/callClosure2; GcRoot makes them precise + rewritten
-    // in place.  Re-read the list each iteration (Rule 2 — the cached raw `src`
-    // would dangle after a relocation); size is stable so cache once.  `fx` is
-    // forced+consumed within the iteration (forceValue roots its own arg; passed
-    // by value into callClosure2 — Rule 3) so it needs no separate root.
-    GcRoot rOp(op), rAcc(acc), rF(f), rList(args[3]);
-    auto * src0 = args[3].asList();
-    const uint32_t sz = src0 ? src0->size : 0;
-    for (uint32_t i = 0; i < sz; ++i) {
-        // Compute f(elem); force the result before passing to op.
-        Value fx = callClosure(*state.vm, f, args[3].asList()->elems[i]);
-        if (__builtin_expect(fx.tag() == Tag::Thunk
-                             || fx.isAppLike()
-                             || fx.tag() == Tag::Slot, 0))
-            fx = forceValue(*state.vm, fx);
-        // Apply op acc fx — T1 saturated 2-arg call (see primFoldl).
-        acc = callClosure2(*state.vm, op, acc, fx);
-        if (__builtin_expect(acc.tag() == Tag::Thunk
-                             || acc.isAppLike()
-                             || acc.tag() == Tag::Slot, 0))
-            acc = forceValue(*state.vm, acc);
-    }
-    out = acc;
-}
-
 void primGenList(EvalState & state, Value * args, Value & out)
 {
     // Tree-walker's prim_genList builds App entries: each element is
@@ -10856,18 +10807,6 @@ void registerBuiltinPrimOps()
         // so per-element forcing inside the fold doesn't grow the C stack.
         registerPrimOp({"foldl'",             3, primFoldl,
                         /*lazyArgs=*/0b010, /*deepForceList=*/0});
-        // 2026-05-18 IR Phase C fused-loop FFI leaf: __foldlMap.
-        // Args: (op, init, f, xs).  Equivalent to
-        // `foldl' (acc: x: op acc (f x)) init xs`.  Recognised by
-        // opt_stream_fusion.cc, which rewrites
-        // `foldl'(op, init, map(f, xs))` to a __foldlMap call.
-        // lazyArgs mirrors foldl' (init is lazy).  Internal — leading
-        // `__` keeps it out of user-visible `builtins`.
-        // C-14: deepForceList=0 (mirrors foldl' — __foldlMap is the fused
-        // `foldl' (acc: x: op acc (f x)) init xs`; it must not pre-force xs's
-        // elements either).
-        registerPrimOp({"__foldlMap",         4, primFoldlMap,
-                        /*lazyArgs=*/0b0010, /*deepForceList=*/0});
         registerPrimOp({"genList",            2, primGenList});
         registerPrimOp({"all",                2, primAll});
         registerPrimOp({"any",                2, primAny});

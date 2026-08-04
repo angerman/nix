@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
 #
-# bc-vs-cpp.sh — A/B v3 BYTECODE primops vs C++, in THREE regimes.
+# bc-vs-cpp.sh — A/B v3 BYTECODE primops vs C++, in TWO regimes.
 #
 #   big   — one call on a large collection (per-element work). C++ wins (only map ties).
 #   small — primop called N× on tiny inputs (per-CALL dispatch). C++ wins all 10.
-#   chain — a fusable chain (map|>filter|>foldl') 3-way: default (bytecode, unfused)
-#           vs STREAM_FUSION=1 (fused, no intermediate lists) vs NO_BYTECODE_PRIMOPS=1
-#           (C++ + intermediates). This is the modest-6's last possible justification —
-#           does fusion beat C++? (NB: opt_stream_fusion is default-OFF + "regresses".)
 #
-# Toggle (run.cc): NIX_V3_NO_BC_<NAME>=1 / NIX_V3_NO_BYTECODE_PRIMOPS=1 / NIX_V3_STREAM_FUSION=1.
+# (A third "chain" regime once A/B'd the stream-fusion pass via
+#  NIX_V3_STREAM_FUSION=1; the pass + that regime were retired 2026-06-05 —
+#  FALSIFIED, see git history.)
+#
+# Toggle (run.cc): NIX_V3_NO_BC_<NAME>=1 / NIX_V3_NO_BYTECODE_PRIMOPS=1.
 # file-based workloads + per-eval timeout that reaps. Run on an IDLE host.
 #
-# Usage:  [NIX_BIN=…] [RUNS=2] [TIMEOUT_S=25] ./bc-vs-cpp.sh [big|small|chain|all]
+# Usage:  [NIX_BIN=…] [RUNS=2] [TIMEOUT_S=25] ./bc-vs-cpp.sh [big|small|all]
 set -uo pipefail
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(git -C "$SELF_DIR" rev-parse --show-toplevel 2>/dev/null || echo "$SELF_DIR/../../..")"
@@ -46,12 +46,6 @@ sm_any()           { echo 'builtins.foldl'"'"' (a: i: a + (if builtins.any (x: x
 sm_partition()     { echo 'builtins.foldl'"'"' (a: i: a + builtins.length (builtins.partition (x: x > i) [ 1 2 3 ]).right) 0 (builtins.genList (j: j) __N__)'; }
 sm_groupBy()       { echo 'builtins.foldl'"'"' (a: i: a + builtins.length (builtins.attrNames (builtins.groupBy (x: toString (x + i)) [ 1 2 3 ]))) 0 (builtins.genList (j: j) __N__)'; }
 
-# ── CHAIN: fusable chains over a large list (__N__ = size) ────────────────────
-ch_mapFilterFold() { echo 'builtins.foldl'"'"' (a: x: a + x) 0 (builtins.filter (x: x > 1) (builtins.map (x: x + 1) (builtins.genList (i: i) __N__)))'; }
-ch_mapMapFold()    { echo 'builtins.foldl'"'"' (a: x: a + x) 0 (builtins.map (x: x * 2) (builtins.map (x: x + 1) (builtins.genList (i: i) __N__)))'; }
-ch_mapFilterLen()  { echo 'builtins.length (builtins.filter (x: x > 1) (builtins.map (x: x + 1) (builtins.genList (i: i) __N__)))'; }
-ch_filterMapFold() { echo 'builtins.foldl'"'"' (a: x: a + x) 0 (builtins.map (x: x * 2) (builtins.filter (x: x > 1) (builtins.genList (i: i) __N__)))'; }
-
 # primop | NO_BC_<VAR> | big-fn | big-sizes | small-fn | small-Ncalls
 PRIMOPS=(
   "map          | MAP            | big_map          | 1000000 2000000 | sm_map          | 1000000 2000000"
@@ -64,13 +58,6 @@ PRIMOPS=(
   "any          | ANY            | big_any          | 1000000 2000000 | sm_any          | 1000000 2000000"
   "partition    | PARTITION      | big_partition    | 250000 500000   | sm_partition    | 1000000 2000000"
   "groupBy      | GROUPBY        | big_groupBy      | 250000 500000   | sm_groupBy      | 500000 1000000"
-)
-# chain | fn | sizes   (names use '.' not '|>' to avoid the field delimiter)
-CHAINS=(
-  "map.filter.foldl | ch_mapFilterFold | 1000000 2000000"
-  "map.map.foldl    | ch_mapMapFold    | 1000000 2000000"
-  "map.filter.len   | ch_mapFilterLen  | 1000000 2000000"
-  "filter.map.foldl | ch_filterMapFold | 1000000 2000000"
 )
 
 # measure <fn> <size> <extra-env|->  → min user-CPU over RUNS | TIMEOUT | NOENG
@@ -124,21 +111,4 @@ if [[ "$MODE" == small || "$MODE" == all ]]; then
     vd=$(awk -v b="$bc" -v c="$cpp" -v n="$s" 'BEGIN{if(b!~/^[0-9.]+$/||c!~/^[0-9.]+$/){print b" / "c;exit}d=(b-c)/n*1e9;if(d<-20)printf"bytecode WIN (saves %.0f ns/call)",-d;else if(d>20)printf"bytecode slower (+%.0f ns/call)",d;else printf"~par (Δ%.0f)",d}')
     printf '%-14s %-9s   %-12s %-12s   %s\n' "$name" "$s" "$bpc" "$cpc" "$vd"
   done
-fi
-
-if [[ "$MODE" == chain || "$MODE" == all ]]; then
-  echo; echo "### CHAIN — fusable chain over a large list, 3-way ###"
-  printf '%-20s %-9s   %-10s %-10s %-10s   %s\n' chain size "deflt(bc)" "FUSED" "C++" "verdict (fused vs C++)"
-  printf '%s\n' "────────────────────────────────────────────────────────────────────────────────────────────"
-  for e in "${CHAINS[@]}"; do
-    IFS='|' read -r name fn szs <<<"$e"; name="${name// /}"; fn="${fn// /}"
-    for s in $szs; do
-      d=$(measure "$fn" "$s" "-"); f=$(measure "$fn" "$s" "NIX_V3_STREAM_FUSION=1"); c=$(measure "$fn" "$s" "NIX_V3_NO_BYTECODE_PRIMOPS=1")
-      vd=$(awk -v f="$f" -v c="$c" 'BEGIN{if(f!~/^[0-9.]+$/||c!~/^[0-9.]+$/){print "fused="f" cpp="c;exit}r=f/c;if(r<=0.9)printf"FUSION WINS (%.2f× of C++)",r;else if(r>=1.1)printf"fusion loses (%.2f× C++)",r;else printf"~par (%.2f×)",r}')
-      printf '%-20s %-9s   %-10s %-10s %-10s   %s\n' "$name" "$s" "$d" "$f" "$c" "$vd"
-    done
-  done
-  echo
-  echo "FUSION WINS = the bytecode+fusion path beats C++-with-intermediates → the modest-6's"
-  echo "only justification. (Note: stream fusion is opt-in/default-OFF and documented as regressing.)"
 fi

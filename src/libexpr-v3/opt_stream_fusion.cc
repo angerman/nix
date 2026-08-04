@@ -1,52 +1,24 @@
 /// @file
-/// IR optimisation pass: stream fusion (Phase C).
+/// IR pass file: retained `foldl'`-idiom detection helpers.
 ///
-/// Recognises `foldl'(op, init, map(f, xs))` patterns and rewrites
-/// to `__foldlMap(op, init, f, xs)` — a single-pass FFI leaf that
-/// fuses the map and foldl' loops.  The intermediate map result list
-/// is never allocated, saving N ValuePair allocations + N callClosure
-/// invocations + one list traversal for an N-element list.
+/// HISTORY: this file once held the IR Phase-C stream-fusion pass, which
+/// recognised `foldl'(op, init, map(f, xs))` and rewrote it to a fused
+/// `__foldlMap(op, init, f, xs)` FFI leaf.  That pass was RETIRED
+/// (FALSIFIED 2026-06-05): the bytecode fusion measured a net regression
+/// vs the cheap C-built genList spine, it sat default-OFF ever after, and
+/// it was deleted — `streamFusion()` / `kRules` / `FusionRule` / the
+/// `__foldlMap` primop are all gone (see git history for the pass + its
+/// falsified-candidate registry).
 ///
-/// Why this matters: nixpkgs / stdenv code does
-///   `foldl' op init (map f xs)`
-/// repeatedly inside the Option 4 derivation wrapper (env-attrset
-/// construction, args list coerce, output-list mapping).  Each
-/// invocation, pre-fusion, allocates an intermediate N-element list
-/// with N Tag::App entries — visible in the alloc stats and the
-/// dominant cost on the v3-vs-TW hello.name perf gap.  After fusion,
-/// allocations drop to zero for these calls; the FFI leaf walks `xs`
-/// once and feeds each (f x) directly to op.
-///
-/// Pattern (matched per binding, within one block):
-///
-///     v_map = PrimOpCall(map, [f, xs])
-///     v_foldl = PrimOpCall(foldl', [op, init, v_map])
-///   →
-///     v_foldl = PrimOpCall(__foldlMap, [op, init, f, xs])
-///
-/// Safety preconditions (ALL must hold):
-///   1. v_foldl's expr is `PrimOpCall(foldl', [op, init, listArg])`.
-///   2. listArg resolves (within the same block, via VarRef chase) to
-///      `PrimOpCall(map, [f, xs])`.
-///   3. The map result's VarId is used EXACTLY ONCE — only by the
-///      foldl' we're fusing.  If used elsewhere, the map's
-///      observable behavior must be preserved (we'd duplicate work).
-///   4. Both `map` and `foldl'` resolve to primops in the v3
-///      registry (we look up `__foldlMap` to confirm it's present).
-///
-/// The match is conservative — only the exact `foldl' op init (map
-/// f xs)` shape, no `map (map ...)`-chain fusion (which would need
-/// a recursive walk and additional cases for `concatMap` /
-/// `filter`).  Phase C+ extensions can be added incrementally.
-///
-/// Gate: DEFAULT-OFF (2026-06-05) — bytecode fusion measured a net regression
-/// even post-go-loop-fix; set NIX_V3_STREAM_FUSION=1 to enable for A/B.  The
-/// pass is retained as a documented registry of falsified candidates + the
-/// mechanism for a future paying rule.  See the registry in streamFusion().
-///
-/// Pipeline placement: AFTER fusePrimOpApps (so we see canonical
-/// PrimOpCall shapes for both `map` and `foldl'`).  Runs alongside
-/// primOpFold (Phase B).
+/// WHAT REMAINS — deliberately retained, NOT falsified:
+///   * detectFoldlAppendIdiom() — a detection-only (no-rewrite) probe for
+///     the `foldl' (acc: x: acc ++ G) [] xs` O(n²) ++-accumulation idiom.
+///     Gated by V3_DBG_FOLDL_APPEND; called from opt_const_fold.cc.  See
+///     the block comment above the definition for the verdict + retirement
+///     criterion.
+///   * the shared call-recognition helpers (chaseInBlock / mapBlockDefs /
+///     recogniseCall / PrimopCallShape) the probe uses to see a primop
+///     call in both its canonical PrimOpCall and unfused App-chain shapes.
 ///
 /// Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>,
 /// Input Output Group.  SPDX-License-Identifier: Apache-2.0
@@ -96,11 +68,6 @@ std::unordered_map<VarId, const Expr *> mapBlockDefs(const Block & b)
     return defs;
 }
 
-// ---------------------------------------------------------------------------
-// (foldlMapPrimOp() retired 2026-06-05 — the fused primops are now resolved
-//  per-rule from the kRules table in streamFusion via findPrimOp.)
-// ---------------------------------------------------------------------------
-
 // Recognise a "primop call with N args" at VarId `v`, accepting both:
 //   - The canonical PrimOpCall(p, [args]) shape  (opt_primop_fuse output)
 //   - The unfused App-chain App(App(...App(LitPrimOp{p}, a0), ...), aN-1)
@@ -112,7 +79,7 @@ std::unordered_map<VarId, const Expr *> mapBlockDefs(const Block & b)
 // bytecode-closure replacement installed (via installBytecodePrimop
 // in bytecode_primops.cc) — `foldl'` and `map` are exactly those.
 // Such primops stay in App-chain form even after the fuse pass.  This
-// helper bridges both forms so streamFusion catches them uniformly.
+// helper bridges both forms so the idiom detector catches them uniformly.
 struct PrimopCallShape {
     const PrimOp * primop = nullptr;
     std::vector<VarId> args;

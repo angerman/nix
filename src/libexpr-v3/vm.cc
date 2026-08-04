@@ -12167,7 +12167,7 @@ Value getBuiltinsValue() noexcept
         // gated by impure/experimental) are deliberately KEPT.  Keyed by the
         // stripped name so both `foo` and `__foo` registrations are covered.
         static const std::unordered_set<std::string_view> kV3InternalBuiltins = {
-            "derivCoerce", "foldlMap", "derivationFromPreprocessed",
+            "derivCoerce", "derivationFromPreprocessed",
             "derivationStrictRaw", "derivationRaw", "v3CompileCallFlake",
             "parseInt", "splitString",
         };
