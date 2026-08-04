@@ -1937,9 +1937,9 @@ namespace {
 /// so a sub-thunk reading the intermediate is reading a valid
 /// snapshot.
 ///
-/// Gated behind `NIX_V3_EARLY_PUBLISH=1`.  Default off; verified
-/// non-functional for nixpkgs WC-38 and DAMAGING (corrupts slot
-/// targets with intermediate values).  Kept as scaffolding only.
+/// This outermost-Black-thunk early-publish approach was verified
+/// non-functional for nixpkgs WC-38 and DAMAGING (corrupts slot targets
+/// with intermediate values); its opt-in gate has been retired.
 ///
 /// Option 2 from the multi-agent synthesis (publish-to-all variant)
 /// was tested and rejected: writing intermediate ExprAttrs values to
@@ -6708,31 +6708,6 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 ip = caller.ip;
                 closure = caller.closure;
                 stackBase = caller.stackBaseOffset;
-
-                // Early publish: only fires when popped frame was a
-                // closure call (not a thunk frame), retVal is fully
-                // resolved (non-thunk/app), and caller is a Black
-                // thunk frame.  Idempotent — the eventual OP_RETURN
-                // of the caller's thunk frame will overwrite with the
-                // FINAL retVal.
-                //
-                // Disabled by default — set NIX_V3_EARLY_PUBLISH=1
-                // to enable.  Currently doesn't fully fix WC-38 but
-                // is kept for experimentation.
-                static const bool s_early_publish =
-                    std::getenv("NIX_V3_EARLY_PUBLISH") != nullptr;
-                if (s_early_publish
-                    && !(fFlags & CFF_THUNK_RETURN)
-                    && (caller.flags & CFF_THUNK_RETURN)
-                    && caller.thunk
-                    && caller.thunk->state == ThunkState::Blackhole
-                    && retVal.tag() != Tag::Thunk
-                    && !retVal.isAppLike()
-                    && retVal.tag() != Tag::Blackhole)
-                {
-                    caller.thunk->state = ThunkState::Evaluated;
-                    thunkSetEvaluated(caller.thunk, retVal);  // Phase D barrier
-                }
 
                 bool retry = (caller.flags & CFF_FORCE_RETRY)
                     && (retVal.tag() == Tag::Thunk
