@@ -3150,23 +3150,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 // via OTHER marked roots (rec Value / caller / closure upvalEnv /
                 // closure capturedWiths), so clearing only invalidates a stale
                 // entry after reclaim — safe + repopulates.
-                // S2.1 (#170): when mid-eval EVACUATION is on, the sweep MOVES
-                // tenured cells — so the "DON'T clear the attrSelect IC" rationale
-                // above (valid only for the NON-moving mark, where walkCuIC marks
-                // the IC's Bindings in place) no longer holds: evac relocates an
-                // IC-cached Bindings without rewriting the IC slot (walkAllV3Roots
-                // doesn't see the libc-resident CU slots), leaving a stale pointer
-                // → UAF / the brute-audit miss ("Bindings[(no-origin)] reachable
-                // via .entries[].value", reached through walkCuIC; RCA 2026-06-25).
-                // Clear it exactly like the proven gen-major path (vm.cc:4114) — the
-                // IC is transient and repopulates on the next lookup.
-                static const bool s_midEvalEvac = std::getenv("NIX_V3_EVAC") != nullptr;
                 for (const CompilationUnit * icu : cuRegistry()) {
                     if (!icu) continue;
                     for (auto & rc : icu->rt.recSlotCache) rc.bindings = nullptr;
-                    if (s_midEvalEvac)
-                        for (auto & ic : icu->rt.attrSelectCache)
-                            for (auto & e : ic.entries) e.bindings = nullptr;
                 }
                 Bindings::clearMaterializeMemo();
                 clearEnvInternTable();

@@ -132,17 +132,6 @@ ScavengeBuffers & threadScavengeBuffers() noexcept
 inline bool phaseDStep7Active() noexcept
 {
     static const bool s_active = [] {
-        // S2.1 (#174): when mid-eval EVACUATION is enabled, the scavenge must NOT
-        // trust the dirty list.  evac's raw-copy relocation + any un-barrier'd
-        // raw/bulk write can leave a tenured→nursery edge out of the remembered
-        // set, and a MOVING collector cannot tolerate a missed root.  Disabling
-        // Step 7 makes the scavenge fully WALK root-reached tenured cells (a
-        // full conservative walk), forwarding EVERY tenured→nursery edge
-        // regardless of barrier completeness — correct by construction, at the cost of extra
-        // scavenge work, paid only under the opt-in NIX_V3_EVAC.  This sidesteps
-        // localizing the specific un-barrier'd write site (lode/SAFEPOINT_
-        // FOUNDATION_S2.1_RCA_2026-06-25.md) with a sound conservative walk.
-        if (std::getenv("NIX_V3_EVAC") != nullptr) return false;
         const char * v = std::getenv("NIX_V3_NO_PHASE_D");
         // Default ON unless explicitly opted out via
         // NIX_V3_NO_PHASE_D=1.
