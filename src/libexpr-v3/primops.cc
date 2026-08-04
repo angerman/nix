@@ -10756,9 +10756,10 @@ void registerBuiltinPrimOps()
         // (one result alloc from `kept`, no per-element singleton lists),
         // unlike the bytecode `concatLists∘map` form (2M singleton ListVecs
         // on a 2M filter).  deepForceList=0 makes the C primFilter the
-        // lazy + lean default; the bytecode form is now opt-in
-        // (NIX_V3_BC_FILTER=1).  forceValue is iterative, so per-element
-        // forcing inside the pred does not grow the C stack.
+        // lazy + lean default; the bytecode reimpl was measured to lose and
+        // has been retired (see bytecode_primops.cc).  forceValue is
+        // iterative, so per-element forcing inside the pred does not grow
+        // the C stack.
         registerPrimOp({"filter",             2, primFilter,
                         /*lazyArgs=*/0, /*deepForceList=*/0});
         // C-14 (CODEBASE_REVIEW_2026-06-11): deepForceList=0 — TW's

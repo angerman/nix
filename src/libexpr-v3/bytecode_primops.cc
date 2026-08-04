@@ -287,169 +287,38 @@ void installAllBytecodePrimops(nix::EvalState & state)
         //     in place so dynamic lookups of `builtins.foo` see the
         //     replacement.
         //
-        // T0b self-test gate: install `floor` as `x: x + 1` so that
-        // `builtins.floor 41 == 42` under v3.  TW remains unchanged
-        // (this is opt-in for verification only).
-        if (std::getenv("NIX_V3_BYTECODE_PRIMOP_SELFTEST"))
-            installBytecodePrimop(state, "floor", "x: x + 1");
-
-        // Phase 1: bytecode-emit callback-heavy primops.  Each
-        // conversion replaces the C primop's callClosure-per-iteration
-        // (C-recursive) with a Nix-source loop where the inner
-        // `op acc elem` call dispatches via OP_CALL (iterative, since
-        // commit 7f5a392f4) and the outer recursive `go i acc` is
-        // rewritten to OP_TAIL_CALL by emit.cc's tail-call peephole.
-        // Result: O(1) C-stack regardless of list size.
+        // ────────────────────────────────────────────────────────────────
+        // Bytecode list/data primops — RETIRED 2026-08 (cleanup batch 2).
         //
-        // Disable per-primop via NIX_V3_NO_BC_<NAME>=1, or globally
-        // via NIX_V3_NO_BYTECODE_PRIMOPS=1 (gated above in run.cc).
-        // Hot primops first; each one runs the property suite + lang
-        // tests + bench as part of its landing commit.
+        // A family of callback-heavy list/data primops (foldl', map, all,
+        // any, concatMap, partition, filter, sort, genericClosure,
+        // zipAttrsWith) was reimplemented in Nix source and installed via
+        // the hook above to move per-element iteration off the C stack.
         //
-        // ───────────────────────────────────────────────────────────────
-        // STATUS 2026-06-08 — BYTECODE LIST/DATA PRIMOPS ARE DEFAULT-OFF.
+        // VERDICT — bench/bc-vs-cpp.sh (3 regimes: per-element / per-call /
+        // fusable-chain; memory project_bytecode_primop_regressions_
+        // 2026-06-07): every bytecode reimpl LOSES to the native C primop in
+        // every regime and config (C++ +395…4630 ns/call; even best-case
+        // stream fusion ~2x behind), and several were also O(n^2) via `++` /
+        // `//` accumulation (Nix has no O(1) append).  All the opt-in
+        // NIX_V3_BC_<NAME> handles + the NIX_V3_BYTECODE_PRIMOP_SELFTEST
+        // probe are removed — the native C primops are the sole path.
         //
-        // The bc-vs-cpp benchmark suite (bench/bc-vs-cpp.sh, 3 regimes:
-        // per-element / per-call / fusable-chain; see memory
-        // project_bytecode_primop_regressions_2026-06-07) found the
-        // bytecode-primop subsystem LOSES TO C++ in every regime, every
-        // config: C++ wins 9/10 big, 10/10 small (+395…+4630 ns/call), and
-        // even stream-fusion on its own best case leaves bytecode ~2× behind.
-        // So each loser is flipped to OPT-IN (default = the native C primop),
-        // not removed — the bytecode source is KEPT here as a documented
-        // registry + A/B handle; opt back in per-primop via NIX_V3_BC_<NAME>=1.
-        //
-        // CORRECTNESS EXCEPTION — stays bytecode-DEFAULT-ON because the C
-        // primop is not a drop-in (a perf loss is irrelevant if the native
-        // path is wrong):
-        //   * groupBy — C primGroupBy's deepForceList force-evaluates list
-        //               ELEMENTS before applying keyFn, so it throws on a
-        //               `throw` keyFn would have skipped (TW=3, C++ THROWS);
-        //               the bytecode form is lazy-correct + measured linear.
-        // (filter WAS such an exception; T4 (2026-06-08) removed primFilter's
-        // deepForceList so the C primop is now lazy-correct AND single-alloc
-        // — filter flipped to C++-default, eliminating the bytecode form's 2M
-        // singleton ListVecs.  groupBy could get the same fix as a follow-up.)
-        // (partition is the opposite: the bytecode form was too LAZY vs TW —
-        // `partition (x: true) [1 (throw) 2]` TW THROWS, bytecode=3 — so it
-        // flips to C++, which both fixes that divergence AND wins on perf.)
-        // ───────────────────────────────────────────────────────────────
-
-        // ORDER MATTERS: bytecode primops are visible to the lowerer
-        // only AFTER they're installed.  If primop B's source uses
-        // primop A, install A first so B's lowering sees A as
-        // replaced and emits App-chain → OP_CALL on the closure
-        // (rather than PrimOpCall on A's C function, which would
-        // C-recurse on every callback).  Foundation primops
-        // (foldl', map) install first; primops built on top of them
-        // (filter, all, any) install after.
-
-        // T1 — foldl': strict left fold.  Foundation: many downstream
-        // primops (filter, partition, listToAttrs, ...) compose on
-        // top of it.  Strict via `builtins.seq` so the accumulator is
-        // WHNF on every tail call (matches TW primFoldl semantics).
-        // The recursive `go` is rewritten to OP_TAIL_CALL by emit.cc's
-        // peephole — O(1) vm.frames regardless of list size.
-        if (std::getenv("NIX_V3_BC_FOLDL"))  // default-off: loses to C++ (bc-vs-cpp); opt-in
-            installBytecodePrimop(state, "foldl'",
-                "op: nul: list: "
-                "  let n = builtins.length list; "
-                "      go = i: acc: "
-                "        if i >= n then acc "
-                "        else "
-                "          let next = op acc (builtins.elemAt list i); "
-                "          in builtins.seq next (go (i + 1) next); "
-                "  in go 0 nul");
-
-        // NOTE: a __mapMap (map∘map) fusion target was prototyped here and
-        // FALSIFIED 2026-06-05 — measured NEUTRAL (insns 54000117 vs
-        // 54000115; peak RSS 791 vs 791 MB on a 1M chain).  map∘map
-        // eliminates only the transient intermediate spine; lazy elements
-        // are forced exactly once either way and the intermediate ListVec is
-        // GC-reclaimed as forcing proceeds, so there is no win at peak.  The
-        // winning fusion shape eliminated the OUTPUT list too (foldl'∘map →
-        // __foldlMap), but that whole stream-fusion track was retired
-        // 2026-06-05 (FALSIFIED — regressed vs the C-built genList spine);
-        // the __foldlMap primop + its opt-in install were removed with it.
-        // See git history for the pass + its falsified-candidate registry.
-
-        // T2 — map: lazy list mapping.  Preserves TW's primMap
-        // laziness (each result entry is forced on demand) by
-        // expressing map in terms of genList — which itself is a
-        // C primop that builds Tag::App entries lazily.
-        if (std::getenv("NIX_V3_BC_MAP"))  // default-off: loses to C++ (bc-vs-cpp); opt-in
-            installBytecodePrimop(state, "map",
-                "fn: list: "
-                "  builtins.genList "
-                "    (i: fn (builtins.elemAt list i)) "
-                "    (builtins.length list)");
-
-        // T4 — all: short-circuit fold for "every elem satisfies pred".
-        // Direct tail-recursive go with early exit on false.  Pure
-        // bytecode iteration (no foldl' dependency — needs early
-        // exit which foldl' doesn't provide).
-        if (std::getenv("NIX_V3_BC_ALL"))  // default-off: loses to C++ (bc-vs-cpp); opt-in
-            installBytecodePrimop(state, "all",
-                "pred: list: "
-                "  let n = builtins.length list; "
-                "      go = i: "
-                "        if i >= n then true "
-                "        else if pred (builtins.elemAt list i) "
-                "             then go (i + 1) "
-                "             else false; "
-                "  in go 0");
-
-        // T6 — concatMap: apply fn to each elem (fn returns a list),
-        // concat the results.  Built on bytecode foldl' (T1) with
-        // `++` between accumulator and each sublist.  Elements
-        // inside the sublists are passed through unchanged (lazy
-        // values remain lazy).  Matches TW primConcatMap semantics
-        // (strict on the spine, lazy on the elements).
-        // O(n) via the native O(total) `concatLists` builder over a lazy
-        // `map` — NOT `foldl' (acc: x: acc ++ fn x)`, whose per-element
-        // `acc ++ …` copies the growing accumulator → O(n²) (Nix `++` is
-        // always a full copy).  `map` keeps the spine lazy / elements
-        // lazy; `concatLists` does ONE count+alloc+copy pass.
-        if (std::getenv("NIX_V3_BC_CONCATMAP"))  // default-off: loses to C++ (bc-vs-cpp); opt-in
-            installBytecodePrimop(state, "concatMap",
-                "fn: list: builtins.concatLists (builtins.map fn list)");
-
-        // T5 — any: short-circuit fold for "some elem satisfies pred".
-        // Mirror of all (early exit on true instead of false).
-        if (std::getenv("NIX_V3_BC_ANY"))  // default-off: loses to C++ (bc-vs-cpp); opt-in
-            installBytecodePrimop(state, "any",
-                "pred: list: "
-                "  let n = builtins.length list; "
-                "      go = i: "
-                "        if i >= n then false "
-                "        else if pred (builtins.elemAt list i) "
-                "             then true "
-                "             else go (i + 1); "
-                "  in go 0");
-
-        // T13-T17 (catAttrs, concatLists, listToAttrs, removeAttrs,
-        // intersectAttrs) — REVERTED 2026-05-17.  These primops don't
-        // take user lambdas as args; they don't C-recurse on callbacks.
-        // Their C versions are O(N) (or O(N log N) with sorted-merge);
-        // the bytecode equivalents I wrote use repeated `++` / `//`
-        // which is O(N²) (each step copies the accumulator).  Measured
-        // regression on attrset-build-1k (+60.4%); keeping them as C
-        // primops is the right choice for A12b (which targets CALLBACK
-        // C-recursion, not arbitrary primop replacement).
-        //
-        // 2026-05-17b A/B re-test: tried adding ONLY concatLists back
-        // (since it shows up in the hello.name C-stack profile) — turns
-        // out it makes things WORSE.  vm.frames depth at SIGBUS goes
-        // 3215 → 1201 (-63%): the bytecode foldl'+`++` chain consumes
-        // more vm.frames per call than the C primConcatLists does, and
-        // since the dispatchLoop frame is what blows C-stack, more
-        // vm.frames per "primDerivation level" means we hit the C-stack
-        // ceiling at fewer levels.  Leave concatLists as C primop.
-
+        // ONE EXCEPTION stays bytecode-DEFAULT — groupBy — for LAZINESS
+        // correctness, not perf: C primGroupBy's deepForceList force-
+        // evaluates list ELEMENTS before applying keyFn, so it throws on a
+        // `throw` element a lazy keyFn would skip (TW = lazy, C++ THROWS).
+        // The bytecode form is lazy-correct + measured linear.  (filter and
+        // partition were once exceptions too; both C primops were since made
+        // lazy-correct — primFilter's deepForceList was removed — so they
+        // flipped to the C default, which also wins on perf.)  Opt OUT of the
+        // bytecode groupBy via NIX_V3_NO_BC_GROUPBY=1 (reverts to the C
+        // primop, which is a laziness divergence — diagnostic only).
+        // ────────────────────────────────────────────────────────────────
         // T10 — groupBy: group list elements by key-fn result.
         //   { ${fn x}: [matching xs] for each x in list }
-        // Built on bytecode foldl'.  Uses `acc.${key} or []` to
-        // accumulate per-key lists.
+        // Built on `builtins.foldl'` (now the native C primop).  Uses
+        // `acc.${key} or []` to accumulate per-key lists.
         if (!std::getenv("NIX_V3_NO_BC_GROUPBY"))
             installBytecodePrimop(state, "groupBy",
                 "fn: list: "
@@ -460,219 +329,6 @@ void installAllBytecodePrimops(nix::EvalState & state)
                 "       in acc // { ${key} = prev ++ [x]; }) "
                 "    {} "
                 "    list");
-
-        // T9 — partition: { right, wrong } split by predicate.
-        //
-        // O(n): tag each element with its predicate result ONCE (lazy
-        // `map`), then build each side with the native O(total)
-        // `concatLists` builder.  The previous `foldl' (… acc.right ++
-        // [x] …)` was **O(n²)** — `acc.right ++ [x]` copies the growing
-        // accumulator every match (Nix `++` is a full copy); same bug
-        // class as the old filter/concatMap.  Tagging keeps `pred` to one
-        // evaluation per element (matches TW primPartition's single pass
-        // + left-to-right throw order); elements stay lazy.
-        if (std::getenv("NIX_V3_BC_PARTITION"))  // default-off: loses to C++ (bc-vs-cpp); opt-in
-            installBytecodePrimop(state, "partition",
-                "pred: list: "
-                "  let tagged = builtins.map (x: { v = x; k = pred x; }) list; "
-                "  in { "
-                "    right = builtins.concatLists "
-                "              (builtins.map (e: if e.k then [ e.v ] else []) tagged); "
-                "    wrong = builtins.concatLists "
-                "              (builtins.map (e: if e.k then [] else [ e.v ]) tagged); "
-                "  }");
-
-        // T3 — filter: keep elements where pred returns true.
-        //
-        // O(n): emit a 1- or 0-element list per element via a lazy `map`,
-        // then flatten once with the native O(total) `concatLists`
-        // builder.  The predicate still runs through the VM (map's
-        // OP_CALL), so this stays V3-native with no per-element
-        // C-recursion; elements are passed through unchanged (lazy values
-        // stay lazy) — same observable semantics as TW primFilter.
-        //
-        // The previous definition `foldl' (acc: x: if pred x then acc ++
-        // [x] else acc) [] list` was **O(n²)**: each kept element's
-        // `acc ++ [x]` copies the entire growing accumulator (Nix `++` is
-        // always a full copy), so n appends = 1+2+…+n element-copies.  At
-        // 100k it allocated ~6 GB and OOM'd (LISTTOATTRS_QUADRATIC sibling;
-        // the old comment's "matches TW append-per-match" was wrong — TW's
-        // primFilter uses an amortised list builder and is O(n)).  Reverts
-        // T4 (LIST_ITERATION_FIX_PLAN_2026-06-08): DEFAULT-OFF now.  The C
-        // primFilter no longer over-forces (its deepForceList was removed —
-        // primops.cc), so it is lazy-correct AND single-allocation, whereas
-        // this bytecode form allocates one singleton `[x]` ListVec per kept
-        // element (2M on a 2M filter = 144MB, the dominant filter cost per
-        // LIST_ITERATION_PERF mem#3).  Opt back into the bytecode form via
-        // NIX_V3_BC_FILTER=1 (A/B handle).
-        if (std::getenv("NIX_V3_BC_FILTER"))  // default-off: C primFilter is lazy+lean (T4)
-            installBytecodePrimop(state, "filter",
-                "pred: list: "
-                "  builtins.concatLists "
-                "    (builtins.map (x: if pred x then [ x ] else []) list)");
-
-        // T18 — sort (Tier 2a; mergesort 2026-06-07).  Stable bottom-up
-        // top-down mergesort.  The per-element CMP callback runs under
-        // OP_CALL (iterative VM dispatch), keeping this V3-native.
-        //
-        // O(n log² n).  Pure Nix has NO O(1) append (`++` always copies),
-        // so a recursive element-by-element merge (`[x] ++ rest`) would be
-        // O(n²) total — no better than the insertion sort it replaces
-        // (which measured O(n³): a 200k sort ran > 25 min).  Instead the
-        // MERGE builds its output in ONE `genList` pass where each output
-        // position k is resolved by a binary-search partition over the two
-        // sorted runs (the "k-th element of two sorted arrays" trick):
-        // O(log) cmp per element, no incremental list growth.  Split is
-        // index-based (`genList`+`elemAt`, O(1) access).  Net O(n log² n)
-        // comparisons; verified byte-identical + STABLE vs TW
-        // `builtins.sort` (ints, records-by-key, reverse/dup/empty) and
-        // sub-quadratic (16×n → ~1.8× time).
-        //
-        // Stability (TW: equal elements keep input order, left run wins):
-        // the merge takes from the right run b only when `cmp b[j] a[i]`
-        // is STRICT; ties resolve to a (the left/earlier run).  The
-        // partition's leftBad/rightBad mirror that strictness.  Reverts to
-        // the O(n log n) C primSort via NIX_V3_NO_BC_SORT=1.
-        if (std::getenv("NIX_V3_BC_SORT"))  // default-off: loses to C++ (bc-vs-cpp); opt-in
-            installBytecodePrimop(state, "sort",
-                "cmp: list: "
-                "  let ea = builtins.elemAt; "
-                "      merge = a: b: "
-                "        let na = builtins.length a; nb = builtins.length b; "
-                "            at = k: "
-                "              let t = k + 1; lo0 = t - nb; lo = if lo0 > 0 then lo0 else 0; "
-                "                  hi = if t < na then t else na; "
-                "                  findAi = l: h: "
-                "                    if l >= h then l "
-                "                    else let ai = (l + h) / 2; bi = t - ai; "
-                "                             leftBad = ai > 0 && bi < nb && cmp (ea b bi) (ea a (ai - 1)); "
-                "                         in if leftBad then findAi l ai "
-                "                            else let rightBad = bi > 0 && ai < na && ! (cmp (ea b (bi - 1)) (ea a ai)); "
-                "                                 in if rightBad then findAi (ai + 1) h else ai; "
-                "                  ai = findAi lo hi; bi = t - ai; "
-                "              in if ai == 0 then ea b (bi - 1) "
-                "                 else if bi == 0 then ea a (ai - 1) "
-                "                 else if cmp (ea b (bi - 1)) (ea a (ai - 1)) then ea a (ai - 1) "
-                "                 else ea b (bi - 1); "
-                "        in builtins.genList at (na + nb); "
-                "      go = lst: "
-                "        let m = builtins.length lst; "
-                "        in if m <= 1 then lst "
-                "           else let half = m / 2; "
-                "                    left = builtins.genList (i: ea lst i) half; "
-                "                    right = builtins.genList (i: ea lst (half + i)) (m - half); "
-                "                in merge (go left) (go right); "
-                "  in go list");
-
-        // T19 — genericClosure (Tier 2b, 2026-05-29).  BFS closure
-        // computation with key-based dedup.  C primGenericClosure
-        // uses `std::deque` + `unordered_set<std::string>` and calls
-        // `callClosure` per item; bytecode uses list-based work-queue
-        // + attrset-based seen-set + native OP_CALL for `operator it`.
-        //
-        // Key dedup: per-type stringification (raw for strings, toString
-        // for int/float/path, "true"/"false" for bool).  Cross-type
-        // collision (e.g. int 1 vs string "1") is impossible because
-        // the firstType check throws on mixed types — matches the C
-        // version's `firstKeyTag` rejection (and the
-        // eval-fail-genericClosure-keys-incompatible-types contract).
-        // NaN float keys are rejected via `k != k` (IEEE).
-        //
-        // 2026-05-29: initial version prefixed strings with "S"/"I"/...
-        // for extra safety.  That propagated `k`'s string context into
-        // the prefixed result (Nix string `+` unions context); under
-        // SHADOW cache's deep-force pass on derivation inputs the
-        // prefixed string surfaced as a context-bearing value whose
-        // body started with "S" — libstore then rejected it as not
-        // matching any valid store-path.  Dropping the prefix matches
-        // the C version exactly (raw key string) and eliminates the
-        // context-propagation hazard.
-        //
-        // Asymptotic: the bytecode is **O(M²)** (M = result size) — per step
-        // `result ++ [it]` and `rest ++ next` copy the growing work-queue /
-        // result (measured 2026-06-07: 16k=516 MB, 32k=1910 MB).  The native
-        // C primGenericClosure is O(M) via deque + unordered_set and dispatches
-        // `operator` via callClosure in a flat BFS loop (no per-item
-        // C-recursion); 32k=44 MB, byte-identical (dedup/ordering/string+int
-        // keys) + --core 20/20.  So DEFAULT = the C primop; the bytecode form
-        // is OPT-IN ONLY via NIX_V3_BC_GENERIC_CLOSURE=1 (same O(n²) ++-
-        // accumulation class as the old filter/sort/zipAttrsWith).
-        if (std::getenv("NIX_V3_BC_GENERIC_CLOSURE"))
-            installBytecodePrimop(state, "genericClosure",
-                "arg: "
-                "  let "
-                "    startSet = arg.startSet; "
-                "    operator = arg.operator; "
-                "    keyToStr = k: "
-                "      let t = builtins.typeOf k; in "
-                "      if t == \"string\" then k "
-                "      else if t == \"int\" then builtins.toString k "
-                "      else if t == \"float\" then "
-                "        (if k != k then throw \"NaN key is not orderable\" "
-                "         else builtins.toString k) "
-                "      else if t == \"path\" then toString k "
-                "      else if t == \"bool\" then (if k then \"true\" else \"false\") "
-                "      else throw \"'key' must be string / int / float / path / bool\"; "
-                "    go = work: result: seen: firstType: "
-                "      if work == [] then result "
-                "      else "
-                "        let "
-                "          it      = builtins.head work; "
-                "          rest    = builtins.tail work; "
-                "          k       = it.key; "
-                "          curType = builtins.typeOf k; "
-                "          newType = "
-                "            if firstType == null then curType "
-                "            else if firstType == curType then firstType "
-                "            else throw \"cannot compare keys of incompatible types\"; "
-                // unsafeDiscardStringContext: when k is a string with
-                // store-path context (common in nixpkgs derivation
-                // attrs), Nix's dynamic-attr-key opcodes preserve
-                // context on the intermediate `ks` value.  Under
-                // SHADOW-cache forceDeep, that context can leak into
-                // downstream derivation env entries with a string body
-                // that doesn't match the context's store path —
-                // libstore then rejects "string not allowed to refer
-                // to a store path".  Stripping context here matches
-                // the C primGenericClosure exactly (it copies
-                // k.asString() into a std::string, dropping context).
-                "          ks      = builtins.unsafeDiscardStringContext (keyToStr k); "
-                "        in "
-                "          builtins.seq newType ( "
-                "            if seen ? ${ks} "
-                "            then go rest result seen newType "
-                "            else "
-                "              let next = operator it; in "
-                "              go (rest ++ next) (result ++ [it]) (seen // { ${ks} = null; }) newType "
-                "          ); "
-                "  in go startSet [] {} null");
-
-        // T20 — zipAttrsWith.  DEFAULT = the native C primZipAttrsWith
-        // (O(N × K_total) via unordered_map, lazy Tag::App entries, fn
-        // applied via callClosure — flat loop, no per-key C-recursion).
-        //
-        // The bytecode version below is OPT-IN ONLY (NIX_V3_BC_ZIP_ATTRS_WITH=1)
-        // because it is **O(n²)** (measured 2026-06-07: 16k sets = 0.96 s/499 MB
-        // vs the C primop's 0.13 s/41 MB; 32k = 1875 MB).  Two quadratic costs:
-        // the name-union `foldl' (a: b: a // b) {} sets` (++/// accumulation —
-        // same antipattern as the old filter/sort), AND `catAttrs name sets`
-        // re-walked once PER name = O(N × S).  The C version is lazy too (Tag::
-        // App entries), so the bytecode form has no compensating advantage —
-        // it was a blanket Tier-2c V3-native install that regressed.  Verified
-        // byte-identical (value-list order, dup keys, fn application) + --core
-        // 20/20 on the C path.
-        if (std::getenv("NIX_V3_BC_ZIP_ATTRS_WITH"))
-            installBytecodePrimop(state, "zipAttrsWith",
-                "fn: sets: "
-                "  let "
-                "    allNames = "
-                "      builtins.attrNames "
-                "        (builtins.foldl' (a: b: a // b) {} sets); "
-                "  in builtins.listToAttrs "
-                "       (builtins.map "
-                "         (name: { inherit name; "
-                "                  value = fn name (builtins.catAttrs name sets); }) "
-                "         allNames)");
 
         // 2026-05-17 — primDerivation* hybrid wrapper (Option 4 in the
         // strategic note).  Replaces the user-facing `derivation` /
