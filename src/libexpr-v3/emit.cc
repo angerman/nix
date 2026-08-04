@@ -2352,28 +2352,6 @@ struct Emitter
         // tail-call / selector peepholes; no-op when no safe candidate).
         compactFuseSetGet(codeStart);
 
-        // #498: dump bytecode + slot map for any function named "final"
-        // or "prev" (extends's `final:` lambda + its inner LetRec thunk).
-        // Use V3_DBG_DUMP_FINAL=1.
-        if (std::getenv("V3_DBG_DUMP_FINAL") && (f.name == "final" || f.name == "prev")) {
-            std::fprintf(stderr,
-                "v3 emit dump: fid=%u name='final' nUp=%u paramVar=%u argName=%u\n",
-                (unsigned)fid, (unsigned)f.freeVars.size(),
-                (unsigned)f.paramVar,
-                (unsigned)f.argName);
-            std::fprintf(stderr, "  freeVars=[");
-            for (auto fv : f.freeVars) std::fprintf(stderr, "%u,", (unsigned)fv);
-            std::fprintf(stderr, "]\n");
-            std::fprintf(stderr, "  slot map (varId → slot):\n");
-            for (auto & [vid, slot] : fc.slot)
-                std::fprintf(stderr, "    var=%u → slot %u\n",
-                    (unsigned)vid, (unsigned)slot);
-            // Disasm the body we just emitted
-            uint32_t codeEnd = static_cast<uint32_t>(unit.code.size());
-            std::fprintf(stderr, "  bytecode [%u..%u):\n", codeStart, codeEnd);
-            disassembleWindow(stderr, unit, codeStart, codeEnd);
-        }
-
         // Tail-call peephole: rewrite OP_CALL → OP_TAIL_CALL whenever
         // the call's result IS this function's return value.  Three
         // shapes need to be caught:
