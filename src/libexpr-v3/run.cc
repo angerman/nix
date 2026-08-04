@@ -944,16 +944,11 @@ RootResult runRootExprModule(nix::EvalState & state, ir::Module module)
                     byteRatio);
             }
         }
-        // #738 Phase E v0.1 (2026-05-21) survival-rate banner.
-        // Emit when ANY scavenge ran during this eval.  The
-        // headline number is the young-gen mortality rate:
-        //     died / (died + survived).
-        // High mortality (>50%) means most allocs are short-lived
-        // — Phase E's survivor-pool design would recover those
-        // bytes.  Low mortality (<10%) means most allocs survive
-        // forever — Phase E wouldn't help; objects would just sit
-        // in survivor pool instead of tenured.  This is the Rule 0
-        // input that drives the v0.2 architectural decision.
+        // Nursery survival-rate banner.  Emit when ANY scavenge ran
+        // during this eval.  The headline number is the young-gen
+        // mortality rate: died / (died + survived).  High mortality
+        // means most allocs are short-lived (the nursery reclaims them
+        // cheaply); low mortality means most allocs survive to tenured.
         {
             const auto & nur = threadNursery();
             const auto & ns  = nur.stats();
@@ -965,9 +960,8 @@ RootResult runRootExprModule(nix::EvalState & state, ir::Module module)
                     ? (double(ns.diedBytes) * 100.0 / double(total))
                     : 0.0;
                 std::fprintf(stderr,
-                    "v3-direct phase-e survival: scavenges=%llu "
-                    "survived=%.1fMB died=%.1fMB mortality=%.1f%% "
-                    "(Phase E v0.2 design driver: kill rate)\n",
+                    "v3-direct nursery survival: scavenges=%llu "
+                    "survived=%.1fMB died=%.1fMB mortality=%.1f%%\n",
                     (unsigned long long)ns.scavengeCount,
                     ns.survivedBytes / 1e6,
                     ns.diedBytes     / 1e6,
@@ -1006,31 +1000,6 @@ RootResult runRootExprModule(nix::EvalState & state, ir::Module module)
                         (unsigned long long)misses,
                         hitPct,
                         ns.allocBytes / 1e6);
-                }
-                // #738 Phase E v0.2: when active, show per-region
-                // promotion breakdown.  yToS is age-1 survivors
-                // (kept in survivor pool, not tenured); sToT is
-                // age-2 (truly tenured); yToTOvf is direct
-                // promotion when the survivor pool overflowed (or
-                // the legacy Phase D path where there's no S at
-                // all).  reclaimedFromS = bytesYToS - bytesSToT
-                // tracks the marginal Phase E reclamation: bytes
-                // that survived Y but died in S before tenuring.
-                if (nur.isPhaseEActive()) {
-                    const uint64_t yToS    = nur.getBytesYToS();
-                    const uint64_t sToT    = nur.getBytesSToT();
-                    const uint64_t yToTOvf = nur.getBytesYToTOvf();
-                    const int64_t reclaimedFromS =
-                        (int64_t)yToS - (int64_t)sToT;
-                    std::fprintf(stderr,
-                        "v3-direct phase-e regions: yToS=%.1fMB "
-                        "sToT=%.1fMB yToTOvf=%.1fMB "
-                        "reclaimedFromS=%.1fMB (Phase E v0.2 marginal "
-                        "win over Phase D)\n",
-                        yToS    / 1e6,
-                        sToT    / 1e6,
-                        yToTOvf / 1e6,
-                        reclaimedFromS / 1e6);
                 }
             }
         }
@@ -1379,12 +1348,8 @@ RootResult runRootExprModule(nix::EvalState & state, ir::Module module)
             const size_t freeListCount = threadArena().freeListEntryCount();
             const size_t freeListEst =
                 freeListCount * sizeof(void *) * 2;  // entries + map overhead
-            // Nursery: young + (when Phase E active) two survivor
-            // buffers of equal size.  When Phase E is off the
-            // single nursery is just `sizeBytes`.
+            // Nursery: single young region of `sizeBytes`.
             uint64_t nurseryBytes = nstats.sizeBytes;
-            if (threadNursery().isPhaseEActive())
-                nurseryBytes += 2 * nstats.sizeBytes; // approx, S=Y default
 
             const size_t sumEst = sctEst + ppsEst + ppsStringBytes
                                 + botEst + cotEst + gstEst + dirtyEst

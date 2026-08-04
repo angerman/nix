@@ -136,9 +136,9 @@ inline bool phaseDStep7Active() noexcept
         // trust the dirty list.  evac's raw-copy relocation + any un-barrier'd
         // raw/bulk write can leave a tenured→nursery edge out of the remembered
         // set, and a MOVING collector cannot tolerate a missed root.  Disabling
-        // Step 7 makes the scavenge fully WALK root-reached tenured cells (the
-        // phaseE behaviour), forwarding EVERY tenured→nursery edge regardless of
-        // barrier completeness — correct by construction, at the cost of extra
+        // Step 7 makes the scavenge fully WALK root-reached tenured cells (a
+        // full conservative walk), forwarding EVERY tenured→nursery edge
+        // regardless of barrier completeness — correct by construction, at the cost of extra
         // scavenge work, paid only under the opt-in NIX_V3_EVAC.  This sidesteps
         // localizing the specific un-barrier'd write site (lode/SAFEPOINT_
         // FOUNDATION_S2.1_RCA_2026-06-25.md) with a sound conservative walk.
@@ -193,25 +193,6 @@ struct Scavenger
     /// so process-lifetime survivedBytes/diedBytes stats can be
     /// reported by run.cc's NIX_VM_STATS path.
     uint64_t bytesSurvived = 0;
-    /// #738 Phase E v0.2 per-scavenge breakdown.  bytesSurvived is
-    /// the union (Y→S + S→T + Y→T-overflow) for legacy comparison;
-    /// these three split the destination so the Phase E banner can
-    /// show what % was age-1 promotion (Y→S) vs age-2 tenuring (S→T)
-    /// vs survivor-overflow (Y→T direct).  Phase E disabled: only
-    /// bytesYToTOvf bumps (legacy single-region behaviour, mapped
-    /// onto the overflow counter for uniform output).
-    uint64_t bytesPhaseEYToS    = 0;
-    uint64_t bytesPhaseESToT    = 0;
-    uint64_t bytesPhaseEYToTOvf = 0;
-    /// #738 Phase E v0.2: containers walked by `walk*` whose copy
-    /// landed in TENURED (either originally-tenured + dirty-list
-    /// entry, or active-S object promoted by this scavenge).  After
-    /// drain, the scavenger re-inspects each via the matching
-    /// post-construct barrier so any tenured→survivor edges the
-    /// scavenger itself created get tracked in dirtyContainers for
-    /// the next cycle.  Stored as (kind, ptr) pairs mirroring
-    /// DirtyEntry semantics.
-    std::vector<std::pair<int, void *>> tenuredWalkedForRebarrier;
     /// Record a tenured [start, end) byte range for the BRUTE
     /// reachability filter.  Called by walk* methods.  No-op if
     /// the pointer is in the nursery (means a nursery copy that
@@ -256,42 +237,9 @@ struct Scavenger
 Closure * Scavenger::fwdClosure(Closure * c)
 {
     if (!c) return nullptr;
-    // #738 Phase E v0.2: split-region dispatch.  When Phase E is
-    // active, Y survivors go to the inactive survivor buffer (age 1
-    // promotion) and active-S survivors go to tenured (age 2 =
-    // tenured).  When Phase E is disabled, every nursery survivor
-    // goes to tenured (legacy Phase D behaviour).
-    if (n.isPhaseEActive()) {
-        if (n.inYoung(c)) {
-            auto it = forward.find(c);
-            if (it != forward.end()) return static_cast<Closure *>(it->second);
-            const size_t bytes = closureAllocatedSize(c);
-            void * dst = n.targetSurvivorAlloc(bytes);
-            const bool toSurv = (dst != nullptr);
-            if (!dst) dst = threadArena().alloc(bytes, CellType::Closure);  // S overflow → T (B0.1: stamp type)
-            std::memcpy(dst, c, bytes);
-            forward.emplace(c, dst);
-            graylist.push_back({dst, GK_CLOSURE});
-            bytesSurvived += bytes;
-            if (toSurv) bytesPhaseEYToS    += bytes;
-            else        bytesPhaseEYToTOvf += bytes;
-            return static_cast<Closure *>(dst);
-        }
-        if (n.inActiveSurvivor(c)) {
-            auto it = forward.find(c);
-            if (it != forward.end()) return static_cast<Closure *>(it->second);
-            const size_t bytes = closureAllocatedSize(c);
-            void * dst = threadArena().alloc(bytes, CellType::Closure);  // B0.1: stamp type
-            std::memcpy(dst, c, bytes);
-            forward.emplace(c, dst);
-            graylist.push_back({dst, GK_CLOSURE});
-            bytesSurvived += bytes;
-            bytesPhaseESToT += bytes;
-            return static_cast<Closure *>(dst);
-        }
-        // Fall through to tenured path.
-    } else if (n.contains(c)) {
-        // Legacy Phase D single-region path: every survivor → tenured.
+    // Single-region (Phase D / gen-major) scavenge: every live nursery
+    // object is copied out to the tenured arena.
+    if (n.contains(c)) {
         auto it = forward.find(c);
         if (it != forward.end()) return static_cast<Closure *>(it->second);
         const size_t bytes = closureAllocatedSize(c);
@@ -299,18 +247,8 @@ Closure * Scavenger::fwdClosure(Closure * c)
         std::memcpy(dst, c, bytes);
         forward.emplace(c, dst);
         graylist.push_back({dst, GK_CLOSURE});
-        bytesSurvived       += bytes;
-        bytesPhaseEYToTOvf  += bytes;  // map legacy onto overflow slot for uniform stats
+        bytesSurvived += bytes;
         return static_cast<Closure *>(dst);
-    }
-    // #738 Phase E v0.2 — under Phase E, force tenured-Closure walk
-    // (same rationale as fwdBindings): the scavenger may update
-    // upvalue[] entries to point into the active-S buffer, and
-    // Phase D Step 7's dirty-list-only path doesn't account for
-    // edges created BY the scavenger itself.
-    if (n.isPhaseEActive()) {
-        if (walked.insert(c).second) graylist.push_back({c, GK_CLOSURE});
-        return c;
     }
     // Originally-tenured: under Phase D Step 7 gate, skip the
     // transitive walk — the dirty-list mechanism (barriers in
@@ -355,44 +293,13 @@ Closure * Scavenger::fwdClosure(Closure * c)
 Thunk * Scavenger::fwdThunk(Thunk * t)
 {
     if (!t) return nullptr;
-    // #738 Phase E v0.2: branch on region same as fwdClosure.
-    // Layout-dependent byte calculation matches the legacy single-
-    // region copy path.
     // FP-2b: single source of truth (includes the optional withs tail slot for
     // Suspended/Blackhole) — this is the EVAC COPY size; under-counting here
     // would drop the slot on relocation = UAF.
     auto computeThunkBytes = [](Thunk * tk) -> size_t { return thunkScanSize(tk); };
-    if (n.isPhaseEActive()) {
-        if (n.inYoung(t)) {
-            auto it = forward.find(t);
-            if (it != forward.end()) return static_cast<Thunk *>(it->second);
-            const size_t bytes = computeThunkBytes(t);
-            void * dst = n.targetSurvivorAlloc(bytes);
-            const bool toSurv = (dst != nullptr);
-            if (!dst) dst = threadArena().alloc(bytes, CellType::Thunk);  // B0.1: stamp type
-            std::memcpy(dst, t, bytes);
-            forward.emplace(t, dst);
-            graylist.push_back({dst, GK_THUNK});
-            bytesSurvived += bytes;
-            if (toSurv) bytesPhaseEYToS    += bytes;
-            else        bytesPhaseEYToTOvf += bytes;
-            return static_cast<Thunk *>(dst);
-        }
-        if (n.inActiveSurvivor(t)) {
-            auto it = forward.find(t);
-            if (it != forward.end()) return static_cast<Thunk *>(it->second);
-            const size_t bytes = computeThunkBytes(t);
-            void * dst = threadArena().alloc(bytes, CellType::Thunk);  // B0.1: stamp type
-            std::memcpy(dst, t, bytes);
-            forward.emplace(t, dst);
-            graylist.push_back({dst, GK_THUNK});
-            bytesSurvived += bytes;
-            bytesPhaseESToT += bytes;
-            return static_cast<Thunk *>(dst);
-        }
-        // Fall through to tenured path.
-    } else if (n.contains(t)) {
-        // Legacy Phase D path.
+    // Single-region (Phase D / gen-major) scavenge: copy live nursery
+    // thunks out to the tenured arena.
+    if (n.contains(t)) {
         auto it = forward.find(t);
         if (it != forward.end()) return static_cast<Thunk *>(it->second);
         // #705 / N1 (2026-05-21): Blackhole MUST copy the full
@@ -407,26 +314,8 @@ Thunk * Scavenger::fwdThunk(Thunk * t)
         std::memcpy(dst, t, bytes);
         forward.emplace(t, dst);
         graylist.push_back({dst, GK_THUNK});
-        bytesSurvived       += bytes;
-        bytesPhaseEYToTOvf  += bytes;
+        bytesSurvived += bytes;
         return static_cast<Thunk *>(dst);
-    }
-    // #738 Phase E v0.2 force-walk tenured Thunk — see fwdBindings.
-    if (n.isPhaseEActive()) {
-        // Skip leaf-tag Bridge/Evaluated as in the optimized path —
-        // those carry no v3-heap pointer to walk.  Suspended/Native/
-        // Blackhole DO carry pointers; walk them under Phase E.
-        switch (t->state) {
-        case ThunkState::Evaluated:
-            if (isLeafTag(t->evaluated.tag()) && !t->cell) return t;
-            break;
-        case ThunkState::Suspended:
-        case ThunkState::Native:
-        case ThunkState::Blackhole:
-            break;
-        }
-        if (walked.insert(t).second) graylist.push_back({t, GK_THUNK});
-        return t;
     }
     // Tenured Thunk fast paths — skip queuing entirely when the
     // thunk has no v3-heap payload to walk.  Material on workloads
@@ -474,35 +363,9 @@ Thunk * Scavenger::fwdThunk(Thunk * t)
 ListVec * Scavenger::fwdList(ListVec * l)
 {
     if (!l) return nullptr;
-    if (n.isPhaseEActive()) {
-        if (n.inYoung(l)) {
-            auto it = forward.find(l);
-            if (it != forward.end()) return static_cast<ListVec *>(it->second);
-            const size_t bytes = sizeof(ListVec) + sizeof(Value) * l->size;
-            void * dst = n.targetSurvivorAlloc(bytes);
-            const bool toSurv = (dst != nullptr);
-            if (!dst) dst = threadArena().alloc(bytes, CellType::List);  // B0.1: stamp type
-            std::memcpy(dst, l, bytes);
-            forward.emplace(l, dst);
-            graylist.push_back({dst, GK_LIST});
-            bytesSurvived += bytes;
-            if (toSurv) bytesPhaseEYToS    += bytes;
-            else        bytesPhaseEYToTOvf += bytes;
-            return static_cast<ListVec *>(dst);
-        }
-        if (n.inActiveSurvivor(l)) {
-            auto it = forward.find(l);
-            if (it != forward.end()) return static_cast<ListVec *>(it->second);
-            const size_t bytes = sizeof(ListVec) + sizeof(Value) * l->size;
-            void * dst = threadArena().alloc(bytes, CellType::List);  // B0.1: stamp type
-            std::memcpy(dst, l, bytes);
-            forward.emplace(l, dst);
-            graylist.push_back({dst, GK_LIST});
-            bytesSurvived += bytes;
-            bytesPhaseESToT += bytes;
-            return static_cast<ListVec *>(dst);
-        }
-    } else if (n.contains(l)) {
+    // Single-region (Phase D / gen-major) scavenge: copy live nursery
+    // lists out to the tenured arena.
+    if (n.contains(l)) {
         auto it = forward.find(l);
         if (it != forward.end()) return static_cast<ListVec *>(it->second);
         const size_t bytes = sizeof(ListVec) + sizeof(Value) * l->size;
@@ -510,14 +373,8 @@ ListVec * Scavenger::fwdList(ListVec * l)
         std::memcpy(dst, l, bytes);
         forward.emplace(l, dst);
         graylist.push_back({dst, GK_LIST});
-        bytesSurvived       += bytes;
-        bytesPhaseEYToTOvf  += bytes;
+        bytesSurvived += bytes;
         return static_cast<ListVec *>(dst);
-    }
-    // #738 Phase E v0.2 force-walk tenured List — see fwdBindings.
-    if (n.isPhaseEActive()) {
-        if (walked.insert(l).second) graylist.push_back({l, GK_LIST});
-        return l;
     }
     // Phase D Step 7: skip queueing originally-tenured.  See fwdClosure.
     if (__builtin_expect(phaseDStep7Active(), 1)) return l;
@@ -533,19 +390,6 @@ Bindings * Scavenger::fwdBindings(Bindings * b)
     // moving Bindings would orphan any Tag::Slot / Thunk::cell
     // that points into entries[].
     if (n.contains(b)) std::abort();
-    // #738 Phase E v0.2 — Phase D Step 7's "trust the dirty list"
-    // optimization is unsafe under Phase E for Bindings reached
-    // via path-roots (AttrSelectIC, bridge handle tables) that
-    // weren't dirtied by a mutator write because the Bindings was
-    // last-modified BEFORE the most recent mutator phase.  Under
-    // Phase E, the scavenger itself updates such Bindings' entries
-    // when forwarding Y/S→T → the new pointers may be in active-S
-    // and need re-barriering.  Force the walk under Phase E so
-    // walkBindings + its post-walk barrier handle the new edges.
-    if (n.isPhaseEActive()) {
-        if (walked.insert(b).second) graylist.push_back({b, GK_BINDINGS});
-        return b;
-    }
     if (__builtin_expect(phaseDStep7Active(), 1)) return b;
     if (walked.insert(b).second) graylist.push_back({b, GK_BINDINGS});
     return b;
@@ -567,11 +411,6 @@ ValuePair * Scavenger::fwdPair(ValuePair * p)
     if (isLeafTag(p->left.tag()) && isLeafTag(p->right.tag())
         && isLeafTag(p->evaluated.tag())
         && isLeafTag(p->third.tag())) return p;
-    // #738 Phase E v0.2 force-walk tenured Pair — see fwdBindings.
-    if (n.isPhaseEActive()) {
-        if (walked.insert(p).second) graylist.push_back({p, GK_PAIR});
-        return p;
-    }
     // Phase D Step 7: same gate as the other fwd*().  Pair evaluated
     // writes go through `pairSetEvaluated`; the dirty list catches.
     if (__builtin_expect(phaseDStep7Active(), 1)) return p;
@@ -670,8 +509,6 @@ void Scavenger::walkClosure(Closure * c)
             visitValue(c->upvalues[i]);
         }
     }
-    // #738 Phase E v0.2 post-walk barrier — see walkList.
-    if (n.isPhaseEActive()) closurePostConstructBarrier(c);
 }
 
 // env-sharing: forward the nursery payloads a shared upvalue Env holds.  The Env
@@ -692,7 +529,6 @@ void Scavenger::walkEnv(Env * e)
     // walker silently drops the chain the day a producer materializes one.
     if (e->parent && walked.insert(e->parent).second)
         graylist.push_back({e->parent, GK_ENV});
-    if (n.isPhaseEActive()) envPostConstructBarrier(e);
 }
 
 void Scavenger::walkThunk(Thunk * t)
@@ -785,8 +621,6 @@ void Scavenger::walkThunk(Thunk * t)
         }
         break;
     }
-    // #738 Phase E v0.2 post-walk barrier — see walkList.
-    if (n.isPhaseEActive()) thunkPostConstructBarrier(t);
 }
 
 void Scavenger::walkList(ListVec * l)
@@ -795,15 +629,6 @@ void Scavenger::walkList(ListVec * l)
     for (uint32_t i = 0; i < l->size; ++i) {
         visitValue(l->elems[i]);
     }
-    // #738 Phase E v0.2 post-walk barrier reinstatement.  If Phase E
-    // is active and `l` is a tenured object (originally-tenured or
-    // newly-promoted from active-S to T), check whether the walk
-    // updated any interior pointer to point into nursery (= the new
-    // active-S after swap).  If so, re-add to dirtyContainers so the
-    // next scavenge finds this T→S edge.  The barrier early-outs
-    // when `l` is itself in nursery (newly-allocated S object), so
-    // it's safe to call unconditionally under Phase E.
-    if (n.isPhaseEActive()) listPostConstructBarrier(l);
 }
 
 void Scavenger::walkBindings(Bindings * b)
@@ -816,8 +641,6 @@ void Scavenger::walkBindings(Bindings * b)
     }
     if (b->parent)
         fwdBindings(const_cast<Bindings *>(b->parent));
-    // Phase E v0.2 post-walk barrier — see walkList.
-    if (n.isPhaseEActive()) bindingsPostConstructBarrier(b);
 }
 
 void Scavenger::walkPair(ValuePair * p)
@@ -835,8 +658,6 @@ void Scavenger::walkPair(ValuePair * p)
     // 2026-05-30: `third` slot for Tag::App3 arg2.  Uninitialized
     // for Tag::App / Tag::PrimOpApp; visitValue no-ops.
     visitValue(p->third);
-    // Phase E v0.2 post-walk barrier — see walkList.
-    if (n.isPhaseEActive()) pairPostConstructBarrier(p);
 }
 
 void Scavenger::drain()
@@ -1153,39 +974,15 @@ void Scavenger::run()
         // tenured (`Alloc::allocValue`), but their CONTENTS may
         // hold a nursery payload.  Walk each cell as a root.
         //
-        // #738 Phase E v0.2: under Phase E, the cell's content might
-        // be forwarded to active-S (still nursery!) rather than to
-        // tenured.  Under Phase D this never happened — survivors
-        // always went to tenured, so clearing the cell registry
-        // was safe.  Under Phase E we must keep cells in the
-        // registry if they still point into nursery after walking,
-        // otherwise the active-S referent becomes unreachable from
-        // the dirty-list-equivalent and the next scavenge misses it.
+        // Single-region (Phase D / gen-major): every survivor is copied
+        // to tenured, so post-walk cells hold tenured payloads.  Clear
+        // the registry; mutator barriers will repopulate.
         auto & cells = standaloneCellRoots();
-        if (n.isPhaseEActive()) {
-            // Filter in place: keep cells whose updated content
-            // still references nursery (active-S or new survivor in
-            // the inactive buffer).  Drop cells that now hold tenured
-            // pointers (they no longer need tracking until the mutator
-            // writes a new nursery pointer through them).
-            size_t kept = 0;
-            for (Value * cell : cells) {
-                visitValue(*cell);
-                if (isNurseryPayload(*cell, n))
-                    cells[kept++] = cell;
-            }
-            cells.resize(kept);
-            releaseIfOversized(cells, 16 * 1024);
-        } else {
-            // Legacy Phase D: every survivor went to tenured, so
-            // post-walk cells hold tenured payloads.  Clear the
-            // registry; mutator barriers will repopulate.
-            for (Value * cell : cells) {
-                visitValue(*cell);
-            }
-            cells.clear();
-            releaseIfOversized(cells, 16 * 1024);
+        for (Value * cell : cells) {
+            visitValue(*cell);
         }
+        cells.clear();
+        releaseIfOversized(cells, 16 * 1024);
     }
 
     // Captured-withs singleton cache slots.  These are libc/static slots in
@@ -1208,21 +1005,9 @@ void Scavenger::run()
     // Leaving them populated until then is harmless and saves the
     // hash-table hashing-pass that `clear()` does when called now.
 
-    // #738 Phase E v0.2: under Phase E, the reset path differs —
-    // young is reset AND the just-promoted active survivor is reset
-    // AND the active idx is flipped so the buffer that just received
-    // Y survivors becomes the new active S.  Legacy single-region
-    // behaviour falls through to `resetBumpAfterScavenge`.
-    if (n.isPhaseEActive()) {
-        n.swapAndResetAfterScavenge();
-        n.recordPhaseEBytes(bytesPhaseEYToS,
-                            bytesPhaseESToT,
-                            bytesPhaseEYToTOvf);
-    } else {
-        n.resetBumpAfterScavenge();
-        // Phase D (legacy) — survivors mapped to overflow slot.
-        n.recordPhaseEBytes(0, 0, bytesPhaseEYToTOvf);
-    }
+    // Single-region (Phase D / gen-major) reset: young bump pointer
+    // reset to base; survivors were already copied out to tenured.
+    n.resetBumpAfterScavenge();
 }
 
 } // namespace

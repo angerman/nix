@@ -149,28 +149,6 @@ public:
         diedBytes += (preUsed > surv) ? (preUsed - surv) : 0;
     }
 
-    /// Phase E v0.2 — record per-region promotion bytes.  Called
-    /// once per scavenge by gc.cc::scavengeNursery, after
-    /// Scavenger::run completes and before resetting bumpers.
-    /// All three are cumulative across the process lifetime.
-    ///
-    ///   yToS    — bytes promoted Y → S (age-1 survivors retained).
-    ///   sToT    — bytes promoted S → T (age-2 = tenured).
-    ///   yToTOvf — bytes promoted Y → T directly because survivor
-    ///             buffer was full (Phase E) OR because Phase E is
-    ///             disabled (legacy single-region path).
-    void recordPhaseEBytes(uint64_t yToS, uint64_t sToT,
-                           uint64_t yToTOvf) noexcept
-    {
-        bytesYToS    += yToS;
-        bytesSToT    += sToT;
-        bytesYToTOvf += yToTOvf;
-    }
-    /// Accessors for run.cc's NIX_VM_STATS banner.
-    uint64_t getBytesYToS()    const noexcept { return bytesYToS; }
-    uint64_t getBytesSToT()    const noexcept { return bytesSToT; }
-    uint64_t getBytesYToTOvf() const noexcept { return bytesYToTOvf; }
-
     /// True iff `p` lies inside this nursery's young buffer (the
     /// bump-allocator-managed region where fresh allocations go).
     /// O(1) range check.
@@ -180,47 +158,17 @@ public:
                && static_cast<const char *>(p) < end;
     }
 
-    /// #738 Phase E v0.2 (2026-05-21) — true iff `p` lies inside
-    /// the currently-ACTIVE survivor buffer.  The active survivor
-    /// holds objects that survived a prior scavenge; they are this
-    /// scavenge's promotion candidates (active-S → tenured).
-    bool inActiveSurvivor(const void * p) const noexcept
-    {
-        if (!p || !phaseEEnabled) return false;
-        const char * cp = static_cast<const char *>(p);
-        return survActiveIdx == 0
-            ? (cp >= survBaseA && cp < survEndA)
-            : (cp >= survBaseB && cp < survEndB);
-    }
-
-    /// True iff `p` lies inside the INACTIVE survivor buffer (the
-    /// destination for this scavenge's Y survivors).  Useful during
-    /// scavenge for sanity checks; not on the hot path.
-    bool inInactiveSurvivor(const void * p) const noexcept
-    {
-        if (!p || !phaseEEnabled) return false;
-        const char * cp = static_cast<const char *>(p);
-        return survActiveIdx == 0
-            ? (cp >= survBaseB && cp < survEndB)
-            : (cp >= survBaseA && cp < survEndA);
-    }
-
-    /// True iff `p` lies inside ANY nursery-managed region (young,
-    /// or either survivor buffer when Phase E is active).  This is
+    /// True iff `p` lies inside the nursery's young buffer.  This is
     /// the API surface that Phase D barriers (in include/v3/barrier.hh)
     /// consult via `isNurseryPayload` to decide whether a write
-    /// crosses the inter-gen boundary.  Phase E extends the semantics:
-    /// any survivor buffer also counts as "nursery", so barriers
-    /// track tenured → survivor edges transparently.
+    /// crosses the inter-gen boundary.  Single-region (Phase D /
+    /// gen-major) semantics: the young buffer is the only
+    /// nursery-managed region.
     bool contains(const void * p) const noexcept
     {
         if (!p) return false;
         const char * cp = static_cast<const char *>(p);
-        if (cp >= base && cp < end) return true;
-        if (!phaseEEnabled) return false;
-        if (cp >= survBaseA && cp < survEndA) return true;
-        if (cp >= survBaseB && cp < survEndB) return true;
-        return false;
+        return cp >= base && cp < end;
     }
 
     /// #34 RCA (2026-07-06): minimum byte distance from raw word `w` to any of
@@ -238,64 +186,23 @@ public:
             if (w >= l && w < h) return 0;
             return (w < l) ? (l - w) : (w - h + 1);
         };
-        uintptr_t d = dist(base, end);
-        if (phaseEEnabled) {
-            uintptr_t da = dist(survBaseA, survEndA);
-            uintptr_t db = dist(survBaseB, survEndB);
-            if (da < d) d = da;
-            if (db < d) d = db;
-        }
-        return d;
+        return dist(base, end);
     }
     uintptr_t youngLo() const noexcept { return reinterpret_cast<uintptr_t>(base); }
     uintptr_t youngHi() const noexcept { return reinterpret_cast<uintptr_t>(end); }
 
     /// Mid-eval non-moving GC (MIDEVAL_GC_DESIGN_2026-06-22): invoke `f(lo, hi)`
     /// for each USED byte range that may hold pointers into the tenured arena —
-    /// the young region `[base, next)` and, under Phase E, both survivor buffers'
-    /// used spans.  A non-moving tenured mark-sweep running with a RESIDENT
-    /// nursery scans these CONSERVATIVELY (word-by-word, arena-bounds filter) to
-    /// mark tenured cells reachable THROUGH nursery cells — the precise mark skips
-    /// them (`tryMark` rejects non-arena pointers, mark_sweep.cc:111).  No-op when
-    /// the young region is empty (`next == base`), so it is also free on the
-    /// gen-major post-forceScavenge path.  Over-approximate ⇒ safe: scanning both
-    /// survivor buffers (incl. the inactive one) only over-retains tenured cells.
+    /// the young region `[base, next)`.  A non-moving tenured mark-sweep running
+    /// with a RESIDENT nursery scans these CONSERVATIVELY (word-by-word,
+    /// arena-bounds filter) to mark tenured cells reachable THROUGH nursery cells
+    /// — the precise mark skips them (`tryMark` rejects non-arena pointers,
+    /// mark_sweep.cc:111).  No-op when the young region is empty (`next == base`),
+    /// so it is also free on the gen-major post-forceScavenge path.
     template <typename F>
     void forEachUsedRange(F && f) const noexcept {
         if (next > base) f(base, next);
-        if (phaseEEnabled) {
-            if (survNextA > survBaseA) f(survBaseA, survNextA);
-            if (survNextB > survBaseB) f(survBaseB, survNextB);
-        }
     }
-
-    /// #738 Phase E v0.2 — bump-allocate `bytes` from the INACTIVE
-    /// survivor buffer (= destination for this scavenge's Y
-    /// survivors).  Returns nullptr if survivor buffer overflows or
-    /// Phase E is disabled; caller falls back to tenured (promotion
-    /// path).  Called only from `Scavenger::fwdX` during scavenge.
-    void * targetSurvivorAlloc(size_t bytes) noexcept
-    {
-        if (!phaseEEnabled) return nullptr;
-        bytes = (bytes + 15) & ~size_t{15};
-        if (survActiveIdx == 0) {
-            if (!survBaseB || survNextB + bytes > survEndB) return nullptr;
-            void * p = survNextB;
-            survNextB += bytes;
-            return p;
-        } else {
-            if (!survBaseA || survNextA + bytes > survEndA) return nullptr;
-            void * p = survNextA;
-            survNextA += bytes;
-            return p;
-        }
-    }
-
-    /// True iff Phase E mode is active (NIX_V3_PHASE_E=1 + nursery
-    /// itself enabled).  Used by gc.cc's Scavenger to choose
-    /// between single-region (Phase D) and two-region (Phase E)
-    /// destination dispatch.
-    bool isPhaseEActive() const noexcept { return phaseEEnabled; }
 
     /// Phase C: heuristic check — true when the nursery is past
     /// the fill threshold and a scavenge should run.  Cheap branch
@@ -359,55 +266,6 @@ public:
     /// allocator and `forceScavenge` returns false — STRESS does
     /// nothing in that case because there's no nursery to clear.
     bool forceScavenge(VMState & vm) noexcept;
-
-    /// #738 Phase E v0.2 — swap active survivor index + reset both
-    /// young and the (now-promoted-to-tenured) old-active survivor.
-    /// Called by `gc.cc::scavengeNursery` at the end of a scavenge
-    /// when Phase E is active, in lieu of `resetBumpAfterScavenge`.
-    ///
-    /// After this call:
-    ///   - young bump pointer reset to base (Y is empty).
-    ///   - The buffer that USED to be active (whose contents we
-    ///     just promoted to tenured) has its bump pointer reset
-    ///     (so future scavenges can reuse it).
-    ///   - `survActiveIdx` is flipped so the buffer that NOW holds
-    ///     this-cycle's Y-survivors becomes the new active S.
-    ///
-    /// The #705 NO_RESET diagnostic gate is honoured for both Y and
-    /// the demoted-active survivor.
-    void swapAndResetAfterScavenge() noexcept
-    {
-        if (!phaseEEnabled) {
-            // Fall back to legacy single-region reset.
-            resetBumpAfterScavenge();
-            return;
-        }
-        static const bool s_noReset =
-            std::getenv("NIX_V3_NURSERY_NO_RESET") != nullptr;
-        if (base) {
-            if (!s_noReset) std::memset(base, 0, size_t(next - base));
-            next = base;
-        }
-        // Reset the OLD-active survivor (it just got promoted to
-        // tenured; its bytes are now reclaimable).
-        if (survActiveIdx == 0) {
-            if (survBaseA) {
-                if (!s_noReset)
-                    std::memset(survBaseA, 0, size_t(survNextA - survBaseA));
-                survNextA = survBaseA;
-            }
-        } else {
-            if (survBaseB) {
-                if (!s_noReset)
-                    std::memset(survBaseB, 0, size_t(survNextB - survBaseB));
-                survNextB = survBaseB;
-            }
-        }
-        // Flip active idx: the buffer we just filled with Y
-        // survivors becomes the new active S.
-        survActiveIdx = 1 - survActiveIdx;
-        ++scavengeCount;
-    }
 
     /// Reset the bump pointer; called by `gc.cc` at the end of
     /// `scavengeNursery`.  The buffer keeps its backing memory.
@@ -525,40 +383,6 @@ private:
             sizeBytes = 0;
             return;
         }
-        // #738 Phase E v0.2 (2026-05-21) survivor-pool init.  Gated
-        // by NIX_V3_PHASE_E=1.  Allocates two equal-sized buffers
-        // for the double-buffered survivor area.  Default survivor
-        // buffer = same size as young (~32 MB default).  Total
-        // nursery footprint under Phase E ≈ 3 × NIX_V3_NURSERY_SIZE.
-        // Tunable via NIX_V3_PHASE_E_SURV_MB.
-        const char * pe = std::getenv("NIX_V3_PHASE_E");
-        phaseEEnabled = pe && pe[0] != '0';
-        if (phaseEEnabled) {
-            const char * survSz = std::getenv("NIX_V3_PHASE_E_SURV_MB");
-            size_t survMb = mb;  // default: match young
-            if (survSz) {
-                long v = std::strtol(survSz, nullptr, 10);
-                if (v > 0 && v < 4096) survMb = static_cast<size_t>(v);
-            }
-            survSizeBytes = survMb * (size_t(1) << 20);
-            survBaseA = static_cast<char *>(std::calloc(1, survSizeBytes));
-            survBaseB = static_cast<char *>(std::calloc(1, survSizeBytes));
-            if (!survBaseA || !survBaseB) {
-                // Survivor allocation failed; degrade to Phase D
-                // single-region behaviour.  Phase E is opt-in so a
-                // failed init shouldn't take the whole eval down.
-                if (survBaseA) std::free(survBaseA);
-                if (survBaseB) std::free(survBaseB);
-                survBaseA = survBaseB = nullptr;
-                phaseEEnabled = false;
-            } else {
-                survNextA = survBaseA;
-                survNextB = survBaseB;
-                survEndA  = survBaseA + survSizeBytes;
-                survEndB  = survBaseB + survSizeBytes;
-                survActiveIdx = 0;
-            }
-        }
 #if NIX_USE_BOEHMGC
         // CORRECTNESS CRITICAL: register the nursery as a Boehm root.
         //
@@ -591,15 +415,6 @@ private:
         // Boehm more time to find the unrooted references and
         // reclaim them mid-eval.
         GC_add_roots(base, base + sizeBytes);
-        // Phase E v0.2: register the survivor buffers as Boehm roots
-        // too.  Same rationale as the young buffer: survivor cells
-        // may hold Bridge thunks whose `bridgeSrc` points at TW
-        // values; without Boehm's scan covering survivor memory the
-        // bridge contents become invisible across libc++abi unwind.
-        if (phaseEEnabled && survBaseA && survBaseB) {
-            GC_add_roots(survBaseA, survBaseA + survSizeBytes);
-            GC_add_roots(survBaseB, survBaseB + survSizeBytes);
-        }
 #endif
         next = base;
         end  = base + sizeBytes;
@@ -628,49 +443,6 @@ private:
     // `stats()` to run.cc's NIX_VM_STATS banner.
     uint64_t survivedBytes = 0;
     uint64_t diedBytes     = 0;
-
-    // #738 Phase E v0.2 (2026-05-21) two-region survivor pool.
-    //
-    // Architecture:
-    //   - young region (this struct's `base..end`): bump-allocator
-    //     for fresh objects.  Same role as Phase A/C/D.
-    //   - survivor A / survivor B: double-buffered survivor pool.
-    //     One is "active" (holds prior-scavenge survivors — this
-    //     scavenge's promotion candidates); the other is the
-    //     "inactive" target for THIS scavenge's Y survivors.
-    //
-    // Per scavenge under Phase E:
-    //   1. Walk roots + dirty list.
-    //   2. fwdX dispatch: Y-source → copy to inactive S (age 1).
-    //                     active-S-source → copy to tenured (age 2 = promote).
-    //   3. Drain queue: forward interior pointers.
-    //   4. `swapAndResetAfterScavenge`: reset Y bump, reset old-active S,
-    //      flip `survActiveIdx`.  Now-active S holds Y survivors;
-    //      now-inactive S is empty awaiting next-cycle Y survivors.
-    //
-    // Phase D barriers transparently extend: `contains(p)` returns
-    // true for any of the three buffers, so any tenured cell holding
-    // a survivor-S pointer is recorded in dirtyContainers when the
-    // mutator writes it, AND post-walk in the scavenger for edges
-    // the scavenger itself created.
-    //
-    // Gated by `NIX_V3_PHASE_E=1`.  Default OFF — Phase D single-
-    // region behaviour preserved.
-    bool   phaseEEnabled = false;
-    char * survBaseA = nullptr, * survEndA = nullptr, * survNextA = nullptr;
-    char * survBaseB = nullptr, * survEndB = nullptr, * survNextB = nullptr;
-    uint8_t survActiveIdx = 0;
-    size_t  survSizeBytes = 0;  // per-buffer size; A and B are equal.
-
-    // #738 Phase E v0.2 per-region byte counters (cumulative across
-    // process lifetime).  Reported by run.cc's NIX_VM_STATS banner.
-    // youngDied is the "true mortality" — bytes that died in Y
-    // without ever reaching the survivor pool, the win that Phase E
-    // delivers vs Phase D.  survDied is bytes that survived once
-    // (Y→S) but died before age 2 — recovered when running.
-    uint64_t bytesYToS    = 0;  // Y survivors promoted to S
-    uint64_t bytesSToT    = 0;  // S survivors promoted to T
-    uint64_t bytesYToTOvf = 0;  // Y survivors promoted directly to T (S full)
 };
 
 // GC_AUDIT_ROUND_2 N5 (LATENT, documented 2026-05-21):
