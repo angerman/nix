@@ -91,6 +91,7 @@ lib_sources = files(
   'emit.cc',
   'vm.cc',
   'vm_debug.cc',
+  'vm_interning.cc',
   'primops.cc',
   'bytecode_primops.cc',
   'limits.cc',
