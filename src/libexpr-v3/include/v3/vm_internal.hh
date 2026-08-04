@@ -73,4 +73,46 @@ ListVec * internOrAllocSingletonCapWiths(const Value & v) noexcept;
 /// scope.  Called on the closure/thunk creation path.  (vm_interning.cc)
 ListVec * snapshotCurrentWiths(VMState & vm);
 
+// --- Applied-import RESULT cache — decision half (vm_applied_cache.cc) -------
+//
+// Step 3 of the vm.cc split.  The LEVER-1 applied-import result cache's policy /
+// key-building / probe / shadow-validation cluster moved out of vm.cc.  These
+// five entry points were file-local (anonymous namespace) but are called from
+// vm.cc's OP_CALL / OP_TAIL_CALL / callClosure apply paths + OP_RETURN
+// (shadow-compare / insert), so the move promotes them to external linkage.
+// The file-local helpers (AppliedCacheProbeStats / appliedCacheProbeStats /
+// kAppliedKeyBudget / appliedProbeBoundedKey / appliedKeyPrecheck /
+// appliedShadowCompareOne) stay `static`/anonymous in vm_applied_cache.cc.  The
+// cache STORAGE half (appliedCacheLookup / Insert / LookupPeek / Note* /
+// StatsDump / RecordImportResult / IsImportResultDesc) lives in primops.cc and
+// is declared in v3/primop.hh, unchanged.
+
+/// Gate: is the applied-import result cache active for reuse?  DEFAULT-ON
+/// (NIX_V3_APPLIED_CACHE unset / "1" / "shadow" / other → true; "0"/"off"/
+/// "probe"/"count" → false).  (vm_applied_cache.cc)
+bool appliedCacheOn() noexcept;
+
+/// True iff NIX_V3_APPLIED_CACHE=shadow — arm+insert but never short-circuit a
+/// would-HIT; OP_RETURN lockstep-compares fresh vs cached instead.
+/// (vm_applied_cache.cc)
+bool appliedCacheShadowMode() noexcept;
+
+/// Build the memo key (callee LambdaDescriptor pointer + canonical args digest)
+/// for an application, or return false when the arg is unhashable (non-forcing
+/// structural pre-check + canonicalHash).  Called on the apply hot path when the
+/// callee is an import-result closure.  (vm_applied_cache.cc)
+bool appliedCacheTryKey(const Closure * callee, const Value & arg, std::string & out);
+
+/// Shadow-mode entry (OP_RETURN): structurally compare `fresh` against the cached
+/// entry for `key` over WHNF-vs-WHNF nodes only; records the verdict.  No-op when
+/// the entry was evicted.  (vm_applied_cache.cc)
+void appliedShadowCompare(const std::string & key, const Value & fresh) noexcept;
+
+/// NIX_V3_APPLIED_CACHE=probe/count instrumentation: observe an eligible
+/// application (site 0=OP_CALL 1=OP_TAIL_CALL 2=callClosure) and, in probe mode,
+/// bounded-force its arg into a per-process key to measure the in-process hit
+/// ceiling.  No-op cost unless the probe/count mode is armed.  (vm_applied_cache.cc)
+void appliedCacheProbeObserve(VMState & vm, const Closure * callee, const Value & arg,
+                              int site, bool hasFormals) noexcept;
+
 } // namespace nix::v3
