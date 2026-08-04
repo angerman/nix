@@ -41,7 +41,6 @@
 #include "v3/alloc.hh"
 #include "v3/primop.hh"  // M2.1: importCacheColdBytes / importCacheCuCount / BytecodeBytes
 #include "v3/precise_root.hh"
-#include "v3/fiber.hh"  // M-5: walkLiveFiberStacks (conservative yielded-fiber scan)
 #include "v3/nursery.hh"  // MIDEVAL_GC: threadNursery().forEachUsedRange conservative scan
 #include "v3/barrier.hh"  // MIDEVAL_GC: dirtyContainers() remembered-set root walk
 #include "v3/bytecode.hh"  // MIDEVAL_GC: CompilationUnit::attrSelectCache IC walk
@@ -908,22 +907,6 @@ static void walkCStackConservative(
         conservativeMarkWord(v, arena,
             *reinterpret_cast<const uintptr_t *>(p), arenaMin, arenaMax);
     }
-
-    // M-5 (CODEBASE_REVIEW_2026-06-11): conservatively scan every YIELDED
-    // fiber's own stack.  A yielded fiber's fiberVm + v3 Values live on its
-    // mmap'd stack, which this scan (the current thread's C-stack only) would
-    // otherwise miss → swept → UAF when the fiber resumes.  No-op when no
-    // fibers are live (NIX_V3_FIBER_BRIDGE dormant).  Same word-scan as above.
-    walkLiveFiberStacks([&](const void * lo, const void * hi) noexcept {
-        uintptr_t a = reinterpret_cast<uintptr_t>(lo)
-                      & ~(uintptr_t(sizeof(void *)) - 1);
-        uintptr_t b = reinterpret_cast<uintptr_t>(hi)
-                      & ~(uintptr_t(sizeof(void *)) - 1);
-        for (uintptr_t p = a; p < b; p += sizeof(void *)) {
-            conservativeMarkWord(v, arena,
-                *reinterpret_cast<const uintptr_t *>(p), arenaMin, arenaMax);
-        }
-    });
 
     // MIDEVAL_GC_DESIGN_2026-06-22: conservatively scan the RESIDENT nursery.
     // The non-moving mid-eval mark-sweep runs with a non-empty nursery; the

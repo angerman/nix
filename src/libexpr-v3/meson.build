@@ -131,7 +131,6 @@ lib_sources = files(
   # NIX_V3_TEST_DRV_RESULT_SERIALIZE=1; default-off cost is one
   # cached-bool load per primDerivationStrict call.
   'value_serialize.cc',
-  'fiber.cc',
   # WS5-D1: process-global desc→CompilationUnit reverse map (interval registry).
   # Holds the runtime `cu` back-pointer that was moved OUT of LambdaDescriptor so
   # the compiled `lambdas[]` array is read-only-after-load (cross-process sharing).
