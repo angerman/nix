@@ -1254,13 +1254,10 @@ void primToString(EvalState & state, Value * args, Value & out)
     // GC-safe: the buffers are C++-static (never freed/moved) and a String
     // Value's char* is not a GC-managed pointer (isNurseryPayload is false for
     // String).  Byte-identical: same decimal text as the slow path's
-    // std::to_string(asInt()); ints carry no string context.  DEFAULT-ON
-    // (opt-out NIX_V3_NO_TOSTRING_INT_CACHE=1) — validated --core 21/21,
-    // hello/git/firefox drvPath, 59-pkg drvPath sweep (cache-diverge=0,
-    // tw-diverge=0).  RETIREMENT: drop the opt-out after a full darwin-4 sweep.
-    static const bool s_toStrFast =
-        std::getenv("NIX_V3_NO_TOSTRING_INT_CACHE") == nullptr;
-    if (s_toStrFast) {
+    // std::to_string(asInt()); ints carry no string context.  Unconditional
+    // — validated --core 21/21, hello/git/firefox drvPath, 59-pkg drvPath
+    // sweep (cache-diverge=0, tw-diverge=0).
+    {
         Value v = args[0];
         Tag t = v.tag();
         if (t == Tag::Thunk || v.isAppLike() || t == Tag::Slot) {
@@ -7172,7 +7169,8 @@ void primImport(EvalState & state, Value * args, Value & out)
     // 1.82× on 1M-element single-IFD, wall-neutral on no-IFD
     // workloads (hello.name, hello.drvPath both within 0.5σ).  True-
     // COLD ≈ OFF (cold-tax is invisible at realistic IFD counts).
-    // Opt-OUT via NIX_V3_NO_IFD_IMPORT_CACHE_DISK=1.  Docs:
+    // Gated only by the blanket NIX_V3_NO_DISK_CACHE switch (the narrower
+    // NIX_V3_NO_IFD_IMPORT_CACHE_DISK opt-out was retired).  Docs:
     // lode/PHASE_4B_SCALE_TEST_2026-05-24.md +
     // lode/PHASE_4B_MULTI_IFD_2026-05-24.md.
     //
@@ -7188,18 +7186,13 @@ void primImport(EvalState & state, Value * args, Value & out)
     // same v3 Value.  No stat-check needed (store paths are immutable
     // by libstore invariant).
     //
-    // Retirement criterion: 30 days of nightly nixpkgs CI without
-    // regression on cardano-node M5 + haskell.nix smoke + standard
-    // hello.drvPath/firefox.name workloads, then delete the opt-out
-    // entirely.
-    // T-7 (CODEBASE_REVIEW_2026-06-11): the blanket NIX_V3_NO_DISK_CACHE must
-    // ALSO disable the IFD EvalResult disk cache — previously only the
-    // narrower NIX_V3_NO_IFD_IMPORT_CACHE_DISK did, so a "cold cache" A/B run
-    // with NIX_V3_NO_DISK_CACHE=1 still hit the IFD result cache and measured a
-    // partially-warm run.
+    // T-7 (CODEBASE_REVIEW_2026-06-11): the IFD EvalResult disk cache is gated
+    // by the blanket NIX_V3_NO_DISK_CACHE switch, so a "cold cache" A/B run with
+    // NIX_V3_NO_DISK_CACHE=1 correctly skips it too.  (The narrower
+    // NIX_V3_NO_IFD_IMPORT_CACHE_DISK opt-out was retired — subsumed by
+    // NIX_V3_NO_DISK_CACHE.)
     static const bool s_ifdImportDiskCache =
-        std::getenv("NIX_V3_NO_IFD_IMPORT_CACHE_DISK") == nullptr
-        && std::getenv("NIX_V3_NO_DISK_CACHE") == nullptr;
+        std::getenv("NIX_V3_NO_DISK_CACHE") == nullptr;
     // #741 Phase 4b RCA fix: only consult the disk cache for ACTUAL
     // IFD imports (string-with-ctx or attrset arg).  Non-IFD imports
     // are literal-path nixpkgs files — they're already handled

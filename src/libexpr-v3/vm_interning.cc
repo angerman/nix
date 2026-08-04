@@ -221,8 +221,8 @@ void clearEnvInternTable() noexcept
 //
 // Memory footprint of the cache itself: 4096 buckets * 24 B = 96 KB.
 //
-// Gate: NIX_V3_NO_CAPWITHS_INTERN=1 reverts every call to a fresh
-// allocList for A/B measurement.
+// The intern is unconditional (the NIX_V3_NO_CAPWITHS_INTERN A/B opt-out,
+// which reverted every call to a fresh allocList, was retired).
 //
 // Retirement criterion (Rule 0): retire the cache when (a) Phase E
 // v0.2 default-on makes nursery-allocated ListVecs cheap enough to
@@ -308,14 +308,6 @@ void clearCapWithsCache() noexcept
 /// chaining at this scale).
 ListVec * internOrAllocSingletonCapWiths(const Value & v) noexcept
 {
-    static const bool s_disabled =
-        std::getenv("NIX_V3_NO_CAPWITHS_INTERN") != nullptr;
-    if (__builtin_expect(s_disabled, 0)) {
-        ListVec * lws = Alloc::allocList(1);
-        lws->elems[0] = v;
-        listPostConstructBarrier(lws);
-        return lws;
-    }
     // Under the moving nursery, the cache's static slots are explicit scavenge
     // roots: gc.cc forwards each ListVec* and then asks vm.cc to refresh the key
     // from the forwarded element.  That keeps the cache sound without falling

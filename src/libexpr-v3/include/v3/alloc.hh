@@ -500,10 +500,7 @@ struct Bindings
         // stale-key UAF trap) so it moves with the object under the nursery and
         // stays valid (a parent moving forwards the pointer but keeps the names).
         // Sentinel 0 = uncomputed (a chain always has >=1 distinct name).
-        // Opt-out: NIX_V3_NO_COUNTDISTINCT_MEMO.
-        static const bool memo =
-            std::getenv("NIX_V3_NO_COUNTDISTINCT_MEMO") == nullptr;
-        if (memo) {
+        {
             uint32_t cached = uint32_t(_pad8[0])
                             | (uint32_t(_pad8[1]) << 8)
                             | (uint32_t(_pad8[2]) << 16);
@@ -512,7 +509,7 @@ struct Bindings
         Cursor c(this, false);
         uint32_t n = 0;
         while (c.next()) ++n;
-        if (memo && n != 0 && n <= 0xFFFFFFu) {
+        if (n != 0 && n <= 0xFFFFFFu) {
             Bindings * self = const_cast<Bindings *>(this);
             self->_pad8[0] = uint8_t(n & 0xFF);
             self->_pad8[1] = uint8_t((n >> 8) & 0xFF);
