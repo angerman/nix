@@ -2931,10 +2931,12 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
         // Previously a separate getenv here left the bookkeeping ON but
         // the TRIGGER OFF when only alloc.hh's default flipped.
         const bool s_majorGcEnabled = Arena::majorGcEnabled();
-        // FP-4 Shape A: generational-major is active when NIX_V3_GEN_MAJOR is set
-        // AND the nursery is on (nursery != nullptr).  It reuses the major-GC
-        // safepoint block below, prepending a forceScavenge so the major mark
-        // sees no nursery cells (M-3).
+        // FP-4 Shape A: generational-major is UNCONDITIONALLY active
+        // (g_genMajorEnabled is a hard constant; the NIX_V3_GEN_MAJOR opt-out
+        // was retired 2026-06-15 and is no longer read anywhere) as long as the
+        // nursery is on (nursery != nullptr — a real defensive check).  It
+        // reuses the major-GC safepoint block below, prepending a forceScavenge
+        // so the major mark sees no nursery cells (M-3).
         const bool s_genMajor = g_genMajorEnabled && nursery != nullptr;
         // P-1 (CODEBASE_REVIEW_2026-06-11): test the CHEAP local `exitDepth==0`
         // FIRST.  The major-GC safepoint only ever fires in the OUTERMOST
@@ -5722,8 +5724,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 // remaining cost is a tag check on a cached value.
                 // The former NIX_V3_EAGER_ARG_FORCE gate is retired:
                 // formals lambdas always force their argument to match TW.
-                constexpr bool needForce = true;
-                if (needForce) {
+                // (Bare scope block — kept only to bound the locals below.)
+                {
                     // STG-12 (#498) diagnostic: see what we're about to
                     // force at OP_CALL.  V3_DBG_OPCALL_FORCE=1 to enable.
                     static const bool s_dbg_callforce =

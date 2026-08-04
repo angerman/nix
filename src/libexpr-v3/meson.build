@@ -172,9 +172,9 @@ lib_sources = files(
   #   lode/GC_DESIGN_POST_CHENEY_2026-05-28.md (the design)
   #   lode/STAGE_6_FALSIFIERS_DAY6_2026-05-28.md (F#1/F#2 data)
   #   lode/STAGE_6_CHENEY_FALSIFIED_2026-05-27.md (the falsification)
-  # Phase 0: runMajorMarkSweep is a no-op stub; vm.cc dispatch-loop
-  # wires the call path so subsequent phases (1-3) can drop in mark +
-  # sweep + free-list-allocator without touching the trigger.
+  # runMajorMarkSweep is the LIVE major collector (mark + sweep +
+  # per-size-class free lists + sparse-block whole-block-free); the vm.cc
+  # dispatch-loop gen-major path calls it at the exitDepth==0 safepoint.
   'mark_sweep.cc',
   # #772 Stage 9 Phase L0 spike: bytecode-level dedup survey.
   'dedup_survey.cc',
