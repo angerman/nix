@@ -4341,13 +4341,12 @@ static int testBruteScanScalarClassifier()
     check("Bindings@24 e0 value",      bruteScanSlotIsScalar(ct(CellType::Bindings), 24), false);
     check("Bindings@32 e1 Sym/Pos",    bruteScanSlotIsScalar(ct(CellType::Bindings), 32), true);
     check("Bindings@40 e1 value",      bruteScanSlotIsScalar(ct(CellType::Bindings), 40), false);
-    // Closure (post-P1b header 32B): desc@0/capturedWiths@8/upvalEnv@16 PTRs,
-    // {nUpvalues,_pad}@24 SCALAR, upvalues@32 Values.
+    // Closure (header 24B after upvalEnv retired 2026-08): desc@0/capturedWiths@8
+    // PTRs, {nUpvalues,_pad}@16 SCALAR, upvalues@24 Values.
     check("Closure@0 desc(ptr)",       bruteScanSlotIsScalar(ct(CellType::Closure), 0),  false);
     check("Closure@8 capWiths(ptr)",   bruteScanSlotIsScalar(ct(CellType::Closure), 8),  false);
-    check("Closure@16 upvalEnv(ptr)",  bruteScanSlotIsScalar(ct(CellType::Closure), 16), false);
-    check("Closure@24 nUpvalues/_pad", bruteScanSlotIsScalar(ct(CellType::Closure), 24), true);
-    check("Closure@32 upvalue0",       bruteScanSlotIsScalar(ct(CellType::Closure), 32), false);
+    check("Closure@16 nUpvalues/_pad", bruteScanSlotIsScalar(ct(CellType::Closure), 16), true);
+    check("Closure@24 upvalue0",       bruteScanSlotIsScalar(ct(CellType::Closure), 24), false);
     // Env: parent@0 PTR, {isWithEnv,nValues}@8 SCALAR, values@16 Values.
     check("Env@0 parent(ptr)",         bruteScanSlotIsScalar(ct(CellType::Env), 0),  false);
     check("Env@8 isWithEnv/nValues",   bruteScanSlotIsScalar(ct(CellType::Env), 8),  true);

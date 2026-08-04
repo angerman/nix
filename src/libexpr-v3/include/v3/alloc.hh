@@ -2846,7 +2846,6 @@ struct Alloc
         c->_pad = 0;
         c->capturedWiths = nullptr;
         // P1b: no Closure::cu to init (derived from desc->cu via closureCU).
-        c->upvalEnv = nullptr;   // env-sharing: inline-FAM path until a gate builds an Env
         closureAllocSiteRecord(c, file, line, nUpvalues);
         return c;
     }
@@ -2889,7 +2888,6 @@ struct Alloc
         c->_pad = 0;
         c->capturedWiths = nullptr;
         // P1b: no Closure::cu to init (derived from desc->cu via closureCU).
-        c->upvalEnv = nullptr;   // env-sharing: inline-FAM path until a gate builds an Env
         closureAllocSiteRecord(c, file, line, nUpvalues);
         return c;
     }
@@ -2938,31 +2936,10 @@ struct Alloc
         return t;
     }
 
-    /// env-sharing (NIX_V3_ENV_SHARING): Suspended thunk whose upvalues live in a
-    /// shared Env (tail[0] holds the Env*, filled by the caller) instead of inline
-    /// in the tail.  Tail is a fixed [Env* @ 0] + [withs @ 1 iff reserveWithsSlot]
-    /// — independent of the logical nUpvalues.  Header stays 24 B (the ENV_SHARED
-    /// flag bit in hasWithsSlot drives thunkScanSize/GC/accessor layout).
-    static Thunk * allocThunkSuspendedShared(uint16_t nUpvalues,
-                                             bool reserveWithsSlot = false,
-                                             const char * file = __builtin_FILE(),
-                                             uint32_t     line = __builtin_LINE()) noexcept
-    {
-        const size_t bytes = sizeof(Thunk)
-            + sizeof(Value) * (1 + (reserveWithsSlot ? 1 : 0));
-        V3_STATS_BUMP(bytesThunks, bytes);
-        auto * t = static_cast<Thunk *>(nurseryOrArena(bytes, CellType::Thunk));
-        t->state = ThunkState::Suspended;
-        t->hasWithsSlot = static_cast<uint8_t>(
-            THUNK_ENV_SHARED | (reserveWithsSlot ? THUNK_WITHS_SLOT : 0));
-        t->nUpvalues = nUpvalues;
-        t->forces = 0;
-        t->cell = nullptr;
-        *reinterpret_cast<Env **>(&t->tail[0]) = nullptr;  // Env* slot; caller fills
-        if (reserveWithsSlot) thunkSetCapturedWiths(t, nullptr);  // tail[1]
-        thunkAllocSiteRecord(t, file, line, nUpvalues);
-        return t;
-    }
+    // (allocThunkSuspendedShared retired 2026-08 with the env-tuple interning /
+    // Closure::upvalEnv plumbing it fed — it allocated a Suspended thunk whose
+    // upvalues lived in a shared Env at tail[0] instead of inline.  Upvalues now
+    // always live inline in the tail via allocThunkSuspended.)
 
     // (allocBridgeThunk retired; TW_VALUE_ERADICATION F4, 2026-06-02.)
 
@@ -3379,11 +3356,6 @@ inline Closure * Alloc::allocFakeClo(uint16_t nUpvalues) noexcept
             // magic at allocFakeClo time, and the magic survived through
             // recycleFakeClo (which doesn't touch _pad).  Caller is about
             // to overwrite desc/cu/capturedWiths/upvalues; magic stays.
-            // env-sharing: MUST reset upvalEnv — a recycled fakeClo from a
-            // prior env-shared force (upvalEnv != null) would otherwise leak a
-            // stale Env into a non-env-shared reuse (closureUpvalue reads it →
-            // wrong value/UAF).  Callers that share set it again after.
-            c->upvalEnv = nullptr;
             return c;
         }
     }
@@ -3397,7 +3369,6 @@ inline Closure * Alloc::allocFakeClo(uint16_t nUpvalues) noexcept
     c->_pad = kFakeCloMagic;   // Mark as fakeClo for safe pooling.
     c->capturedWiths = nullptr;
     // P1b: no Closure::cu to init (derived from desc->cu via closureCU).
-    c->upvalEnv = nullptr;   // env-sharing: inline-FAM path (fakeClos never share an Env)
     return c;
 }
 

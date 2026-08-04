@@ -2471,20 +2471,14 @@ frameNUpvalues(const Closure * closure, const CallFrame & frame) noexcept
 frameUpvalue(const Closure * closure, const CallFrame & frame, uint32_t i) noexcept
 {
     if (closure) return closureUpvalue(closure, i);
-    Thunk * thunk = frame.thunk;
-    if (Env * env = thunkUpvalEnv(thunk))
-        return env->values[i];
-    return thunk->tail[i];
+    return frame.thunk->tail[i];
 }
 
 [[gnu::always_inline]] inline const Value *
 frameUpvaluePtr(const Closure * closure, const CallFrame & frame, uint32_t i) noexcept
 {
     if (closure) return closureUpvaluePtr(closure, i);
-    Thunk * thunk = frame.thunk;
-    if (Env * env = thunkUpvalEnv(thunk))
-        return &env->values[i];
-    return &thunk->tail[i];
+    return &frame.thunk->tail[i];
 }
 
 [[gnu::always_inline]] inline const LambdaDescriptor *
@@ -6445,18 +6439,12 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 // otherwise pinned by every per-attr selector thunk.
                 {
                     Thunk * t = fr.thunk;
-                    // env-sharing: the upvalues live in the shared Env (tail[0]
-                    // is the Env*, tail size is 1-2 — NOT nUpvalues slots).  The
-                    // Suspended/Blackhole→Evaluated transition just below makes
-                    // thunkScanSize header-only, so the Env (and its upvalues)
-                    // drops out of the GC graph automatically — no per-slot clear,
-                    // which would corrupt tail[0] and run off the end.  Skipping
-                    // it also keeps tail[0] a valid Env* for the whole
-                    // Suspended/Blackhole lifetime (the GC walkers rely on that).
-                    if (!thunkEnvShared(t)) {
-                        for (uint16_t ui = 0; ui < t->nUpvalues; ++ui)
-                            t->tail[ui] = Value{};
-                    }
+                    // Clear the inline upvalue tail as the thunk transitions to
+                    // Evaluated (below), so stale nursery payloads drop out of the
+                    // GC graph.  (env-sharing, where upvalues lived in a shared Env
+                    // at tail[0] instead, retired 2026-08.)
+                    for (uint16_t ui = 0; ui < t->nUpvalues; ++ui)
+                        t->tail[ui] = Value{};
                     // Don't reset nUpvalues -- the FAM size was set at
                     // alloc time; reusing the slot would require the
                     // count.  Leaving it preserves alloc-time
@@ -9883,7 +9871,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                                 "  current-frame nUpvalues=%u\n", nUp);
                             for (uint16_t i = 0; i < nUp && i < 8; ++i) {
                                 Value uv = cl ? closureUpvalue(cl, i)
-                                    : (thunkUpvalEnv(th) ? thunkUpvalEnv(th)->values[i] : th->tail[i]);
+                                    : th->tail[i];
                                 std::fprintf(stderr,
                                     "    upvalue[%u] tag=%u",
                                     i, (unsigned)uv.tag());

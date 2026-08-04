@@ -359,18 +359,9 @@ closurePostConstructBarrier(Closure * c) noexcept
         // payload — one push covers all entries since DirtyKind::Closure
         // re-walks the whole container.
         bool dirty = false;
-        if (c->upvalEnv) {
-            // env-sharing: upvalues live in the shared (tenured) Env, not the
-            // inline FAM (which is poisoned at MAKE_CLOSURE).  Scan the Env so a
-            // tenured closure holding nursery payloads via its Env is remembered;
-            // dirtying the closure makes the scavenge gray the Env (walkClosure).
-            for (uint16_t i = 0; i < c->upvalEnv->nValues; ++i) {
-                if (isNurseryPayload(c->upvalEnv->values[i], n)) { dirty = true; break; }
-            }
-        } else {
-            for (uint16_t i = 0; i < c->nUpvalues; ++i) {
-                if (isNurseryPayload(c->upvalues[i], n)) { dirty = true; break; }
-            }
+        // Upvalues live inline in the FAM.  (env-sharing retired 2026-08.)
+        for (uint16_t i = 0; i < c->nUpvalues; ++i) {
+            if (isNurseryPayload(c->upvalues[i], n)) { dirty = true; break; }
         }
         if (!dirty && c->capturedWiths && n.contains(c->capturedWiths))
             dirty = true;
@@ -412,21 +403,11 @@ thunkPostConstructBarrier(Thunk * t) noexcept
         const Nursery & n = threadNursery();
         if (n.contains(t)) return;
         bool dirty = false;
-        if (Env * te = thunkUpvalEnv(t)) {
-            // env-sharing: upvalues live in the shared Env (tail[0] is the Env*,
-            // NOT a Value — and the tail is only 1-2 slots, so iterating
-            // nUpvalues here would read garbage + run off the end).  Scan the
-            // Env; dirtying the thunk makes the scavenge gray the Env (walkThunk).
-            for (uint16_t i = 0; i < te->nValues; ++i) {
-                if (isNurseryPayload(te->values[i], n)) { dirty = true; break; }
-            }
-        } else {
-            // tail[i] for Suspended / Native / Blackhole carries upvalues.
-            // Native / Blackhole are rare; iterating tail is harmless if
-            // nUpvalues == 0 (e.g. Bridge).
-            for (uint16_t i = 0; i < t->nUpvalues; ++i) {
-                if (isNurseryPayload(t->tail[i], n)) { dirty = true; break; }
-            }
+        // tail[i] for Suspended / Native / Blackhole carries upvalues inline.
+        // Native / Blackhole are rare; iterating tail is harmless if
+        // nUpvalues == 0 (e.g. Bridge).  (env-sharing retired 2026-08.)
+        for (uint16_t i = 0; i < t->nUpvalues; ++i) {
+            if (isNurseryPayload(t->tail[i], n)) { dirty = true; break; }
         }
         // Suspended-capturedWiths.  FP-2b: now in the tail slot (thunkCapturedWiths),
         // present only for Suspended/Blackhole with hasWithsSlot — so the state

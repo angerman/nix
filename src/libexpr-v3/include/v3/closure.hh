@@ -85,51 +85,40 @@ struct Closure
     /// closure is invoked, the dispatcher re-pushes these onto the
     /// runtime with-stack so OP_WITH_LOOKUP inside the body finds them.
     ListVec *                capturedWiths;
-    /// Env-sharing: when non-null, the
-    /// upvalues live in this shared (tenured) Env's values[] instead of the
-    /// inline FAM below — multiple closures from the same capture-set share one
-    /// Env, cutting the per-closure upvalue-copy alloc. GET_UPVALUE reads
-    /// `upvalEnv->values[n]` when set, else `upvalues[n]`. The inline-FAM path
-    /// remains available via NIX_V3_NO_ENV_SHARING / NIX_V3_ENV_SHARING=0.
-    Env *                    upvalEnv;
     uint16_t                 nUpvalues;
-    uint16_t                 _pad;
-    Value                    upvalues[]; // FAM (unused when upvalEnv != null)
+    uint16_t                 _pad;      // fakeClo magic marker (kFakeCloMagic)
+    Value                    upvalues[]; // FAM: the captured upvalues
 };
 
-/// Env-sharing upvalue accessors: read upvalue `i` from the shared Env when one
-/// was built (gate-on), else from the inline FAM.  Centralizes the null-check so
-/// every reader is consistent; until a gate builds an Env (`upvalEnv` always
-/// null) these are exactly the inline-FAM path (byte-identical).
+// The env-sharing / env-tuple interning path (a `Closure::upvalEnv` field that,
+// when non-null, held the upvalues in a shared tenured Env instead of the inline
+// FAM) was RETIRED 2026-08: interning was default-disabled and shared ~nothing on
+// real workloads, so the field was provably always null.  Upvalues now always
+// live in the inline FAM; the accessors below are the plain FAM reads.
+
 inline Value closureUpvalue(const Closure * c, uint32_t i) noexcept
 {
-    return c->upvalEnv ? c->upvalEnv->values[i] : c->upvalues[i];
+    return c->upvalues[i];
 }
 inline Value * closureUpvaluePtr(Closure * c, uint32_t i) noexcept
 {
-    return c->upvalEnv ? &c->upvalEnv->values[i] : &c->upvalues[i];
+    return &c->upvalues[i];
 }
 /// const overload: diagnostic/trace readers hold a `const Closure *` and only
 /// need a `const Value *` (e.g. dbgLogForceSite).  Mirrors the mutable variant.
 inline const Value * closureUpvaluePtr(const Closure * c, uint32_t i) noexcept
 {
-    return c->upvalEnv ? &c->upvalEnv->values[i] : &c->upvalues[i];
+    return &c->upvalues[i];
 }
 
 [[gnu::always_inline]] inline std::size_t closureScanSize(const Closure * c) noexcept
 {
-    return sizeof(Closure)
-         + (c->upvalEnv ? 0 : sizeof(Value) * c->nUpvalues);
+    return sizeof(Closure) + sizeof(Value) * c->nUpvalues;
 }
 
 [[gnu::always_inline]] inline std::size_t closureAllocatedSize(const Closure * c) noexcept
 {
-    // Real env-shared closures are allocated with a zero-length FAM.  Fake
-    // closures keep their pool bucket capacity in the FAM even when upvalEnv is
-    // set, but that tail is semantically dead and must not be scanned for roots.
-    const bool hasInlineStorage = !c->upvalEnv || c->_pad != 0;
-    return sizeof(Closure)
-         + (hasInlineStorage ? sizeof(Value) * c->nUpvalues : 0);
+    return sizeof(Closure) + sizeof(Value) * c->nUpvalues;
 }
 
 // ---------------------------------------------------------------------------
@@ -252,35 +241,22 @@ static_assert(sizeof(Thunk) == 24,
     "FP-2: Thunk header must be 24 B (state-word 8 + cell 8 + union 8). The "
     "optional capturedWiths lives at tail[nUpvalues] when hasWithsSlot==1.");
 
-// env-sharing: the `hasWithsSlot` byte is repurposed as a
-// FLAGS bitfield rather than adding a field — FP-2 keeps the header at 24 B, so
-// the thunk-side Env reference must NOT grow it.  Bit 0 (THUNK_WITHS_SLOT) is the
-// original capturedWiths-slot flag; bit 1 (THUNK_ENV_SHARED) marks env-sharing,
-// where the thunk's upvalues live in a shared tenured Env (`tail[0]` holds the
-// raw Env*) instead of inline in tail[0..nUpvalues).  When env-shared the tail is
-// just [Env* @ tail[0]] + [capturedWiths @ tail[1] iff THUNK_WITHS_SLOT] — so the
-// withs slot RELOCATES from tail[nUpvalues] to tail[1] (nUpvalues stays the
-// LOGICAL upvalue count, read from the Env).  This lets the per-force fakeClo
-// share the Env (fakeClo->upvalEnv = thunkUpvalEnv(t)) with NO upvalue copy.
+// The `hasWithsSlot` byte is a FLAGS bitfield.  Bit 0 (THUNK_WITHS_SLOT) marks a
+// reserved capturedWiths slot at tail[nUpvalues].
+//
+// (Bit 1 was THUNK_ENV_SHARED — env-sharing, where a thunk's upvalues lived in a
+// shared tenured Env referenced via tail[0] instead of inline in the tail.  It
+// was fed only by the env-tuple interning that was default-disabled and shared
+// ~nothing on real workloads; RETIRED 2026-08 with the Closure::upvalEnv field.
+// Upvalues now always live inline in tail[0..nUpvalues).  Bit 2 was
+// THUNK_ENV_CAPTURE — the env-pointer-capture experiment KILLed at Gate C
+// 2026-07-04.  Both are reusable after a schema bump — 19 already gates the disk
+// cache.)
 enum : uint8_t {
     THUNK_WITHS_SLOT = 1,
-    THUNK_ENV_SHARED = 2,
-    // (bit 4 was THUNK_ENV_CAPTURE — the env-pointer-capture experiment,
-    // KILLed at Gate C 2026-07-04 and deleted.  Retired, not reusable while
-    // pre-deletion arenas could be replayed; safe to reuse after a schema
-    // bump — 19 already gates the disk cache.)
 };
 [[gnu::always_inline]] inline bool thunkHasWithsSlot(const Thunk * t) noexcept
 { return (t->hasWithsSlot & THUNK_WITHS_SLOT) != 0; }
-[[gnu::always_inline]] inline bool thunkEnvShared(const Thunk * t) noexcept
-{ return (t->hasWithsSlot & THUNK_ENV_SHARED) != 0; }
-/// Shared upvalue Env (env-sharing), or null on the default inline-tail path.
-[[gnu::always_inline]] inline Env * thunkUpvalEnv(const Thunk * t) noexcept
-{
-    return thunkEnvShared(t)
-        ? *reinterpret_cast<Env * const *>(&t->tail[0])
-        : nullptr;
-}
 
 // FP-2b SINGLE SOURCE OF TRUTH for a thunk's scanned/copied byte size.  EVERY GC
 // size computation (evac copy in Cheney/scavenge, line-marking, byte accounting)
@@ -294,11 +270,6 @@ enum : uint8_t {
     switch (t->state) {
     case ThunkState::Suspended:
     case ThunkState::Blackhole:
-        // env-sharing: tail is [Env* @ 0] + [withs @ 1 iff WITHS_SLOT] — fixed
-        // 1-or-2 slots (upvalues live in the Env).
-        if (thunkEnvShared(t))
-            return sizeof(Thunk)
-                 + sizeof(Value) * (1 + (thunkHasWithsSlot(t) ? 1 : 0));
         return sizeof(Thunk) + sizeof(Value) * t->nUpvalues
              + (thunkHasWithsSlot(t) ? sizeof(Value) : 0);
     case ThunkState::Native:
@@ -325,14 +296,14 @@ enum : uint8_t {
         || !(t->state == ThunkState::Suspended
              || t->state == ThunkState::Blackhole))
         return nullptr;
-    // env-sharing relocates the withs slot to tail[1] (tail[0] is the Env*);
-    // the default inline-tail path keeps it at tail[nUpvalues].
-    const std::size_t idx = thunkEnvShared(t) ? 1 : t->nUpvalues;
+    // The withs slot sits at tail[nUpvalues], past the inline upvalues.
+    // (env-sharing, which relocated it to tail[1], retired 2026-08.)
+    const std::size_t idx = t->nUpvalues;
     return *reinterpret_cast<ListVec * const *>(&t->tail[idx]);
 }
 [[gnu::always_inline]] inline void thunkSetCapturedWiths(Thunk * t, ListVec * w) noexcept
 {
-    const std::size_t idx = thunkEnvShared(t) ? 1 : t->nUpvalues;
+    const std::size_t idx = t->nUpvalues;
     *reinterpret_cast<ListVec **>(&t->tail[idx]) = w;
 }
 

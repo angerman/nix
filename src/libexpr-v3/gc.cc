@@ -486,17 +486,11 @@ void Scavenger::walkClosure(Closure * c)
         }
     }
     if (c->capturedWiths) c->capturedWiths = fwdList(c->capturedWiths);
-    // env-sharing (NIX_V3_ENV_SHARING): upvalues live in a shared Env rather than
-    // the inline FAM.  The Env is TENURED (allocEnv → threadArena), so it never
-    // moves — we don't forward c->upvalEnv, only gray the Env so walkEnv forwards
-    // the nursery payloads it holds.  When upvalEnv is set the inline FAM is unused.
-    if (c->upvalEnv) {
-        if (walked.insert(c->upvalEnv).second)
-            graylist.push_back({c->upvalEnv, GK_ENV});
-    } else {
-        for (uint16_t i = 0; i < c->nUpvalues; ++i) {
-            visitValue(c->upvalues[i]);
-        }
+    // Upvalues live inline in the FAM.  (The env-sharing path — upvalues in a
+    // shared tenured Env grayed via GK_ENV — was retired 2026-08 with the
+    // Closure::upvalEnv field.)
+    for (uint16_t i = 0; i < c->nUpvalues; ++i) {
+        visitValue(c->upvalues[i]);
     }
 }
 
@@ -544,14 +538,9 @@ void Scavenger::walkThunk(Thunk * t)
         }
         if (ListVec * w = thunkCapturedWiths(t))  // FP-2b: tail slot, was suspended.capturedWiths
             thunkSetCapturedWiths(t, fwdList(w));
-        if (Env * te = thunkUpvalEnv(t)) {
-            // env-sharing: upvalues live in the shared tenured Env (tail[0]); gray
-            // it so walkEnv forwards its nursery payloads (the Env never moves).
-            if (walked.insert(te).second) graylist.push_back({te, GK_ENV});
-        } else {
-            for (uint16_t i = 0; i < t->nUpvalues; ++i) {
-                visitValue(t->tail[i]);
-            }
+        // Upvalues live inline in the tail.  (env-sharing retired 2026-08.)
+        for (uint16_t i = 0; i < t->nUpvalues; ++i) {
+            visitValue(t->tail[i]);
         }
         break;
     case ThunkState::Evaluated:
@@ -600,13 +589,10 @@ void Scavenger::walkThunk(Thunk * t)
         // Fix: identical to the Suspended case.
         if (ListVec * w = thunkCapturedWiths(t))  // FP-2b: tail slot, was suspended.capturedWiths
             thunkSetCapturedWiths(t, fwdList(w));
-        if (Env * te = thunkUpvalEnv(t)) {
-            // env-sharing: mirror the Suspended case (Blackhole shares the layout).
-            if (walked.insert(te).second) graylist.push_back({te, GK_ENV});
-        } else {
-            for (uint16_t i = 0; i < t->nUpvalues; ++i) {
-                visitValue(t->tail[i]);
-            }
+        // Upvalues live inline in the tail (Blackhole shares the Suspended
+        // layout).  (env-sharing retired 2026-08.)
+        for (uint16_t i = 0; i < t->nUpvalues; ++i) {
+            visitValue(t->tail[i]);
         }
         break;
     }
@@ -1050,12 +1036,9 @@ struct Auditor {
             for (uint32_t i = 0; i < c->capturedWiths->size; ++i)
                 visitValue(c->capturedWiths->elems[i], "Closure.capturedWiths.elem");
         }
-        // env-sharing: upvalues live in a shared Env, not the inline FAM.
-        if (c->upvalEnv)
-            visitEnv(c->upvalEnv, "Closure.upvalEnv");
-        else
-            for (uint16_t i = 0; i < c->nUpvalues; ++i)
-                visitValue(c->upvalues[i], "Closure.upvalues[]");
+        // Upvalues live inline in the FAM.  (env-sharing retired 2026-08.)
+        for (uint16_t i = 0; i < c->nUpvalues; ++i)
+            visitValue(c->upvalues[i], "Closure.upvalues[]");
     }
 
     void visitEnv(const Env * e, const char * site)
@@ -1087,12 +1070,9 @@ struct Auditor {
             walkCUAttrSelectCache(thunkCU(t));  // FP-2a: was t->suspended.cu
             if (ListVec * w = thunkCapturedWiths(t))  // FP-2b: tail slot
                 check(w, "Thunk.suspended.capturedWiths", site);
-            if (Env * te = thunkUpvalEnv(t))
-                visitEnv(te, "Thunk.suspended.upvalEnv");  // env-sharing
-            else {
-                for (uint16_t i = 0; i < t->nUpvalues; ++i)
-                    visitValue(t->tail[i], "Thunk.suspended.tail[]");
-            }
+            // Upvalues live inline in the tail.  (env-sharing retired 2026-08.)
+            for (uint16_t i = 0; i < t->nUpvalues; ++i)
+                visitValue(t->tail[i], "Thunk.suspended.tail[]");
             break;
         case ThunkState::Native:
             // N7 (audit Round 2): Suspended and Native have DIFFERENT
@@ -1115,12 +1095,9 @@ struct Auditor {
             if (ListVec * w = thunkCapturedWiths(t))  // FP-2b: tail slot
                 check(w,
                       "Thunk.Blackhole.suspended.capturedWiths", site);
-            if (Env * te = thunkUpvalEnv(t))
-                visitEnv(te, "Thunk.Blackhole.upvalEnv");  // env-sharing
-            else {
-                for (uint16_t i = 0; i < t->nUpvalues; ++i)
-                    visitValue(t->tail[i], "Thunk.Blackhole.tail[]");
-            }
+            // Upvalues live inline in the tail.  (env-sharing retired 2026-08.)
+            for (uint16_t i = 0; i < t->nUpvalues; ++i)
+                visitValue(t->tail[i], "Thunk.Blackhole.tail[]");
             break;
         }
     }
@@ -1423,7 +1400,9 @@ bool bruteScanSlotIsScalar(uint8_t cellType, size_t off) noexcept
         // entry 16B: [+0,+8)={SymbolId,PosIdx32} SCALAR; value@[+8,+16) is a Value.
         return (off < 8) || (off >= 16 && ((off - 16) % 16) < 8);
     case CellType::Env:     return (off >= 8 && off < 16);   // {isWithEnv,nValues}
-    case CellType::Closure: return (off >= 24 && off < 32);  // {nUpvalues,_pad}
+    // Closure header 24 B: desc@0 + capturedWiths@8 (ptrs) + {nUpvalues,_pad}@16
+    // (scalar) + upvalues[] FAM @24.  (upvalEnv@16 retired 2026-08 — header 32→24.)
+    case CellType::Closure: return (off >= 16 && off < 24);  // {nUpvalues,_pad}
     case CellType::Thunk:   return (off < 8);                // {state,hasWithsSlot,nUpvalues,forces}
     case CellType::List:    return (off < 8);                // {size,_pad}
     case CellType::None: case CellType::Value:

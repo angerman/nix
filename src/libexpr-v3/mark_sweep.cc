@@ -634,56 +634,19 @@ private:
 
     void walkClosure(Closure * c) noexcept
     {
-        // Step 11′ (Immix, 2026-05-29): mark the allocated Closure range.
-        // Real env-shared closures have no FAM; fake closures keep their pool
-        // bucket capacity even when the FAM is semantically unused.
+        // Step 11′ (Immix, 2026-05-29): mark the allocated Closure range
+        // (header + inline upvalue FAM).
         if (arenaSetForSlot_) {
             arenaSetForSlot_->markLinesForCell(c, closureAllocatedSize(c));
         }
         if (c->capturedWiths)
             visitList(c->capturedWiths);
         walkCuIC(closureCU(c));  // P1b: was c->cu. MIDEVAL_GC: IC-pinned Bindings (mirror scavenger)
-        // env-sharing (NIX_V3_ENV_SHARING): upvalues live in a shared, tenured
-        // (non-moving) Env rather than the inline FAM.  Mark the Env's lines and
-        // visit its values precisely; the inline FAM is unused when upvalEnv is set.
-        if (c->upvalEnv) {
-            // P0.A-4 (§1.9): mark the Env AND its parent chain.
-            // MIDEVAL_GC: also traverse a nursery-resident Env (tryMark fails for
-            // non-arena cells); dedup via the nursery set.  Stop at the first
-            // already-marked Env — its parents were walked with it on a prior
-            // visit (first-visit-wins ⇒ dedup + cycle-safe).
-            //
-            // ⚠ W2 PRECONDITION (adversarial review 2026-07-03): the early-break
-            // assumes "already-marked Env ⇒ its whole parent chain was walked".
-            // That holds for the P0.A-4 loops in isolation, but an Env can be
-            // mark-bit-set WITHOUT a precise values-walk via the interior
-            // Tag::Slot→Env conservative-mark path (visitSlot → CellType::Env
-            // markConservative), and the conservative byte-scan does NOT de-box
-            // boxed Values.  So once real Env chains exist
-            // (any future Env-chain producer; the env-capture experiment that
-            // motivated this was deleted 2026-07-04), a `break` here could skip
-            // an ancestor Env's boxed values[] → missed tenured root.  INERT
-            // today (parent always null; the loop runs exactly once).  Before
-            // real chains land, close it: track precise-Env-walk in a separate
-            // set (don't reuse the mark bit), or forbid interior-Slot
-            // owner-marking of Env cells.  The
-            // SCAVENGER (production generational collector) is immune — it grays
-            // each parent as an independent GK_ENV item, no early-break.
-            for (Env * e = c->upvalEnv; e; e = e->parent) {
-                const bool fresh = marker_.tryMark(e)
-                    || (nursery_ && nursery_->contains(e)
-                        && nurseryVisited_.insert(e).second);
-                if (!fresh) break;
-                if (arenaSetForSlot_)
-                    arenaSetForSlot_->markLinesForCell(
-                        e, sizeof(Env) + sizeof(Value) * e->nValues);
-                for (uint16_t i = 0; i < e->nValues; ++i)
-                    visitValue(e->values[i]);
-            }
-        } else {
-            for (uint16_t i = 0; i < c->nUpvalues; ++i)
-                visitValue(c->upvalues[i]);
-        }
+        // Upvalues live inline in the FAM.  (The env-sharing path — upvalues in a
+        // shared tenured Env, marked with its parent chain — was retired 2026-08
+        // with the Closure::upvalEnv field.)
+        for (uint16_t i = 0; i < c->nUpvalues; ++i)
+            visitValue(c->upvalues[i]);
     }
     void walkThunk(Thunk * t) noexcept
     {
@@ -720,26 +683,11 @@ private:
             walkCuIC(thunkCU(t));  // MIDEVAL_GC: IC-pinned Bindings (mirror scavenger)
             if (ListVec * w = thunkCapturedWiths(t))  // FP-2b: tail slot
                 visitList(w);
-            if (Env * te = thunkUpvalEnv(t)) {
-                // env-sharing: upvalues live in the shared, tenured Env (tail[0]).
-                // P0.A-4 (§1.9): mark te AND its parent chain.  MIDEVAL_GC: also
-                // traverse a nursery-resident Env.  Stop at the first already-marked
-                // Env (first-visit-wins ⇒ dedup + cycle-safe).
-                for (Env * e = te; e; e = e->parent) {
-                    const bool fresh = marker_.tryMark(e)
-                        || (nursery_ && nursery_->contains(e)
-                            && nurseryVisited_.insert(e).second);
-                    if (!fresh) break;
-                    if (arenaSetForSlot_)
-                        arenaSetForSlot_->markLinesForCell(
-                            e, sizeof(Env) + sizeof(Value) * e->nValues);
-                    for (uint16_t i = 0; i < e->nValues; ++i)
-                        visitValue(e->values[i]);
-                }
-            } else {
-                for (uint16_t i = 0; i < t->nUpvalues; ++i)
-                    visitValue(t->tail[i]);
-            }
+            // Upvalues live inline in the tail.  (The env-sharing path — upvalues
+            // in a shared tenured Env at tail[0], marked with its parent chain —
+            // was retired 2026-08 with the Closure::upvalEnv field.)
+            for (uint16_t i = 0; i < t->nUpvalues; ++i)
+                visitValue(t->tail[i]);
             break;
         case ThunkState::Evaluated:
             visitValue(t->evaluated);

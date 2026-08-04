@@ -227,16 +227,12 @@ private:
     {
         ++counts.closures;
         counts.bytesClosures += sizeof(Closure)
-                              + (c->upvalEnv ? 0 : size_t(c->nUpvalues) * sizeof(Value));
+                              + size_t(c->nUpvalues) * sizeof(Value);
         if (c->capturedWiths)
             enqueue(c->capturedWiths, GK_LIST);
-        if (c->upvalEnv) {
-            for (uint16_t i = 0; i < c->upvalEnv->nValues; ++i)
-                auditAndVisit(c->upvalEnv->values[i]);
-        } else {
-            for (uint16_t i = 0; i < c->nUpvalues; ++i)
-                auditAndVisit(c->upvalues[i]);
-        }
+        // Upvalues live inline in the FAM.  (env-sharing retired 2026-08.)
+        for (uint16_t i = 0; i < c->nUpvalues; ++i)
+            auditAndVisit(c->upvalues[i]);
     }
 
     /// Walk a Thunk.  State-dependent: Suspended/Native/Blackhole have
@@ -780,15 +776,10 @@ private:
 
     void walkClosure(Closure * c)
     {
-        account(sizeof(Closure)
-            + (c->upvalEnv ? 0 : size_t(c->nUpvalues) * sizeof(Value)));
+        account(sizeof(Closure) + size_t(c->nUpvalues) * sizeof(Value));
         if (c->capturedWiths) enqueue(c->capturedWiths, GK_LIST);
-        if (c->upvalEnv) {
-            for (uint16_t i = 0; i < c->upvalEnv->nValues; ++i)
-                visitValue(c->upvalEnv->values[i]);
-        } else {
-            for (uint16_t i = 0; i < c->nUpvalues; ++i) visitValue(c->upvalues[i]);
-        }
+        // Upvalues live inline in the FAM.  (env-sharing retired 2026-08.)
+        for (uint16_t i = 0; i < c->nUpvalues; ++i) visitValue(c->upvalues[i]);
     }
     void walkThunk(Thunk * t)
     {
@@ -1672,13 +1663,9 @@ private:
     void walkClosure(Closure * c) noexcept
     {
         if (c->capturedWiths) visitList(c->capturedWiths);
-        if (c->upvalEnv) {
-            for (uint16_t i = 0; i < c->upvalEnv->nValues; ++i)
-                visitValue(c->upvalEnv->values[i]);
-        } else {
-            for (uint16_t i = 0; i < c->nUpvalues; ++i)
-                visitValue(c->upvalues[i]);
-        }
+        // Upvalues live inline in the FAM.  (env-sharing retired 2026-08.)
+        for (uint16_t i = 0; i < c->nUpvalues; ++i)
+            visitValue(c->upvalues[i]);
     }
     void walkThunk(Thunk * t) noexcept
     {
