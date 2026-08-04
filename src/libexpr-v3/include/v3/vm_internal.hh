@@ -16,6 +16,8 @@
 
 #include <cstdint>
 #include <string>
+#include <string_view>
+#include <unordered_map>
 
 namespace nix::v3 {
 
@@ -114,5 +116,85 @@ void appliedShadowCompare(const std::string & key, const Value & fresh) noexcept
 /// ceiling.  No-op cost unless the probe/count mode is armed.  (vm_applied_cache.cc)
 void appliedCacheProbeObserve(VMState & vm, const Closure * callee, const Value & arg,
                               int site, bool hasFormals) noexcept;
+
+// --- Value-manipulation helpers (vm_values.cc, step 4 of the vm.cc split) ----
+//
+// The LARGER, cold-ish value helpers moved out of vm.cc: the recursive
+// error-message value printer (valueRepr), string coercion (coerceToString /
+// requireNoStringContextRuntime), and the attrset `//` merge (mergeBindings —
+// the #1 Bindings producer).  They were file-local (anonymous-namespace
+// `inline`) but are called from vm.cc's dispatch / error / apply paths, so the
+// move promotes them to external linkage.  The small, extremely-hot helpers
+// (isTrueValue on every OP_IF; valueLess in sort/compare loops) deliberately
+// STAY `inline` in vm.cc — out-of-lining them risks a perf regression --brute
+// cannot see.
+//
+// Two shared symbols moved with the cluster: kMaxIndirectionChase (also used by
+// vm.cc's force/chase loops — hence a shared constexpr here) and the WS-A
+// chain-writeback detector (g_sharedWbDetect + chainChildCount, defined in
+// vm_values.cc where mergeBindings is their chief producer; vm.cc's OP_*
+// writeback sites + the barrier reporter read them through these decls).  The
+// MergeBindingsSite enum moved HERE (not into vm_values.cc) because vm.cc's `//`
+// / extends / compose call sites still name MergeBindingsSite::… unchanged.
+
+/// Slot/thunk indirection-chase bound (100000): coerceToString's Slot-deref loop
+/// (vm_values.cc) + vm.cc's forceValue / OP_FORCE chase loops.  See the
+/// chase-vs-call-depth note in vm.cc.  (was vm.cc file-local)
+constexpr int kMaxIndirectionChase = 100000;
+
+struct Bindings;  // fwd (chainChildCount return type; full def in v3/alloc.hh)
+
+/// #821 site IDs for per-caller mergeBindings attribution.  Exhaustive list of
+/// in-VM call sites is documented above the `mergeBindingsCallsBySite[]` field in
+/// alloc.hh; each integer maps to the matching ID slot there.  Site 8 is reserved
+/// for primIntersectAttrs's two-pass merge in primops.cc; the remaining 7 slots
+/// in `kMergeBindingsSiteSlots=16` are spare (no renumber when adding one).  Moved
+/// from vm.cc: the call sites there name these, mergeBindings (vm_values.cc) reads
+/// them.
+enum class MergeBindingsSite : uint8_t {
+    AttrsUpdate          = 0,
+    AttrsUpdateTail      = 1,
+    ExtendsCallPrev      = 2,
+    ExtendsCallPrevPrime = 3,
+    ComposeCallApplied   = 4,
+    ExtendsTailPrev      = 5,
+    ExtendsTailPrevPrime = 6,
+    ComposeTailApplied   = 7,
+    // 8+ reserved (primops.cc, future sites)
+};
+
+/// WS-A shared-writeback detector gate (V3_DBG_SHARED_WB).  Defined in
+/// vm_values.cc; read by mergeBindings + vm.cc's OP_* writeback sites + the
+/// barrier reporter.  (was vm.cc file-local static)
+extern const bool g_sharedWbDetect;
+
+/// WS-A per-chain-parent child counter (detector-only; populated only when
+/// g_sharedWbDetect).  Defined in vm_values.cc (mergeBindings' chain-construct
+/// sites populate it); the vm.cc reporter iterates it.  (was vm.cc file-local)
+std::unordered_map<const Bindings *, uint32_t> & chainChildCount() noexcept;
+
+/// #691 — TW `ValuePrinter` mirror for error-message value rendering
+/// (maxDepth/maxAttrs/maxListItems = 10, force=false).  Does NOT force lazy
+/// values — Tag::Thunk/App/Slot render as «…» placeholders.  Used by
+/// coerceToString, valueLess, and OP_CALL/OP_TAIL_CALL formals errors.
+/// (vm_values.cc)
+std::string valueRepr(const Value & v, int depth = 0);
+
+/// #685 — opcode-side mirror of TW's `forceStringNoCtx`: throws TW's exact error
+/// when the string value carries any store-path context.  Used for dynamic attr
+/// names (`{ ${s} = v; }` / `.${s}` / `?${s}`).  (vm_values.cc)
+void requireNoStringContextRuntime(const Value & v, std::string_view siteHint);
+
+/// #680 — coerce a Value to a string for `+` / `${…}` (coerceMore=false): String
+/// + Path only (paths copied to store when forceString=true); everything else
+/// throws TW's `cannot coerce <type> to a string: <value>`.  Chases Tag::Slot
+/// first.  (vm_values.cc)
+std::string coerceToString(const Value & vIn, bool forceString);
+
+/// Attrset `//` merge (b wins on duplicate keys) — the #1 Bindings producer.
+/// Handles the MapAttrs no-realize merge, Chain compose/extend, and the two-pass
+/// sorted merge.  siteId drives #821 per-caller attribution.  (vm_values.cc)
+Bindings * mergeBindings(const Bindings * a, const Bindings * b,
+                         MergeBindingsSite siteId = MergeBindingsSite::AttrsUpdate);
 
 } // namespace nix::v3

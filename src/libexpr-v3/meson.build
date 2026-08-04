@@ -93,6 +93,7 @@ lib_sources = files(
   'vm_debug.cc',
   'vm_interning.cc',
   'vm_applied_cache.cc',
+  'vm_values.cc',
   'primops.cc',
   'bytecode_primops.cc',
   'limits.cc',
