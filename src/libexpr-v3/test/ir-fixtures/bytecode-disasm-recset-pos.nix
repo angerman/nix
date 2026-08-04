@@ -7,22 +7,25 @@
 # function (nested attrsets are thunked into other functions, so within one
 # function the inits are sequential and non-overlapping).
 #
-# Source order here (b, a) deliberately != sorted order (a, b), so this also
-# locks the rank INDIRECTION: REC_SET operand=1 must resolve to `b`, not the
-# source-index-0 attr.  A naive "operand = source index" would mislabel.
+# A `rec` set is used because only recursive attrsets keep the REC_INIT/REC_SET
+# form — non-recursive `{ ... }` literals are demoted to OP_ATTRS_INIT at emit
+# (unconditional).  Source order here (b, a) deliberately != sorted trailer
+# order (a, b), so this locks the rank INDIRECTION: the REC_SETs are emitted in
+# sorted-trailer order and operand=0 must resolve to `a`, operand=1 to `b`
+# through the sorted trailer.  A naive "operand = source index" would mislabel.
 #
 # `--no-opt` because the attrset construction is emitted at lowering, not by
 # an optimiser pass — this locks the disassembler, not the optimiser.
 
-{ b = 1; a = 2; }
+rec { b = 1; a = 2; }
 
 # The init lists the attrs SymbolId-sorted:
 # CHECK: OP_ATTRS_REC_INIT{{.*}}; {a, b}
 
-# Each REC_SET resolves to its attr name.  Emit order is source order
-# (b then a), and the rank operands (1 then 0) resolve through the sorted
-# trailer to the right names:
-# CHECK: OP_ATTRS_REC_SET{{.*}}operand=1{{.*}}; b
+# Each REC_SET resolves to its attr name via the sorted trailer.  The REC_SETs
+# emit in sorted-trailer order (a then b); the rank operands (0 then 1) resolve
+# through the trailer to the right names:
 # CHECK: OP_ATTRS_REC_SET{{.*}}operand=0{{.*}}; a
+# CHECK: OP_ATTRS_REC_SET{{.*}}operand=1{{.*}}; b
 
 # CHECK-NOT: OP_???

@@ -185,15 +185,15 @@ namespace nix::v3::serialize {
 /// fields and the OP_MAKE_ENV/OP_SET_ENV/OP_GET_ENV opcodes (0xE0-0xE2) are
 /// removed from the wire format; opcode values retired, not reused.
 ///
-/// 20 (2026-07-04): LEVER-1 step 2b const-eager literal lowering
-/// (NIX_V3_NO_CONST_EAGER opt-out).  Nested constant Attrs/List attr-values,
+/// 20 (2026-07-04): LEVER-1 step 2b const-eager literal lowering.
+/// Nested constant Attrs/List attr-values,
 /// list-elements, and call-args now lower EAGERLY (inline ir::AttrSet/
 /// ListExpr) instead of a MkThunk wrapper, so the emitted bytecode for the
 /// same source differs.  A cache-loaded pre-20 CU carries the old lazy shape
 /// (still a VALID, value-identical program, but misses the eager win and
 /// would trip the byte-compare verify path); the bump forces recompile so old
-/// lazy and new eager CUs never share a key.  The kGates fingerprint
-/// separately namespaces an A/B `NIX_V3_NO_CONST_EAGER=1` run.
+/// lazy and new eager CUs never share a key.  (The const-eager lowering is now
+/// unconditional; its NIX_V3_NO_CONST_EAGER A/B opt-out has been retired.)
 ///
 /// 21 (2026-07-16, WS5-D2a): the four read-only POD sections (code,
 /// intConstants, floatConstants, lambdaCodeOffsets) are relocated into a

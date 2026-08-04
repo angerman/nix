@@ -13,8 +13,9 @@
 # demotion (letrecDemote-nonrec-pos.nix) to the acyclic-multi-binding case,
 # which the real-corpus measurement showed is ~70% of recursive lets.
 #
-# Regression guard: NIX_V3_NO_DAG_DEMOTE=1 reverts to the LetRec form (and
-# the truly-cyclic case — self / mutual recursion — always keeps it).
+# Regression guard: DAG demotion is unconditional; without it this would
+# emit the LetRec form (and the truly-cyclic case — self / mutual
+# recursion — always keeps it).
 
 let b = a + 1; a = 2; c = a + b; in c
 

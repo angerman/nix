@@ -9,7 +9,8 @@
 # per-iteration `seq next (go (i+1) next)`.
 #
 # Implemented at lowering (cli/lower_v3.hh, a::Kind::Call).
-# Regression guard: NIX_V3_NO_SEQ_FORCE=1 reverts to the seq primop call.
+# Regression guard: the seq→force rewrite is unconditional; without it this
+# would emit the seq primop call.
 
 a: b: builtins.seq a (b + b)
 

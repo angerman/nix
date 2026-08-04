@@ -8,7 +8,8 @@
 # per iteration.  Affects EVERY non-recursive `let` in nixpkgs.
 #
 # Fixed at lowering (cli/lower_v3.hh lowerLetRec non-recursive demotion).
-# Regression guard: NIX_V3_NO_LETREC_DEMOTE=1 reverts to the LetRec form.
+# Regression guard: the demotion is unconditional; without it this would
+# emit the LetRec form.
 
 a: b: let x = a + b; in x + x
 

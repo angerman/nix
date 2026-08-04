@@ -386,12 +386,7 @@ struct LowererV3 {
             // preserved (thunkifyForAttr, same as the generic arg path), so
             // this is safe in lazy contexts.  deepSeq is excluded (it deep-
             // forces, which a shallow Force does not implement).
-            // Retirement: drop the NIX_V3_NO_SEQ_FORCE opt-out once this has
-            // shipped byte-identical on --core + a nixpkgs sample across ≥10
-            // runs (it is a pure local rewrite; the gate exists only as a
-            // bisect handle during rollout).
-            static const bool noSeqForce = std::getenv("NIX_V3_NO_SEQ_FORCE") != nullptr;
-            if (!noSeqForce && c->args.size() == 2) {
+            if (c->args.size() == 2) {
                 if (const v3::PrimOp * po = primopOfRecentBinding(f);
                     po && po->name == "seq") {
                     forceVal(lowerExpr(c->args[0]));     // force a (seq's effect)
@@ -517,16 +512,13 @@ struct LowererV3 {
             // arrow lowering (byte-identical).  The VM's OP_CALL_N + PAP make
             // partial/saturated/over-application of the arity-N function all
             // behave like the curried original.
-            // DEFAULT-ON (2026-06-05): eval/apply is validated byte-identical
+            // Unconditional (2026-06-05): eval/apply is validated byte-identical
             // (--core 19/19 both ways, 15 nixpkgs pkgs) and faster (fold-add
-            // 13.67×→7.97× TW with the strictArgs companion).  Gate is now
-            // opt-OUT NIX_V3_NO_EVAL_APPLY=1 (bisect handle).  Retirement:
-            // remove the gate + the curried fallback once it has soaked on the
-            // broader cutover-parity corpus + M5/HNE.
-            static const bool s_evalApply =
-                std::getenv("NIX_V3_NO_EVAL_APPLY") == nullptr;
+            // 13.67×→7.97× TW with the strictArgs companion).  The curried
+            // fallback (below, when this arity-collapse doesn't apply) stays as
+            // the >16-arity / formals path.
             const nix::v3::ast::Node * bodyToLower = lam->body;
-            if (s_evalApply && !lam->arg.empty()) {
+            if (!lam->arg.empty()) {
                 // Cap arity at 16 (1 paramVar + ≤15 extraParams): the VM's
                 // PAP saturate gathers into a fixed argbuf[16] and the
                 // LambdaDescriptor::arity field is uint8_t.  Beyond the cap the
@@ -653,11 +645,8 @@ struct LowererV3 {
         // upvalue), exactly like the non-recursive `let` demotion.  Only a
         // sibling-referencing default keeps the LetRec (the acyclic-DAG case
         // is handled by the let path's pattern; formals rarely hit it).
-        // Gate: NIX_V3_NO_FORMALS_DEMOTE=1 (A/B bisect, default-ON).
-        static const bool noFormalsDemote =
-            std::getenv("NIX_V3_NO_FORMALS_DEMOTE") != nullptr;
         bool formalsReferencing = false;
-        if (!noFormalsDemote) {
+        {
             ir::BlockId formalsEnd = static_cast<ir::BlockId>(m.blocks.size());
             for (ir::BlockId b = formalsBlkStart;
                  b < formalsEnd && !formalsReferencing; ++b)
@@ -669,7 +658,7 @@ struct LowererV3 {
                     }
                 }
         }
-        if (!noFormalsDemote && !formalsReferencing) {
+        if (!formalsReferencing) {
             // Independent formals → plain ordered locals (reuse the thunks).
             Scope plainScope;
             if (!lam->arg.empty()) plainScope.byName.emplace(lam->arg, param);
@@ -813,16 +802,10 @@ struct LowererV3 {
 
     ir::VarId thunkifyForAttr(const nix::v3::ast::Node * e)
     {
-        // LEVER-1 step 2b gate: NIX_V3_NO_CONST_EAGER=1 restores the leaf-only
-        // predicate (A/B bisect + emergency mitigation).  In kGates (the disk-
-        // cache codegen fingerprint) so a flipped gate can't collide with a
-        // default-lowered CU.  Retirement: drop the opt-out (hard-true) after a
-        // full darwin-4 nixpkgs byte-equality sweep, mirroring NONREC_ATTRS_INIT.
-        static const bool s_constEager =
-            std::getenv("NIX_V3_NO_CONST_EAGER") == nullptr;
-        const bool eager = s_constEager
-            ? isConstEagerLiteral(e, 0)
-            : isTrivialForValue(e);
+        // LEVER-1 step 2b: eager const-literal lowering is unconditional (the
+        // NIX_V3_NO_CONST_EAGER opt-out, which restored the old leaf-only
+        // isTrivialForValue predicate, was retired).
+        const bool eager = isConstEagerLiteral(e, 0);
         return eager ? lowerExpr(e) : thunkify(e);
     }
 
@@ -1031,13 +1014,8 @@ struct LowererV3 {
         //   - NON-recursive: no entry's lowered body references recVar via
         //     RecBindingSlotRef (a sibling/self reference) — scanned over the
         //     entry blocks only (the body isn't lowered yet).
-        // Gate: NIX_V3_NO_LETREC_DEMOTE=1 (regression bisection / A-B).
-        // RETIREMENT: fold into a shared helper if the TW-side lowerer ever
-        // produces v3 IR, or delete if measurement falsifies the win.
         {
-            static const bool noDemote =
-                std::getenv("NIX_V3_NO_LETREC_DEMOTE") != nullptr;
-            bool eligible = hasBody && !noDemote
+            bool eligible = hasBody
                 && at->inheritFromExprs.empty() && at->dynamicAttrs.empty();
             for (auto * d : bs)
                 if (d->kind != nix::v3::ast::Attrs::AttrKind::Plain)
@@ -1081,10 +1059,8 @@ struct LowererV3 {
                 // over earlier-in-topo-order thunks are acyclic by
                 // construction — no blackhole / rec slot needed.  Measured
                 // ~70% of recursive lets are acyclic-DAG (V3_DBG_LETREC_CLASS).
-                // Gate: NIX_V3_NO_DAG_DEMOTE=1 (A/B bisect, default-ON).
-                static const bool noDagDemote =
-                    std::getenv("NIX_V3_NO_DAG_DEMOTE") != nullptr;
-                if (!noDagDemote) {
+                // Unconditional (the NIX_V3_NO_DAG_DEMOTE A/B opt-out was retired).
+                {
                     const size_t n = bs.size();
                     // sibling name → entry index
                     std::unordered_map<ir::SymbolId, size_t> nameIdx;
