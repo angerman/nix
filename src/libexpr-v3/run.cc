@@ -1210,12 +1210,6 @@ RootResult runRootExprModule(nix::EvalState & state, ir::Module module)
                 std::fprintf(stderr, "\n");
             }
         }
-        // #741 Phase 3a SHADOW eval-result cache diagnostics.
-        // Only emits when NIX_V3_EVAL_RESULT_CACHE=1.
-        value_serialize::dumpEvalResultCacheStats(stderr);
-        // #741 Phase 3e SHADOW drv-hash cache diagnostics.
-        // Only emits when NIX_V3_DRV_HASH_CACHE=1.
-        value_serialize::dumpDrvHashCacheStats(stderr);
         // #746 (2026-05-21) Bindings-attribution rollup.  Phase 1 of
         // the post-Stage-4-v4.2 plan: the dominant v3-arena consumer
         // on hello.drvPath is Bindings (84% / 956 MB).  Until we know

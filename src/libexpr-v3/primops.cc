@@ -5289,59 +5289,6 @@ static void buildAndWriteDrvNative(
         : ns.store->writeDerivation(drv, ns.repair);
     std::string drvPathS = ns.store->printStorePath(drvPath);
 
-    // #741 Phase 3e SHADOW / ACTIVE: drv-hash-keyed cache lookup.
-    // drvPath IS the canonical content hash of `drv` (libstore
-    // semantics: same drvPath ⇒ same drv ⇒ same effective inputs).
-    // Two primop calls producing the same drvPath produce identical
-    // result attrsets.  SHADOW: always continues body; ACTIVE: skips
-    // the remaining libstore tail on hit.
-    Value v3DrvCached;
-    std::string v3DrvKey;
-    bool v3DrvHit = false;
-    if (value_serialize::drvHashCacheEnabled()
-        || value_serialize::drvHashCacheActiveEnabled()
-        || value_serialize::drvHashCacheDiskEnabled()) {
-        // #828 B1 audit: instrument the drvHash lookup site so we can
-        // see which call paths produce cache hits vs misses.  Helps
-        // verify Phase 3e ACTIVE's "skip-on-hit is sound" invariant
-        // (the assumption that two primDerivationStrict invocations
-        // producing the same drvPath produce identical result
-        // attrsets).
-        CACHE_HOOK_DEFINE_SITE(siteDrvHashLookup,
-            "primDerivationStrict-drvHash-lookup");
-        CacheHookTimer drvTimer(siteDrvHashLookup);
-        v3DrvKey = drvPathS;
-        v3DrvHit = value_serialize::drvHashCacheLookup(v3DrvKey, v3DrvCached);
-        if (v3DrvHit) cacheHookHit(siteDrvHashLookup);
-        else          cacheHookMiss(siteDrvHashLookup);
-    }
-
-    // Phase 3e ACTIVE — skip-on-hit.  In-process safe because the
-    // populating miss already ran hashDerivationModulo +
-    // drvHashes.insert_or_assign(drvPath, h) (the libstore drvHashes
-    // map is process-global; subsequent pathDerivationModulo callers
-    // find drvPath via that earlier insert regardless of who put it
-    // there).  In `nix eval --impure` (readOnlyMode), writeDerivation
-    // was already a no-op so no .drv-file concern.
-    //
-    // NOT safe for cross-process replay (Phase 5): a freshly-loaded
-    // cache wouldn't have populated drvHashes.  Phase 5 must cache
-    // the modulo hash alongside the result and replay it on hit.
-    if (v3DrvHit && value_serialize::drvHashCacheActiveEnabled()) {
-        // #828 B1 audit: count the actual ACTIVE skip-on-hit firings
-        // separately from the lookup hits.  drvHashCacheStats already
-        // tracks `activeSkips`; we mirror it here for the per-site
-        // dump so B1's audit can see exactly how often the
-        // skip-the-libstore-tail optimisation fires per call site.
-        CACHE_HOOK_DEFINE_SITE(siteDrvHashSkip,
-            "primDerivationStrict-drvHash-active-skip");
-        cacheHookFire(siteDrvHashSkip);
-        cacheHookHit(siteDrvHashSkip);
-        out = v3DrvCached;
-        ++value_serialize::drvHashCacheStats().activeSkips;
-        return;
-    }
-
     {
         auto h = nix::hashDerivationModulo(*ns.store, drv, false);
         nix::drvHashes.insert_or_assign(drvPath, std::move(h));
@@ -5394,18 +5341,6 @@ static void buildAndWriteDrvNative(
     }
     out.mkAttrs(resultB);
 
-    // #741 Phase 3e SHADOW: verify hit or insert on miss.  Uses
-    // drvPath as the cache key (canonical content hash of drv per
-    // libstore).  mismatchHits > 0 falsifies either libstore
-    // content-addressing or our serialiser determinism.
-    if (!v3DrvKey.empty()) {
-        if (v3DrvHit) {
-            if (!value_serialize::valuesEqual(v3DrvCached, out))
-                ++value_serialize::drvHashCacheStats().mismatchHits;
-        } else {
-            value_serialize::drvHashCacheInsert(v3DrvKey, out);
-        }
-    }
 }
 
 // 2026-05-17 — Option 4 hybrid FFI leaf.
@@ -5452,40 +5387,6 @@ static void primDerivationFromPreprocessed(EvalState & state, Value * args, Valu
     }
     if (!args[0].isAttrs() || !args[0].asAttrs())
         typeError("__derivationFromPreprocessed", "attrset");
-
-    // #741 Phase 3a SHADOW / #885 PRODUCTION cache.  SHADOW: body
-    // always runs; hit just verifies.  PRODUCTION (`NIX_V3_EVAL_RESULT_
-    // CACHE_PRODUCTION=1`): on hit, assign cached value to `out` and
-    // return immediately, skipping the entire body.  See
-    // value_serialize.hh::evalResultCacheProductionEnabled for the
-    // safety argument (idempotent side effects + first-call-populates).
-    std::string v3CacheKey;
-    Value v3CachedOut;
-    bool v3CacheClaimed = false;
-    if (value_serialize::evalResultCacheEnabled()) {
-        forceDeep(*state.vm, args[0]);
-        v3CacheClaimed =
-            value_serialize::evalResultCacheLookup(args[0], v3CachedOut, v3CacheKey);
-    }
-    // PRODUCTION skip-on-hit.  Cache hit implies the body's output
-    // would equal cached (verified in SHADOW with mismatch=0 across
-    // hello.drvPath + HNE, 2026-05-29).  Skipping the body is safe
-    // because side effects (writeDerivation, drvHashes.insert) are
-    // idempotent and the first miss in this process populated them.
-    if (v3CacheClaimed && value_serialize::evalResultCacheProductionEnabled()) {
-        out = v3CachedOut;
-        ++value_serialize::evalResultCacheStats().activeSkips;
-        return;
-    }
-    auto v3CacheFinaliser = [&]() {
-        if (v3CacheKey.empty()) return;
-        if (v3CacheClaimed) {
-            if (!value_serialize::valuesEqual(v3CachedOut, out))
-                ++value_serialize::evalResultCacheStats().mismatchHits;
-        } else {
-            value_serialize::evalResultCacheInsert(v3CacheKey, out);
-        }
-    };
 
     auto * pp = args[0].asAttrs();
 
@@ -5678,8 +5579,6 @@ static void primDerivationFromPreprocessed(EvalState & state, Value * args, Valu
                             contentAddressed, isImpure,
                             outputHashStr, outputHashAlgoStr, outputHashModeStr,
                             out);
-    // #741 Phase 3a SHADOW: verify hit, or insert on miss.
-    v3CacheFinaliser();
 }
 
 static void primDerivationStrictNative(
@@ -5687,69 +5586,6 @@ static void primDerivationStrictNative(
 {
     auto * src = args[0].asAttrs();
     const auto & sym = drvStrictSymbols();
-
-    // #741 Phase 3a SHADOW cache: deep-force input, hash, look up.
-    // ALWAYS continue body; on hit just verify at end.  Side effects
-    // (.drv file write, drvHashes) remain authoritative via body run.
-    std::string v3CacheKey;
-    Value v3CachedOut;
-    bool v3CacheClaimed = false;
-    if (value_serialize::evalResultCacheEnabled()) {
-        // #741 Phase 3a-RCA-A + 3c-RCA-B (2026-05-23): two attempted
-        // deep-force approaches falsified.
-        //   * forceDeep (with bindingsSetValue writeback) → broke
-        //     hello.drvPath via Tag::Slot replacement.
-        //   * forceDeepReadOnly (no writeback) → STILL broke
-        //     hello.drvPath.  Root cause: forceValue itself fires
-        //     Thunk::shapeCell cell-updates during nested thunk
-        //     evaluation, which pollute outer thunks' shape state
-        //     when deep-forced from a primop entry context (see
-        //     lode/CELL_UPDATE_EVERYWHERE_2026-05-12.md:169 for the
-        //     known precedent).
-        //
-        // Architectural conclusion: input-hashing from a primop
-        // entry CANNOT deep-force its input safely.  The cache must
-        // either (a) accept partial coverage with un-evaluated
-        // hashErrors (current Phase 3a behaviour, ~11% hit rate),
-        // (b) defer hashing to AFTER the primop body has done its
-        // own forcing (no skip-on-hit possible), or (c) hash a
-        // derived canonical form (e.g. the constructed `drv`
-        // struct's content-hash) computed mid-body.
-        //
-        // For Phase 3a we keep (a): cache attempts lookup with the
-        // partially-forced args[0]; canonicalHash throws on
-        // un-evaluated indirections (now down to App / Suspended
-        // Thunk per Phase 3b's chaseToWHNF), those calls miss the
-        // cache and run the primop body normally.
-        v3CacheClaimed =
-            value_serialize::evalResultCacheLookup(args[0], v3CachedOut, v3CacheKey);
-    }
-    // #885 PRODUCTION skip-on-hit.  See primDerivationFromPreprocessed
-    // for the safety argument.  On hit, assign cached → `out` and
-    // return; the body's side effects (writeDerivation, drvHashes
-    // populate, .drv file write) are idempotent and were already
-    // performed by the populating MISS earlier in this process.
-    if (v3CacheClaimed && value_serialize::evalResultCacheProductionEnabled()) {
-        out = v3CachedOut;
-        ++value_serialize::evalResultCacheStats().activeSkips;
-        return;
-    }
-    // RAII-style end-of-function action: verify on hit, insert on miss.
-    auto v3CacheFinaliser = [&]() {
-        if (v3CacheKey.empty()) return;
-        if (v3CacheClaimed) {
-            if (!value_serialize::valuesEqual(v3CachedOut, out))
-                ++value_serialize::evalResultCacheStats().mismatchHits;
-        } else {
-            value_serialize::evalResultCacheInsert(v3CacheKey, out);
-        }
-    };
-    // Use a guard so even early returns / throws don't skip the
-    // finaliser.  We only insert on successful body completion, so
-    // we run the finaliser AT THE END, not in a destructor (a
-    // destructor would also run on exception, but inserting a
-    // partial / never-computed `out` would be wrong).
-    // → defer to manual call at the end (no early returns in this body).
 
     // ---- name ----
     const Value * nameVRaw = src->lookup(sym.name);
@@ -6057,10 +5893,6 @@ static void primDerivationStrictNative(
         contentAddressed, isImpure,
         outputHashStr, outputHashAlgoStr, outputHashModeStr,
         out);
-    // #741 Phase 3a SHADOW: verify hit, or insert on miss.  Runs on
-    // normal completion only; exceptions (rethrown from any of the
-    // calls above) skip the cache update.
-    v3CacheFinaliser();
 }
 
 void primDerivation(EvalState & state, Value * args, Value & out)
