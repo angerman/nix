@@ -4798,22 +4798,47 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                             std::fprintf(stderr, "[genmajor-fire] arena=%zuMB\n",
                                 arena.bytesAllocated() >> 20);
                     }
-                    const MajorGcResult gcr = runMajorMarkSweep(vm);
-                    // NONMOVING_INLINE_THUNK_PLAN §5.2(3): Phase-S spike.
-                    // After the (non-moving) precise mark, rebuild the free-line
-                    // spans from the freshly-recomputed line-marks so the NEXT
-                    // allocations bump into reclaimed line-spans of the SAME
-                    // blocks — IN-PLACE reclaim, NO move, NO whole-block-free,
-                    // NO evacuation (runMajorMarkSweep's sparse-block relocation
-                    // stays off; its own rebuild call is g_immixAllocEnabled-only
-                    // so it does not fire under this compile flag).  The mark
-                    // ran post-forceScavenge (nursery empty), so every surviving
-                    // cell is tenured + its lines are marked live; the dead lines
-                    // become spans.  Reclaim is safepoint-only (never mid-primop)
-                    // — the live-cell / C-stack-live hazard (plan §6 #1) cannot
-                    // hand back a marked-live span.
-                    if (nix::v3::detail::nonmovingTenured())
-                        threadArena().rebuildFreeSpansFromLineMarks();
+                    // RC-2 (2026-08-04): skip the tenured major mark when no
+                    // tenured-reclaim path is enabled.  `cellMetaEnabled()` is
+                    // the EXACT predicate: the bump path only sets cell-start
+                    // bits when it is true (alloc.hh, `if (cellMetaEnabled())`),
+                    // so when false the sweep iterates EMPTY bitmaps → scans 0
+                    // cells → frees 0 bytes, and the precise mark is non-moving,
+                    // so its only consumers (the dead sweep + `gcr` below) are
+                    // both inert.  It is a full precise walk over the entire live
+                    // set for nothing (measured 2026-08-04: firefox 1 fire,
+                    // preciseWalk=108ms, blocksScanned=0, bytesFreed=0; seconds
+                    // on M5/HNE).  No reclaim is missed: `evac` requires
+                    // `majorGcEnabled` ⇒ `cellMetaEnabled`, and `freeListReuse`
+                    // alone leaves `cellMetaEnabled` false ⇒ no cell metadata ⇒
+                    // inert.  We still synthesize `gcr` (heap = live arena, freed
+                    // = 0) so the freedLittle backoff below self-suppresses the
+                    // point exactly as a real useless collection would.
+                    // RETIRE (Rule 0): when a tenured collector actually reclaims
+                    // (Immix, GC_DECISION_2026-05-29), `cellMetaEnabled()` flips
+                    // true and the mark runs again with zero code change here.
+                    MajorGcResult gcr{};
+                    if (Arena::cellMetaEnabled()) {
+                        gcr = runMajorMarkSweep(vm);
+                        // NONMOVING_INLINE_THUNK_PLAN §5.2(3): Phase-S spike.
+                        // After the (non-moving) precise mark, rebuild the free-line
+                        // spans from the freshly-recomputed line-marks so the NEXT
+                        // allocations bump into reclaimed line-spans of the SAME
+                        // blocks — IN-PLACE reclaim, NO move, NO whole-block-free,
+                        // NO evacuation (runMajorMarkSweep's sparse-block relocation
+                        // stays off; its own rebuild call is g_immixAllocEnabled-only
+                        // so it does not fire under this compile flag).  The mark
+                        // ran post-forceScavenge (nursery empty), so every surviving
+                        // cell is tenured + its lines are marked live; the dead lines
+                        // become spans.  Reclaim is safepoint-only (never mid-primop)
+                        // — the live-cell / C-stack-live hazard (plan §6 #1) cannot
+                        // hand back a marked-live span.
+                        if (nix::v3::detail::nonmovingTenured())
+                            threadArena().rebuildFreeSpansFromLineMarks();
+                    } else {
+                        gcr.heapBytes  = arena.bytesAllocated();
+                        gcr.bytesFreed = 0;
+                    }
                     // Frame pointers may have been forwarded.
                     // Re-read dispatch locals.
                     if (!vm.frames.empty()) {
