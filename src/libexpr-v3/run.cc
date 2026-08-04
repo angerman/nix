@@ -53,10 +53,6 @@
 #include <cstring>          // A3: token-scan helpers
 #include <unordered_set>    // A1: manifest membership set
 #include <sys/resource.h>
-#ifdef __APPLE__
-#include <malloc/malloc.h>   // M1.D: malloc_zone_pressure_relief
-#include <mach/mach.h>       // M1.D: task_info TASK_VM_INFO phys_footprint (current RSS)
-#endif
 #if NIX_USE_BOEHMGC
 #include <gc/gc.h>
 #endif
@@ -708,26 +704,6 @@ RootResult runRootExprModule(nix::EvalState & state, ir::Module module)
         // (libc malloc, mmap).  Stage 3 Phase D shape (a/b/c) depends
         // on which one dominates.
 #if NIX_USE_BOEHMGC
-        // 2026-05-27 §6.2 spike: NIX_V3_BOEHM_FORCE_UNMAP=1 fires
-        // `GC_gcollect_and_unmap()` once before reading heap stats,
-        // letting us observe whether Boehm's munmap is functional on
-        // this build/platform (some builds skip USE_MUNMAP).  If the
-        // mechanism works, the reported boehm_heap drops and the
-        // boehm_unmapped grows by the same delta.  Sequel: fire from
-        // checkLimits() periodically to reduce peak_rss mid-eval.
-        // Retirement: when periodic-unmap is wired into checkLimits
-        // OR when Boehm is downscoped to FFI-only, drop the gate.
-        static const bool s_forceUnmap =
-            std::getenv("NIX_V3_BOEHM_FORCE_UNMAP") != nullptr;
-        if (s_forceUnmap) {
-            // Boehm's `force_unmap_on_gcollect` flag is the actual
-            // switch — `GC_gcollect_and_unmap()` is documented to
-            // unmap unconditionally, but in practice on macOS the
-            // unmap depends on this flag being set.  Enable it
-            // alongside the explicit collect call to be sure.
-            GC_set_force_unmap_on_gcollect(1);
-            GC_gcollect_and_unmap();
-        }
         size_t boehmHeap = GC_get_heap_size();
         size_t boehmFree = GC_get_free_bytes();
         size_t boehmUnmapped = GC_get_unmapped_bytes();
@@ -813,35 +789,6 @@ RootResult runRootExprModule(nix::EvalState & state, ir::Module module)
                 cuBytecode / 1e6, cuCount, sqliteRes / 1e6, rest / 1e6,
                 boehmHeap / 1e6, boehmFree / 1e6);
         }
-#ifdef __APPLE__
-        // M1.D (BOUNDED_MEMORY_PLAN_2026-06-29): probe malloc-fragmentation
-        // reclaimability.  Reads CURRENT resident (phys_footprint, not maxrss),
-        // forces libmalloc to return freed-but-retained pages to the OS
-        // (malloc_zone_pressure_relief, all zones), re-reads.  A large drop => the
-        // "rest" bucket holds reclaimable malloc fragmentation => a MID-EVAL-safepoint
-        // pressure-relief could lower PEAK (the M1.D lever).  Gated
-        // NIX_V3_MALLOC_RECLAIM_PROBE; retire once the reclaim decision is made.
-        static const bool s_mallocReclaimProbe =
-            std::getenv("NIX_V3_MALLOC_RECLAIM_PROBE") != nullptr;
-        if (s_mallocReclaimProbe) {
-            auto curResident = []() -> size_t {
-                task_vm_info_data_t vmInfo;
-                mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT;
-                if (task_info(mach_task_self(), TASK_VM_INFO,
-                        reinterpret_cast<task_info_t>(&vmInfo), &cnt) == KERN_SUCCESS)
-                    return static_cast<size_t>(vmInfo.phys_footprint);
-                return 0;
-            };
-            const size_t before = curResident();
-            malloc_zone_pressure_relief(nullptr, 0);   // all zones, reclaim all
-            const size_t after = curResident();
-            std::fprintf(stderr,
-                "v3-direct malloc-reclaim probe: current_resident %.0fMB -> %.0fMB "
-                "(pressure_relief returned %.0fMB to OS)\n",
-                before / 1e6, after / 1e6,
-                (before > after ? before - after : 0) / 1e6);
-        }
-#endif
         // 2026-05-27: Boehm GC time/count line — input to the
         // "ditch Boehm" decision per IDEAL_GC_DESIGN_2026-05-26.md.
         // If boehm_gc_ms is sub-1 % of overall wall, the wall case
