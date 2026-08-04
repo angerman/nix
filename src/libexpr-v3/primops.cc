@@ -5061,30 +5061,6 @@ void primDerivationStrict(EvalState & state, Value * args, Value & out)
         }
     }
 
-    // V3_DRV_NO_BRIDGE=1 makes the native-path throw user-visible
-    // instead of bouncing through the TW bridge.  Used to diagnose
-    // which native-path error is the actual blocker for a given
-    // workload; the bridge cascade otherwise hides the root cause
-    // behind a soup of follow-on TW-callback failures.
-    static const bool s_drvNoBridge =
-        std::getenv("V3_DRV_NO_BRIDGE") != nullptr;
-    if (__builtin_expect(s_drvNoBridge, 0)) {
-        // Native path either succeeded (returned above) or threw.
-        // If it threw, the catch above swallowed it and we're here
-        // — re-throw a generic error that includes the drv name.
-        std::string drvName = "<unknown>";
-        if (args[0].isAttrs() && args[0].asAttrs()) {
-            const auto & syms = drvStrictSymbols();
-            if (auto * nv = args[0].asAttrs()->lookup(syms.name)) {
-                if (nv->isString() && nv->asString())
-                    drvName = nv->asString();
-            }
-        }
-        throw std::runtime_error(
-            "v3 primDerivationStrict: native path failed for `" + drvName
-            + "` and V3_DRV_NO_BRIDGE=1; check V3_DRV_DEBUG output for "
-              "the underlying error");
-    }
     // FFI_KILL_PLAN Phase C6 + TW_VALUE_ERADICATION F5 (2026-06-02): the
     // derivationStrict TW-bridge fallback (V3_DRV_KEEP_BRIDGE) is DELETED.
     // It was default-off since 2026-06-01 (Phase C0: 2414 native / 0
@@ -5473,18 +5449,6 @@ static void buildAndWriteDrvNative(
         bindingsSetValue(resultB, static_cast<uint32_t>(i), entries[i].second);  // Phase D
     }
     out.mkAttrs(resultB);
-
-    // #741 Phase 1: round-trip-test the result Value through the
-    // value-serialiser when NIX_V3_TEST_DRV_RESULT_SERIALIZE=1.
-    // Default-off; gate is a cached bool load.  No effect on the
-    // result; pure observation.  Stats dumped under NIX_VM_STATS.
-    value_serialize::runRoundTripTest(out);
-
-    // #741 Phase 2: canonical-hash determinism dump when
-    // NIX_V3_TEST_CANONICAL_HASH=1.  Per-result `V3-VAL-HASH: <hex>`
-    // to stderr; sort + diff across two process invocations should
-    // produce empty diff (the determinism falsifier).
-    value_serialize::dumpCanonicalHashLine(out);
 
     // #741 Phase 3e SHADOW: verify hit or insert on miss.  Uses
     // drvPath as the cache key (canonical content hash of drv per
@@ -6997,7 +6961,6 @@ const std::string & codegenGateFingerprint()
             "NIX_V3_OCCUR_DCE", "NIX_V3_OCCUR_DCE_VALIDATE",
             "NIX_V3_OPT_PHASE_LIMIT", "NIX_V3_RAW_FORMALS",
             "NIX_V3_SKIP_FORCE_LINES",
-            "NIX_V3_STAGE4_ALL_MODULES",
         };
         std::string s;
         for (const char * g : kGates) {

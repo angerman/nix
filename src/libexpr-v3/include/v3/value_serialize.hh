@@ -74,35 +74,6 @@ Value deserialize(std::string_view in);
 /// recursive.  Other tags compare unequal.
 bool valuesEqual(const Value & a, const Value & b) noexcept;
 
-/// Round-trip diagnostics.  Bumped from `runRoundTripTest` (called by
-/// `buildAndWriteDrvNative` when test mode is enabled).
-struct RoundTripStats {
-    uint64_t attempts        = 0;  // total runRoundTripTest calls
-    uint64_t successes       = 0;  // round-trip + valuesEqual passed
-    uint64_t mismatches      = 0;  // round-trip OK but valuesEqual failed
-    uint64_t serErrors       = 0;  // serialize threw
-    uint64_t deserErrors     = 0;  // deserialize threw
-    uint64_t totalBytes      = 0;  // sum of serialised blob sizes
-    uint64_t totalSerNs      = 0;  // wall ns in serialize()
-    uint64_t totalDeserNs    = 0;  // wall ns in deserialize()
-    uint64_t totalCompareNs  = 0;  // wall ns in valuesEqual()
-};
-
-RoundTripStats & roundTripStats() noexcept;
-
-/// Read NIX_V3_TEST_DRV_RESULT_SERIALIZE once at process start; cache
-/// the bool so primDerivationStrict's per-call check is one load.
-bool testModeEnabled() noexcept;
-
-/// Run serialise → deserialise → valuesEqual on `result` and bump
-/// roundTripStats accordingly.  No-op (cheap) when testModeEnabled()
-/// is false.
-void runRoundTripTest(const Value & result) noexcept;
-
-/// Format the stats as a human-readable summary line(s).  Called
-/// from run.cc under NIX_VM_STATS when testModeEnabled() is true.
-void dumpStats(std::FILE * out);
-
 // ---------------------------------------------------------------------------
 // #741 Phase 2 — canonical Value hash (cross-process determinism gate).
 //
@@ -114,13 +85,8 @@ void dumpStats(std::FILE * out);
 // preserves set-iteration order).  Positions / GC addresses / SymbolIds
 // are not part of the encoded form.  Therefore serialize()'s output
 // is a deterministic function of the Value's structural content.
-// canonicalHash() is just SHA-256 over those bytes.
-//
-// Phase 2 falsifier: two processes computing canonicalHash() on the
-// same logical input must produce byte-identical 32-byte digests for
-// ≥99.9% of inputs.  Gate: NIX_V3_TEST_CANONICAL_HASH=1 emits a
-// `V3-VAL-HASH: <64-hex>` stderr line per derivation result.  Sort
-// + diff across two process invocations.
+// canonicalHash() is just SHA-256 over those bytes.  It is the memo-key
+// digest for the live applied / eval-result cache (vm_applied_cache.cc).
 // ---------------------------------------------------------------------------
 
 /// Compute the canonical 32-byte SHA-256 digest of `v`'s structural
@@ -130,12 +96,6 @@ void canonicalHash(const Value & v, uint8_t out[32]);
 
 /// Lowercase-hex form of canonicalHash (64 chars).
 std::string canonicalHashHex(const Value & v);
-
-bool canonicalHashTestModeEnabled() noexcept;
-
-/// When canonicalHashTestModeEnabled(), compute + emit
-/// `V3-VAL-HASH: <64-hex>` to stderr.  Cheap no-op otherwise.
-void dumpCanonicalHashLine(const Value & v) noexcept;
 
 // ---------------------------------------------------------------------------
 // #741 Phase 3a — in-memory SHADOW eval-result cache (intra-process).

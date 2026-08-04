@@ -267,8 +267,8 @@ RootResult runRootExprModule(nix::EvalState & state, ir::Module module)
     // also exercises them) measured 1 elision in 40 961 considered
     // Apps on hello.drvPath at ~33 ms wall-clock cost.  The
     // bottleneck is `isInlinableMkThunk`'s single-use + simple-body
-    // constraints, not strictness analysis coverage.  Opt-in to
-    // all-modules via `NIX_V3_STAGE4_ALL_MODULES=1`.
+    // constraints, not strictness analysis coverage — so per-module
+    // Stage 4 was falsified and retired (the gate is gone).
     // #742/#743 caller-side strictness: computeFunctionStrictness then
     // applyStrictnessAtCallSites to a fixpoint (compound shapes — an outer
     // MkThunk over an AttrSet whose entries are themselves thunked — need a
@@ -1254,11 +1254,6 @@ RootResult runRootExprModule(nix::EvalState & state, ir::Module module)
                 std::fprintf(stderr, "\n");
             }
         }
-        // #741 Phase 1 spike: derivation-result round-trip diagnostics.
-        // Only emits when NIX_V3_TEST_DRV_RESULT_SERIALIZE=1; no output
-        // on the default path.  Validates the value-serialiser
-        // architecture for the multi-week IFD eval-result cache.
-        value_serialize::dumpStats(stderr);
         // #741 Phase 3a SHADOW eval-result cache diagnostics.
         // Only emits when NIX_V3_EVAL_RESULT_CACHE=1.
         value_serialize::dumpEvalResultCacheStats(stderr);

@@ -5757,19 +5757,6 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                         // V3_STATS bumps off the OP_CALL hot path the capture-model
                         // trial edits, per DEFECT_REVIEW §2.5 / the WS-0 no-creep rule.
                         const auto & tbl = ir::globalSymbolTable();
-                        // #809 (2026-05-24): diagnostic gate.  When
-                        // NIX_V3_PERMISSIVE_FORMALS=1, treat every
-                        // lambda as ellipsis=1 (accept extra args
-                        // silently).  Used to isolate whether the
-                        // strict extra-arg check is the load-bearing
-                        // blocker on haskell.nix-class workloads, or
-                        // whether downstream over-forcing persists
-                        // even after we let extra args through.
-                        // OFF-by-default; semantically incorrect when
-                        // ON (TW would also reject in pure strict
-                        // mode).
-                        static const bool s_permissiveFormals =
-                            std::getenv("NIX_V3_PERMISSIVE_FORMALS") != nullptr;
                         auto hasFormal = [&](SymbolId name) noexcept {
                             size_t lo = 0, hi = desc->formals.size();
                             while (lo < hi) {
@@ -5782,12 +5769,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                             return false;
                         };
                         // (a) Extra-arg check for non-ellipsis lambdas.
-                        // #803 (2026-05-24): print FIRST (under
-                        // V3_DBG_FORMALS_DIAG), THEN gate the throw under
-                        // !PERMISSIVE_FORMALS.  This lets the trace fire
-                        // under PERMISSIVE mode without killing the eval —
-                        // captures the H10 divergent call across the long
-                        // haskell.nix run.
+                        // #803 (2026-05-24): the V3_DBG_FORMALS_DIAG trace
+                        // (below) prints FIRST, then the throw fires — so the
+                        // diagnostic is captured before the eval unwinds.
                         if (!desc->ellipsis) {
                             b->forEach([&](const Bindings::Entry & entry) {
                                 SymbolId name = entry.name;
@@ -5883,14 +5867,10 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                                         }
                                         std::fflush(stderr);
                                     }
-                                    if (!s_permissiveFormals)
-                                        throw std::runtime_error(
-                                            "function '" + lambdaName()
-                                            + "' called with unexpected argument '"
-                                            + nm + "'");
-                                    // PERMISSIVE: continue silently
-                                    // — keep scanning further extras
-                                    // for diagnostic but don't throw.
+                                    throw std::runtime_error(
+                                        "function '" + lambdaName()
+                                        + "' called with unexpected argument '"
+                                        + nm + "'");
                                 }
                             });
                         }
@@ -6473,12 +6453,6 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                         // P0.B: TEMP P2.1-a sizing probe deleted (twin of the
                         // OP_CALL site above; see that comment).
                         const auto & tbl = ir::globalSymbolTable();
-                        // #809: same NIX_V3_PERMISSIVE_FORMALS gate as
-                        // the call-site path above.  Both OP_CALL and
-                        // OP_TAIL_CALL hit this check; both must obey
-                        // the gate or the diagnostic isn't honest.
-                        static const bool s_permissiveFormalsTC =
-                            std::getenv("NIX_V3_PERMISSIVE_FORMALS") != nullptr;
                         auto hasFormal = [&](SymbolId name) noexcept {
                             size_t lo = 0, hi = tcDesc->formals.size();
                             while (lo < hi) {
@@ -6490,7 +6464,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                             }
                             return false;
                         };
-                        if (!tcDesc->ellipsis && !s_permissiveFormalsTC) {
+                        if (!tcDesc->ellipsis) {
                             b->forEach([&](const Bindings::Entry & entry) {
                                 SymbolId name = entry.name;
                                 if (!hasFormal(name)) {

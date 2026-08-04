@@ -4,8 +4,8 @@
 /// See header for the binary format spec.  This file holds:
 ///   - serialize() / deserialize() recursive encoders
 ///   - valuesEqual() structural comparator
-///   - runRoundTripTest() instrumented per-call gate
-///   - dumpStats() summary writer
+///   - canonicalHash() / canonicalHashHex() content digests
+///   - the in-memory + drv-hash SHADOW caches
 ///
 /// Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>,
 ///   Input Output Group.
@@ -601,71 +601,6 @@ bool valuesEqual(const Value & a, const Value & b) noexcept
 }
 
 // ---------------------------------------------------------------------------
-// Round-trip diagnostics.
-// ---------------------------------------------------------------------------
-
-RoundTripStats & roundTripStats() noexcept
-{
-    static RoundTripStats s;
-    return s;
-}
-
-bool testModeEnabled() noexcept
-{
-    // Cached once at first call; getenv is cheap but a per-derivation
-    // call could add measurable noise to the 4 ms/call primop cost
-    // we're profiling.
-    static const bool enabled = []() {
-        const char * e = std::getenv("NIX_V3_TEST_DRV_RESULT_SERIALIZE");
-        return e && *e && *e != '0';
-    }();
-    return enabled;
-}
-
-void runRoundTripTest(const Value & result) noexcept
-{
-    if (!testModeEnabled()) return;
-    auto & stats = roundTripStats();
-    stats.attempts++;
-    std::string buf;
-    auto t0 = std::chrono::steady_clock::now();
-    try {
-        serialize(result, buf);
-    } catch (const std::exception &) {
-        stats.serErrors++;
-        return;
-    } catch (...) {
-        stats.serErrors++;
-        return;
-    }
-    auto t1 = std::chrono::steady_clock::now();
-    Value restored;
-    try {
-        restored = deserialize(buf);
-    } catch (const std::exception &) {
-        stats.deserErrors++;
-        // still count bytes + ser time
-        stats.totalBytes += buf.size();
-        stats.totalSerNs += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
-        return;
-    } catch (...) {
-        stats.deserErrors++;
-        stats.totalBytes += buf.size();
-        stats.totalSerNs += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
-        return;
-    }
-    auto t2 = std::chrono::steady_clock::now();
-    bool ok = valuesEqual(result, restored);
-    auto t3 = std::chrono::steady_clock::now();
-    if (ok) stats.successes++;
-    else    stats.mismatches++;
-    stats.totalBytes     += buf.size();
-    stats.totalSerNs     += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
-    stats.totalDeserNs   += std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count();
-    stats.totalCompareNs += std::chrono::duration_cast<std::chrono::nanoseconds>(t3 - t2).count();
-}
-
-// ---------------------------------------------------------------------------
 // #741 Phase 2 — canonical Value hash.
 // ---------------------------------------------------------------------------
 
@@ -695,30 +630,6 @@ std::string canonicalHashHex(const Value & v)
         out[i * 2 + 1] = kHex[ bytes[i]       & 0xF];
     }
     return out;
-}
-
-bool canonicalHashTestModeEnabled() noexcept
-{
-    static const bool enabled = []() {
-        const char * e = std::getenv("NIX_V3_TEST_CANONICAL_HASH");
-        return e && *e && *e != '0';
-    }();
-    return enabled;
-}
-
-void dumpCanonicalHashLine(const Value & v) noexcept
-{
-    if (!canonicalHashTestModeEnabled()) return;
-    try {
-        std::string hex = canonicalHashHex(v);
-        // Single line per derivation result.  Two processes' sorted
-        // dumps must diff to empty for the falsifier to pass.
-        std::fprintf(stderr, "V3-VAL-HASH: %s\n", hex.c_str());
-    } catch (const std::exception & e) {
-        std::fprintf(stderr, "V3-VAL-HASH-ERR: %s\n", e.what());
-    } catch (...) {
-        std::fprintf(stderr, "V3-VAL-HASH-ERR: unknown\n");
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1070,34 +981,6 @@ void dumpDrvHashCacheStats(std::FILE * out)
             (unsigned long long)ds.evalInserts,
             (unsigned long long)ds.evalInsertFailures);
     }
-}
-
-void dumpStats(std::FILE * out)
-{
-    if (!testModeEnabled()) return;
-    const auto & s = roundTripStats();
-    // Suppress 0-attempt dumps: sub-evals (builtins / derivationStrict /
-    // wrapper script compilation) call dumpStats() before any
-    // derivation has been constructed.  Only the main eval's
-    // non-zero summary is useful.
-    if (s.attempts == 0) return;
-    double avgBytes   = static_cast<double>(s.totalBytes) / s.attempts;
-    double avgSerUs   = (s.totalSerNs    / 1000.0) / s.attempts;
-    double avgDeserUs = (s.totalDeserNs  / 1000.0) / s.attempts;
-    double avgCmpUs   = (s.totalCompareNs/ 1000.0) / s.attempts;
-    double avgTotalUs = avgSerUs + avgDeserUs + avgCmpUs;
-    std::fprintf(out,
-        "v3-direct value-serialize: attempts=%llu success=%llu mismatch=%llu "
-        "serErr=%llu deserErr=%llu\n"
-        "  avg blob=%.0f B  ser=%.2f µs  deser=%.2f µs  cmp=%.2f µs  total=%.2f µs\n"
-        "  total bytes=%.2f MB\n",
-        (unsigned long long)s.attempts,
-        (unsigned long long)s.successes,
-        (unsigned long long)s.mismatches,
-        (unsigned long long)s.serErrors,
-        (unsigned long long)s.deserErrors,
-        avgBytes, avgSerUs, avgDeserUs, avgCmpUs, avgTotalUs,
-        s.totalBytes / (1024.0 * 1024.0));
 }
 
 } // namespace nix::v3::value_serialize
