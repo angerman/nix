@@ -521,11 +521,6 @@ inline void dump()
 }
 } // namespace upvaldup
 
-// Env-tuple interning (envintern::*, maybeInternUpvalueEnvFromStack,
-// clearEnvInternTable) was extracted to vm_interning.cc — declared in
-// v3/vm_internal.hh.  Call sites below (OP_MAKE_CLOSURE / OP_MAKE_THUNK, and
-// the gen-major safepoint's clearEnvInternTable()) are unchanged.
-
 // (FP-2b sizing probe V3_DBG_THUNK_WITHS retired 2026-06-14 — it measured the
 // capturedWiths null-fraction (firefox 74% / M5 97%) to greenlight FP-2b's
 // tail-relocation; FP-2b landed byte-identical with M5 arena −151 MB, so the
@@ -2989,11 +2984,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     // as the ICs above.  Clear it before the mark/sweep so no
                     // stale chain pointer survives a collection.
                     Bindings::clearMaterializeMemo();
-                    // Env tuple interning is a weak per-epoch cache, not a root.
-                    // Clear it before mark/sweep so dead Envs can be reclaimed and
-                    // no stale Env* remains in the side table after collection.
-                    clearEnvInternTable();
-                    // Captured-withs singleton interning is also a weak cache.
+                    // Captured-withs singleton interning is a weak cache.
                     // Minor GC forwards/rekeys it, but major GC should not keep
                     // cache-only ListVecs alive.
                     clearCapWithsCache();
@@ -4019,17 +4010,7 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 break;
             }
 
-            static const bool s_envSharing = []{
-                if (std::getenv("NIX_V3_NO_ENV_SHARING")) return false;
-                const char * e = std::getenv("NIX_V3_ENV_SHARING");
-                if (e) return e[0] != '0';
-                return true;
-            }();
-            Env * closureEnv = nullptr;
-            if (__builtin_expect(s_envSharing && nUp > 0, 0))
-                closureEnv = maybeInternUpvalueEnvFromStack(vm, nUp);
-            const bool shareUpvalues = closureEnv != nullptr;
-            Closure * c = Alloc::allocClosure(shareUpvalues ? 0 : nUp);
+            Closure * c = Alloc::allocClosure(nUp);
             V3_STATS_INC(closuresAllocated);
             c->desc = &cu->lambdas[funcIdx];
             registerCuLambdaRange(cu);   // WS5-D1: was c->desc->cu = cu
@@ -4038,21 +4019,11 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // the with-target block beneath.  Build capturedWiths
             // outermost-first by filling reverse into the ListVec.
             //
-            // env-sharing (default ON, NIX_V3_NO_ENV_SHARING opts out): when a
-            // capture tuple recurs enough to pay for the Env header, store the
-            // upvalues in a shared, tenured Env (Closure::upvalEnv) rather than
-            // the inline FAM.  One-off low-arity captures stay inline so the
-            // sharing layer does not add memory relative to the old v3 path.
-            // The closure is allocated with a zero-length FAM when shared;
-            // nUpvalues remains the logical count and closureUpvalue() reads
-            // the Env.
-            // Env-aware GC: scavenge walkClosure grays the Env; mark/evac/auditor +
-            // closurePostConstructBarrier all branch on upvalEnv (gc.cc/mark_sweep.cc).
-            if (__builtin_expect(shareUpvalues, 1)) {
-                c->upvalEnv = closureEnv;
-            } else {
-                for (uint16_t i = nUp; i > 0; --i) c->upvalues[i - 1] = pop(vm);
-            }
+            // Upvalues are copied into the closure's inline FAM.  (The env-tuple
+            // interning / shared-Env path — which stored them in a shared tenured
+            // Env instead — was RETIRED 2026-08: it interned ~nothing on real
+            // workloads while adding a dead branch on the #1 opcode family.)
+            for (uint16_t i = nUp; i > 0; --i) c->upvalues[i - 1] = pop(vm);
             if (nWiths == 1) {
                 // Day 13-15 (2026-05-29): singleton interning for the
                 // overwhelmingly-dominant 1-element case (avg 1.04 on
@@ -4163,30 +4134,12 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             const bool willHaveWiths = (nWiths > 0)
                 || (vm.withStack.size()
                     > (vm.frames.empty() ? 0 : vm.frames.back().withStackBase));
-            // env-sharing (default ON, NIX_V3_NO_ENV_SHARING opts out): store the thunk's
-            // upvalues in a shared tenured Env (tail[0]=Env*) so the per-force
-            // fakeClo shares it with NO upvalue copy (the forceValue lever).  See
-            // OP_MAKE_CLOSURE for the gate retirement criterion.  Header stays
-            // 24 B (ENV_SHARED flag in hasWithsSlot, not a new field).
-            static const bool s_envSharingThunk = []{
-                if (std::getenv("NIX_V3_NO_ENV_SHARING")) return false;
-                const char * e = std::getenv("NIX_V3_ENV_SHARING");
-                if (e) return e[0] != '0';
-                return true;
-            }();
+            // Upvalues are stored inline in the thunk's FAM tail.  (The env-tuple
+            // interning / shared-Env path — which stored them in a shared tenured
+            // Env referenced via tail[0] + the THUNK_ENV_SHARED flag — was RETIRED
+            // 2026-08 with the dead Closure::upvalEnv plumbing it fed.)
             const LambdaDescriptor & thunkDesc = cu->lambdas[funcIdx];
-            Thunk * t;
-            Env * thunkEnv = nullptr;
-            {
-                if (__builtin_expect(s_envSharingThunk && nUp > 0, 0))
-                    thunkEnv = maybeInternUpvalueEnvFromStack(vm, nUp);
-                if (__builtin_expect(thunkEnv != nullptr, 0)) {
-                    t = Alloc::allocThunkSuspendedShared(nUp, willHaveWiths);
-                    *reinterpret_cast<Env **>(&t->tail[0]) = thunkEnv;  // Env* @ tail[0]
-                } else {
-                    t = Alloc::allocThunkSuspended(nUp, willHaveWiths);
-                }
-            }
+            Thunk * t = Alloc::allocThunkSuspended(nUp, willHaveWiths);
             // The "descriptor" we use is the LambdaDescriptor for the
             // referenced function (treated as 0-arg for thunks).
             // Reuse the LambdaDescriptor pointer through suspended.desc.
@@ -4301,15 +4254,11 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                     cu};
                 thunkCreationMap()[t] = info;
             }
-            // env-sharing: upvalues go into the shared Env, not the inline tail
-            // (tail[0] holds the Env*).  Stack order is identical (upvalues on
-            // top, withs below), so the withs-pop logic below is unaffected.
-            // Fill the inline FAM upvalues (tail[0..nUp)).  env-shared thunks skip
-            // this (their upvalues live in the shared Env at tail[0]).
-            if (!thunkEnv) {
-                for (uint16_t i = nUp; i > 0; --i) t->tail[i - 1] = pop(vm);
-            }
-            if (__builtin_expect(g_dbgUpvalDup, 0) && nUp > 0 && !thunkEnv)
+            // Fill the inline FAM upvalues (tail[0..nUp)).  Stack order is
+            // upvalues on top, withs below, so the withs-pop logic below is
+            // unaffected.
+            for (uint16_t i = nUp; i > 0; --i) t->tail[i - 1] = pop(vm);
+            if (__builtin_expect(g_dbgUpvalDup, 0) && nUp > 0)
                 recordUpvalDup(t, nUp);  // workstream H sizing probe
             // FP-2b: capturedWiths now lives in the reserved tail slot
             // (tail[nUpvalues], present iff willHaveWiths).  Each branch that

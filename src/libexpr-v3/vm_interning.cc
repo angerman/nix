@@ -1,21 +1,23 @@
 /// @file
-/// v3 VM interning subsystems — extracted from vm.cc (step 2 of the vm.cc
-/// split).  PURE MOVE: these definitions are byte-for-byte the ones that used
-/// to live in vm.cc; only the linkage of the cross-TU entry points changed
+/// v3 VM captured-withs singleton interning — extracted from vm.cc (step 2 of the
+/// vm.cc split).  PURE MOVE: these definitions are byte-for-byte the ones that
+/// used to live in vm.cc; only the linkage of the cross-TU entry points changed
 /// (internal → external, declared in v3/vm_internal.hh) so vm.cc's dispatch /
 /// creation paths + the GC scavenger / gen-major safepoint can reach them.
 ///
-/// Two subsystems:
-///   1. Env-tuple interning (envintern::*, maybeInternUpvalueEnvFromStack,
-///      clearEnvInternTable) — a weak epoch-local table sharing byte-identical
-///      upvalue-capture tuples across closures/thunks.  DEFAULT-DISABLED
-///      (shareAfter returns UINT32_MAX), cleared at the major-GC safepoint.
-///   2. Captured-withs singleton interning (internOrAllocSingletonCapWiths,
-///      snapshotCurrentWiths, clearCapWithsCache, refreshCapWithsCacheAfter-
-///      Scavenge, get*CapWiths* stats) — a 4096-bucket cache sharing 1-element
-///      capturedWiths ListVecs.  Its slots are minor-GC roots
-///      (singletonCapturedWithsRegistry); gc.cc forwards them then calls
-///      refreshCapWithsCacheAfterScavenge to rekey; gen-major clears it.
+/// Captured-withs singleton interning (internOrAllocSingletonCapWiths,
+/// snapshotCurrentWiths, clearCapWithsCache, refreshCapWithsCacheAfterScavenge,
+/// get*CapWiths* stats) — a 4096-bucket cache sharing 1-element capturedWiths
+/// ListVecs.  Its slots are minor-GC roots (singletonCapturedWithsRegistry);
+/// gc.cc forwards them then calls refreshCapWithsCacheAfterScavenge to rekey;
+/// gen-major clears it.
+///
+/// (The Env-tuple interning subsystem — envintern::*,
+/// maybeInternUpvalueEnvFromStack, clearEnvInternTable — that also lived here was
+/// RETIRED 2026-08: it was default-disabled (shareAfter returned UINT32_MAX ⇒
+/// always nullptr ⇒ inline-FAM), interned ~nothing on real workloads, and its
+/// only opt-in was an A/B knob.  Purged with the dead Closure::upvalEnv /
+/// THUNK_ENV_SHARED plumbing it fed.)
 ///
 /// pushCapturedWiths (the ~20-call-site hot loop reading a capturedWiths ListVec
 /// onto vm.withStack at every apply) deliberately stays `inline` in vm.cc —
@@ -27,173 +29,13 @@
 
 #include "v3/vm_internal.hh"
 #include "v3/vm.hh"       // VMState, Env, ListVec, Value, Tag
-#include "v3/alloc.hh"    // Alloc::allocEnv, Alloc::allocList
-#include "v3/barrier.hh"  // envPostConstructBarrier, listPostConstructBarrier, singletonCapturedWithsRegistry
+#include "v3/alloc.hh"    // Alloc::allocList
+#include "v3/barrier.hh"  // listPostConstructBarrier, singletonCapturedWithsRegistry
 
-#include <cassert>
 #include <cstdint>
-#include <cstdlib>
-#include <unordered_map>
 #include <vector>
 
 namespace nix::v3 {
-
-// Env tuple interning -------------------------------------------------------
-//
-// Env-sharing moved closure/thunk captures out of inline FAM tails, but the
-// first implementation still allocated one fresh Env per runtime object.  This
-// weak, epoch-local table shares byte-identical capture tuples across closures
-// and thunks, which recovers the common "many lazy siblings close over the same
-// lexical state" shape without changing the public object model.
-//
-// The table is deliberately NOT a GC root.  It is cleared at the outermost
-// major-GC safepoint before mark/sweep, just like the Bindings materialize memo,
-// so no stale Env* survives a collection.  Minor scavenges may rewrite values
-// inside an Env, which can make a bucket miss later; that only loses sharing
-// until the next equal tuple is inserted, not correctness.
-namespace envintern {
-struct Entry {
-    Env * env = nullptr;
-    uint32_t observations = 0;
-    uint16_t nUp = 0;
-};
-
-using Bucket = std::vector<Entry>;
-
-inline bool enabled() noexcept
-{
-    static const bool s_enabled = [] {
-        if (std::getenv("NIX_V3_NO_ENV_INTERN")) return false;
-        const char * e = std::getenv("NIX_V3_ENV_INTERN");
-        if (e) return e[0] != '0';
-        return true;
-    }();
-    return s_enabled;
-}
-
-inline std::unordered_map<uint64_t, Bucket> & table()
-{
-    static thread_local std::unordered_map<uint64_t, Bucket> t;
-    return t;
-}
-
-inline uint32_t shareAfter(uint16_t nUp) noexcept
-{
-    static const uint32_t s_override = [] {
-        const char * e = std::getenv("NIX_V3_ENV_SHARE_AFTER");
-        if (!e || !*e) return 0u;
-        char * end = nullptr;
-        unsigned long v = std::strtoul(e, &end, 10);
-        return end != e ? static_cast<uint32_t>(v) : 0u;
-    }();
-    if (s_override) return s_override;
-
-    // P0.C (BEAT_TW_V3_PLAN §3.1, 2026-07-03): RETIRED — env-share interning is
-    // a structural no-op that never earned its keep, so the DEFAULT never
-    // interns (always UINT32_MAX ⇒ maybeInternFromStack returns nullptr ⇒ inline
-    // FAM).  FALSIFIER (Rule 0): the heuristic only interned nUp>8 capture tuples
-    // reused ≥2×, but the Phase-1 nUp histogram measured avg nUp 1.88–2.10 across
-    // hello/firefox/git/M5 (and firefox `envs=0.1 MB` of 677 MB RSS) — i.e. it
-    // shared ~nothing while adding a dead 8 B upvalEnv branch on the #1 opcode
-    // family + a call per creation.  DEV: the mechanism stays testable via
-    // NIX_V3_ENV_SHARE_AFTER=N (the s_override above) for any future A/B.  KEEP
-    // the plumbing (Env / upvalEnv / closureUpvalue / walkEnv / ENV_SHARED).
-    // (The env-pointer-capture trial that also reused this plumbing was KILLed
-    // at Gate C 2026-07-04 and deleted; branch 8eebbe25b preserves it.)
-    return UINT32_MAX;
-}
-
-template <typename Stack>
-inline uint64_t hashStackTuple(const Stack & stack,
-                               size_t base,
-                               uint16_t nUp) noexcept
-{
-    uint64_t h = 0x9E3779B97F4A7C15ull ^ (uint64_t(nUp) * 0xC2B2AE3D27D4EB4Full);
-    for (uint16_t i = 0; i < nUp; ++i) {
-        uint64_t x = stack[base + i].rawWord();
-        x ^= x >> 33; x *= 0xff51afd7ed558ccdull; x ^= x >> 33;
-        h ^= x; h *= 0x100000001B3ull;
-    }
-    return h;
-}
-
-template <typename Stack>
-inline bool sameTuple(const Env * env,
-                      const Stack & stack,
-                      size_t base,
-                      uint16_t nUp) noexcept
-{
-    if (!env || env->nValues != nUp) return false;
-    for (uint16_t i = 0; i < nUp; ++i)
-        if (env->values[i].rawWord() != stack[base + i].rawWord())
-            return false;
-    return true;
-}
-
-Env * maybeInternFromStack(VMState & vm, uint16_t nUp)
-{
-    assert(nUp > 0);
-    assert(vm.valueStack.size() >= nUp);
-    const size_t base = vm.valueStack.size() - nUp;
-    const uint32_t threshold = shareAfter(nUp);
-    if (threshold == UINT32_MAX)
-        return nullptr;
-
-    if (__builtin_expect(enabled(), 1)) {
-        uint64_t h = hashStackTuple(vm.valueStack, base, nUp);
-        Bucket & b = table()[h];
-        Entry * seed = nullptr;
-        for (Entry & e : b) {
-            if (e.env && sameTuple(e.env, vm.valueStack, base, nUp)) {
-                ++e.observations;
-                vm.valueStack.resize(base);
-                return e.env;
-            }
-            if (!e.env && e.nUp == nUp && !seed)
-                seed = &e;
-        }
-
-        if (!seed) {
-            b.push_back(Entry{nullptr, 0, nUp});
-            seed = &b.back();
-        }
-        ++seed->observations;
-        if (seed->observations < threshold)
-            return nullptr;
-
-        Env * env = Alloc::allocEnv(nUp);
-        for (uint16_t i = 0; i < nUp; ++i)
-            env->values[i] = vm.valueStack[base + i];
-        // P0.A-4 (DEFECT_REVIEW_2026-07-03 §1.9): the interned Env is TENURED but
-        // its values[] copy nursery cells off the value stack; register it as a
-        // barriered root source at creation.  Previously covered only
-        // TRANSITIVELY via each consumer's closure/thunk post-construct scan —
-        // one new frame-Env consumer away from a missed root.  One line
-        // closes it.
-        envPostConstructBarrier(env);
-        vm.valueStack.resize(base);
-        seed->env = env;
-        return env;
-    }
-
-    return nullptr;
-}
-
-inline void clear() noexcept
-{
-    table().clear();
-}
-} // namespace envintern
-
-Env * maybeInternUpvalueEnvFromStack(VMState & vm, uint16_t nUp)
-{
-    return envintern::maybeInternFromStack(vm, nUp);
-}
-
-void clearEnvInternTable() noexcept
-{
-    envintern::clear();
-}
 
 // ---------------------------------------------------------------------------
 // EXIT_GC_SPIRAL Week 2 Day 13-15 (2026-05-29): singleton interning pool

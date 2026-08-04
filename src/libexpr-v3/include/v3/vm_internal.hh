@@ -41,25 +41,20 @@ std::string v3ThunkTracePos(const Thunk * t);
 [[gnu::cold]] void dbgLogForceSite(const CompilationUnit * cu, uint32_t instrIp,
                                    const Value * forcing = nullptr);
 
-// --- Interning subsystems (vm_interning.cc, step 2 of the vm.cc split) ------
+// --- Captured-withs singleton interning (vm_interning.cc, step 2 of split) ---
 //
-// Env-tuple interning + captured-withs singleton interning were extracted from
-// vm.cc.  The entry points below were file-local (`static` / anonymous-namespace
-// `inline`) but are called from vm.cc's dispatch / creation paths and its
-// gen-major safepoint (clear*), so the move promotes them to external linkage.
+// The captured-withs singleton interning cache was extracted from vm.cc.  The
+// entry points below were file-local (`static` / anonymous-namespace `inline`)
+// but are called from vm.cc's dispatch / creation paths and its gen-major
+// safepoint (clearCapWithsCache), so the move promotes them to external linkage.
 // The GC-facing stats + scavenge-refresh wrappers (getCapWithsHits / Misses /
 // Evicts + refreshCapWithsCacheAfterScavenge, called from run.cc + gc.cc) are
 // declared in v3/vm.hh, unchanged.  pushCapturedWiths stays `inline` in vm.cc
 // (hot call-path loop, deliberately NOT extracted).
-
-/// Env-tuple interning: share a byte-identical nUp-slot upvalue Env off the top
-/// of vm.valueStack.  DEFAULT-DISABLED (shareAfter returns UINT32_MAX ⇒ nullptr
-/// ⇒ caller allocates the Env inline).  (moved from vm.cc — vm_interning.cc)
-Env * maybeInternUpvalueEnvFromStack(VMState & vm, uint16_t nUp);
-
-/// Clear the Env-tuple intern table.  Called at the major-GC safepoint before
-/// mark/sweep so no stale Env* survives a collection.  (vm_interning.cc)
-void clearEnvInternTable() noexcept;
+//
+// (The Env-tuple interning entry points — maybeInternUpvalueEnvFromStack /
+// clearEnvInternTable — were RETIRED 2026-08 with the dead Closure::upvalEnv /
+// THUNK_ENV_SHARED plumbing they fed.)
 
 /// Clear the captured-withs singleton cache (a weak cache — major GC must not
 /// keep cache-only ListVecs alive).  Called at the major-GC safepoint.
