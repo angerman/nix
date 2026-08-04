@@ -3,18 +3,13 @@
 # Positive test: a battery of patterns that the pass IS supposed to
 # inline (same-block, single-arg, no formals, simple body) and a few
 # patterns it MUST NOT touch (multi-use, formals, nested closures).
-# All must produce the same value vs TW and with the pass disabled
-# (NIX_V3_NO_BETA_REDUCE=1).
+# All must produce the same value vs TW (beta-reduction is unconditional).
 #
 # Run (parity):
 #   NIX_V3_DIRECT_EVAL=1 nix eval --impure -f repro-beta-reduce.nix
 #   nix eval --impure -f repro-beta-reduce.nix
 #
-# Run (gate-off):
-#   NIX_V3_NO_BETA_REDUCE=1 NIX_V3_DIRECT_EVAL=1 \
-#     nix eval --impure -f repro-beta-reduce.nix
-#
-# Expected output (all three):
+# Expected output (both):
 #   { aa = 6; bb = 30; cc = 60; dd = 100; ee = 31; ff = 42; gg = 6; hh = 21; }
 #
 # Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>,

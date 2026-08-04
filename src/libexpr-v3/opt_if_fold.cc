@@ -29,7 +29,8 @@
 /// constantFold + inlineTrivialBindings so VarRef chains and
 /// literal-folding have settled.
 ///
-/// Gate: NIX_V3_NO_IF_FOLD=1 disables for A/B perf measurement.
+/// Unconditional (the NIX_V3_NO_IF_FOLD A/B opt-out was retired once it
+/// shipped byte-identical).
 ///
 /// Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>,
 ///   Input Output Group.
@@ -83,10 +84,6 @@ std::optional<bool> resolveBool(VarId v,
 
 size_t ifThenFold(Module & m)
 {
-    static const bool disabled =
-        std::getenv("NIX_V3_NO_IF_FOLD") != nullptr;
-    if (disabled) return 0;
-
     static const bool s_dbg =
         std::getenv("V3_DBG_IF_FOLD") != nullptr;
 

@@ -29,7 +29,8 @@
 /// All folded shapes are observably IDENTICAL to runtime evaluation,
 /// so this pass cannot introduce semantic divergence.
 ///
-/// Gate: NIX_V3_NO_PRIMOP_FOLD=1 disables for A/B measurement.
+/// Unconditional (the NIX_V3_NO_PRIMOP_FOLD A/B opt-out was retired once
+/// it shipped byte-identical).
 ///
 /// Runs AFTER fusePrimOpApps (so we see PrimOpCall shapes for
 /// `length`, `head`, etc. that the lower.cc lowering exposed) and
@@ -390,10 +391,6 @@ std::optional<Expr> tryFoldPrimOpCall(
 
 size_t primOpFold(Module & m)
 {
-    static const bool s_disabled =
-        std::getenv("NIX_V3_NO_PRIMOP_FOLD") != nullptr;
-    if (s_disabled) return 0;
-
     size_t folded = 0;
 
     for (BlockId bid = 1; bid < (BlockId)m.blocks.size(); ++bid) {

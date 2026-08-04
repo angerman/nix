@@ -37,7 +37,8 @@
 ///      we're processing) — prevents work-duplication if the same
 ///      thunk feeds multiple call sites.
 ///
-/// Gate: `NIX_V3_NO_STRICT_CALL_UNTHUNK=1` disables for A/B testing.
+/// Unconditional (the NIX_V3_NO_STRICT_CALL_UNTHUNK A/B opt-out was retired
+/// once it shipped byte-identical).
 /// Telemetry: `NIX_V3_DBG_STRICT_CALL_UNTHUNK=1` prints the count of
 /// elisions at the end of the pass.
 ///
@@ -667,9 +668,6 @@ static FuncId resolveLetRecEntryFuncIdx(const Module & m, const LetRec & lr,
 
 size_t applyStrictnessAtCallSites(Module & m)
 {
-    static const bool disabled =
-        std::getenv("NIX_V3_NO_STRICT_CALL_UNTHUNK") != nullptr;
-    if (disabled) return 0;
     static const bool dbg =
         std::getenv("NIX_V3_DBG_STRICT_CALL_UNTHUNK") != nullptr;
     // #2(B) eager-forced-let: a MkThunk that is unconditionally Force'd in
@@ -679,11 +677,7 @@ size_t applyStrictnessAtCallSites(Module & m)
     // evaluating it eagerly forces nothing the program wouldn't have.  The
     // bytecode foldl''s `let next = op acc elem; in seq next (go (i+1) next)`
     // (next: forced by seq, also captured by the go-call thunk) is the
-    // motivating shape.  Retirement: fold into the unconditional eager path
-    // (drop NIX_V3_NO_EAGER_FORCED_LET) once shipped byte-identical on --core
-    // + a nixpkgs sample across ≥10 runs.
-    static const bool noEagerLet =
-        std::getenv("NIX_V3_NO_EAGER_FORCED_LET") != nullptr;
+    // motivating shape — now the unconditional eager path.
 
     // Module-wide use count for the "MkThunk has one use" safety check.
     UseCounter uses = countModuleUses(m);
@@ -756,25 +750,19 @@ size_t applyStrictnessAtCallSites(Module & m)
     // entryName) → callee FuncId on the UN-mutated module: store FuncIds
     // (stable), never Expr*, so the per-block rebuilds below can't dangle them.
     // rb->attrs may be the recVar OR its Tag::Slot companion → key both.
-    // Retirement: fold into resolveCalleeLambda (drop NIX_V3_NO_REC_UNTHUNK)
-    // once shipped byte-identical on --core + a nixpkgs sample.
-    static const bool noRecUnthunk =
-        std::getenv("NIX_V3_NO_REC_UNTHUNK") != nullptr;
     std::unordered_map<VarId, std::unordered_map<SymbolId, FuncId>> recCallTarget;
-    if (!noRecUnthunk) {
-        for (const auto & b : m.blocks)
-            for (const auto & bd : b.bindings)
-                if (const auto * lr = std::get_if<LetRec>(&bd.expr)) {
-                    std::vector<VarId> keys{lr->recVar};
-                    auto sv = m.recVarToSlotVar.find(lr->recVar);
-                    if (sv != m.recVarToSlotVar.end()) keys.push_back(sv->second);
-                    for (const auto & ent : lr->entries) {
-                        FuncId fi = resolveLetRecEntryFuncIdx(m, *lr, ent.name);
-                        if (fi < (FuncId)m.functions.size())
-                            for (VarId k : keys) recCallTarget[k][ent.name] = fi;
-                    }
+    for (const auto & b : m.blocks)
+        for (const auto & bd : b.bindings)
+            if (const auto * lr = std::get_if<LetRec>(&bd.expr)) {
+                std::vector<VarId> keys{lr->recVar};
+                auto sv = m.recVarToSlotVar.find(lr->recVar);
+                if (sv != m.recVarToSlotVar.end()) keys.push_back(sv->second);
+                for (const auto & ent : lr->entries) {
+                    FuncId fi = resolveLetRecEntryFuncIdx(m, *lr, ent.name);
+                    if (fi < (FuncId)m.functions.size())
+                        for (VarId k : keys) recCallTarget[k][ent.name] = fi;
                 }
-    }
+            }
 
     for (BlockId bid = 1; bid < (BlockId)m.blocks.size(); ++bid) {
         Block & blk = m.blocks[bid];
@@ -849,8 +837,6 @@ size_t applyStrictnessAtCallSites(Module & m)
                     } else if (uses.at(fres.definer) == 1) {
                         ++passedToInlineForce;
                         mkthunksToElide.insert(fres.definer);
-                    } else if (noEagerLet) {
-                        ++forceFailMultiUse;
                     } else {
                         ++passedToInlineForce;
                         mkthunksToEager.insert(fres.definer);
@@ -869,7 +855,7 @@ size_t applyStrictnessAtCallSites(Module & m)
             // whose LetRec is in an enclosing block (the recursive self-call,
             // e.g. `go (i+1)`).  Recover via the pre-resolved, pointer-stable map.
             bool viaRec = false;
-            if (calleeFid >= (FuncId)m.functions.size() && !noRecUnthunk) {
+            if (calleeFid >= (FuncId)m.functions.size()) {
                 if (const Expr * fe = chaseInBlock(app->fun, defs))
                     if (const auto * rb = std::get_if<RecBindingSlotRef>(fe)) {
                         auto it = recCallTarget.find(rb->attrs);

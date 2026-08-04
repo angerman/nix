@@ -35,7 +35,8 @@
 /// Larger genList calls fall through to the original PrimOpCall
 /// path.
 ///
-/// Gate: NIX_V3_NO_GENLIST_UNROLL=1 disables.
+/// Unconditional (the NIX_V3_NO_GENLIST_UNROLL A/B opt-out was retired
+/// once it shipped byte-identical).
 ///
 /// Dependency: Phase B (primOpFold).  The `n` argument must already
 /// resolve to a LitInt — primOpFold collapses chains like
@@ -137,10 +138,6 @@ FuncId buildElementThunk(Module & m, VarId fVar, int64_t i)
 
 size_t genListUnroll(Module & m)
 {
-    static const bool disabled =
-        std::getenv("NIX_V3_NO_GENLIST_UNROLL") != nullptr;
-    if (disabled) return 0;
-
     static const bool s_dbg =
         std::getenv("V3_DBG_GENLIST_UNROLL") != nullptr;
 

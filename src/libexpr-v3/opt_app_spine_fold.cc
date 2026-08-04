@@ -36,7 +36,8 @@
 /// remapExprVars helpers (re-duplicated here for namespace
 /// isolation) give us the substitution machinery.
 ///
-/// Gate: NIX_V3_NO_APP_SPINE_FOLD=1 disables.
+/// Unconditional (the NIX_V3_NO_APP_SPINE_FOLD / NIX_V3_NO_DETHUNK_STRICT
+/// A/B opt-outs were retired once they shipped byte-identical).
 ///
 /// Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>,
 ///   Input Output Group.
@@ -472,10 +473,6 @@ std::unordered_map<VarId, uint32_t> countModuleUses(const Module & m)
 // ---------------------------------------------------------------------------
 size_t deThunkForcedStrictArgs(Module & m)
 {
-    static const bool s_off =
-        std::getenv("NIX_V3_NO_DETHUNK_STRICT") != nullptr;
-    if (s_off) return 0;
-
     auto isStrict = [](std::string_view n) {
         return n == "__add" || n == "__sub" || n == "__mul"
             || n == "__div" || n == "__lessThan";
@@ -599,10 +596,6 @@ size_t deThunkForcedStrictArgs(Module & m)
 
 size_t appSpineFold(Module & m)
 {
-    static const bool disabled =
-        std::getenv("NIX_V3_NO_APP_SPINE_FOLD") != nullptr;
-    if (disabled) return 0;
-
     static const bool s_dbg =
         std::getenv("V3_DBG_APP_SPINE_FOLD") != nullptr;
 

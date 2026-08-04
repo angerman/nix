@@ -932,8 +932,7 @@ size_t commonSubexprElim(Module & m);
 /// body has no nested Function/Block-carrying Exprs (Lambda/MkThunk/
 /// LetRec/If/With/Assert/And/Or/Impl).  See opt_beta_reduce.cc for
 /// the exact predicate and the clone-with-substitution algorithm.
-/// Gate: NIX_V3_NO_BETA_REDUCE=1 disables.  Returns the number of
-/// App bindings rewritten.
+/// Unconditional.  Returns the number of App bindings rewritten.
 size_t betaReduce(Module & m);
 
 /// IR Phase B (2026-05-18): pure-primop constant folding.  Recognises
@@ -943,8 +942,7 @@ size_t betaReduce(Module & m);
 /// head / tail / elemAt / toString / attrNames).  Rewrites to a
 /// literal / VarRef / ListExpr.  Conservative — only folds patterns
 /// whose runtime result is statically computable without throwing.
-/// Gate: NIX_V3_NO_PRIMOP_FOLD=1 disables.  Returns the number of
-/// PrimOpCall bindings folded.
+/// Unconditional.  Returns the number of PrimOpCall bindings folded.
 size_t primOpFold(Module & m);
 
 // streamFusion (IR Phase-C stream fusion, `foldl'∘map` → `__foldlMap`) was
@@ -964,8 +962,8 @@ size_t detectFoldlAppendIdiom(const Module & m);
 /// `If(LitBool, thenBlock, elseBlock)` patterns and rewrites the
 /// binding to inline the chosen block's bindings + a VarRef to the
 /// chosen block's TermReturn target.  Eliminates the OP_BRANCH_FALSE
-/// emit + the discarded branch's bytecode.  Gate: NIX_V3_NO_IF_FOLD=1
-/// disables.  Returns the number of If bindings folded.
+/// emit + the discarded branch's bytecode.  Unconditional.  Returns
+/// the number of If bindings folded.
 size_t ifThenFold(Module & m);
 
 /// IR Phase H (2026-05-18): static genList unrolling.  Recognises
@@ -973,8 +971,7 @@ size_t ifThenFold(Module & m);
 /// in 0..8 and rewrites to an N-element ListExpr of per-element
 /// MkThunk bindings (each thunk's body is `App(f, LitInt i)`).
 /// Laziness preserved: each MkThunk forces its body only on demand.
-/// Gate: NIX_V3_NO_GENLIST_UNROLL=1 disables.  Returns the number of
-/// genList calls unrolled.
+/// Unconditional.  Returns the number of genList calls unrolled.
 size_t genListUnroll(Module & m);
 
 /// IR Phase F (2026-05-18): static App-spine folding.  Recognises
@@ -982,8 +979,8 @@ size_t genListUnroll(Module & m);
 /// `f` resolves to a Lambda whose body is an N-deep canonical
 /// curried-Lambda chain and all `a_i` are PURE.  Substitutes all N
 /// args into the deepest body in one shot, eliminating N-1
-/// PartialApp allocations.  Gate: NIX_V3_NO_APP_SPINE_FOLD=1
-/// disables.  Returns the number of spines folded.
+/// PartialApp allocations.  Unconditional.  Returns the number of
+/// spines folded.
 size_t appSpineFold(Module & m);
 
 /// IR (2026-06-05): de-thunk USE-ONCE MkThunk args to STRICT arithmetic
@@ -992,9 +989,8 @@ size_t appSpineFold(Module & m);
 /// forces its args when its block runs, so a use-once arg-thunk's deferral is
 /// redundant — inlining the thunk body is byte-identical and exposes nested
 /// arithmetic to constant folding (e.g. `x*y*z`'s inner `x*y` thunk, which
-/// otherwise blocks appSpineFold).  Runs BEFORE appSpineFold.  Gate:
-/// NIX_V3_NO_DETHUNK_STRICT=1 disables (bisect handle; retire once shipped
-/// byte-identical on --core + a nixpkgs sample).  Returns the number de-thunked.
+/// otherwise blocks appSpineFold).  Runs BEFORE appSpineFold.
+/// Unconditional.  Returns the number de-thunked.
 size_t deThunkForcedStrictArgs(Module & m);
 
 /// #429: fuse App-chains over LitPrimOp into a single PrimOpCall.
@@ -1063,9 +1059,8 @@ void computeFunctionStrictness(Module & m);
 ///
 /// Runs AFTER `computeFunctionStrictness` (so strictArgs is set)
 /// and BEFORE `computeFreeVars` (so the inlined bindings are
-/// visible to freeVars).  Gate: NIX_V3_NO_STRICT_CALL_UNTHUNK=1
-/// disables.  Telemetry: NIX_V3_DBG_STRICT_CALL_UNTHUNK=1 prints
-/// elision count.
+/// visible to freeVars).  Unconditional.  Telemetry:
+/// NIX_V3_DBG_STRICT_CALL_UNTHUNK=1 prints elision count.
 size_t applyStrictnessAtCallSites(Module & m);
 
 /// Run the caller-side strictness passes as a unit: computeFunctionStrictness

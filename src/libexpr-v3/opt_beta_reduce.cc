@@ -53,9 +53,8 @@
 ///      conservatively prevents work-duplication if the Lambda
 ///      appears as an upvalue in another closure or in lexicalWiths.
 ///
-/// Gate: NIX_V3_NO_BETA_REDUCE=1 to disable the pass for A/B testing.
-/// Retire when bench shows stable wins across the corpus and no
-/// regressions in v3-property-tests or v3-lang-tests.
+/// Unconditional (the NIX_V3_NO_BETA_REDUCE A/B opt-out was retired once
+/// it shipped byte-identical across the property + lang test corpus).
 ///
 /// Runs BEFORE inlineTrivialBindings (so the cloned bindings' VarRefs
 /// get path-compressed) and BEFORE constantFold (so cloned literal
@@ -498,10 +497,6 @@ VarId inlineBody(Module & m,
 
 size_t betaReduce(Module & m)
 {
-    static const bool s_disabled =
-        std::getenv("NIX_V3_NO_BETA_REDUCE") != nullptr;
-    if (s_disabled) return 0;
-
     // Pass 1: count uses across the entire module.
     UseCounter uses = countModuleUses(m);
 

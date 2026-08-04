@@ -234,25 +234,15 @@ void computeFunctionStrictness(Module & m)
 {
     static const bool s_dbg =
         std::getenv("NIX_V3_DBG_STRICTNESS") != nullptr;
-    static const bool s_disabled =
-        std::getenv("NIX_V3_NO_FUNC_STRICTNESS") != nullptr;
-    // #745 v4.3: opt-out for cross-function propagation specifically,
-    // so we can A/B-measure the additional analysis cost vs. the
-    // baseline v3 + v4 result.
-    static const bool s_disableCrossFn =
-        std::getenv("NIX_V3_NO_CROSS_FN_STRICTNESS") != nullptr;
-    if (s_disabled) return;
 
     // #745 v4.3: build per-block (VarId → Expr*) maps ONCE before
     // the fixed-point iteration.  defs is read-only inside the
     // analysis; rebuilding per iteration would waste time.
     std::unordered_map<BlockId, std::unordered_map<VarId, const Expr *>> blockDefs;
-    if (!s_disableCrossFn) {
-        for (BlockId bid = 0; bid < (BlockId)m.blocks.size(); ++bid) {
-            auto & defs = blockDefs[bid];
-            for (const auto & bd : m.blocks[bid].bindings) {
-                defs[bd.var] = &bd.expr;
-            }
+    for (BlockId bid = 0; bid < (BlockId)m.blocks.size(); ++bid) {
+        auto & defs = blockDefs[bid];
+        for (const auto & bd : m.blocks[bid].bindings) {
+            defs[bd.var] = &bd.expr;
         }
     }
 
@@ -364,18 +354,14 @@ void computeFunctionStrictness(Module & m)
         // pass the Module and this block's defs map so App-case
         // can propagate strictness from statically-resolvable
         // callees (callee.strictArgs[0] true → arg is forced).
-        // Falls back to the legacy non-propagating behavior when
-        // cross-fn is disabled.
         const std::unordered_map<VarId, const Expr *> * blockDefsPtr = nullptr;
-        if (!s_disableCrossFn) {
+        {
             auto it = blockDefs.find(f.entryBlock);
             if (it != blockDefs.end()) blockDefsPtr = &it->second;
         }
         std::unordered_set<VarId> forced;
         for (const auto & bind : b.bindings) {
-            if (!collectForced(bind.expr, forced,
-                               s_disableCrossFn ? nullptr : &m,
-                               blockDefsPtr)) break;
+            if (!collectForced(bind.expr, forced, &m, blockDefsPtr)) break;
         }
         // TermReturn: the returned value is NOT forced by the body
         // itself — the caller forces it.  Skip.
@@ -455,7 +441,7 @@ void computeFunctionStrictness(Module & m)
         std::fprintf(stderr,
             "v3 stage4 strictness: converged after %d iter(s) "
             "(cross-fn %s; total-Apps-seen=%llu resolved=%llu strict-hit=%llu)\n",
-            iter, s_disableCrossFn ? "disabled" : "enabled",
+            iter, "enabled",
             (unsigned long long)cs.appsSeen,
             (unsigned long long)cs.appsResolved,
             (unsigned long long)cs.appsStrictHit);

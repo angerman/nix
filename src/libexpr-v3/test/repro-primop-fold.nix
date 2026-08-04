@@ -11,11 +11,7 @@
 #   nix eval --impure -f repro-primop-fold.nix
 #   NIX_V3_DIRECT_EVAL=1 nix eval --impure -f repro-primop-fold.nix
 #
-# Run (gate-off):
-#   NIX_V3_NO_PRIMOP_FOLD=1 NIX_V3_DIRECT_EVAL=1 \
-#     nix eval --impure -f repro-primop-fold.nix
-#
-# All three must produce identical output.
+# Both must produce identical output (primop-fold is unconditional).
 #
 # Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>,
 # Input Output Group.  SPDX-License-Identifier: Apache-2.0

@@ -7,13 +7,11 @@
 # collapses the literal arithmetic into a single LitInt.
 #
 # In effect: this should evaluate to a LitInt at compile time, with
-# no runtime computation at all.  Comparing v3 (with beta-reduce)
-# vs v3 (NIX_V3_NO_BETA_REDUCE=1) should show:
-#   - beta-reduce ON:  ~0 thunk allocations beyond startup overhead
-#   - beta-reduce OFF: many closure/thunk allocations
+# no runtime computation at all.  With beta-reduce (now unconditional)
+# the fixture allocates ~0 thunks beyond startup overhead.
 #
-# A future bench-harness test could compare NIX_VM_STATS allocs
-# under both modes; this fixture is the input.
+# A future bench-harness test could track NIX_VM_STATS allocs on this
+# fixture as a perf guardrail; this fixture is the input.
 #
 # Run:
 #   nix eval --impure -f repro-beta-reduce-perf.nix
