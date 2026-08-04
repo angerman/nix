@@ -377,21 +377,6 @@ RootResult runRootExprModule(nix::EvalState & state, ir::Module module)
     }
     pt.mark(pt.run_ms);
     snapAfterRun = takePhaseSnap();  // DIAG-4
-
-    // DIAG analysis spike (2026-05-29 evening): test the hypothesis
-    // that DIAG-2 Phase 2's 311 MB at all-packages.nix:9112 is held
-    // by the in-memory ImportCache.  Clearing the cache before
-    // dumpV3LiveFraction drops those roots; the resulting live-bytes
-    // delta quantifies what end-of-eval cache eviction would
-    // reclaim.  Safe AFTER run() returns; no further eval expected.
-    static const bool s_clearImportCache =
-        std::getenv("NIX_V3_END_OF_EVAL_CLEAR_IMPORT_CACHE") != nullptr;
-    if (__builtin_expect(s_clearImportCache, 0)) {
-        clearImportCacheResultsForDiag();
-        std::fprintf(stderr,
-            "v3-direct DIAG spike: cleared in-memory ImportCache "
-            "results (NIX_V3_END_OF_EVAL_CLEAR_IMPORT_CACHE=1)\n");
-    }
     // (bridge-table DIAG clear retired — TW_VALUE_ERADICATION F4, 2026-06-02.)
 
     // Periodic L(t) CSV flush (Step 4 of post-Phase-3.8).  Hoisted OUT of

@@ -168,13 +168,6 @@ size_t importCacheStringConstRefs() noexcept;  // M-10: total interned-string re
 /// LambdaDescriptor::name).  Gated by the caller (NIX_V3_MEM_BUCKETS).
 void importCachePrintFieldBreakdown() noexcept;
 
-/// 2026-05-29 evening (DIAG analysis spike): clear in-memory import
-/// cache result set so a subsequent LiveTracer / GC walk sees the
-/// nixpkgs evaluation graph as freeable.  Safe to call AFTER run()
-/// returns; UNSAFE mid-eval (orphans in-flight imports).  Gated
-/// via NIX_V3_END_OF_EVAL_CLEAR_IMPORT_CACHE=1 in run.cc.
-void clearImportCacheResultsForDiag() noexcept;
-
 
 
 

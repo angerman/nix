@@ -6252,30 +6252,11 @@ void importCachePrintFieldBreakdown() noexcept
         100.0 * diag / (irreducible + diag ? irreducible + diag : 1));
 }
 
-// 2026-05-29 evening (DIAG analysis spike): clear in-memory import
-// cache result set.  Used by run.cc's end-of-eval hook to test
-// whether the LiveTracer's "concentrated retention" finding
-// (62.8 % at all-packages.nix:9112) is held by ImportCache.
-// Clearing drops the roots; subsequent dumpV3LiveFraction sees the
-// nixpkgs evaluation graph as freeable.
-//
-// Note: ONLY clears `results` (the Value cache).  `cus` (the
-// CompilationUnit storage) stays so cached bytecode persists.
-// Safe to call after run() returns and before subsequent dumps;
-// unsafe mid-eval (would orphan in-flight imports).
-//
-// Gate: NIX_V3_END_OF_EVAL_CLEAR_IMPORT_CACHE=1 invokes from
-// run.cc:runRootExpr after run() returns.
-void clearImportCacheResultsForDiag() noexcept
-{
-    auto & cache = importCache();
-    cache.results.clear();
-}
 
 // 2026-05-29 evening (production end-of-eval clear).  Promotes the
-// DIAG spikes (clearV3BridgesForDiag + clearImportCacheResultsForDiag)
-// to a single public entry point for the `nix eval` CLI to call
-// AFTER rendering completes.
+// end-of-eval DIAG clears (bridges + import-cache results) to a single
+// public entry point for the `nix eval` CLI to call AFTER rendering
+// completes.
 //
 // Mechanism: drop the global-root retention sources that pin the
 // transitive evaluation graph at end-of-eval.  Per
