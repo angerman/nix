@@ -218,7 +218,6 @@ RootResult runRootExprModule(nix::EvalState & state, ir::Module module)
         uint64_t bytesLists;
         uint64_t bytesPairs;
         uint64_t bytesChars;
-        uint64_t bytesEnvs;
     };
     auto takePhaseSnap = []() -> PhaseAllocSnap {
         const auto & a = allocStats();
@@ -226,7 +225,7 @@ RootResult runRootExprModule(nix::EvalState & state, ir::Module module)
             threadArena().bytesAllocated(),
             a.bytesValues, a.bytesClosures, a.bytesThunks,
             a.bytesBindings, a.bytesLists, a.bytesPairs,
-            a.bytesChars, a.bytesEnvs,
+            a.bytesChars,
         };
     };
     PhaseAllocSnap snapStart = takePhaseSnap();
@@ -459,15 +458,14 @@ RootResult runRootExprModule(nix::EvalState & state, ir::Module module)
         std::fprintf(stderr,
             "v3-direct run-phase per-tag bytes (MB): "
             "values=%.2f closures=%.2f thunks=%.2f bindings=%.2f "
-            "lists=%.2f pairs=%.2f chars=%.2f envs=%.2f\n",
+            "lists=%.2f pairs=%.2f chars=%.2f\n",
             deltaTagBytes(snapAfterCompile.bytesValues,   snapAfterRun.bytesValues),
             deltaTagBytes(snapAfterCompile.bytesClosures, snapAfterRun.bytesClosures),
             deltaTagBytes(snapAfterCompile.bytesThunks,   snapAfterRun.bytesThunks),
             deltaTagBytes(snapAfterCompile.bytesBindings, snapAfterRun.bytesBindings),
             deltaTagBytes(snapAfterCompile.bytesLists,    snapAfterRun.bytesLists),
             deltaTagBytes(snapAfterCompile.bytesPairs,    snapAfterRun.bytesPairs),
-            deltaTagBytes(snapAfterCompile.bytesChars,    snapAfterRun.bytesChars),
-            deltaTagBytes(snapAfterCompile.bytesEnvs,     snapAfterRun.bytesEnvs));
+            deltaTagBytes(snapAfterCompile.bytesChars,    snapAfterRun.bytesChars));
         const auto & a = allocStats();
         std::fprintf(stderr,
             "v3-direct alloc: values=%llu closures=%llu thunks=%llu "
@@ -530,16 +528,15 @@ RootResult runRootExprModule(nix::EvalState & state, ir::Module module)
         // hello.drvPath lives outside Boehm — these byte counters
         // tell us which v3 subsystem owns the growth).
         const uint64_t totalAllocBytes =
-              a.bytesValues + a.bytesClosures + a.bytesThunks + a.bytesEnvs
+              a.bytesValues + a.bytesClosures + a.bytesThunks
             + a.bytesLists  + a.bytesBindings + a.bytesPairs   + a.bytesChars;
         std::fprintf(stderr,
             "v3-direct bytes (in arena/nursery): values=%.1fMB closures=%.1fMB "
-            "thunks=%.1fMB envs=%.1fMB lists=%.1fMB bindings=%.1fMB pairs=%.1fMB "
+            "thunks=%.1fMB lists=%.1fMB bindings=%.1fMB pairs=%.1fMB "
             "chars=%.1fMB total_alloc=%.1fMB arena_pinned=%.1fMB\n",
             a.bytesValues   / 1e6,
             a.bytesClosures / 1e6,
             a.bytesThunks   / 1e6,
-            a.bytesEnvs     / 1e6,
             a.bytesLists    / 1e6,
             a.bytesBindings / 1e6,
             a.bytesPairs    / 1e6,

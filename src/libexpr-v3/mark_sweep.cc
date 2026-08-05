@@ -279,29 +279,6 @@ public:
             ++statsPairs_;
         } else enqueueNurseryCell(p, KPair);
     }
-    /// A frame's defEnv root (walkAllV3Roots).  MARK the Env cell (else sweep
-    /// frees a live Env whose only root is the frame register) + mark its lines
-    /// + walk its values (visitValue enqueues nested cells) + recurse the parent
-    /// chain — mirroring walkClosure's upvalEnv walk (P0.A-4).  Deduped via
-    /// tryMark / nurseryVisited_.  ⚠ shares the W2-precondition early-break
-    /// caveat with the walkClosure/evac Env-walks (documented at those sites):
-    /// close before real chains exist.  CallFrame::defEnv is ALWAYS NULL today
-    /// (the env-capture experiment that populated it was deleted 2026-07-04);
-    /// the walker is kept as null-safe scaffolding for env-sharing futures.
-    void visitEnv(Env * & e) override
-    {
-        for (Env * cur = e; cur; cur = cur->parent) {
-            const bool fresh = marker_.tryMark(cur)
-                || (nursery_ && nursery_->contains(cur)
-                    && nurseryVisited_.insert(cur).second);
-            if (!fresh) break;
-            if (arenaSetForSlot_)
-                arenaSetForSlot_->markLinesForCell(
-                    cur, sizeof(Env) + sizeof(Value) * cur->nValues);
-            for (uint16_t i = 0; i < cur->nValues; ++i)
-                visitValue(cur->values[i]);
-        }
-    }
     void visitSlot(Value * & p) override
     {
         if (!p) return;
@@ -363,7 +340,6 @@ public:
                 case CellType::List:     { ListVec  * l = reinterpret_cast<ListVec  *>(o); visitList(l);     break; }
                 case CellType::Pair:     { ValuePair * pr = reinterpret_cast<ValuePair *>(o); visitPair(pr); break; }
                 case CellType::Value:
-                case CellType::Env:
                 case CellType::Chars:
                 case CellType::None:
                     markConservative(o); break;  // unstamped → fallback
@@ -507,7 +483,7 @@ public:
             // Bindings reached via a C-stack pointer was the conservative
             // drain's 2236 s / 7.4e9-word blow-up on M5 (flaky multi-
             // minute mark pauses → wall-time timeouts under default-ON GC).
-            // Only genuinely-untyped cells (Value/Env/Chars/None) still
+            // Only genuinely-untyped cells (Value/Chars/None) still
             // need the byte-scan; those are small.
             char * cs = const_cast<char *>(cellStart);
             switch (arena.cellTypeAt(cellStart)) {
@@ -517,7 +493,6 @@ public:
             case CellType::List:     walkList(reinterpret_cast<ListVec *>(cs));      continue;
             case CellType::Pair:     walkPair(reinterpret_cast<ValuePair *>(cs));    continue;
             case CellType::Value:
-            case CellType::Env:
             case CellType::Chars:
             case CellType::None:
                 break;  // unknown layout → conservative byte-scan below

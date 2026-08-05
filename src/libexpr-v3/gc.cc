@@ -69,7 +69,6 @@ enum GrayKind : uint8_t {
     GK_LIST     = 2,
     GK_BINDINGS = 3,
     GK_PAIR     = 4,
-    GK_ENV      = 5,  ///< env-sharing: a shared upvalue Env (tenured, non-moving)
 };
 
 struct Gray { void * ptr; uint8_t kind; };
@@ -215,7 +214,6 @@ struct Scavenger
     void walkList    (ListVec  * l);
     void walkBindings(Bindings * b);
     void walkPair    (ValuePair * p);
-    void walkEnv     (Env      * e);  ///< env-sharing: walk a shared upvalue Env
 
     // -- top-level driver ---------------------------------------
 
@@ -494,26 +492,6 @@ void Scavenger::walkClosure(Closure * c)
     }
 }
 
-// env-sharing: forward the nursery payloads a shared upvalue Env holds.  The Env
-// itself is tenured (non-moving) so there is no Env relocation; we only walk the
-// values[] FAM (mirror of walkClosure's upvalue loop) and re-arm the post-walk
-// barrier so a survivor Env that still references the nursery is remembered.
-void Scavenger::walkEnv(Env * e)
-{
-    recordLiveTenured(e, sizeof(Env) + sizeof(Value) * e->nValues, CellType::Env);
-    for (uint16_t i = 0; i < e->nValues; ++i) {
-        visitValue(e->values[i]);
-    }
-    // P0.A-4 (DEFECT_REVIEW_2026-07-03 §1.9): walk the Env::parent chain.  Env is
-    // TENURED (allocEnv → threadArena) and never moves, so gray the parent via
-    // GK_ENV (deduped by `walked`); the graylist drains it back through walkEnv,
-    // so an arbitrary-depth chain is handled iteratively (no C recursion).  This
-    // is a benign no-op today (no allocEnv caller sets `parent`), kept so no
-    // walker silently drops the chain the day a producer materializes one.
-    if (e->parent && walked.insert(e->parent).second)
-        graylist.push_back({e->parent, GK_ENV});
-}
-
 void Scavenger::walkThunk(Thunk * t)
 {
     // BRUTE-refinement: Thunk size depends on state (matches fwdThunk's
@@ -646,7 +624,6 @@ void Scavenger::drain()
         case GK_LIST:     walkList    (static_cast<ListVec  *>(g.ptr)); break;
         case GK_BINDINGS: walkBindings(static_cast<Bindings *>(g.ptr)); break;
         case GK_PAIR:     walkPair    (static_cast<ValuePair *>(g.ptr)); break;
-        case GK_ENV:      walkEnv     (static_cast<Env      *>(g.ptr)); break;
         }
     }
 }
@@ -687,10 +664,6 @@ void Scavenger::run()
             if (f.thunk)
                 f.thunk = fwdThunk(f.thunk);
             if (f.forceWriteTarget) visitValue(*f.forceWriteTarget);
-            // Gray the frame's defEnv (see the main frame-walk below);
-            // always null today (env-capture deleted) — kept null-safe.
-            if (f.defEnv && walked.insert(f.defEnv).second)
-                graylist.push_back({f.defEnv, GK_ENV});
         }
     }
 
@@ -748,15 +721,6 @@ void Scavenger::run()
             }
             visitValue(*f.forceWriteTarget);
         }
-        // The frame's defEnv would be a TENURED Env holding escaping locals.
-        // Gray it (GK_ENV) so walkEnv forwards its nursery payloads AND its
-        // parent chain (P0.A-4); the Env never moves.  ALWAYS NULL today (the
-        // env-capture experiment that populated it was deleted 2026-07-04);
-        // kept as null-safe scaffolding.  GC-CRITICAL if ever repopulated: a
-        // non-null defEnv reached only via the frame register would otherwise
-        // be a missed root.
-        if (f.defEnv && walked.insert(f.defEnv).second)
-            graylist.push_back({f.defEnv, GK_ENV});
     }
 
     // (bridge-table roots retired — TW_VALUE_ERADICATION F4, 2026-06-02;
@@ -921,13 +885,6 @@ void Scavenger::run()
                 }
                 break;
             }
-            case DirtyKind::Env: {
-                auto * env = static_cast<Env *>(ptr);
-                if (walked.insert(env).second) {
-                    graylist.push_back({env, GK_ENV});
-                }
-                break;
-            }
             }
         }
         auto releaseIfOversized = [](auto & v, size_t maxRetained) {
@@ -1039,18 +996,6 @@ struct Auditor {
         // Upvalues live inline in the FAM.  (env-sharing retired 2026-08.)
         for (uint16_t i = 0; i < c->nUpvalues; ++i)
             visitValue(c->upvalues[i], "Closure.upvalues[]");
-    }
-
-    void visitEnv(const Env * e, const char * site)
-    {
-        if (!e) return;
-        check(e, "Env", site);
-        if (!visited.insert(e).second) return;
-        for (uint16_t i = 0; i < e->nValues; ++i)
-            visitValue(e->values[i], "Env.values[]");
-        // P0.A-4 (§1.9): walk the Env::parent chain.  `visited` dedups, so
-        // this recursion is cycle-safe.
-        if (e->parent) visitEnv(e->parent, "Env.parent");
     }
 
     void visitThunk(const Thunk * t, const char * site)
@@ -1240,10 +1185,6 @@ void postScavengeAudit(const Nursery & n, const VMState & vm)
             // cell; the contents may carry nursery payloads.
             if (f.forceWriteTarget)
                 a.visitValue(*f.forceWriteTarget, "frame.forceWriteTarget");
-            // Audit the frame's defEnv (+ parent chain via the auditor's
-            // visitEnv, P0.A-4).  Always null today (env-capture deleted);
-            // kept null-safe.
-            if (f.defEnv) a.visitEnv(f.defEnv, "frame.defEnv");
         }
     };
     walkVm("currentVm", &vm);
@@ -1320,10 +1261,6 @@ void postScavengeAudit(const Nursery & n, const VMState & vm)
                 if (a.visited.insert(ptr).second)
                     a.visitList(static_cast<ListVec *>(ptr), "dirty.List");
                 break;
-            case DirtyKind::Env:
-                if (a.visited.insert(ptr).second)
-                    a.visitEnv(static_cast<Env *>(ptr), "dirty.Env");
-                break;
             }
         }
         a.root = "standaloneCell";   // S2.1 RCA
@@ -1399,7 +1336,6 @@ bool bruteScanSlotIsScalar(uint8_t cellType, size_t off) noexcept
         // header 16B: [0,8)=kind/size SCALAR; parent@[8,16) is a pointer.
         // entry 16B: [+0,+8)={SymbolId,PosIdx32} SCALAR; value@[+8,+16) is a Value.
         return (off < 8) || (off >= 16 && ((off - 16) % 16) < 8);
-    case CellType::Env:     return (off >= 8 && off < 16);   // {isWithEnv,nValues}
     // Closure header 24 B: desc@0 + capturedWiths@8 (ptrs) + {nUpvalues,_pad}@16
     // (scalar) + upvalues[] FAM @24.  (upvalEnv@16 retired 2026-08 — header 32→24.)
     case CellType::Closure: return (off >= 16 && off < 24);  // {nUpvalues,_pad}
@@ -1440,7 +1376,6 @@ void postScavengeBruteScan(
         case CellType::Bindings: return "Bindings";
         case CellType::List:     return "List";
         case CellType::Pair:     return "ValuePair";
-        case CellType::Env:      return "Env";
         case CellType::Chars:    return "Chars";
         case CellType::None:     return "None";
         }

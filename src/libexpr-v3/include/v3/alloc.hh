@@ -572,7 +572,6 @@ struct AllocStats
     uint64_t valuesAllocated   = 0;
     uint64_t closuresAllocated = 0;
     uint64_t thunksAllocated   = 0;
-    uint64_t envsAllocated     = 0;
     uint64_t listsAllocated    = 0;
     uint64_t attrsetsAllocated = 0;
     uint64_t pairsAllocated    = 0;
@@ -758,7 +757,6 @@ struct AllocStats
     uint64_t bytesValues   = 0;
     uint64_t bytesClosures = 0;
     uint64_t bytesThunks   = 0;
-    uint64_t bytesEnvs     = 0;
     uint64_t bytesLists    = 0;
     uint64_t bytesBindings = 0;
     uint64_t bytesPairs    = 0;
@@ -1236,14 +1234,13 @@ enum class CellType : uint8_t {
     Bindings = 4,
     List     = 5,
     Pair     = 6,  ///< ValuePair (App / App3 / PrimOpApp)
-    Env      = 7,
-    Chars    = 8,  ///< allocChars string/path buffer
+    Chars    = 7,  ///< allocChars string/path buffer
 };
 
 // M-9 (CODEBASE_REVIEW_2026-06-11): the per-block cellTypes array is
 // NIBBLE-PACKED — two adjacent 16-byte granules share one byte (even granule
-// in the low nibble, odd granule in the high nibble).  CellType has 9 values
-// (0-8), so 4 bits suffice; this halves the array from 1 MB to 512 KB per
+// in the low nibble, odd granule in the high nibble).  CellType has 8 values
+// (0-7), so 4 bits suffice; this halves the array from 1 MB to 512 KB per
 // 16 MB block (≈ tens of MB on firefox/HNE-class arenas).  Every read/write
 // of cellTypes routes through these three helpers so the packing layout lives
 // in exactly ONE place (alloc.hh's stamp sites + mark_sweep's sweepOneBlock).
@@ -2942,18 +2939,6 @@ struct Alloc
     // always live inline in the tail via allocThunkSuspended.)
 
     // (allocBridgeThunk retired; TW_VALUE_ERADICATION F4, 2026-06-02.)
-
-    static Env * allocEnv(uint16_t nValues) noexcept
-    {
-        const size_t bytes = sizeof(Env) + sizeof(Value) * nValues;
-        V3_STATS_INC(envsAllocated);
-        V3_STATS_BUMP(bytesEnvs, bytes);
-        auto * e = static_cast<Env *>(threadArena().alloc(bytes, CellType::Env));
-        e->parent = nullptr;
-        e->isWithEnv = false;
-        e->nValues = nValues;
-        return e;
-    }
 
     /// T1.3 (2026-05-27): file/line attribution via `__builtin_FILE` /
     /// `__builtin_LINE` default args.  NIX_V3_LISTS_ATTR=1 enables

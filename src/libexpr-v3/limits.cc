@@ -425,7 +425,7 @@ extern "C" void rssCapTimerHandler(int /*signo*/) noexcept
     aSafeAppendLit(p, " pairs=");    aSafeAppendBytes(p, a.bytesPairs);
     aSafeAppendLit(p, " chars=");    aSafeAppendBytes(p, a.bytesChars);
     const uint64_t v3Total =
-          a.bytesValues + a.bytesClosures + a.bytesThunks + a.bytesEnvs
+          a.bytesValues + a.bytesClosures + a.bytesThunks
         + a.bytesLists  + a.bytesBindings + a.bytesPairs + a.bytesChars;
     aSafeAppendLit(p, "\n         v3_total=");
     aSafeAppendBytes(p, v3Total);

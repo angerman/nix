@@ -120,24 +120,6 @@ struct RootVisitor
     virtual void visitString   (const char * & s) noexcept { (void)s; }
     virtual void visitPath     (const char * & s) noexcept { (void)s; }
 
-    /// A shared frame `Env *` root — the
-    /// CallFrame::defEnv holding a frame's escaping locals, reachable ONLY via
-    /// the frame register until a child captures it, so it must be walked as a
-    /// distinct root class (the upvalEnv walkers do NOT cover it).  DEFAULT: walk
-    /// each Env's values + its parent chain via visitValue — correct for the
-    /// EVAC visitor (rewrites the value pointers; the Env cell is non-moving) and
-    /// for tracers.  A MARKING visitor MUST OVERRIDE to also set the Env cell's
-    /// mark bit (else sweep frees a live Env whose only root is the frame
-    /// register → UAF).  Env parent chains are acyclic (lexical nesting), so the
-    /// plain walk terminates.  Default no-op-ish today: CallFrame::defEnv is null
-    /// until W2 emission, so walkAllV3Roots never calls this on a real Env.
-    virtual void visitEnv      (Env * & e)
-    {
-        for (Env * cur = e; cur; cur = cur->parent)
-            for (uint16_t i = 0; i < cur->nValues; ++i)
-                visitValue(cur->values[i]);
-    }
-
     /// Convenience: visit a Value slot.  Dispatches on `tag()` and
     /// calls the appropriate typed callback.  Scalar tags are
     /// no-ops.  Non-virtual to give the compiler full visibility for

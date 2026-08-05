@@ -86,12 +86,6 @@ inline void walkOneVMState(VMState & vm, RootVisitor & visitor) noexcept
             if (f.forceWriteTarget)
                 visitor.visitValue(*f.forceWriteTarget);
         }
-        // The frame's defEnv would be a root reachable only via the frame
-        // register — the upvalEnv walkers do NOT cover it.  visitEnv walks its
-        // values + parent chain (mark/evac override to mark/rewrite the Env
-        // cell too).  ALWAYS NULL today (env-capture deleted 2026-07-04); kept
-        // as null-safe scaffolding.  GC-CRITICAL if ever repopulated.
-        if (f.defEnv) visitor.visitEnv(f.defEnv);
     }
 }
 

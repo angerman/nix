@@ -64,7 +64,6 @@ enum class DirtyKind : uint8_t {
     Thunk    = 2,  ///< Thunk header (Thunk::evaluated or Thunk::tail mutation)
     Closure  = 3,  ///< Closure (upvalues[] or capturedWiths mutation)
     List     = 4,  ///< ListVec (elems[] mutation; mostly write-once at build)
-    Env      = 5,  ///< Env (env-sharing: shared upvalue Env's values[] holds nursery payloads)
 };
 
 /// One dirty-list entry: which kind + raw container pointer.  Container
@@ -366,26 +365,6 @@ closurePostConstructBarrier(Closure * c) noexcept
         if (!dirty && c->capturedWiths && n.contains(c->capturedWiths))
             dirty = true;
         if (dirty) dirtyContainers().push_back({DirtyKind::Closure, c});
-    }
-}
-
-/// Env-sharing (NIX_V3_ENV_SHARING): an upvalue Env is tenured (allocEnv) but its
-/// values[] may hold nursery payloads written at MAKE_CLOSURE.  Mirror
-/// closurePostConstructBarrier: if any value is a nursery payload, remember the Env
-/// (DirtyKind::Env) so a minor scavenge walks it (walkEnv) even when the Env isn't
-/// reached from a root that pass.  Call AFTER filling the Env's values[].
-[[gnu::always_inline]] inline void
-envPostConstructBarrier(Env * e) noexcept
-{
-    if (__builtin_expect(phaseDActive(), 1)) [[likely]] {  // P3.5: always-true (opt-out retired)
-        const Nursery & n = threadNursery();
-        if (n.contains(e)) return;  // (Envs are tenured, but mirror the guard)
-        for (uint16_t i = 0; i < e->nValues; ++i) {
-            if (isNurseryPayload(e->values[i], n)) {
-                dirtyContainers().push_back({DirtyKind::Env, e});
-                return;
-            }
-        }
     }
 }
 

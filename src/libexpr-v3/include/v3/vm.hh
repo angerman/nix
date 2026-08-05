@@ -60,14 +60,14 @@ enum CallFrameFlag : uint8_t
     CFF_FORCE_WB_PTR_KEEP = 1 << 5,
 };
 
-/// CallFrame — 72 bytes.  (The old "40 bytes" comment was stale, WS-1 C5:
-/// the frame grew via forceWriteTarget / deepForceCursor / defEnv /
-/// memoKeyIdx.)  resultSlot/resultPtr were never read on return paths and are
+/// CallFrame — 56 bytes.  (The old "40 bytes" comment was stale, WS-1 C5:
+/// the frame grew via forceWriteTarget / deepForceCursor / memoKeyIdx.)
+/// resultSlot/resultPtr were never read on return paths and are
 /// gone; the return value is pushed onto valueStack and consumed by the
 /// caller.  The static_assert after the struct pins the size so this doc
-/// can't rot again — update both together.  Note the two 4-byte alignment
-/// holes (after deepForceCursor and after memoKeyIdx); a new u32 field can
-/// land in either for free.
+/// can't rot again — update both together.  deepForceCursor + memoKeyIdx
+/// pack the two u32 fields into the final 8-byte slot, so the struct has no
+/// tail padding today; a new pointer/u64 field costs a full 8 bytes.
 struct CallFrame
 {
     const CompilationUnit * cu;        // 8
@@ -104,13 +104,6 @@ struct CallFrame
     /// progress); reset to 0 once all deep args are WHNF.  In-class
     /// default keeps every `CallFrame{...}` aggregate init at 0.
     uint32_t  deepForceCursor = 0;          // 4
-    /// Frame "definition environment" — ALWAYS NULL today.  The env-pointer-
-    /// capture experiment (NIX_V3_ENV_CAPTURE) that populated it was KILLed at
-    /// Gate C and deleted 2026-07-04 (branch 8eebbe25b preserves the build).
-    /// The field + its null-safe GC walks (scavenger/auditor gc.cc frame walks;
-    /// mark/evac via walkAllV3Roots → RootVisitor::visitEnv) are KEPT as
-    /// scaffolding for env-sharing/JIT futures that may install a frame Env.
-    Env *     defEnv = nullptr;             // 8
     /// LEVER-1 applied-import cache (NIX_V3_APPLIED_CACHE=1): 1-based index
     /// into VMState::pendingMemoKeys for a frame whose OP_RETURN value should
     /// be inserted into the applied cache under that key (the CFF_MEMO_RETURN
@@ -124,7 +117,7 @@ struct CallFrame
 /// WS-1 C5: pin the CallFrame size so its doc comment can't silently rot.
 /// If this fires, update BOTH this number and the comment above the struct
 /// (and check whether a new field should reuse one of the two 4-byte holes).
-static_assert(sizeof(CallFrame) == 72, "CallFrame size changed — update the doc comment above and this assert");
+static_assert(sizeof(CallFrame) == 56, "CallFrame size changed — update the doc comment above and this assert");
 
 /// Per-EvalState VM state.
 ///

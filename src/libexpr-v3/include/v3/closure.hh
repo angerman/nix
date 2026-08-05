@@ -12,7 +12,7 @@
 #include <type_traits>  // std::is_trivially_copyable_v (LambdaDescriptor POD assert)
 #include <vector>    // std::vector
 /// @file
-/// v3 Closure / Thunk / Env representation.
+/// v3 Closure / Thunk representation.
 ///
 /// Design (per doc/v3-design/v3-design.md §3.2-§3.5):
 ///
@@ -30,9 +30,6 @@
 ///     ...
 ///   }
 ///
-///   Env (only for `let` / `with` scopes — NOT for closure upvalues):
-///     parent + values[FAM]
-///
 /// Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>, Input Output Group.
 /// SPDX-License-Identifier: Apache-2.0
 
@@ -48,21 +45,6 @@ namespace nix::v3 {
 
 struct LambdaDescriptor;
 struct PrimOp;
-
-// ---------------------------------------------------------------------------
-// Env: only for `let`/`with` scopes, NOT for closure upvalues.
-// ---------------------------------------------------------------------------
-
-/// Env is allocated by OP_ENTER_LET / OP_PUSH_WITH / OP_INHERIT_FROM_INIT.
-/// Closures use Closure directly (FAM upvalues); thunks use Thunk directly.
-/// This dramatically reduces the env-allocation count vs v2.
-struct Env
-{
-    Env *  parent;        // outer scope, or nullptr at the base.
-    bool   isWithEnv;     // true if values[0] holds a with-attrset.
-    uint16_t nValues;     // size of FAM (slot count).
-    Value  values[];      // FAM
-};
 
 // ---------------------------------------------------------------------------
 // Closure

@@ -936,12 +936,11 @@ int main(int argc, char ** argv)
             nix::v3::dumpPrimOpStats(stderr);
             auto & a = nix::v3::allocStats();
             std::fprintf(stderr,
-                "v3 alloc stats: closures=%llu thunks=%llu lists=%llu attrsets=%llu envs=%llu arena=%llu MB\n",
+                "v3 alloc stats: closures=%llu thunks=%llu lists=%llu attrsets=%llu arena=%llu MB\n",
                 (unsigned long long)a.closuresAllocated,
                 (unsigned long long)a.thunksAllocated,
                 (unsigned long long)a.listsAllocated,
                 (unsigned long long)a.attrsetsAllocated,
-                (unsigned long long)a.envsAllocated,
                 (unsigned long long)(nix::v3::threadArena().bytesAllocated() >> 20));
             // IR Phase E (2026-05-18): selector-lambda fast-path
             // counter.  Confirms the emit-time peephole + runtime

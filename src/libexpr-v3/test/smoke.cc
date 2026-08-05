@@ -4347,10 +4347,6 @@ static int testBruteScanScalarClassifier()
     check("Closure@8 capWiths(ptr)",   bruteScanSlotIsScalar(ct(CellType::Closure), 8),  false);
     check("Closure@16 nUpvalues/_pad", bruteScanSlotIsScalar(ct(CellType::Closure), 16), true);
     check("Closure@24 upvalue0",       bruteScanSlotIsScalar(ct(CellType::Closure), 24), false);
-    // Env: parent@0 PTR, {isWithEnv,nValues}@8 SCALAR, values@16 Values.
-    check("Env@0 parent(ptr)",         bruteScanSlotIsScalar(ct(CellType::Env), 0),  false);
-    check("Env@8 isWithEnv/nValues",   bruteScanSlotIsScalar(ct(CellType::Env), 8),  true);
-    check("Env@16 values0",            bruteScanSlotIsScalar(ct(CellType::Env), 16), false);
     // Thunk/List: only the [0,8) header word is scalar; rest is pointer-capable.
     check("Thunk@0 state/flags/forces",bruteScanSlotIsScalar(ct(CellType::Thunk), 0),  true);
     check("Thunk@16 non-header",       bruteScanSlotIsScalar(ct(CellType::Thunk), 16), false);
