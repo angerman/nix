@@ -37,4 +37,4 @@ run() { # $1=label $2=expr $3=opts $4=v3extra
 }
 
 run firefox '(import <nixpkgs> { config.allowUnfree = true; }).firefox.drvPath' '' ''
-run M5 "(builtins.getFlake \"path:$CN\").packages.aarch64-darwin.cardano-node.name" '--no-eval-cache --option allow-import-from-derivation true' 'NIX_V3_NO_NATIVE_CALL_FLAKE=1'
+run M5 "(builtins.getFlake \"path:$CN\").packages.aarch64-darwin.cardano-node.name" '--no-eval-cache --option allow-import-from-derivation true' ''

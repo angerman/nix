@@ -22,7 +22,7 @@ W="${1:-firefox}"
 DUR="${DUR:-8}"; [ "$W" = M5 ] && DUR="${DUR:-13}"
 
 V3="NIX_V3_DIRECT_EVAL=1 NIX_V3_NO_DISK_CACHE=1"
-V3F="$V3 NIX_V3_NO_NATIVE_CALL_FLAKE=1"
+V3F="$V3"
 case "$W" in
   firefox) ENV_W="$V3";  EXPR='(import <nixpkgs> { config.allowUnfree = true; }).firefox.drvPath' ;;
   M5)  ENV_W="$V3F"; EXPR="(builtins.getFlake \"path:$CN_PATH\").outputs.packages.aarch64-darwin.cardano-node.name" ;;

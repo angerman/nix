@@ -73,7 +73,6 @@ V3_LIMITS=(
     NIX_V3_DIRECT_EVAL=1
     NIX_V3_MAX_HEAP=16G
     NIX_V3_MAX_WALL_TIME=180s
-    NIX_V3_NO_NATIVE_CALL_FLAKE=1
 )
 
 # ---------------------------------------------------------------------------
@@ -196,7 +195,6 @@ elif [[ "$MODE" == "full" ]]; then
         || echo "  (cache clear failed; cold measurement may be partial)" >&2
     run_one "cold"          ""                                || failures=$((failures+1))
     run_one "warm"          ""                                || failures=$((failures+1))
-    run_one "warm+drvhash"  "NIX_V3_DRV_HASH_CACHE_DISK=1"    || failures=$((failures+1))
 fi
 
 # ---------------------------------------------------------------------------

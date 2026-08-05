@@ -31,7 +31,7 @@ CN="${CN_PATH:-/Users/angerman/Projects/iohk/cardano-node}"
 HNEP="${HNE_PATH:-/Users/angerman/Projects/iohk/haskell-nix-example}"
 run firefox "NIX_V3_DIRECT_EVAL=1 NIX_V3_MAX_HEAP=4G" "" \
   '(import <nixpkgs> { config.allowUnfree = true; }).firefox.drvPath'
-run M5  "NIX_V3_DIRECT_EVAL=1 NIX_V3_NO_NATIVE_CALL_FLAKE=1 NIX_V3_MAX_HEAP=8G" "--no-eval-cache" \
+run M5  "NIX_V3_DIRECT_EVAL=1 NIX_V3_MAX_HEAP=8G" "--no-eval-cache" \
   "(builtins.getFlake \"path:$CN\").outputs.packages.aarch64-darwin.cardano-node.name"
-run HNE "NIX_V3_DIRECT_EVAL=1 NIX_V3_NO_NATIVE_CALL_FLAKE=1 NIX_V3_MAX_HEAP=6G" "--no-eval-cache" \
+run HNE "NIX_V3_DIRECT_EVAL=1 NIX_V3_MAX_HEAP=6G" "--no-eval-cache" \
   "(builtins.getFlake \"path:$HNEP\").packages.aarch64-darwin.hello.drvPath"

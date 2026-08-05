@@ -54,9 +54,8 @@ if [[ -x "$NIX" ]]; then HAS_NIX=1; fi
 source "$(dirname "${BASH_SOURCE[0]}")/nixpkgs-pin.sh"
 
 # Shared gates.  1 MB nursery so a 1000-iteration workload scavenges
-# many times — exposes any sticky tenured→nursery edge.
-export NIX_V3_NURSERY=1
-export NIX_V3_NURSERY_SCAVENGE=1
+# many times — exposes any sticky tenured→nursery edge.  (nursery + scavenge
+# are unconditional now — NIX_V3_NURSERY / _SCAVENGE retired to no-ops.)
 export NIX_V3_NURSERY_SIZE=1
 export V3_DBG_NURSERY_BRUTE=1
 export V3_DBG_NURSERY_AUDIT=1

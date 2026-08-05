@@ -77,13 +77,13 @@ esac
 export _NIX_TEST_NO_ENVIRONMENT_WARNINGS=1
 
 if [[ "$mode" == "brute" ]]; then
-  export NIX_V3_NURSERY=1
-  export NIX_V3_NURSERY_SCAVENGE=1
+  # nursery + scavenge are unconditional now (NIX_V3_NURSERY / _SCAVENGE retired
+  # to no-ops); the 1 MB nursery size is the live stress lever.
   export NIX_V3_NURSERY_SIZE=1                   # 1 MB nursery → frequent scavenge
   export V3_DBG_NURSERY_AUDIT=1
   export V3_DBG_NURSERY_BRUTE=1
   echo "all-v3-tests: --brute — gates exported:"
-  echo "  NIX_V3_NURSERY=1 NIX_V3_NURSERY_SCAVENGE=1 NIX_V3_NURSERY_SIZE=1"
+  echo "  NIX_V3_NURSERY_SIZE=1"
   echo "  V3_DBG_NURSERY_AUDIT=1 V3_DBG_NURSERY_BRUTE=1"
   echo
 fi

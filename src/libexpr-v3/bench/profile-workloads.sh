@@ -55,8 +55,8 @@ wl_opts() { case "$1" in
   firefox) echo "" ;;
   *) echo "--no-eval-cache --option allow-import-from-derivation true" ;;
 esac; }
-# v3 native-flake bridge off on the flake workloads (matches beat-tw-compare).
-wl_v3xtra() { case "$1" in firefox) echo "" ;; *) echo "NIX_V3_NO_NATIVE_CALL_FLAKE=1" ;; esac; }
+# NIX_V3_NO_NATIVE_CALL_FLAKE retired (v3-native callFlake is now the sole path); no extra env.
+wl_v3xtra() { case "$1" in firefox) echo "" ;; *) echo "" ;; esac; }
 
 med() { sort -n | awk '{a[NR]=$0} END{ if(!NR){print "NA";exit} m=int((NR+1)/2); if(NR%2)print a[m]; else printf "%.2f",(a[m]+a[m+1])/2 }'; }
 

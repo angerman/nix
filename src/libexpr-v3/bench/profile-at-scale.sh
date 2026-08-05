@@ -55,7 +55,7 @@ done
 DUR_firefox="${DUR_firefox:-8}"; DUR_M5="${DUR_M5:-13}"; DUR_HNE="${DUR_HNE:-9}"
 
 V3="NIX_V3_DIRECT_EVAL=1 NIX_V3_NO_DISK_CACHE=1"
-V3F="$V3 NIX_V3_NO_NATIVE_CALL_FLAKE=1"   # flake workloads
+V3F="$V3"   # flake workloads (NIX_V3_NO_NATIVE_CALL_FLAKE retired — v3-native callFlake is now the sole path)
 
 # workload -> (env, expr).  Match pin-seven-rows.sh; cache-OFF exposes the full
 # parse+lower+eval pipeline (the disk cache amortizes parse/lower in real evals).

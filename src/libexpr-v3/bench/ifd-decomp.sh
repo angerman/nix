@@ -58,7 +58,7 @@ GITHASH="${COMMIT:-$(cd "$ROOT" && git rev-parse --short HEAD 2>/dev/null || ech
 
 # workload -> env + expr (mirrors profile-at-scale.sh so numbers are comparable).
 V3="NIX_V3_DIRECT_EVAL=1"
-V3F="$V3 NIX_V3_NO_NATIVE_CALL_FLAKE=1"
+V3F="$V3"
 wl_env()  { case "$1" in firefox) echo "$V3";; M5|HNE) echo "$V3F";; esac; }
 wl_expr() {
   case "$1" in

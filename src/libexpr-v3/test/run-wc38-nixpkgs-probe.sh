@@ -29,7 +29,6 @@
 #
 # Diagnostic env vars (see project_wc38_with_blackhole.md memory):
 #   V3_DBG_FORCE_SITE=1  V3_DBG_WITH=1  V3_DBG_FORCE_TRACE=1
-#   NIX_V3_EARLY_PUBLISH=1  NIX_V3_NO_BINOP_FORCE=1  ...
 
 set -u
 
