@@ -1198,20 +1198,14 @@ MajorGcResult runMajorMarkSweep(VMState & vm) noexcept
                 if (syms) ::free(syms);
             }
         }
-        // S1.2 LIVE-vs-STALE MEASUREMENT (NIX_V3_NO_CONSERV_SCAN): skip the
-        // conservative C-stack scan to test whether the conservativeOnly pins are
-        // LIVE-but-precise-missed (→ removing the scan sweeps a live cell → UAF /
-        // divergence → handle migration is the path) or STALE/DEAD (→ byte-id
-        // survives → the scan over-pins dead cells, and the RSS win is removing
-        // the scan, NOT migrating handles).  MEASUREMENT ONLY: this is unsafe by
-        // construction (it deliberately drops a root source); the gate exists to
-        // answer the live-vs-stale question on a throwaway eval.  RETIREMENT: once
-        // the question is answered + recorded (CONSERV_PIN_PROVENANCE doc), delete
-        // this gate — it must NEVER ship enabled (a real eval would UAF if any pin
-        // is live).  Compare the output drvPath to TW to detect corruption.
-        static const bool s_noConservScan = std::getenv("NIX_V3_NO_CONSERV_SCAN") != nullptr;
-        if (!__builtin_expect(s_noConservScan, 0))
-            walkCStackConservative(visitor, arena, sp);
+        // Conservative C-stack scan — unconditional (the safe default).  The
+        // NIX_V3_NO_CONSERV_SCAN measurement toggle that could skip it was
+        // unsafe by construction ("must NEVER ship enabled" — dropping a root
+        // source UAFs if any conservativeOnly pin is live); it was retired once
+        // its live-vs-stale question was answered + recorded in
+        // lode/CONSERV_PIN_PROVENANCE_2026-06-25.md, and its consumer
+        // experiment (EVAC/MIDEVAL) was removed.
+        walkCStackConservative(visitor, arena, sp);
     }
 
     const size_t conservativeOnlyCells =
