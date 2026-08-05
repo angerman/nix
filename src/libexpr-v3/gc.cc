@@ -102,42 +102,18 @@ ScavengeBuffers & threadScavengeBuffers() noexcept
 /// Per-scavenge state — references into the thread-local
 /// `ScavengeBuffers` above so we don't allocate fresh containers
 /// on every call.  Lifetime is bounded by `scavengeNursery`.
-// Phase D Step 7 gate — process-wide.  When ACTIVE, scavenger's
-// fwd*() helpers SKIP queueing originally-tenured pointers for the
-// transitive walk.  Newly-forwarded copies (nursery → tenured) still
-// get queued so their fields' nursery pointers can be located and
-// forwarded.
+// Scavenger tenured-skip: fwd*() helpers do NOT queue originally-tenured
+// pointers for the transitive walk.  Newly-forwarded copies (nursery →
+// tenured) are still queued so their fields' nursery pointers can be located
+// and forwarded.
 //
-// Correctness invariant: every tenured-to-nursery write MUST go
-// through a barrier helper (`v3/barrier.hh`) so the inter-gen edge
-// lands in `dirtyContainers`.  The scavenger walks the dirty list
-// AFTER natural roots; that catches any tenured container with a
-// nursery edge that the original Phase C transitive walk would have
-// found.
-//
-// 2026-05-21: promoted to DEFAULT-ON after `NIX_V3_PHASE_D=1` +
-// STRESS=1000 validation showed 15/15 PASS across synthetic +
-// nixpkgs workloads through firefox.name (see commit 780e419bf for
-// the milestone).  Opt out via `NIX_V3_NO_PHASE_D=1` if Phase C's
-// blanket walk is preferred for diagnostic comparison or in case a
-// regression appears.
-//
-// Note: this only matters when `NIX_V3_NURSERY=1` (without nursery
-// routing, scavenge never fires).  Production default
-// `NIX_V3_NURSERY=0` keeps Phase D inert.
-//
-// Cached once on first scavenge.  Cheap branch in fwd*() under
-// `__builtin_expect(gate, 1)` so ON mode is the predicted path.
-inline bool phaseDStep7Active() noexcept
-{
-    static const bool s_active = [] {
-        const char * v = std::getenv("NIX_V3_NO_PHASE_D");
-        // Default ON unless explicitly opted out via
-        // NIX_V3_NO_PHASE_D=1.
-        return v == nullptr || v[0] == '\0' || v[0] == '0';
-    }();
-    return s_active;
-}
+// Correctness invariant: every tenured-to-nursery write MUST go through a
+// barrier helper (`v3/barrier.hh`) so the inter-gen edge lands in
+// `dirtyContainers`.  The scavenger walks the dirty list AFTER natural roots;
+// that catches any tenured container with a nursery edge.  Phase-D barriers
+// are unconditional (barrier.hh phaseDActive() is constexpr true), so the
+// legacy Phase-C blanket walk selected by the retired `NIX_V3_NO_PHASE_D`
+// toggle was dead redundancy — the tenured-skip below is now unconditional.
 
 // PhD-6 (2026-06-14): a walked tenured object's [lo,hi) range + its CellType,
 // so the BRUTE scanner can TYPE the holder of a missed-root word (and compute
@@ -237,12 +213,9 @@ Closure * Scavenger::fwdClosure(Closure * c)
         bytesSurvived += bytes;
         return static_cast<Closure *>(dst);
     }
-    // Originally-tenured: under Phase D Step 7 gate, skip the
-    // transitive walk — the dirty-list mechanism (barriers in
-    // v3/barrier.hh) guarantees any nursery edge in this Closure
+    // Originally-tenured: skip the transitive walk — the dirty-list mechanism
+    // (barriers in v3/barrier.hh) guarantees any nursery edge in this Closure
     // is recorded in dirtyContainers and walked separately.
-    if (__builtin_expect(phaseDStep7Active(), 1)) return c;
-    if (walked.insert(c).second) graylist.push_back({c, GK_CLOSURE});
     return c;
 }
 
@@ -337,13 +310,10 @@ Thunk * Scavenger::fwdThunk(Thunk * t)
     case ThunkState::Native:
         break;
     }
-    // Phase D Step 7: skip queueing originally-tenured.  See
-    // fwdClosure for rationale.  Note: the leaf-tag fast paths above
-    // ALREADY skip queueing for trivially-no-pointer states; this
-    // gate generalises the skip to ALL tenured states once barrier
-    // coverage is validated.
-    if (__builtin_expect(phaseDStep7Active(), 1)) return t;
-    if (walked.insert(t).second) graylist.push_back({t, GK_THUNK});
+    // Skip queueing originally-tenured.  See fwdClosure for rationale.  The
+    // leaf-tag fast paths above ALREADY skip queueing for trivially-no-pointer
+    // states; this generalises the skip to ALL tenured states (barrier
+    // coverage validated — the dirty list catches every inter-gen edge).
     return t;
 }
 
@@ -363,9 +333,7 @@ ListVec * Scavenger::fwdList(ListVec * l)
         bytesSurvived += bytes;
         return static_cast<ListVec *>(dst);
     }
-    // Phase D Step 7: skip queueing originally-tenured.  See fwdClosure.
-    if (__builtin_expect(phaseDStep7Active(), 1)) return l;
-    if (walked.insert(l).second) graylist.push_back({l, GK_LIST});
+    // Skip queueing originally-tenured.  See fwdClosure.
     return l;
 }
 
@@ -377,8 +345,6 @@ Bindings * Scavenger::fwdBindings(Bindings * b)
     // moving Bindings would orphan any Tag::Slot / Thunk::cell
     // that points into entries[].
     if (n.contains(b)) std::abort();
-    if (__builtin_expect(phaseDStep7Active(), 1)) return b;
-    if (walked.insert(b).second) graylist.push_back({b, GK_BINDINGS});
     return b;
 }
 
@@ -398,10 +364,8 @@ ValuePair * Scavenger::fwdPair(ValuePair * p)
     if (isLeafTag(p->left.tag()) && isLeafTag(p->right.tag())
         && isLeafTag(p->evaluated.tag())
         && isLeafTag(p->third.tag())) return p;
-    // Phase D Step 7: same gate as the other fwd*().  Pair evaluated
-    // writes go through `pairSetEvaluated`; the dirty list catches.
-    if (__builtin_expect(phaseDStep7Active(), 1)) return p;
-    if (walked.insert(p).second) graylist.push_back({p, GK_PAIR});
+    // Skip queueing originally-tenured — same as the other fwd*().  Pair
+    // evaluated writes go through `pairSetEvaluated`; the dirty list catches.
     return p;
 }
 
