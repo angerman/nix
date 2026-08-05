@@ -91,8 +91,10 @@ run_one() {
   fi
 }
 
-# Modes: TW, v3 default.
-for spec in "tw::" "v3::NIX_USE_V3=1"; do
+# Modes: TW baseline, then v3-direct.  NIX_V3_REQUIRE=1 makes a silent
+# tree-walker fallback FAIL the test rather than masquerade as a v3 pass
+# (NIX_USE_V3 was the retired cutover hook; NIX_V3_DIRECT_EVAL is current).
+for spec in "tw::" "v3::NIX_V3_DIRECT_EVAL=1 NIX_V3_REQUIRE=1"; do
   IFS=:: read -r tag _ envspec <<< "$spec"
   IFS=' ' read -ra envarr <<< "$envspec"
   run_one "$tag/p1" "$TMP/p1.nix" "$EXP_P1" "${envarr[@]}"
@@ -100,23 +102,24 @@ for spec in "tw::" "v3::NIX_USE_V3=1"; do
   run_one "$tag/p3" "$TMP/p3.nix" "$EXP_P3" "${envarr[@]}"
 done
 
-# p4: nixpkgs hello.name.  This is the exact canary that surfaced
-#     the cycle.  Best-effort -- skip if nixpkgs not configured.
-#
-# Runs under STG mode (NIX_V3_STG=1).  The legacy-publish default
-# mode fails on this case at all-packages.nix:2276 (callPackage
-# missing) -- a documented v3 regression that STG mode (no
-# publish/recovery, single-VM) resolves.  See #498 STG-{1..10} and
-# project_498_always_thunkify_regression.md.
-hello_tw=$("$NIX_BIN" eval --raw nixpkgs#hello.name 2>/dev/null) || true
+# p4: nixpkgs hello.name -- the real-world canary that surfaced the
+#     cycle.  Uses --expr: v3-direct handles --expr / -f, but NOT flake
+#     installables (`nixpkgs#hello.name`), which silently fall back to the
+#     tree-walker.  NIX_V3_REQUIRE=1 forces v3 (no silent fallback).
+#     Best-effort -- skip if <nixpkgs> is not in NIX_PATH.  The
+#     callPackage-cycle failure this originally tripped is resolved in
+#     default v3; the old STG-mode workaround (NIX_V3_STG=1) was retired.
+hello_expr='(import <nixpkgs> {}).hello.name'
+hello_tw=$("$NIX_BIN" eval --raw --impure --expr "$hello_expr" 2>/dev/null) || true
 if [[ -n "$hello_tw" ]]; then
-  hello_v3=$(NIX_USE_V3=1 NIX_V3_STG=1 "$NIX_BIN" eval --raw nixpkgs#hello.name 2>/dev/null) \
+  hello_v3=$(NIX_V3_DIRECT_EVAL=1 NIX_V3_REQUIRE=1 NIX_V3_MAX_WALL_TIME=180s \
+    NIX_V3_MAX_HEAP=8G "$NIX_BIN" eval --raw --impure --expr "$hello_expr" 2>/dev/null) \
     || hello_v3="<error>"
   if [[ "$hello_v3" == "$hello_tw" ]]; then
     ok=$((ok + 1))
   else
     fail=$((fail + 1))
-    fail_names+=("v3/p4(nixpkgs#hello.name)  expected=$hello_tw  got=$hello_v3")
+    fail_names+=("v3/p4(hello.name)  expected=$hello_tw  got=$hello_v3")
   fi
 else
   skipped=$((skipped + 1))
