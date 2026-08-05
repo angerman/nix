@@ -74,12 +74,9 @@ for w in "${WL[@]}"; do
   echo; echo "#### $w ####"
   read tc tm tcs tms < <(measure ""                                              "$expr" "$opts")
   read dc dm dcs dms < <(measure "$V3 $v3f"                                       "$expr" "$opts")
-  read rc rm rcs rms < <(measure "$V3 $v3f NIX_V3_MIDEVAL_GC=1 NIX_V3_MIDEVAL_REUSE=1" "$expr" "$opts")
   printf "  %-16s CPU=%6ss  RSS=%6sMB\n" "TW (stock)" "$tc" "$tm"
   printf "  %-16s CPU=%6ss  RSS=%6sMB   (%.2f× CPU, %.2f× RSS vs TW)\n" "v3 default"  "$dc" "$dm" \
     "$(awk -v a=$dc -v b=$tc 'BEGIN{print a/b}')" "$(awk -v a=$dm -v b=$tm 'BEGIN{print a/b}')"
-  printf "  %-16s CPU=%6ss  RSS=%6sMB   (%.2f× CPU, %.2f× RSS vs TW)\n" "v3 mideval"  "$rc" "$rm" \
-    "$(awk -v a=$rc -v b=$tc 'BEGIN{print a/b}')" "$(awk -v a=$rm -v b=$tm 'BEGIN{print a/b}')"
-  printf "    spreads: TW cpu=%s rss=%s | v3 cpu=%s rss=%s | mideval cpu=%s rss=%s\n" "$tcs" "$tms" "$dcs" "$dms" "$rcs" "$rms"
+  printf "    spreads: TW cpu=%s rss=%s | v3 cpu=%s rss=%s\n" "$tcs" "$tms" "$dcs" "$dms"
 done
 rm -f /tmp/btc.$$

@@ -114,12 +114,6 @@ const LitInt * asLitInt(VarId v, const std::unordered_map<VarId, const Expr *> &
     return e ? std::get_if<LitInt>(e) : nullptr;
 }
 
-const LitFloat * asLitFloat(VarId v, const std::unordered_map<VarId, const Expr *> & defs)
-{
-    const Expr * e = arg(v, defs);
-    return e ? std::get_if<LitFloat>(e) : nullptr;
-}
-
 // Resolve `v` through same-block VarRefs AND through a trivial MkThunk — a
 // no-param thunk whose body block just returns a value — to the underlying
 // Expr in the thunk's body.  The lowerer wraps lazy primop args in thunks, so

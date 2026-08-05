@@ -340,7 +340,6 @@ static const bool s_mapAttrsMergeLazy = []{
     return std::getenv("NIX_V3_NO_MAPATTRS_MERGE_LAZY") == nullptr;
 }();
 static const bool s_chain = []{
-    if (std::getenv("NIX_V3_NO_CHAIN_BINDINGS")) return false;
     const char * e = std::getenv("NIX_V3_CHAIN_BINDINGS");
     if (e) return e[0] != '0';   // explicit force on/off (=0 → off)
     return true;                 // default ON

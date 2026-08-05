@@ -234,9 +234,9 @@ EOF
 assert_match "c5 alternate names" "ComposeExtensions" "$TMP/c5.nix"
 
 # ----------------------------------------------------------------------
-# d1 — DISPATCH (positive, opt-in via NIX_V3_INTRINSIC_DISPATCH=1).
-# When intrinsic dispatch is enabled, the simple fix case returns the
-# correct value AND the native dispatch counter bumps.
+# d1 — simple fix evaluates correctly through the v3 pipeline.
+# (Native intrinsic dispatch was retired 786acb235; recognition still
+# fires but the lambda evaluates via the regular bytecode path.)
 cat > "$TMP/d1.nix" <<'EOF'
 let
   fix = f: let x = f x; in x;
@@ -245,25 +245,14 @@ in (fix ext).b
 EOF
 NIX_BIN="${NIX_BIN:-$ROOT/build/src/nix/nix}"
 if [[ -x "$NIX_BIN" ]]; then
-  # #820 (2026-05-26): the dispatch counter is now printed only under
-  # V3_DBG_INTRINSIC=1 (was previously emitted under NIX_VM_STATS=1 in
-  # an older diagnostic format).  We set both env vars so we can both
-  # see the dispatch line ("v3 intrinsic Fix dispatch [#N]: ...") and
-  # the standard stats dump.
-  d1_out=$(NIX_V3_DIRECT_EVAL=1 NIX_V3_INTRINSIC_DISPATCH=1 NIX_VM_STATS=1 \
+  d1_out=$(NIX_V3_DIRECT_EVAL=1 NIX_VM_STATS=1 \
     V3_DBG_INTRINSIC=1 \
     "$NIX_BIN" eval --impure -f "$TMP/d1.nix" 2>&1)
   if echo "$d1_out" | grep -q '^11$'; then
     PASS=$((PASS + 1))
   else
     FAIL=$((FAIL + 1))
-    fail_names+=("d1 simple fix dispatch result: expected 11, got $(echo "$d1_out" | tail -3)")
-  fi
-  if echo "$d1_out" | grep -qE "v3 intrinsic Fix dispatch \[#[1-9]"; then
-    PASS=$((PASS + 1))
-  else
-    FAIL=$((FAIL + 1))
-    fail_names+=("d1 simple fix dispatch counter: expected calls>=1, got: $(echo "$d1_out" | grep -i intrinsic || echo none)")
+    fail_names+=("d1 simple fix result: expected 11, got $(echo "$d1_out" | tail -3)")
   fi
 fi
 
@@ -315,7 +304,7 @@ let
   ext = self: { a = 1; b = self.a + 10; };
 in (fixedPoints.fix ext).b
 EOF
-  d3a_out=$(NIX_V3_DIRECT_EVAL=1 NIX_V3_INTRINSIC_DISPATCH=1 NIX_V3_PARSE_PRECOMPILE=1 \
+  d3a_out=$(NIX_V3_DIRECT_EVAL=1 NIX_V3_PARSE_PRECOMPILE=1 \
     "$NIX_BIN" eval --impure -f "$TMP/d3a.nix" 2>&1)
   if echo "$d3a_out" | grep -q '^11$'; then
     PASS=$((PASS + 1))
@@ -336,7 +325,7 @@ EOF
   # the eager mid-construction force that previously surfaced as
   # "infinite recursion".  Regression-asserted as 11 so silent
   # reintroduction of the level>=1 bug is caught.
-  d3b_out=$(timeout 20 env NIX_V3_DIRECT_EVAL=1 NIX_V3_INTRINSIC_DISPATCH=1 \
+  d3b_out=$(timeout 20 env NIX_V3_DIRECT_EVAL=1 \
     NIX_V3_PARSE_PRECOMPILE=1 "$NIX_BIN" eval --impure -f "$TMP/d3b.nix" 2>&1)
   if echo "$d3b_out" | grep -q '^11$'; then
     PASS=$((PASS + 1))
@@ -349,7 +338,7 @@ EOF
   # superset of default behaviour since #530 closed the level>=1 gap).
   # Kept as a regression check that the wider heuristic doesn't itself
   # introduce a different shape failure.
-  d3b_optin_out=$(timeout 20 env NIX_V3_DIRECT_EVAL=1 NIX_V3_INTRINSIC_DISPATCH=1 \
+  d3b_optin_out=$(timeout 20 env NIX_V3_DIRECT_EVAL=1 \
     NIX_V3_PARSE_PRECOMPILE=1 NIX_V3_SELF_DOT_MAX_LEVEL=2 \
     "$NIX_BIN" eval --impure -f "$TMP/d3b.nix" 2>&1)
   if echo "$d3b_optin_out" | grep -q '^11$'; then
