@@ -220,7 +220,19 @@ namespace nix::v3::serialize {
 /// canonical seeding, remapped on the owned path, identity on borrow) rather
 /// than serialized inline as file/line/col.  Pre-22 blobs are incompatible.
 /// See lode/WS5_D2_INPLACE_AOT_DESIGN_2026-07-16.md "D1+D2b" + WS5_INTEGRATION.
-constexpr uint32_t kSchemaVersion = 22;
+///
+/// 23 (2026-08-05): retired the dead descriptor-level intrinsic-dispatch
+/// fields.  LambdaDescriptor's `intrinsicKind` (uint8 enum Fix..ComposeBody)
+/// + `intrinsicVar0/1/2` (int8 upvalue indices) became write-only when the
+/// native intrinsic-dispatch runtime was removed (786acb235): no reader
+/// consumes them — the OP_CALL/callClosure path that read
+/// `descriptor.intrinsicKind` is gone.  Removing them shrinks the flat
+/// LambdaDescriptor POD block by 4 bytes, so the serialized layout changes
+/// and pre-23 blobs are incompatible: they are cleanly rejected + recompiled
+/// (never misread against the new layout).  AST-side intrinsic RECOGNITION
+/// (`ir::Function::intrinsicKind` + the optimizer bail-out guards) is
+/// unaffected — it never rode the on-disk descriptor.
+constexpr uint32_t kSchemaVersion = 23;
 
 /// 8-byte magic prefix at the start of every serialized blob.
 /// Includes a discriminator so format mismatches are detected early.

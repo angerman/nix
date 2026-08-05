@@ -472,66 +472,16 @@ struct LambdaDescriptor
     bool isOrDefault = false;
     bool isInheritWrapper = false;
 
-    /// #495: native intrinsic kind.  When recognised at lower-time,
-    /// the lambda's body matches a canonical Nix-stdlib pattern (lib.fix,
-    /// lib.extends, lib.composeExtensions, ...) and OP_CALL dispatches
-    /// to a v3-native implementation that evaluates the entire fix-
-    /// point machinery in v3 -- no TW round-trips.  Eliminates the
-    /// captured-env / with-stack mismatch that today blocks lambda-skip
-    /// default-on for nixpkgs (project_493_step3d_with_stack memo).
-    ///
-    /// Detection is structural AST match in lower.cc lowerLambda;
-    /// matchers are narrow (one canonical shape per kind), so a
-    /// nixpkgs change to fix.nix that alters the shape silently
-    /// falls through to the non-intrinsic v3 dispatch.  No
-    /// correctness loss -- intrinsics are PURE optimization.
-    enum class Intrinsic : uint8_t {
-        None                  = 0,
-        Fix                   = 1,  ///< fix = f: let x = f x; in x
-        Extends               = 2,  ///< extends = overlay: f: (final: ...)
-        ComposeExtensions     = 3,  ///< composeExtensions = f: g: final: prev: ...
-        ComposeManyExtensions = 4,  ///< composeManyExtensions = lib.foldr ...
-        /// STG-13a (#509/#510): innermost lambda of an `extends` chain,
-        /// i.e. chain[2] = `final: let prev = f final; in prev // overlay
-        /// final prev`.  Recognised when chain[0] (`overlay:`) is matched
-        /// as Extends; lower.cc threads the marker via a deferred map so
-        /// chain[2]'s ir::Function gets this kind set when it is lowered
-        /// recursively.  Native dispatch in OP_CALL/callClosure executes
-        /// the body without going through bytecode -- the call path that
-        /// today bridges the recursive rattrs through TW and trips the
-        /// STG-12 BlackholeError when arg chases to a Black v3 thunk.
-        ExtendsBody           = 5,
-        /// STG-13a (#509/#510): innermost lambda of a
-        /// `composeExtensions` chain, i.e. chain[3] = `prev: <body>`
-        /// where the body computes `f final prev // g final prev'` (with
-        /// the intermediate `f final prev`/`prev // f final prev`
-        /// bindings).  Same recognition + deferred-marker scheme as
-        /// ExtendsBody.
-        ComposeBody           = 6,
-    };
-    Intrinsic intrinsicKind = Intrinsic::None;
-
-    /// STG-13b (#509/#511): for ExtendsBody / ComposeBody dispatch, the
-    /// upvalue indices of the captured `f` / `overlay` / `g` / `final`
-    /// vars (or -1 if unused).  Native dispatch reads these to load the
-    /// right closure->upvalues[i] without name-matching at runtime.
-    /// Populated by emit.cc after freeVars are finalised; ordered by the
-    /// natural roles of each intrinsic:
-    ///   ExtendsBody : intrinsicVar0 = overlay, intrinsicVar1 = f
-    ///   ComposeBody : intrinsicVar0 = f, intrinsicVar1 = g,
-    ///                 intrinsicVar2 = final
-    /// (final is the runtime arg in both cases; prev is local.)
-    int8_t intrinsicVar0 = -1;
-    int8_t intrinsicVar1 = -1;
-    int8_t intrinsicVar2 = -1;
-
-    // WS5-B2 (D2b, 2026-07-16): the `void * astLambda` field (the original
-    // `nix::ExprLambda *` for the retired v3ToTreeWalker formals bridge) was
-    // REMOVED.  It has no readers left (the TW bridge was retired in the
-    // TW_VALUE_ERADICATION work — the only remaining mention is a stale comment
-    // in primops.cc), and a per-process host pointer cannot live in a
-    // read-only, cross-process-shared descriptor block.  ir::Function still
-    // carries its own `astLambda`; emit simply no longer copies it here.
+    // 2026-08-05: the descriptor-level intrinsic-dispatch fields
+    // (`Intrinsic intrinsicKind` + `int8_t intrinsicVar0/1/2`) were
+    // REMOVED.  They fed the native OP_CALL/callClosure dispatch for
+    // recognised lib.fix/extends/compose bodies, which was retired in
+    // 786acb235; with the runtime reader gone they were write-only dead
+    // weight riding the on-disk descriptor block.  Their removal shrinks
+    // the flat POD block, so the CU/bytecode cache schema was bumped
+    // (22 -> 23) in lockstep to reject pre-23 blobs.  AST-side intrinsic
+    // RECOGNITION lives on in `ir::Function::intrinsicKind` (read only by
+    // the optimizer bail-out guards) and never rode this descriptor.
 
     // WS5-D1 (2026-07-16): the runtime-mutable owning-CU backpointer `cu` was
     // REMOVED from LambdaDescriptor (it was STAMPED at every closure/thunk
@@ -577,10 +527,6 @@ struct LambdaBuild
     bool isFormalWrapper = false;
     bool isOrDefault = false;
     bool isInheritWrapper = false;
-    LambdaDescriptor::Intrinsic intrinsicKind = LambdaDescriptor::Intrinsic::None;
-    int8_t intrinsicVar0 = -1;
-    int8_t intrinsicVar1 = -1;
-    int8_t intrinsicVar2 = -1;
 };
 
 /// A suspended thunk's owning CU.  WS5-D1: derived from its descriptor's address

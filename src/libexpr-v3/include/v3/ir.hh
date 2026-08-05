@@ -561,20 +561,13 @@ struct Function {
     /// matching tree-walker's TW_DBG_FORCE format for direct trace diff.
     uint32_t            posHandle = 0;
 
-    /// #493 / #484 follow-on: original `nix::ExprLambda *` this IR Function
-    /// was lowered from, or nullptr if synthesised internally (per-formal
-    /// default thunks).  Held as `void *` so ir.hh stays decoupled from
-    /// libnixexpr's AST headers.  Carried through to LambdaDescriptor at
-    /// emit time so v3ToTreeWalker can construct a proper TW Tag::tLambda
-    /// when bridging a formals closure back to TW (autoCallFunction needs
-    /// the original ExprLambda for formals introspection).
-    void *              astLambda = nullptr;
-
-    /// #495: native-intrinsic kind, mirrors LambdaDescriptor::Intrinsic
-    /// (enumerated as uint8_t here to keep ir.hh decoupled from
-    /// closure.hh's enum class).  Set by lower.cc's lowerLambda
-    /// structural-match pass; carried through to LambdaDescriptor at
-    /// emit time so OP_CALL can dispatch to the v3-native impl.
+    /// #495: native-intrinsic kind — an AST recognition tag set by the
+    /// lowerer's structural-match pass.  Read only by the optimizer
+    /// bail-out guards (`f.intrinsicKind != 0` in opt_beta_reduce /
+    /// opt_primop_fold / opt_app_spine_fold), which skip rewriting a
+    /// recognised stdlib fix/extends/compose body.  The descriptor-level
+    /// mirror + native OP_CALL dispatch were RETIRED (786acb235 removed the
+    /// runtime; the dead LambdaDescriptor fields + CU schema went with it).
     /// Values:
     ///   0 = None
     ///   1 = Fix

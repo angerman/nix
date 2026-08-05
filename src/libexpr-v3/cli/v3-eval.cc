@@ -948,11 +948,8 @@ int main(int argc, char ** argv)
             // here = no selectors recognised (silent regression);
             // healthy nixpkgs evals should see this in the millions.
             std::fprintf(stderr,
-                "v3 fastpath stats: selectorLambda=%llu intrinsicFix=%llu intrinsicExtends=%llu intrinsicCompose=%llu\n",
-                (unsigned long long)a.selectorLambdaCalls,
-                (unsigned long long)a.intrinsicFixCalls,
-                (unsigned long long)a.intrinsicExtendsCalls,
-                (unsigned long long)a.intrinsicComposeCalls);
+                "v3 fastpath stats: selectorLambda=%llu\n",
+                (unsigned long long)a.selectorLambdaCalls);
             // Phase 13: thunk-force counters.  ratio = forced/allocated.
             // A healthy lazy evaluator has ratio ≤ 1 (most thunks are
             // forced once or never).  ratio > 1 means we're allocating

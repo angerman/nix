@@ -682,22 +682,10 @@ struct AllocStats
     uint64_t fwdCapturesEmitted   = 0;   // capture-GETs resolving to an upvalue
     uint64_t totalCapturesEmitted = 0;   // all capture-GETs (local + upvalue)
 
-    /// #495: how many OP_CALL invocations dispatched to the v3-native
-    /// `lib.fix` intrinsic (instead of running its bytecode body).
-    /// Mirrors selectorLambdaCalls -- confirms that lower.cc's
-    /// recogniseIntrinsic is firing AND the runtime dispatch is
-    /// taking the fast path on real workloads.
-    uint64_t intrinsicFixCalls = 0;
-
-    /// STG-13c (#509/#512): native-dispatch counters for the inner
-    /// `extends` / `composeExtensions` lambdas.  Each call replaces
-    /// the bytecode body of `final: let prev = f final; in prev //
-    /// overlay final prev` (or the 4-arg compose body) with a v3-side
-    /// computation that calls f/overlay (or f/g) directly + merges the
-    /// resulting attrsets via mergeBindings.  Eliminates the OP_CALL
-    /// frames that today bridge to TW for the chain's leaf rattrs.
-    uint64_t intrinsicExtendsCalls = 0;
-    uint64_t intrinsicComposeCalls = 0;
+    // (2026-08-05) the intrinsicFix/Extends/ComposeCalls native-dispatch
+    // counters were removed with the descriptor-level intrinsic-dispatch
+    // machinery — the dispatch that bumped them is gone (786acb235), so they
+    // were permanently zero.
 
     /// #821 (2026-05-26) per-caller attribution for `mergeBindings`.
     /// On HNE `.hello.drvPath` the function alone accounts for 584 MB

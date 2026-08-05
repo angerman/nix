@@ -2398,62 +2398,17 @@ struct Emitter
         lb.name           = f.name;
         lb.contextualName = f.contextualName;
         lb.posHandle      = f.posHandle;
-        // #495: native-intrinsic kind (0=None, 1=Fix, 2=Extends, ...) -- when
-        // set, OP_CALL on a closure with this descriptor dispatches to a
-        // v3-native impl.  Carried through from ir::Function which lower.cc
-        // structurally-matched at lower-time.  (WS5-B2: the retired
-        // `astLambda` field is no longer copied — it has no readers.)
-        lb.intrinsicKind  = static_cast<LambdaDescriptor::Intrinsic>(f.intrinsicKind);
-        // STG-13b (#509/#511): upvalue indices for ExtendsBody / ComposeBody
-        // native dispatch -- populated below (depend on freeVars search).
-        lb.intrinsicVar0  = -1;
-        lb.intrinsicVar1  = -1;
-        lb.intrinsicVar2  = -1;
+        // (2026-08-05) the descriptor-level intrinsic-dispatch fields
+        // (intrinsicKind + intrinsicVar0/1/2) were retired — native OP_CALL
+        // dispatch was removed in 786acb235, leaving them write-only.  The
+        // AST-side `f.intrinsicKind` recognition tag lives on for the
+        // optimizer bail-out guards; it is simply no longer copied here.
         // P2.1 step-0 measure (2026-07-02, TEMPORARY): carry the formal-
         // wrapper tag from ir::Function into the descriptor.
         lb.isFormalWrapper = f.isFormalWrapper;
         // P2.3 step-0 measure (2026-07-02, TEMPORARY): same for the §4.3 classes.
         lb.isOrDefault = f.isOrDefault;
         lb.isInheritWrapper = f.isInheritWrapper;
-        // STG-13b (#509/#511): for ExtendsBody / ComposeBody dispatch,
-        // find the upvalue index of each captured VarId by searching
-        // freeVars.  Linear search is fine -- freeVars typically has 2
-        // (Extends) or 3 (Compose) entries for these intrinsics.
-        if (f.intrinsicKind == 5 /*ExtendsBody*/
-            || f.intrinsicKind == 6 /*ComposeBody*/) {
-            auto findIdx = [&](ir::VarId v) -> int8_t {
-                if (v == ir::kInvalid) return -1;
-                for (size_t i = 0; i < f.freeVars.size(); ++i)
-                    if (f.freeVars[i] == v) return static_cast<int8_t>(i);
-                return -1;
-            };
-            auto & desc = lb;
-            desc.intrinsicVar0 = findIdx(f.intrinsicVar0);
-            desc.intrinsicVar1 = findIdx(f.intrinsicVar1);
-            desc.intrinsicVar2 = findIdx(f.intrinsicVar2);
-            // If any required var didn't make it into freeVars (could
-            // happen if optimization rewrites the body and elides the
-            // capture), demote to None so we fall back to bytecode.
-            // Native dispatch requires ALL named captures to be
-            // resolvable; partial info would mis-index.
-            bool ok = (f.intrinsicKind == 5)
-                ? (desc.intrinsicVar0 >= 0 && desc.intrinsicVar1 >= 0)
-                : (desc.intrinsicVar0 >= 0 && desc.intrinsicVar1 >= 0
-                   && desc.intrinsicVar2 >= 0);
-            if (!ok) {
-                static const bool s_dbg =
-                    std::getenv("V3_DBG_INTRINSIC") != nullptr;
-                if (s_dbg) std::fprintf(stderr,
-                    "v3 emit: demoting intrinsic kind=%u for fid=%u "
-                    "name='%s' (capture not in freeVars: var0=%d var1=%d var2=%d)\n",
-                    (unsigned)f.intrinsicKind, (unsigned)fid,
-                    f.name.c_str(),
-                    (int)desc.intrinsicVar0, (int)desc.intrinsicVar1,
-                    (int)desc.intrinsicVar2);
-                desc.intrinsicKind = LambdaDescriptor::Intrinsic::None;
-                desc.intrinsicVar0 = desc.intrinsicVar1 = desc.intrinsicVar2 = -1;
-            }
-        }
         if (f.hasFormals) {
             auto & desc = lb;
             desc.formals.reserve(f.formals.size());

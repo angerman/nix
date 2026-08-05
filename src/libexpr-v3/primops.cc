@@ -4398,29 +4398,9 @@ void primDerivation(EvalState & state, Value * args, Value & out);
 // definition (was here at line 3581 before forward-declare was
 // needed).
 
-/// #493: side-table mapping sentinel `nix::Env *` (held in
-/// `Value::lambda().env` of bridged TW lambdas) to the handle in
-/// `v3BridgeClosures()` of the underlying v3 Closure (with its
-/// captured upvalues).
-///
-/// When `v3ToTreeWalker` bridges a v3 Tag::Closure with hasFormals=true
-/// to TW, instead of refusing (the pre-#493 behaviour) it constructs a
-/// real `Tag::tLambda` whose `lambda.fun` points at the original
-/// `nix::ExprLambda *` (recovered from `LambdaDescriptor::astLambda`)
-/// and whose `lambda.env` is a freshly-allocated sentinel Env keyed
-/// here.  TW's `autoCallFunction` then introspects formals via
-/// `lambda.fun->getFormals()` and dispatches via `callFunction` -- the
-/// v3 call hook detects the sentinel env, recovers the v3 Closure, and
-/// runs the body in v3 with the original captured upvalues.
-///
-/// Pointer keys are stable: the sentinel Env is GC-allocated by
-/// `EvalMemory::allocEnv` and held alive by the closure value
-/// reference.  Boehm scans the key set indirectly via the `Closure*`
-/// in `v3BridgeClosures` (traceable_allocator there).  This map is
-/// non-traceable but values are size_t, not pointers, so no roots
-/// needed for the values; the keys (Env*) are held by the bridged TW
-/// lambda Value which is itself rooted by its consumer.
-// (v3FormalsLambdaBridges side-table retired — TW_VALUE_ERADICATION F4, 2026-06-02.)
+// (v3FormalsLambdaBridges side-table retired — TW_VALUE_ERADICATION F4, 2026-06-02.
+//  The #493 sentinel-Env → v3-Closure formals bridge it documented recovered the
+//  original ExprLambda from the descriptor's `astLambda` field, itself since removed.)
 
 // (treeWalkerToV3 forward-decls retired — TW_VALUE_ERADICATION F4.)
 

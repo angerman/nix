@@ -105,10 +105,6 @@ void LambdaTable::finalize()
         d.isFormalWrapper         = b.isFormalWrapper;
         d.isOrDefault             = b.isOrDefault;
         d.isInheritWrapper        = b.isInheritWrapper;
-        d.intrinsicKind           = b.intrinsicKind;
-        d.intrinsicVar0           = b.intrinsicVar0;
-        d.intrinsicVar1           = b.intrinsicVar1;
-        d.intrinsicVar2           = b.intrinsicVar2;
         // formals: copy into the block, store self-relative offset.
         d.formals.count = static_cast<uint32_t>(b.formals.size());
         if (!b.formals.empty()) {
@@ -165,10 +161,6 @@ void LambdaTable::loadBuildFromBlock(const uint8_t * p, std::size_t nbytes,
         b.isFormalWrapper         = d.isFormalWrapper;
         b.isOrDefault             = d.isOrDefault;
         b.isInheritWrapper        = d.isInheritWrapper;
-        b.intrinsicKind           = d.intrinsicKind;
-        b.intrinsicVar0           = d.intrinsicVar0;
-        b.intrinsicVar1           = d.intrinsicVar1;
-        b.intrinsicVar2           = d.intrinsicVar2;
         b.name           = d.name.str();
         b.contextualName = d.contextualName.str();
         b.formals.assign(d.formals.begin(), d.formals.end());
