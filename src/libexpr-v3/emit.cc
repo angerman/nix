@@ -2398,11 +2398,12 @@ struct Emitter
         lb.name           = f.name;
         lb.contextualName = f.contextualName;
         lb.posHandle      = f.posHandle;
-        // (2026-08-05) the descriptor-level intrinsic-dispatch fields
-        // (intrinsicKind + intrinsicVar0/1/2) were retired — native OP_CALL
-        // dispatch was removed in 786acb235, leaving them write-only.  The
-        // AST-side `f.intrinsicKind` recognition tag lives on for the
-        // optimizer bail-out guards; it is simply no longer copied here.
+        // (2026-08-05) the intrinsic-dispatch experiment was fully retired:
+        // the descriptor fields (intrinsicKind + intrinsicVar0/1/2) went with
+        // the native OP_CALL dispatch (786acb235), and the AST-side recognition
+        // tag (ir::Function::intrinsicKind + the optimizer guards) followed —
+        // recogniseIntrinsic was deleted with lower.cc in the parser Stage-2
+        // cutover, so nothing set it. Nothing intrinsic is copied here now.
         // P2.1 step-0 measure (2026-07-02, TEMPORARY): carry the formal-
         // wrapper tag from ir::Function into the descriptor.
         lb.isFormalWrapper = f.isFormalWrapper;

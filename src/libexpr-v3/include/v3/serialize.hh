@@ -229,9 +229,9 @@ namespace nix::v3::serialize {
 /// `descriptor.intrinsicKind` is gone.  Removing them shrinks the flat
 /// LambdaDescriptor POD block by 4 bytes, so the serialized layout changes
 /// and pre-23 blobs are incompatible: they are cleanly rejected + recompiled
-/// (never misread against the new layout).  AST-side intrinsic RECOGNITION
-/// (`ir::Function::intrinsicKind` + the optimizer bail-out guards) is
-/// unaffected — it never rode the on-disk descriptor.
+/// (never misread against the new layout).  (The AST-side `ir::Function`
+/// intrinsic tag was later retired too, with no schema impact — it never
+/// rode the on-disk descriptor.)
 constexpr uint32_t kSchemaVersion = 23;
 
 /// 8-byte magic prefix at the start of every serialized blob.

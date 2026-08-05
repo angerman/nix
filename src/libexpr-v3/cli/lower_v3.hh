@@ -487,8 +487,8 @@ struct LowererV3 {
     /// thunk `if param?X then param.X else default` in a synthetic
     /// rec scope, so defaults can reference sibling formals; the body
     /// resolves formals via the rec attrset).  Mirrors lower.cc::
-    /// lowerLambda.  No intrinsic recognition yet (Phase 4) — the
-    /// fast-path is an optimization, intrinsicKind=0 is correct.
+    /// lowerLambda.  (The native lowerer never did intrinsic recognition;
+    /// that experiment was fully retired 2026-08-05.)
     ir::VarId lowerLambda(const nix::v3::ast::Lambda * lam)
     {
         m.functions.emplace_back();
