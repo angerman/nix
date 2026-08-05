@@ -163,7 +163,6 @@ walkCurriedChain(const Module & m, FuncId startFid, size_t needDepth)
         // Safety preconditions — same as Phase A.
         if (f.argName == kInvalidSymbol) return std::nullopt;
         if (f.hasFormals)                return std::nullopt;
-        if (f.intrinsicKind != 0)        return std::nullopt;
         // eval/apply (#3): a collapsed uncurried multi-arity Function carries
         // its later params in extraParams (not as nested Lambda bodies).  The
         // curried-chain fold would substitute only paramVar and leave the
@@ -214,7 +213,6 @@ walkCollapsedChain(const Module & m, FuncId fid, size_t needDepth)
     const Function & f = m.functions[fid];
     if (f.argName == kInvalidSymbol)              return std::nullopt;
     if (f.hasFormals)                             return std::nullopt;
-    if (f.intrinsicKind != 0)                     return std::nullopt;
     if (f.extraParams.empty())                    return std::nullopt;  // not collapsed
     if (1 + f.extraParams.size() != needDepth)    return std::nullopt;  // arity ≠ spine
     if (f.entryBlock == kInvalidBlock
@@ -527,7 +525,7 @@ size_t deThunkForcedStrictArgs(Module & m)
                 if (fid == 0 || fid >= m.functions.size()) continue;
                 const Function & f = m.functions[fid];
                 if (f.paramVar != kInvalid || f.hasFormals
-                    || f.intrinsicKind != 0 || !f.extraParams.empty()) continue;
+                    || !f.extraParams.empty()) continue;
                 if (f.entryBlock == kInvalidBlock
                     || f.entryBlock >= m.blocks.size()) continue;
                 const Block & body = m.blocks[f.entryBlock];

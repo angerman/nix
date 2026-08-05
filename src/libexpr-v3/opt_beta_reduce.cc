@@ -36,7 +36,6 @@
 ///   2. The Lambda's funcIdx points at a Function F where:
 ///        - F.argName != kInvalidSymbol (has a single named arg)
 ///        - !F.hasFormals (not formals-style)
-///        - F.intrinsicKind == 0 (not Fix/Extends/Compose intrinsic)
 ///        - F.entryBlock != kInvalidBlock
 ///   3. F.entryBlock's bindings contain NO:
 ///        - Lambda    (nested closure — VarId scoping gets complex)
@@ -556,7 +555,6 @@ size_t betaReduce(Module & m)
             // dangling as free vars.  Skip — the runtime PAP handles arity-N
             // application.  (extraParams is empty unless NIX_V3_EVAL_APPLY.)
             if (!f.extraParams.empty())       { out.push_back(bd); continue; }
-            if (f.intrinsicKind != 0)         { out.push_back(bd); continue; }
             if (f.entryBlock == kInvalidBlock
                 || f.entryBlock >= m.blocks.size()) {
                 out.push_back(bd); continue;

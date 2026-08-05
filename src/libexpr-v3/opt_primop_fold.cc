@@ -135,7 +135,7 @@ const Expr * argThroughThunk(VarId v,
     if (!th) return e;
     if (th->funcIdx == 0 || th->funcIdx >= m.functions.size()) return e;
     const Function & f = m.functions[th->funcIdx];
-    if (f.argName != kInvalidSymbol || f.hasFormals || f.intrinsicKind != 0) return e;
+    if (f.argName != kInvalidSymbol || f.hasFormals) return e;
     if (f.entryBlock == kInvalidBlock || f.entryBlock >= m.blocks.size()) return e;
     const Block & body = m.blocks[f.entryBlock];
     const auto * term = std::get_if<TermReturn>(&body.terminal);

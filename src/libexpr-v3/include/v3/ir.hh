@@ -561,41 +561,7 @@ struct Function {
     /// matching tree-walker's TW_DBG_FORCE format for direct trace diff.
     uint32_t            posHandle = 0;
 
-    /// #495: native-intrinsic kind — an AST recognition tag set by the
-    /// lowerer's structural-match pass.  Read only by the optimizer
-    /// bail-out guards (`f.intrinsicKind != 0` in opt_beta_reduce /
-    /// opt_primop_fold / opt_app_spine_fold), which skip rewriting a
-    /// recognised stdlib fix/extends/compose body.  The descriptor-level
-    /// mirror + native OP_CALL dispatch were RETIRED (786acb235 removed the
-    /// runtime; the dead LambdaDescriptor fields + CU schema went with it).
-    /// Values:
-    ///   0 = None
-    ///   1 = Fix
-    ///   2 = Extends
-    ///   3 = ComposeExtensions
-    ///   4 = ComposeManyExtensions
-    ///   5 = ExtendsBody  (STG-13a #509/#510 — chain[2] of extends)
-    ///   6 = ComposeBody  (STG-13a #509/#510 — chain[3] of compose)
-    uint8_t             intrinsicKind = 0;
-
-    /// STG-13a (#509/#510): for ExtendsBody / ComposeBody, the captured
-    /// VarIds we'll read from the closure as upvalues at native dispatch
-    /// time.  Resolved by lowerLambda when it processes chain[2]/chain[3]
-    /// against the live scope stack: scopes still contain chain[0]/chain[1]
-    /// (and chain[2] for ComposeBody) with their byName/byDispl, so we
-    /// can find the VarId for `overlay`/`f`/`g`/`final` directly.
-    ///
-    /// At emit time, these VarIds are looked up in `freeVars` to compute
-    /// the upvalue indices stored on LambdaDescriptor.
-    ///
-    /// Roles per intrinsic:
-    ///   ExtendsBody : intrinsicVar0 = overlay, intrinsicVar1 = f
-    ///   ComposeBody : intrinsicVar0 = f, intrinsicVar1 = g,
-    ///                 intrinsicVar2 = final
-    /// kInvalid sentinel = unused.
-    VarId intrinsicVar0 = kInvalid;
-    VarId intrinsicVar1 = kInvalid;
-    VarId intrinsicVar2 = kInvalid;
+    // #495 intrinsic recognition (intrinsicKind + intrinsicVar0/1/2) retired 2026-08-05 — recogniseIntrinsic was deleted with lower.cc in 700b00e12; the tag was never set on the native path.
 
     /// #740 Stage 4 v3 (2026-05-21) formal-rec attrset VarId.
     ///

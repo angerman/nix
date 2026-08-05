@@ -479,9 +479,11 @@ struct LambdaDescriptor
     // 786acb235; with the runtime reader gone they were write-only dead
     // weight riding the on-disk descriptor block.  Their removal shrinks
     // the flat POD block, so the CU/bytecode cache schema was bumped
-    // (22 -> 23) in lockstep to reject pre-23 blobs.  AST-side intrinsic
-    // RECOGNITION lives on in `ir::Function::intrinsicKind` (read only by
-    // the optimizer bail-out guards) and never rode this descriptor.
+    // (22 -> 23) in lockstep to reject pre-23 blobs.  The AST-side
+    // intrinsic-RECOGNITION tag `ir::Function::intrinsicKind` was retired
+    // too (2026-08-05): recogniseIntrinsic went with lower.cc in 700b00e12,
+    // so the tag was never set on the native path and its optimizer
+    // bail-out guards were provably dead — all removed.
 
     // WS5-D1 (2026-07-16): the runtime-mutable owning-CU backpointer `cu` was
     // REMOVED from LambdaDescriptor (it was STAMPED at every closure/thunk
