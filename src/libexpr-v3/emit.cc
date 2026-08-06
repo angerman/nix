@@ -272,6 +272,7 @@ struct Emitter
     void flushBelowBranchCond()
     {
         if (ctx->pendingDefer.empty()) return;
+        checkSlotBudget(ctx->nextSlot);   // C1
         uint16_t scratchSlot = ctx->nextSlot++;
         if (scratchSlot + 1 > ctx->nLocals) ctx->nLocals = scratchSlot + 1;
         unit.code.push_back(encode(OP_SET_LOCAL, scratchSlot));
@@ -313,10 +314,43 @@ struct Emitter
 
     // Helpers ---------------------------------------------------------------
 
+    // C1: local slots are counted by a uint16 `nLocals` (the frame size) and
+    // referenced by GET/SET_LOCAL operands.  Assigning a 65536th slot wraps
+    // `nextSlot`/`nLocals` back to 0 — the runtime then allocates a 0-slot
+    // frame while the body still emits GET/SET_LOCAL up to 65535 → OOB.  The
+    // max representable frame is 0xFFFF slots (indices 0..0xFFFE); index
+    // 0xFFFF is the first that cannot be framed.  `next` is the index about to
+    // be assigned; throw a typed emit error instead of wrapping.  Machine-
+    // generated Nix (the realistic trigger) hits this cleanly at compile time.
+    static constexpr uint32_t kMaxLocalSlots = 0xFFFFu;
+    static void checkSlotBudget(uint32_t next)
+    {
+        if (next >= kMaxLocalSlots)
+            throw std::runtime_error(
+                "v3 emit: function exceeds 65535 local slots");
+    }
+
+    // C2: bytecode operands are 24 bits (encode()/patchJump mask to
+    // 0x00FFFFFF).  A CU with >16,777,215 instructions (jump target) or
+    // >16M literals/functions (const-pool / funcIdx index) would silently
+    // wrap the operand → wrong control transfer or constant load.  Validate
+    // an index/target fits before it is encoded and throw a typed emit error.
+    static constexpr uint32_t kMaxOperand24 = 0x00FFFFFFu;
+    static uint32_t checkOperand24(uint32_t v, const char * what)
+    {
+        if (v > kMaxOperand24)
+            throw std::runtime_error(
+                std::string("v3 emit: ") + what + " index "
+                + std::to_string(v)
+                + " exceeds 24-bit bytecode operand limit (16777215)");
+        return v;
+    }
+
     uint16_t getOrAssignSlot(ir::VarId v)
     {
         auto it = ctx->slot.find(v);
         if (it != ctx->slot.end()) return it->second;
+        checkSlotBudget(ctx->nextSlot);   // C1
         uint16_t s = ctx->nextSlot++;
         ctx->slot[v] = s;
         if (s + 1 > ctx->nLocals) ctx->nLocals = s + 1;
@@ -632,19 +666,25 @@ struct Emitter
     uint32_t addIntConst(int64_t n)
     {
         unit.intConstants.push_back(n);
-        return static_cast<uint32_t>(unit.intConstants.size() - 1);
+        // C2: the returned index becomes an OP_LIT_INT_BIG 24-bit operand.
+        return checkOperand24(
+            static_cast<uint32_t>(unit.intConstants.size() - 1), "int constant");
     }
     uint32_t addFloatConst(double d)
     {
         unit.floatConstants.push_back(d);
-        return static_cast<uint32_t>(unit.floatConstants.size() - 1);
+        // C2: the returned index becomes an OP_LIT_FLOAT 24-bit operand.
+        return checkOperand24(
+            static_cast<uint32_t>(unit.floatConstants.size() - 1), "float constant");
     }
     uint32_t addStringConst(std::string_view s)
     {
         // M-10 (CODEBASE_REVIEW_2026-06-11): intern against the process-wide
         // pool so literals recurring across CUs are stored once.
         unit.stringConstants.push_back(internStringConstant(s));
-        return static_cast<uint32_t>(unit.stringConstants.size() - 1);
+        // C2: the returned index becomes an OP_LIT_STR/OP_LIT_PATH 24-bit operand.
+        return checkOperand24(
+            static_cast<uint32_t>(unit.stringConstants.size() - 1), "string constant");
     }
 
     // Patch helpers ---------------------------------------------------------
@@ -661,6 +701,10 @@ struct Emitter
 
     void patchJump(uint32_t at, uint32_t target)
     {
+        // C2: the target is the destination instruction index; it must fit the
+        // 24-bit operand or the mask below silently wraps → wrong control
+        // transfer.  Every real jump target flows through here.
+        checkOperand24(target, "jump target");
         // Preserve the opcode byte; replace the 24-bit operand.
         Instruction prev = unit.code[at];
         unit.code[at] = (prev & 0xFF000000u) | (target & 0x00FFFFFFu);
@@ -2117,6 +2161,7 @@ struct Emitter
     {
         auto it = fc.slot.find(v);
         if (it != fc.slot.end()) return it->second;
+        checkSlotBudget(fc.nextSlot);   // C1
         uint16_t s = fc.nextSlot++;
         fc.slot[v] = s;
         if (s + 1 > fc.nLocals) fc.nLocals = s + 1;
@@ -2580,6 +2625,14 @@ struct Emitter
         // hello.drvPath's 269 import compiles (~270 MB of compile-
         // time alloc churn).  Keep the field for ABI compatibility
         // with any code that constructs a CU outside emit.
+
+        // C2: OP_MAKE_CLOSURE / OP_MAKE_THUNK encode a funcIdx into a 24-bit
+        // operand.  Every emitted funcIdx is an index into m.functions, so a
+        // single check on the largest id (functions.size()-1) covers all such
+        // emits without touching the hot per-site encode paths.
+        if (!m.functions.empty())
+            (void)checkOperand24(
+                static_cast<uint32_t>(m.functions.size() - 1), "function");
 
         // Emit inner functions first so their descriptors and code are
         // available before the top-level (which references them via
