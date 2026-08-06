@@ -73,12 +73,11 @@ void walkBuiltinsRoot(const std::function<void(Value &)> & visit);
 
 /// Returns the bytecode-closure replacement Value for `po`, or
 /// nullptr if no replacement has been installed.  Used by:
-///   - `vm.cc` OP_LIT_PRIMOP to push the replacement Closure
-///     instead of a Tag::PrimOp Value.
-///   - `lower.cc` `lowerCall` to skip the static PrimOpCall path
-///     for replaced primops (forcing the call through the generic
-///     App-chain → OP_CALL emit path, which then sees the
-///     replacement Closure via the OP_LIT_PRIMOP hook above).
+///   - `vm.cc` OP_LIT_PRIMOP (only) to push the replacement Closure
+///     instead of a Tag::PrimOp Value.  OP_CALL_PRIMOP does not.
+///   - `opt_primop_fuse.cc` to skip fusing a replaced primop into a
+///     static OP_CALL_PRIMOP, forcing the call through the generic
+///     App-chain → OP_LIT_PRIMOP redirect → OP_CALL path above.
 ///
 /// Cheap (one unordered_map lookup).  Safe to call before
 /// `installAllBytecodePrimops` — returns nullptr until populated.

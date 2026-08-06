@@ -3316,9 +3316,11 @@ void primZipAttrsWith(EvalState & state, Value * args, Value & out)
         // regression cause (memo collision with arg2) is fixed by the
         // separate `third` slot.
         //
-        // Note: this is the C fallback for zipAttrsWith.  The default
-        // is the bytecode-installed version per commit 1243c158b
-        // (Tier 2c); this site fires only with NIX_V3_NO_BC_ZIP_ATTRS_WITH=1.
+        // Note: this v3-native C zipAttrsWith is now the SOLE path — the
+        // bytecode-installed version (commit 1243c158b, Tier 2c) was retired
+        // in the 2026-08 bytecode list/data-primop cleanup (see
+        // bytecode_primops.cc).  There was never a NIX_V3_NO_BC_ZIP_ATTRS_WITH
+        // env gate; that name only ever existed in this comment.
         ValuePair * pp = Alloc::allocPair();
         pp->left   = fn;
         pp->right  = nameV;

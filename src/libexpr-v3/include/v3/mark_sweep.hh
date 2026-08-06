@@ -28,11 +28,17 @@
 ///     (cell-granularity vs line-granularity).
 ///   * Implementation budget 1.5-2 KLoC, 2-3 weeks.
 ///
-/// ## Cost when not invoked
+/// ## When invoked
 ///
-/// The trigger in vm.cc dispatch-loop is gated `NIX_V3_MAJOR_GC=1`
-/// (default OFF; production unaffected).  When gate is OFF this
-/// function is never called and the implementation pays nothing.
+/// `runMajorMarkSweep` is reached from the vm.cc dispatch-loop major-GC
+/// safepoint, which fires for EITHER (a) the opt-in `NIX_V3_MAJOR_GC=1`
+/// gate OR (b) the default-on generational-major path (`g_genMajorEnabled`,
+/// a hard constant, active whenever a nursery exists — i.e. always).  In
+/// both cases the safepoint runs only at `exitDepth == 0` once the arena
+/// passes the dynamic threshold, and the precise mark itself is skipped
+/// unless `Arena::cellMetaEnabled()` (RC-2 2026-08-04: no cell metadata ⇒
+/// nothing to reclaim ⇒ inert).  The flat mark-sweep keeps cells IN PLACE
+/// (non-moving; no 2x peak).
 ///
 /// Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>,
 ///   Input Output Group.

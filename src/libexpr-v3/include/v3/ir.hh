@@ -597,10 +597,12 @@ struct Function {
     /// the body does NOT force formal #i — the formal MUST stay
     /// lazy at the call site (thunkify-for-arg as today).
     ///
-    /// This is INFORMATION ONLY for v2 — the call-site emitter does
-    /// not yet consume the signature.  Future v3 wiring through
-    /// OP_CALL_STRICT (or equivalent) will skip MkThunk on strict
-    /// positions when the callee is statically known.
+    /// CONSUMED by `opt_strict_call_unthunk.cc` (the strict-call-unthunk
+    /// pass, which runs after `computeFunctionStrictness`): at a call site
+    /// whose callee is statically known, it drops the MkThunk on strict
+    /// argument positions (`callee.strictArgs[i] == true`) and pushes the
+    /// pre-forced value directly.  (Originally "information only"; the pass
+    /// wired it up in #742/#745.)
     ///
     /// The vector is sized once by `computeFunctionStrictness`;
     /// empty if the pass hasn't run yet.

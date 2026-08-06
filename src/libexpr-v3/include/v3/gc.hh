@@ -1,22 +1,23 @@
 // Cheney scavenge for the v3 nursery.  Background and design:
 // `lode/CHENEY_NURSERY_DESIGN.md`.
 //
-// Phase C entry point: walk live VM roots, copy live nursery objects
-// (Thunk / Closure / ListVec) to the tenured arena via a side-table
-// forwarding map, rewrite all encountered references, then reset the
-// nursery's bump pointer so the buffer can be reused.
+// Scavenge (SHIPPED, default-on): walk live VM roots, copy live nursery
+// objects (Thunk / Closure / ListVec) to the tenured arena via a
+// side-table forwarding map, rewrite all encountered references, then
+// reset the nursery's bump pointer so the buffer can be reused.
 //
-// Bindings are NOT in the nursery in Phase C: their entries[] hold
-// Tag::Slot targets and `Thunk::cell` write-back pointers that must
-// remain pointer-stable.  Phase D will revisit if Bindings turn out
-// to dominate nursery pressure.
+// Bindings are NOT allocated in the nursery (they stay tenured): their
+// entries[] hold Tag::Slot targets and `Thunk::cell` write-back pointers
+// that must remain pointer-stable.
 //
-// Cells (`Value *` allocated via `Alloc::allocValue`) are tenured.  In
-// Phase C v1 we DO NOT maintain a cell registry; instead we walk
-// every tenured Bindings / ValuePair / Closure / Thunk / ListVec we
-// reach from live roots with a visited-set, so any tenured-to-
-// nursery reference is found through the live graph.  Phase D will
-// switch to a remembered-set / cell-registry to bound walk cost.
+// Cells (`Value *` allocated via `Alloc::allocValue`) are tenured.  The
+// Phase-D remembered-set is now in place (default-on): rather than walk
+// every tenured container from live roots, the write barriers record
+// inter-gen edges in the dirty list (`dirtyContainers`) and standalone
+// Value cells in the standalone-cell registry (`standaloneCellRoots()`),
+// and the scavenge walks those after the natural roots.  (Phase C v1's
+// full visited-set walk of every tenured Bindings / ValuePair / Closure /
+// Thunk / ListVec has been retired.)
 //
 // Trigger: `Nursery::maybeScavenge(vm)` is called between opcodes in
 // the dispatch loop (when the nursery is past a fill threshold).

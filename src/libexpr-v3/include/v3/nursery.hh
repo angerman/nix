@@ -2,9 +2,13 @@
 // thunk/closure/bindings/list allocations.  Background and design:
 // `lode/CHENEY_NURSERY_DESIGN.md`.
 //
-// Phase A (this file's initial form): bump-pointer allocator with
-// fall-back-to-tenured-on-overflow.  No scavenge yet.  Gated by
-// `NIX_V3_NURSERY=1`; default OFF.
+// SHIPPED + DEFAULT-ON (flip e863f127d; opt-out retired 3c17abb08).  The
+// bump-pointer young generation, the scavenge pass (copy live survivors to
+// the tenured arena, reset the bump pointer), and gen-major collection are
+// all unconditional now — `NIX_V3_NURSERY` / `_SCAVENGE` / `GEN_MAJOR` are
+// NO-OPS.  (An earlier form was a Phase-A instrumentation-only allocator
+// gated `NIX_V3_NURSERY=1`, default OFF, with no scavenge — that gate is
+// gone.)
 //
 // Per-thread (`thread_local`) instance, mirroring `threadArena()`.
 //
@@ -42,10 +46,11 @@ struct VMState;
 /// allocation request.  Default size 32 MB; tunable via
 /// `NIX_V3_NURSERY_SIZE` (megabytes, integer).
 ///
-/// Allocation: bumps `next`; on overflow, Phase A falls back to
-/// the tenured arena (so the existing alloc semantics are
-/// preserved).  Phase C will add a scavenge pass that copies live
-/// nursery objects to the tenured arena and resets `next`.
+/// Allocation: bumps `next`; on overflow, falls back to the tenured
+/// arena (so the existing alloc semantics are preserved).  The scavenge
+/// pass (`maybeScavenge` / `forceScavenge`, impl in gc.cc) copies live
+/// nursery objects to the tenured arena and resets `next`; it is
+/// unconditional (default-on).
 ///
 /// Nursery memory is malloc'd AND registered with Boehm via
 /// `GC_add_roots` at `initLazy` time.  Earlier design assumed

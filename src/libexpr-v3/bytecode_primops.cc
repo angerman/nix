@@ -84,13 +84,14 @@ std::set<std::string> & installedNames()
 /// Side-table: maps a v3 PrimOp pointer to its bytecode-Closure
 /// replacement Value.  Populated by `installBytecodePrimop`.
 /// Read by:
-///   - `vm.cc` OP_LIT_PRIMOP to push the replacement instead of a
-///     Tag::PrimOp Value (so `let f = builtins.foldl'; in f a b c`
-///     and similar dynamic dispatch see the closure).
-///   - `lower.cc` `lowerCall` to skip the static PrimOpCall path
-///     for replaced primops (so saturated `builtins.foldl' a b c`
-///     calls also see the closure via the App-chain → OP_CALL
-///     emit path).
+///   - `vm.cc` OP_LIT_PRIMOP (only) to push the replacement instead of
+///     a Tag::PrimOp Value (so `let f = builtins.foldl'; in f a b c`
+///     and similar dynamic dispatch see the closure).  OP_CALL_PRIMOP
+///     does NOT consult it.
+///   - `opt_primop_fuse.cc` to SKIP fusing a replaced primop into a
+///     saturated PrimOpCall (→ OP_CALL_PRIMOP), so `builtins.foldl' a b c`
+///     routes through the App-chain → OP_LIT_PRIMOP redirect → OP_CALL
+///     instead of the static fast path.
 std::unordered_map<const PrimOp *, Value> & primopReplacementMap()
 {
     static std::unordered_map<const PrimOp *, Value> m;
@@ -104,8 +105,8 @@ std::unordered_map<const PrimOp *, Value> & primopReplacementMap()
 // (the bytecode-primop install path compiles a Nix source via
 // `runRootExpr` and the resulting closure may be allocated through
 // the nursery).  Without this walk, the map holds a stale closure
-// pointer after scavenge → next OP_LIT_PRIMOP / OP_CALL_PRIMOP
-// hands the dispatch a Value that derefs into freed nursery memory.
+// pointer after scavenge → the next OP_LIT_PRIMOP hands the dispatch
+// a Value that derefs into freed nursery memory.
 //
 // Discovered 2026-05-21 while hunting the hello.drvPath scavenge
 // SIGSEGV.  The crash signature (`desc = nullptr` in forceValue
@@ -213,19 +214,20 @@ void installBytecodePrimop(
     // (vBuiltins patch) carry the bytecode replacement entirely.
 
     // Install path 2: register in v3's side-table keyed by v3 PrimOp
-    // pointer.  This is what makes v3's OP_LIT_PRIMOP / OP_CALL_PRIMOP
-    // dispatch see the replacement — v3 has its own builtins attrset
-    // (vm.cc:8298 getBuiltinsValue) built from the v3 PrimOp registry,
-    // bypassing TW's builtins entirely.  The v3 lookup in vm.cc and
-    // the v3 lowerCall skip-check in lower.cc both consult
-    // `lookupPrimopReplacement(po)`.
+    // pointer.  This is what makes v3's OP_LIT_PRIMOP dispatch see the
+    // replacement — v3 has its own builtins attrset (getBuiltinsValue in
+    // vm.cc) built from the v3 PrimOp registry, bypassing TW's builtins
+    // entirely.  OP_LIT_PRIMOP (vm.cc) consults `lookupPrimopReplacement(po)`
+    // and pushes the closure in place of the Tag::PrimOp; opt_primop_fuse.cc
+    // consults it too, to keep replaced primops OFF the saturated
+    // OP_CALL_PRIMOP fast path.  OP_CALL_PRIMOP itself does NOT consult it.
     const PrimOp * po = findPrimOp(primopName);
     if (!po) {
         // Should not happen: getBuiltin succeeded above, so the primop
         // is in TW's registry — but the v3 registry is independent.
         // Most primops are dual-registered (in both); if not, the
-        // OP_LIT_PRIMOP / OP_CALL_PRIMOP redirect won't fire and the
-        // installed closure is only visible to dynamic TW lookups.
+        // OP_LIT_PRIMOP redirect won't fire and the installed closure
+        // is only visible to dynamic TW lookups.
         if (dbgEnabled())
             std::fprintf(stderr,
                 "v3 bytecode-primop install: '%s' has no v3 PrimOp "
@@ -277,10 +279,9 @@ void installAllBytecodePrimops(nix::EvalState & state)
         // T0b status (2026-05-17): dispatch hook live.
         //   - vm.cc OP_LIT_PRIMOP checks lookupPrimopReplacement and
         //     pushes the closure Value if found.
-        //   - lower.cc lowerCall skips the static PrimOpCall emission
-        //     for replaced primops (forcing the call through the
-        //     generic App-chain → OP_CALL path that goes through the
-        //     OP_LIT_PRIMOP redirect above).
+        //   - opt_primop_fuse.cc skips fusing a replaced primop into a
+        //     static OP_CALL_PRIMOP, forcing the call through the generic
+        //     App-chain → OP_LIT_PRIMOP redirect → OP_CALL path above.
         //   - installBytecodePrimop also patches v3's static vBuiltins
         //     in place so dynamic lookups of `builtins.foo` see the
         //     replacement.
