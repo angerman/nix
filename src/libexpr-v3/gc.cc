@@ -277,43 +277,20 @@ Thunk * Scavenger::fwdThunk(Thunk * t)
         bytesSurvived += bytes;
         return static_cast<Thunk *>(dst);
     }
-    // Tenured Thunk fast paths — skip queuing entirely when the
-    // thunk has no v3-heap payload to walk.  Material on workloads
-    // that build many tenured thunks then evaluate them to leaf
-    // scalars (e.g. genList of integers force-iterated by foldl'):
-    // pre-fix, every such thunk was hashed into `walked` and
-    // queued + walked + dispatched-on-state, even though its only
-    // ref-bearing fields contained Tag::Int.  Hash insert + queue +
-    // drain dominated the per-scavenge cost.
-    //
-    // Bridge: bridgeSrc is a `nix::Value *` (TW heap), never v3
-    // nursery — no work for that field.  BUT a Bridge thunk MAY
-    // carry a `cell` (`STG-14b option (a)` cell-update protocol;
-    // see vm.cc Bridge handler comment) whose contents may hold a
-    // nursery payload.  #705 (2026-05-20): if the cell is set,
-    // queue the thunk so walkThunk walks the cell.
-    //
-    // Blackhole: state's payload is irrelevant (body mid-exec),
-    // but the cell is preserved across blackhole → evaluated
-    // (CFF_THUNK_RETURN propagates), so the same caveat applies.
-    //
-    // Evaluated with leaf tag: `evaluated` payload has no
-    // forwardable pointer.  Cell included in the gate.
-    switch (t->state) {
-    case ThunkState::Blackhole:
-        if (!t->cell) return t;  // truly nothing to walk
-        break;                   // fall through to queue if cell set
-    case ThunkState::Evaluated:
-        if (isLeafTag(t->evaluated.tag()) && !t->cell) return t;
-        break;
-    case ThunkState::Suspended:
-    case ThunkState::Native:
-        break;
-    }
-    // Skip queueing originally-tenured.  See fwdClosure for rationale.  The
-    // leaf-tag fast paths above ALREADY skip queueing for trivially-no-pointer
-    // states; this generalises the skip to ALL tenured states (barrier
-    // coverage validated — the dirty list catches every inter-gen edge).
+    // Originally-tenured: skip the transitive walk (mirrors fwdClosure /
+    // fwdList).  For a tenured thunk this returns `t` unconditionally.  The
+    // `switch (t->state)` that used to sit here was DEAD — every arm fell
+    // through to this same `return t` (the leaf-tag / no-cell early-outs
+    // returned `t`; every other arm just `break`ed to it) — so it has been
+    // removed.  Coverage of any nursery edge reachable through this thunk comes
+    // from the Phase-D barrier + dirty list (dirtyContainers, walked separately
+    // after the natural roots).  A tenured thunk's optional `cell` (STG-14b
+    // cell-update write-back, Blackhole/Evaluated) is NOT queued here either:
+    // the write-back goes through `cellWrite`, which registers the cell in the
+    // standalone-cell registry (`standaloneCellRoots()`) and dirties its
+    // container — so the cell is a scavenge root in its own right, not reached
+    // via this thunk.  (Bridge `bridgeSrc` is a TW `nix::Value *`, never a
+    // v3-nursery payload.)
     return t;
 }
 
