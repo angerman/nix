@@ -6573,9 +6573,13 @@ inline std::pair<int64_t, int64_t> importStat(const std::string & path)
 /// this fingerprint into the key namespaces the cache per gate-config.  In
 /// production (no gates set) the fingerprint is EMPTY, so existing warm caches
 /// are unchanged.  Keep this list in sync with the getenv() reads in emit.cc /
-/// opt_*.cc / cli/lower_v3.hh / ir.cc (test/lint-cache-coherence.sh enforces).
-/// A1 (2026-07-06): also folded into the TOP-LEVEL cache key (run.cc), so this
-/// must have external linkage — hence hoisted out of the anonymous namespace.
+/// opt_*.cc / cli/lower_v3.hh / ir.cc / run.cc (test/lint-cache-coherence.sh
+/// Rule 3 enforces).
+/// The imported-CU disk-cache key in `primImport` (below) is the sole consumer.
+/// The external linkage (and the `primop.hh` declaration) is a remnant of the
+/// A1 (2026-07-06) top-level cache whose comment here once claimed run.cc also
+/// read it — it does NOT: run.cc has no reference to this function.  The
+/// linkage is harmless and left in place.
 const std::string & codegenGateFingerprint()
 {
     static const std::string fp = []() {
@@ -6583,7 +6587,9 @@ const std::string & codegenGateFingerprint()
         static const char * const kGates[] = {
             "NIX_V3_DBG_OPT_STRICT", "NIX_V3_DBG_STRICTNESS",
             "NIX_V3_DBG_STRICT_CALL_UNTHUNK",
+            "NIX_V3_NO_BYTECODE_PRIMOPS",
             "NIX_V3_NO_OPT",
+            "NIX_V3_NO_OPTIMISE",
             "NIX_V3_NO_OPT_STRICT",
             "NIX_V3_OCCUR_DCE", "NIX_V3_OCCUR_DCE_VALIDATE",
             "NIX_V3_OPT_PHASE_LIMIT", "NIX_V3_RAW_FORMALS",

@@ -102,6 +102,8 @@ rule3_allowlist=(
   "NIX_V3_EMIT_BYTECODE"          # dump: disassemble CU to stderr/file
   "NIX_V3_EMIT_BYTECODE_OUT"      # dump: output-path for the above
   "NIX_V3_DBG_STRICTNESS_VERBOSE" # dump: per-Function strictArgs report
+  "NIX_V3_FREE_LIST_STATS"        # dump: end-of-eval free-list stats (run.cc; post-eval, codegen bit-identical)
+  "NIX_V3_STRINGS_ATTR"           # dump: end-of-eval allocChars attribution (run.cc; post-eval, codegen bit-identical)
 )
 
 # run_rule3 PRIMOPS CODEGEN_DIR -> prints violations; returns 0 clean,
@@ -127,7 +129,7 @@ run_rule3() {
   # Collect the codegen files (missing ones are simply skipped — the
   # fixture dir only has a subset).
   local files=() f
-  for f in "$cgdir/emit.cc" "$cgdir/ir.cc" "$cgdir"/opt_*.cc \
+  for f in "$cgdir/emit.cc" "$cgdir/ir.cc" "$cgdir/run.cc" "$cgdir"/opt_*.cc \
            "$cgdir/cli/lower_v3.hh" "$cgdir/lower_v3.hh"; do
     [[ -f "$f" ]] && files+=("$f")
   done
