@@ -3161,6 +3161,120 @@ static int testDeserializeRejectsCorruption()
     return 0;
 }
 
+/// B4 — a corrupt element COUNT in a cache blob must throw the typed
+/// SerializationError *before* the pre-allocation, NOT surface as a
+/// std::bad_alloc / std::length_error that a `catch(SerializationError)`
+/// caller (disk_cache::lookup) would miss.  We build a CU whose sole string
+/// constant is a distinctive sentinel, locate its bytes, and rewrite the
+/// preceding stringConstants count (== 1) to 0xFFFFFFFF.  Deserialise must
+/// reject it (count > remaining-blob-bytes / 4) rather than attempt a
+/// multi-GB reserve().
+static int testDeserializeRejectsMalformedStringCount()
+{
+    using namespace serialize;
+    const char * kSentinel = "V3_B4_SENTINEL_STRING_CONSTANT_XYZZY";
+
+    auto m = ir::makeModule();
+    auto entry = m.freshBlock();
+    funcOf(m, 0).entryBlock = entry;
+    auto v = addBinding(m, entry, ir::LitString{kSentinel});
+    setReturn(m, entry, v);
+    ir::computeFreeVars(m);
+    auto cu = compile(m);
+    std::string good = serializeCU(cu);
+
+    // Sanity: the good blob round-trips.
+    {
+        bool ok = false;
+        try { (void)deserializeCU(good); ok = true; }
+        catch (const std::exception & e) {
+            std::fprintf(stderr,
+                "testDeserializeRejectsMalformedStringCount: good blob threw: %s\n",
+                e.what());
+        }
+        if (!ok) return 1;
+    }
+
+    // The stringConstants section is [count:u32][len:u32][bytes...]; the
+    // sentinel is the sole entry, so the u32 at (sentinelOffset - 8) is the
+    // count.  Verify it reads as 1 before corrupting it.
+    size_t sp = good.find(kSentinel);
+    if (sp == std::string::npos || sp < 8) {
+        std::fprintf(stderr,
+            "testDeserializeRejectsMalformedStringCount: sentinel not located (%zu)\n",
+            sp);
+        return 1;
+    }
+    std::string bad = good;
+    size_t countPos = sp - 8;
+    uint32_t curCount = 0;
+    std::memcpy(&curCount, &bad[countPos], sizeof(curCount));
+    if (curCount != 1) {
+        std::fprintf(stderr,
+            "testDeserializeRejectsMalformedStringCount: expected count==1 at "
+            "offset %zu, got %u\n", countPos, curCount);
+        return 1;
+    }
+    uint32_t huge = 0xFFFFFFFFu;
+    std::memcpy(&bad[countPos], &huge, sizeof(huge));
+
+    bool threwTyped = false;
+    bool threwOther = false;
+    try { (void)deserializeCU(bad); }
+    catch (const SerializationError &) { threwTyped = true; }
+    catch (const std::exception &)     { threwOther = true; }
+    if (!threwTyped) {
+        std::fprintf(stderr,
+            "testDeserializeRejectsMalformedStringCount: corrupt count should "
+            "throw SerializationError (threwOther=%d)\n", (int)threwOther);
+        return 1;
+    }
+    std::fprintf(stderr,
+        "testDeserializeRejectsMalformedStringCount: OK (huge stringConstants "
+        "count rejected as SerializationError)\n");
+    return 0;
+}
+
+/// C1 — a function needing more than 65535 local slots must throw a typed
+/// emit error, not wrap the uint16 `nLocals` frame-size counter to 0 (which
+/// would allocate a 0-slot frame while the body indexes slots up to 65535 →
+/// OOB).  compile() runs NO optimiser passes, so the non-const Add bindings
+/// below all survive to the emitter's slot preassign pass.
+static int testEmitRejectsTooManyLocalSlots()
+{
+    auto m = ir::makeModule();
+    auto entry = m.freshBlock();
+    funcOf(m, 0).entryBlock = entry;
+    auto a = addBinding(m, entry, ir::LitInt{1});
+    auto b = addBinding(m, entry, ir::LitInt{2});
+    ir::VarId last = b;
+    // 70000 > 65535 distinct non-const bindings ⇒ 70000 distinct slots.
+    for (int i = 0; i < 70000; ++i)
+        last = addBinding(m, entry, ir::Add{a, b});
+    setReturn(m, entry, last);
+    ir::computeFreeVars(m);
+
+    bool threw = false;
+    std::string msg;
+    try { (void)compile(m); }
+    catch (const std::exception & e) { threw = true; msg = e.what(); }
+    if (!threw) {
+        std::fprintf(stderr,
+            "testEmitRejectsTooManyLocalSlots: expected emit error, none thrown\n");
+        return 1;
+    }
+    if (msg.find("65535 local slots") == std::string::npos) {
+        std::fprintf(stderr,
+            "testEmitRejectsTooManyLocalSlots: wrong error text: %s\n",
+            msg.c_str());
+        return 1;
+    }
+    std::fprintf(stderr,
+        "testEmitRejectsTooManyLocalSlots: OK (>65535 slots rejected: %s)\n",
+        msg.c_str());
+    return 0;
+}
+
 // ===========================================================================
 // #539 — IR text dumper + FileCheck-style helper.
 // ===========================================================================
@@ -4426,6 +4540,8 @@ int main()
     rc |= testSerializeBorrowRoundTrip();
     rc |= testDiskCacheRoundTrip();
     rc |= testDeserializeRejectsCorruption();
+    rc |= testDeserializeRejectsMalformedStringCount();   // B4
+    rc |= testEmitRejectsTooManyLocalSlots();             // C1
 
     // #539 — IR text dumper + FileCheck.
     rc |= testIrDumpBasic();
