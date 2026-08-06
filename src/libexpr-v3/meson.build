@@ -181,6 +181,10 @@ lib_sources = files(
   'ffi.cc',
   'print.cc',
   'run.cc',
+  # Per-eval DIAGNOSTIC helpers extracted from run.cc's runRootExprModule
+  # (PhaseTimer dump, DIAG-4 snapshot, NIX_VM_STATS + abort dumps).  All COLD /
+  # env-gated; mirrors the vm.cc → vm_debug.cc split.  See v3/run_internal.hh.
+  'run_diag.cc',
   # #698: v3-native callFlake — see lode/V3_NATIVE_CALL_FLAKE_DESIGN_2026-05-20.md
   'v3_call_flake.cc',
   # PERF_TRACE_TOOL_DESIGN_2026-05-20.md: in-process Boehm-heap sampler.
