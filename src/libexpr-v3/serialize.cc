@@ -140,11 +140,40 @@ void LambdaTable::loadBuildFromBlock(const uint8_t * p, std::size_t nbytes,
     // The wire bytes may be unaligned (SQLite blob) → copy into an aligned
     // buffer so each descriptor's self-relative FlatStr/FlatArray resolve.
     std::vector<uint8_t> tmp(p, p + nbytes);
+    // B1: the fixed-stride descriptor array must fit within the block before
+    // we index descs[i] for i<count (a corrupt (count, nbytes) pair — e.g.
+    // count=1000, nbytes=8 — would otherwise OOB-read the aligned buffer, and
+    // build_.resize(count) below would attempt a multi-GB allocation).  This
+    // is defence-in-depth alongside the same check at the deserializeImpl call
+    // site; loadBuildFromBlock is a standalone entry point.
+    if (nbytes < static_cast<std::size_t>(count) * sizeof(LambdaDescriptor))
+        throw serialize::SerializationError(
+            "v3 deserialize: lambda block too small for descriptor count");
     const auto * descs = reinterpret_cast<const LambdaDescriptor *>(tmp.data());
     build_.clear();
     build_.resize(count);
+    // B1: each descriptor's self-relative FlatStr (name/contextualName) and
+    // FlatArray (formals) views point WITHIN the block via a signed byte
+    // offset; a crafted rel/len could dereference outside `tmp`.  Validate each
+    // sub-region lies inside [0, nbytes) before it is read below.  A valid blob
+    // always passes: the emitter packs these regions after the descriptor array
+    // inside the same block.
+    auto subInBlock = [&](const void * field, int32_t rel, std::size_t bytes) {
+        if (bytes == 0) return true;   // empty FlatStr/FlatArray: rel unused
+        int64_t base  = reinterpret_cast<const uint8_t *>(field) - tmp.data();
+        int64_t start = base + rel;
+        return start >= 0
+            && static_cast<uint64_t>(start) + bytes <= static_cast<uint64_t>(nbytes);
+    };
     for (uint32_t i = 0; i < count; ++i) {
         const LambdaDescriptor & d = descs[i];   // self-relative views valid in tmp
+        if (!subInBlock(&d.name, d.name.rel, d.name.len)
+         || !subInBlock(&d.contextualName, d.contextualName.rel, d.contextualName.len)
+         || !subInBlock(&d.formals, d.formals.rel,
+                        static_cast<std::size_t>(d.formals.count)
+                            * sizeof(LambdaDescriptor::Formal)))
+            throw serialize::SerializationError(
+                "v3 deserialize: lambda descriptor self-relative view out of bounds");
         LambdaBuild & b = build_[i];
         b.codeOffset              = d.codeOffset;
         b.prologueOffset          = d.prologueOffset;
@@ -250,6 +279,12 @@ struct Writer {
 struct Reader {
     std::string_view buf;
     size_t pos = 0;
+    /// Bytes still unread.  Used by the corrupt-blob count guards: a
+    /// blob-supplied element count can never exceed the bytes left to
+    /// hold those elements, so an absurd count is rejected as a typed
+    /// SerializationError *before* the pre-allocation (rather than as a
+    /// std::bad_alloc a `catch(SerializationError)` caller would miss).
+    size_t remaining() const noexcept { return buf.size() - pos; }
     void readBytes(void * dst, size_t n) {
         if (pos + n > buf.size())
             throw SerializationError("v3 deserialize: truncated blob");
@@ -1038,6 +1073,14 @@ std::string serializeCU(const CompilationUnit & cu)
 //             seeding); otherwise it is materialised (copied) and remapped.
 //             The never-remapped POD sections (int/float, lambdaCodeOffsets)
 //             are borrowed whenever the mmap is aligned.
+// B2: sane upper bound on a serialized symbol/pos `maxId`.  A remap of
+// (maxId+1) uint32 entries at this cap is ~1 GB; a crafted blob claiming a
+// near-UINT32_MAX maxId would otherwise trigger a ~16 GB assign() DoS.  Real
+// global symbol/pos id spaces stay orders of magnitude below this (nixpkgs
+// interns ~1e5 symbols; the heaviest measured evals stay under ~1e7), so a
+// valid blob is never rejected.
+constexpr uint32_t kMaxRemapId = 0x0FFFFFFFu;  // 268,435,455
+
 static CompilationUnit deserializeImpl(std::string_view blob, bool allowBorrow)
 {
     Reader r{blob};
@@ -1120,6 +1163,12 @@ static CompilationUnit deserializeImpl(std::string_view blob, bool allowBorrow)
     // process-wide pool (disk format unchanged — still raw strings on disk).
     {
         uint32_t n = r.u32();
+        // B4: each stringConstant is at least a 4-byte length prefix on the
+        // wire, so `n` strings need >= 4n bytes remaining.  Reject an absurd
+        // count as a typed error before reserve() attempts a multi-GB alloc.
+        if (n > r.remaining() / 4)
+            throw SerializationError(
+                "v3 deserialize: stringConstants count exceeds remaining blob");
         cu.stringConstants.reserve(n);
         for (uint32_t i = 0; i < n; ++i) cu.stringConstants.push_back(internStringConstant(r.str()));
     }
@@ -1151,7 +1200,18 @@ static CompilationUnit deserializeImpl(std::string_view blob, bool allowBorrow)
     {
         uint32_t n = r.u32();
         uint32_t maxId = r.u32();
-        remap.assign(maxId + 1, 0u);
+        // B2: `maxId + 1` is a uint32 that WRAPS to 0 at maxId==0xFFFFFFFF,
+        // giving an empty remap whose `origId > maxId` guard can never fire →
+        // OOB `remap[origId]` write.  Widen to size_t BEFORE the +1 so the
+        // vector is correctly sized and the guard is sound, AND reject an
+        // absurd maxId so a crafted blob can't force a multi-GB assign() DoS.
+        // kMaxRemapId (256M ids ⇒ ≤1 GB remap) sits far above any real global
+        // symbol/pos id (nixpkgs interns ~1e5 symbols; the heaviest evals stay
+        // well under 1e7), so no valid blob is ever rejected.
+        if (maxId > kMaxRemapId)
+            throw SerializationError(
+                "v3 deserialize: symbolTable maxId absurdly large");
+        remap.assign(size_t(maxId) + 1, 0u);
         for (uint32_t i = 0; i < n; ++i) {
             uint32_t origId = r.u32();
             std::string_view name = r.strv();
@@ -1182,7 +1242,11 @@ static CompilationUnit deserializeImpl(std::string_view blob, bool allowBorrow)
     {
         uint32_t n = r.u32();
         uint32_t maxId = r.u32();
-        posRemap.assign(maxId + 1, 0u);
+        // B2: same overflow + DoS guard as the symbolTable maxId above.
+        if (maxId > kMaxRemapId)
+            throw SerializationError(
+                "v3 deserialize: posTable maxId absurdly large");
+        posRemap.assign(size_t(maxId) + 1, 0u);
         for (uint32_t i = 0; i < n; ++i) {
             uint32_t origId = r.u32();
             uint8_t hasPS = r.u8();
@@ -1217,6 +1281,16 @@ static CompilationUnit deserializeImpl(std::string_view blob, bool allowBorrow)
     uint32_t lamBlockLen = r.u32();
     r.pad8();  // block starts at an 8-aligned blob offset (mirrors the writer)
     const void * lamPtr = r.takePtr(lamBlockLen);
+    // B1: `lamCount` and `lamBlockLen` are read independently; only lamBlockLen
+    // was bounds-checked (takePtr, above).  The fixed-stride descriptor array
+    // [lamCount × sizeof(LambdaDescriptor)] must fit within the block before
+    // either path indexes descs[i] for i<lamCount (borrow path via end() =
+    // data()+count_, owned path in loadBuildFromBlock).  A header-valid blob
+    // with e.g. lamCount=1000, lamBlockLen=8 would otherwise OOB-read.  The
+    // product is computed in size_t (no uint32 overflow on 64-bit).
+    if (lamBlockLen < static_cast<size_t>(lamCount) * sizeof(LambdaDescriptor))
+        throw SerializationError(
+            "v3 deserialize: lambda block too small for lamCount descriptors");
     if (dbg) { breakdown().lambdasNs += nowNs() - t0; t0 = nowNs(); }
 
     // (lambdaCodeOffsets was read from the WS5-D2a POD block above.)
@@ -1226,6 +1300,10 @@ static CompilationUnit deserializeImpl(std::string_view blob, bool allowBorrow)
     // materialise a std::string per primop.
     {
         uint32_t n = r.u32();
+        // B4: each primop is at least a 4-byte name-length prefix on the wire.
+        if (n > r.remaining() / 4)
+            throw SerializationError(
+                "v3 deserialize: primops count exceeds remaining blob");
         cu.primops.reserve(n);
         for (uint32_t i = 0; i < n; ++i) {
             std::string_view name = r.strv();
@@ -1253,12 +1331,26 @@ static CompilationUnit deserializeImpl(std::string_view blob, bool allowBorrow)
     // Section: attrSelectCache size (zeroed entries on load).
     {
         uint32_t n = r.u32();
+        // B4: these caches carry NO per-entry wire bytes (entries are zeroed on
+        // load), so they can't be bounded by remaining blob bytes.  But every
+        // IC entry is referenced by an emitted instruction (an OP_ATTRS_SELECT
+        // plus its IC follow-up word), so the count can never exceed the code
+        // word count; a larger `n` is corruption → reject before a multi-GB
+        // resize().  (codeCount was itself bounds-checked against the blob via
+        // takePtr above.)
+        if (n > codeCount)
+            throw SerializationError(
+                "v3 deserialize: attrSelectCache count exceeds code size");
         cu.rt.attrSelectCache.resize(n);
     }
 
     // Section: recSlotCache size (#779 Schema 10; zeroed on load).
     {
         uint32_t n = r.u32();
+        // B4: same invariant — one IC entry per emitted instruction site.
+        if (n > codeCount)
+            throw SerializationError(
+                "v3 deserialize: recSlotCache count exceeds code size");
         cu.rt.recSlotCache.resize(n);
     }
 

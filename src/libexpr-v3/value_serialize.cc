@@ -124,6 +124,12 @@ public:
 
     bool atEnd() const { return data >= end; }
 
+    /// Bytes still unread.  B4: a blob-supplied element count can never
+    /// exceed the bytes left to hold those elements; reject an absurd
+    /// count as a typed SerializeError before the pre-allocation so a
+    /// corrupt blob can't force a multi-GB alloc / std::bad_alloc.
+    size_t remaining() const { return static_cast<size_t>(end - data); }
+
 private:
     const char * data;
     const char * end;
@@ -373,6 +379,10 @@ static Value deserializeString(Reader & r)
     v.mkString(buf);
     uint32_t ctxCount = r.u32();
     if (ctxCount > 0) {
+        // B4: each context entry is at least a 4-byte length prefix on the
+        // wire; reject an absurd count before reserve() attempts a huge alloc.
+        if (ctxCount > r.remaining() / 4)
+            throw SerializeError("context count exceeds remaining input");
         std::vector<std::string> entries;
         entries.reserve(ctxCount);
         for (uint32_t i = 0; i < ctxCount; ++i) {
@@ -400,6 +410,11 @@ static Value deserializePath(Reader & r)
 static Value deserializeList(Reader & r)
 {
     uint32_t n = r.u32();
+    // B4: each element is at least a 1-byte tag on the wire, so `n` elements
+    // need >= n bytes remaining.  Reject an absurd count before allocList()
+    // attempts a multi-GB allocation (the loop below reads the elements).
+    if (n > r.remaining())
+        throw SerializeError("list count exceeds remaining input");
     Value v;
     if (n == 0) {
         v = Value::vEmptyList;
@@ -417,6 +432,11 @@ static Value deserializeList(Reader & r)
 static Value deserializeAttrs(Reader & r)
 {
     uint32_t n = r.u32();
+    // B4: each attr entry is at least a 4-byte name-length prefix plus a
+    // 1-byte value tag (>= 5 bytes) on the wire.  Reject an absurd count
+    // before tmp.reserve(n) / allocBindings(n) attempt a huge allocation.
+    if (n > r.remaining() / 5)
+        throw SerializeError("attrs count exceeds remaining input");
     Value v;
     if (n == 0) {
         v = Value::vEmptyAttrs;
