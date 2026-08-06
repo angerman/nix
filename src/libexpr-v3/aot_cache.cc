@@ -241,7 +241,11 @@ bool tryInitLocked()
             if (loadU32(e + 32) != static_cast<uint32_t>(TBL_CU)) continue;
             uint64_t off = loadU64(e + 40);
             uint64_t len = loadU64(e + 48);
-            if (off + len > fileSize) continue;
+            // B3: `off` and `len` are two attacker-controllable u64 read from
+            // the file; `off + len` can WRAP past `fileSize`, yielding a wild
+            // in-bounds-looking string_view → SIGSEGV.  Check overflow-safe
+            // (never form `off + len`).  Best-effort seed loop: skip the entry.
+            if (len > fileSize || off > fileSize - len) continue;
             if (!serialize::readSparseTables(
                     std::string_view(reinterpret_cast<const char *>(base + off),
                                      static_cast<size_t>(len)),
@@ -368,7 +372,10 @@ lookup(const disk_cache::CacheKey & key, TableId table) noexcept
             const uint8_t * e2 = r.entries + mid * kEntrySize;
             uint64_t off = loadU64(e2 + 40);
             uint64_t len = loadU64(e2 + 48);
-            if (off + len > r.mapBytes) {
+            // B3: overflow-safe bound (never form `off + len`, which wraps for
+            // attacker-controlled u64s and would yield a wild string_view →
+            // SIGSEGV).  A corrupt entry is a lookup miss/error, not a crash.
+            if (len > r.mapBytes || off > r.mapBytes - len) {
                 ++st.errors;
                 return std::nullopt;
             }
