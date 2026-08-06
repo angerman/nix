@@ -434,7 +434,7 @@ public:
                 static const bool s_prov = std::getenv("NIX_VM_STATS") != nullptr;
                 if (__builtin_expect(s_prov, 0) && cellStart) {
                     auto ct = static_cast<uint8_t>(arenaSetForSlot_->cellTypeAt(cellStart));
-                    if (ct < 9) ++statsConservByType_[ct];
+                    if (ct < 8) ++statsConservByType_[ct];
                 }
                 if (cellStart) {
                     const char * cellEnd =
@@ -556,13 +556,13 @@ private:
     // success).  Since precise marking finishes BEFORE the conservative C-stack
     // scan runs (runMajorMarkSweep captures preciseMarkedCells first), every
     // tryMark success here is a cell the precise root graph did NOT reach — i.e.
-    // a genuine conservative-ONLY pin.  Indexed by CellType (0-8).  Read-only
+    // a genuine conservative-ONLY pin.  Indexed by CellType (0-7).  Read-only
     // diagnostic (reported under NIX_VM_STATS); zero hot-path cost beyond the
     // increment.  Tells us WHICH cell type dominates firefox's 12.5% pinned set
     // → which construction/eval/FFI paths to migrate to precise handles next
     // (guessing the targets from a static census kept missing — args[], list
     // primops both measured-unchanged).
-    size_t statsConservByType_[9] = {0,0,0,0,0,0,0,0,0};
+    size_t statsConservByType_[8] = {0,0,0,0,0,0,0,0};
     std::vector<void *> conservativeRoots_;
     Arena * arenaSetForSlot_ = nullptr;
     bool typedInteriorOwners_ = false;  // Lever 3: mark-only typed walk
@@ -863,11 +863,11 @@ struct SweepStats {
     size_t sparseLiveBytes = 0;  // live bytes in sparse blocks = copy cost
 
     // R2.1′ (2026-06-03): live-cell tally by CellType (index = CellType
-    // value 0..8).  Validates the per-cell type stamping AND shows how
+    // value 0..7).  Validates the per-cell type stamping AND shows how
     // much of the live set is now typed (movable by the metadata-aware
     // mover) vs None (unstamped → pinned).  None (index 0) counts
     // interior/huge/non-bump cells the mover can't directly type.
-    size_t cellTypeHist[9] = {0,0,0,0,0,0,0,0,0};
+    size_t cellTypeHist[8] = {0,0,0,0,0,0,0,0};
 
     // P1/P2 sizing (2026-07-06, REPRESENTATION_REWRITE Phase 0): DEAD-cell
     // tally by CellType, mirroring cellTypeHist but for the swept-dead branch.
@@ -875,8 +875,8 @@ struct SweepStats {
     // deadCellTypeHist[t].  Pins P1a's ceiling (8B * total-tenured Bindings =
     // the header-shrink peak-RSS bound) and sizes P2 (per-type reclaimable
     // dead bytes/count).  Measurement-only; reported under NIX_VM_STATS.
-    size_t deadCellTypeHist[9]  = {0,0,0,0,0,0,0,0,0};
-    size_t deadCellTypeBytes[9] = {0,0,0,0,0,0,0,0,0};
+    size_t deadCellTypeHist[8]  = {0,0,0,0,0,0,0,0};
+    size_t deadCellTypeBytes[8] = {0,0,0,0,0,0,0,0};
 
     // R2.4b: per regular-block (start, live-byte fraction).  The
     // evacuator filters this to the sparse candidate set.  Populated
@@ -961,7 +961,7 @@ static bool sweepOneBlock(
             const size_t gran = offset >> 4;
             const uint8_t ty =
                 static_cast<uint8_t>(nix::v3::cellTypeUnpack(cellTypeBytes, gran));
-            stats.cellTypeHist[ty < 9 ? ty : 0]++;
+            stats.cellTypeHist[ty < 8 ? ty : 0]++;
         } else {
             ++stats.deadCells;
             stats.deadBytes += cellSize;
@@ -971,7 +971,7 @@ static bool sweepOneBlock(
                 const size_t gran = offset >> 4;
                 const uint8_t ty = static_cast<uint8_t>(
                     nix::v3::cellTypeUnpack(cellTypeBytes, gran));
-                const size_t ti = ty < 9 ? ty : 0;
+                const size_t ti = ty < 8 ? ty : 0;
                 stats.deadCellTypeHist[ti]++;
                 stats.deadCellTypeBytes[ti] += cellSize;
             }
@@ -1455,19 +1455,19 @@ MajorGcResult runMajorMarkSweep(VMState & vm) noexcept
             const size_t * c = visitor.statsConservByType();
             std::fprintf(stderr,
                 "v3 conserv-provenance: None=%zu Value=%zu Closure=%zu Thunk=%zu "
-                "Bindings=%zu List=%zu Pair=%zu Env=%zu Chars=%zu\n",
-                c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7], c[8]);
+                "Bindings=%zu List=%zu Pair=%zu Chars=%zu\n",
+                c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]);
         }
         // R2.1′: live-cell tally by stamped CellType — validates the
         // per-cell type metadata + shows the typed (movable) fraction.
         {
             const size_t * h = sweep.cellTypeHist;
-            const size_t typed = h[1]+h[2]+h[3]+h[4]+h[5]+h[6]+h[7]+h[8];
+            const size_t typed = h[1]+h[2]+h[3]+h[4]+h[5]+h[6]+h[7];
             std::fprintf(stderr,
                 "v3 evac-celltypes: None=%zu Value=%zu Closure=%zu Thunk=%zu "
-                "Bindings=%zu List=%zu Pair=%zu Env=%zu Chars=%zu "
+                "Bindings=%zu List=%zu Pair=%zu Chars=%zu "
                 "(typed/movable=%.1f%%)\n",
-                h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], h[8],
+                h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7],
                 (typed + h[0]) > 0 ? 100.0 * double(typed)
                                      / double(typed + h[0]) : 0.0);
         }
@@ -1481,8 +1481,8 @@ MajorGcResult runMajorMarkSweep(VMState & vm) noexcept
             const size_t * db = sweep.deadCellTypeBytes;
             std::fprintf(stderr,
                 "v3 dead-celltypes: None=%zu Value=%zu Closure=%zu Thunk=%zu "
-                "Bindings=%zu List=%zu Pair=%zu Env=%zu Chars=%zu\n",
-                dh[0], dh[1], dh[2], dh[3], dh[4], dh[5], dh[6], dh[7], dh[8]);
+                "Bindings=%zu List=%zu Pair=%zu Chars=%zu\n",
+                dh[0], dh[1], dh[2], dh[3], dh[4], dh[5], dh[6], dh[7]);
             std::fprintf(stderr,
                 "v3 dead-celltype-MB: Closure=%.1f Thunk=%.1f Bindings=%.1f "
                 "List=%.1f Pair=%.1f (Bindings total-tenured=%zu -> "
