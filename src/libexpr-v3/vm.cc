@@ -7467,7 +7467,16 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 push(vm, lhs);
                 break;
             }
-            uint32_t n = lhs.asList()->size + rhs.asList()->size;
+            // C3: widen the sum to size_t so `size + size` cannot wrap a
+            // uint32 → under-allocation + heap overflow in the copy loops
+            // below.  The bounds check is a branch that is never taken for
+            // real lists (kept out of the hot copy path); a >4 G-element
+            // concatenation is rejected rather than silently truncated.
+            size_t n64 = static_cast<size_t>(lhs.asList()->size)
+                       + static_cast<size_t>(rhs.asList()->size);
+            if (__builtin_expect(n64 > UINT32_MAX, 0))
+                throw std::runtime_error("v3 OP_LIST_CONCAT: result list too large");
+            uint32_t n = static_cast<uint32_t>(n64);
             ListVec * out = Alloc::allocList(n);
             V3_STATS_INC(listsAllocated);
             uint32_t k = 0;
