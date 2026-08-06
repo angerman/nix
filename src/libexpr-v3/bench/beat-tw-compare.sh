@@ -70,10 +70,9 @@ if [ "${WARM:-0}" = 1 ]; then V3="NIX_V3_DIRECT_EVAL=1"; else V3="NIX_V3_DIRECT_
 for w in "${WL[@]}"; do
   expr="$(wl_expr "$w")"; opts="$(wl_opts "$w")"
   [ -z "$expr" ] && { echo "unknown workload $w"; continue; }
-  v3f=""; [ "$w" = M5 ] && v3f="NIX_V3_NO_NATIVE_CALL_FLAKE=1"
   echo; echo "#### $w ####"
   read tc tm tcs tms < <(measure ""                                              "$expr" "$opts")
-  read dc dm dcs dms < <(measure "$V3 $v3f"                                       "$expr" "$opts")
+  read dc dm dcs dms < <(measure "$V3"                                            "$expr" "$opts")
   printf "  %-16s CPU=%6ss  RSS=%6sMB\n" "TW (stock)" "$tc" "$tm"
   printf "  %-16s CPU=%6ss  RSS=%6sMB   (%.2f× CPU, %.2f× RSS vs TW)\n" "v3 default"  "$dc" "$dm" \
     "$(awk -v a=$dc -v b=$tc 'BEGIN{print a/b}')" "$(awk -v a=$dm -v b=$tm 'BEGIN{print a/b}')"

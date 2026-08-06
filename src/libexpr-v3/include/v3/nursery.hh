@@ -149,15 +149,6 @@ public:
         diedBytes += (preUsed > surv) ? (preUsed - surv) : 0;
     }
 
-    /// True iff `p` lies inside this nursery's young buffer (the
-    /// bump-allocator-managed region where fresh allocations go).
-    /// O(1) range check.
-    bool inYoung(const void * p) const noexcept
-    {
-        return p && static_cast<const char *>(p) >= base
-               && static_cast<const char *>(p) < end;
-    }
-
     /// True iff `p` lies inside the nursery's young buffer.  This is
     /// the API surface that Phase D barriers (in include/v3/barrier.hh)
     /// consult via `isNurseryPayload` to decide whether a write
@@ -293,33 +284,6 @@ public:
         }
         ++scavengeCount;
     }
-
-    /// Allocator helper for `gc.cc`: bump-pointer allocate `bytes`
-    /// from this nursery, ignoring the tenured fall-through path.
-    /// Used to implement to-space when (in a future phase) we move
-    /// from one half of the nursery to the other.  Currently
-    /// unused — scavenge always copies to tenured.
-    [[gnu::always_inline]] inline void * tryAllocLocal(size_t bytes) noexcept
-    {
-        if (!enabled || !base) return nullptr;
-        bytes = (bytes + 15) & ~size_t{15};
-        if (next + bytes > end) return nullptr;
-        void * p = next;
-        next += bytes;
-        return p;
-    }
-
-    /// Toggle from env var on first access.  Default: disabled
-    /// (Phase A is purely instrumentation; gates the routing
-    /// without correctness risk).
-    bool isEnabled() const noexcept { return enabled; }
-
-    /// Phase C: env-var-gated toggle for the actual scavenge.
-    /// `NIX_V3_NURSERY_SCAVENGE=1` (default OFF for safe rollout).
-    /// Independent of `NIX_V3_NURSERY` so we can route allocations
-    /// to the nursery (Phase A) without enabling reclamation
-    /// (Phase C) until validated.
-    bool isScavengeEnabled() const noexcept { return scavengeEnabled; }
 
 private:
     void initLazy() noexcept

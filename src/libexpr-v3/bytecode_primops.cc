@@ -51,7 +51,6 @@ namespace {
 /// in a heap-allocated holder, and patch `closure->cu` to point at
 /// the holder's final cu location.
 struct InstalledPrimop {
-    std::string name;        // primop name (e.g. "foldl'")
     RootResult  rr;          // owns cu + the compiled lambda Value
 };
 
@@ -200,7 +199,6 @@ void installBytecodePrimop(
     // points at the stable heap CU).  The holder still owns the CU
     // for lifetime (installedPrimops() keeps it alive for the process).
     auto holder = std::make_unique<InstalledPrimop>();
-    holder->name = primopName;
     holder->rr = std::move(rr);
     InstalledPrimop * installedPtr = holder.get();
     installedPrimops().push_back(std::move(holder));

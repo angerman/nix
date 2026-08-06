@@ -354,12 +354,6 @@ bool deepestBodyIsSimple(const Block & body)
 // capturing closure elsewhere.
 // ---------------------------------------------------------------------------
 
-void collectExprUses(const Expr & e,
-                     std::unordered_map<VarId, uint32_t> & uses);
-
-void collectBlockUses(const Module & m, BlockId bid,
-                      std::unordered_map<VarId, uint32_t> & uses);
-
 void bump(VarId v, std::unordered_map<VarId, uint32_t> & uses)
 {
     if (v == kInvalid) return;

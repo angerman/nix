@@ -40,7 +40,7 @@ eval_one() {
   fi
 
   # v3-direct
-  NIX_V3_DIRECT_EVAL=1 NIX_V3_SKIP_INSTALLABLE_PREEVAL=1 \
+  NIX_V3_DIRECT_EVAL=1 \
   NIX_V3_MAX_WALL_TIME=600s NIX_V3_MAX_HEAP=12G \
     "$N" eval --impure "$@" --expr "$expr" >/tmp/hcr.v3.out 2>/tmp/hcr.v3.err
   local v3_rc=$?

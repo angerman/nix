@@ -2,9 +2,11 @@
 # LEVER-1 flake-workload double-eval characterization (task #16b).
 #
 # Same construct as bench/lever1-gate.sh but on the real haskell.nix flake
-# workloads (M5 = cardano-node, HNE) where the flake LAYER is TW-evaluated
-# (NIX_V3_NO_NATIVE_CALL_FLAKE=1) and the applied-import cache addresses the
-# INNER v3 imports (nixpkgs + haskell.nix modules).  Reports, per workload,
+# workloads (M5 = cardano-node, HNE).  (The flake LAYER used to be TW-evaluated
+# via NIX_V3_NO_NATIVE_CALL_FLAKE=1; that gate was retired — v3-native callFlake
+# is now the sole path — so it is no longer set.)  The applied-import cache
+# addresses the INNER v3 imports (nixpkgs + haskell.nix modules).  Reports, per
+# workload,
 # the eval#2 marginal CPU + steady RSS with the cache OFF vs ON.  These are
 # CHARACTERIZATION rows (how much of each workload's re-eval the v1 cache
 # already collapses), not a SHIP/KILL gate — the pre-committed gate ran on
@@ -29,7 +31,7 @@ wl_expr() { case "$1" in
   HNE) echo "(builtins.getFlake \"path:$HNE\").packages.aarch64-darwin.hello.drvPath" ;;
 esac; }
 OPTS="--no-eval-cache --option allow-import-from-derivation true"
-V3ENV="NIX_V3_NO_NATIVE_CALL_FLAKE=1 NIX_V3_DIRECT_EVAL=1"
+V3ENV="NIX_V3_DIRECT_EVAL=1"
 
 med() { sort -n | awk '{a[NR]=$0} END{ if(!NR){print "NA";exit} m=int((NR+1)/2); if(NR%2)print a[m]; else printf "%.2f",(a[m]+a[m+1])/2 }'; }
 
