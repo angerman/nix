@@ -1004,13 +1004,30 @@ void primIsPath    (EvalState &, Value * args, Value & out) { out = args[0].isPa
 /// coerceToString); same shape.
 static std::string toStringCoerceCtx(EvalState & state, Value v,
                                      std::vector<std::string> & ctx,
-                                     bool copyPathsToStore = false)
+                                     bool copyPathsToStore = false,
+                                     bool coerceMore = true)
 {
     auto absorbCtx = [&](const char * s) {
         if (!s) return;
         if (auto * raw = lookupStringContextEntries(s)) {
             ctx.insert(ctx.end(), raw->begin(), raw->end());
         }
+    };
+    // #740 (2026-08-06): `coerceMore` mirrors TW's `coerceToString`
+    // second bool.  With coerceMore=false (used by concatStringsSep /
+    // substring / stringLength — TW passes the eval.hh default there,
+    // i.e. coerceMore=FALSE), int/float/bool/null/list are NOT coerced:
+    // TW throws `cannot coerce <type> to a string: <value>` from the
+    // final fall-through of EvalState::coerceToString (eval.cc:2745).
+    // toString/derivCoerce keep coerceMore=true (the historical v3
+    // default).  Byte-match TW: `showType` phrasing + ValuePrinter repr
+    // (v3's printNixValue == TW's simplified printer, same as the
+    // attrset case below).
+    auto coerceMoreThrow = [&](const char * typePhrase) -> std::string {
+        std::ostringstream os;
+        os << "cannot coerce " << typePhrase << " to a string: ";
+        nix::v3::printNixValue(os, v, ir::globalSymbolTable());
+        throw std::runtime_error(os.str());
     };
     // S1.2 PRECISE ROOT (CONSERV_PIN_PROVENANCE): firefox.drvPath's conservative
     // C-stack pins are 51.5% Chars + 23.4% Bindings, sourced by this recursive
@@ -1080,11 +1097,16 @@ static std::string toStringCoerceCtx(EvalState & state, Value v,
             throw;
         }
     }
-    case Tag::Int:    return std::to_string(v.asInt());
-    case Tag::Float:  return std::to_string(v.asFloat());
-    case Tag::Bool:   return v.asInt() == 1 ? "1" : "";
-    case Tag::Null:   return "";
+    case Tag::Int:    if (!coerceMore) return coerceMoreThrow("an integer");
+                      return std::to_string(v.asInt());
+    case Tag::Float:  if (!coerceMore) return coerceMoreThrow("a float");
+                      return std::to_string(v.asFloat());
+    case Tag::Bool:   if (!coerceMore) return coerceMoreThrow("a Boolean");
+                      return v.asInt() == 1 ? "1" : "";
+    case Tag::Null:   if (!coerceMore) return coerceMoreThrow("null");
+                      return "";
     case Tag::List: {
+        if (!coerceMore) return coerceMoreThrow("a list");
         std::string out;
         if (!v.asList()) return out;
         // Rule 2: do NOT cache the `ListVec*` across the re-entrant forceValue +
@@ -1097,7 +1119,7 @@ static std::string toStringCoerceCtx(EvalState & state, Value v,
         for (uint32_t i = 0; i < n; ++i) {
             Value el = forceValue(*state.vm, v.asList()->elems[i]);
             GcRoot rootEl(el);
-            out += toStringCoerceCtx(state, el, ctx, copyPathsToStore);
+            out += toStringCoerceCtx(state, el, ctx, copyPathsToStore, coerceMore);
             if (i + 1 < n) {
                 bool elIsEmptyList = el.isList()
                     && (!el.asList() || el.asList()->size == 0);
@@ -1129,14 +1151,14 @@ static std::string toStringCoerceCtx(EvalState & state, Value v,
                     GcRoot rootRes(res);
                     Value forced = forceValue(*state.vm, res);
                     GcRoot rootForced(forced);
-                    return toStringCoerceCtx(state, forced, ctx, copyPathsToStore);
+                    return toStringCoerceCtx(state, forced, ctx, copyPathsToStore, coerceMore);
                 }
                 // non-callable: fall through to outPath
             }
             if (auto * outV = v.asAttrs()->lookup(sOutPath)) {
                 Value forced = forceValue(*state.vm, *outV);
                 GcRoot rootForced(forced);
-                return toStringCoerceCtx(state, forced, ctx, copyPathsToStore);
+                return toStringCoerceCtx(state, forced, ctx, copyPathsToStore, coerceMore);
             }
             // #760 (2026-05-22): match TW's `EvalState::coerceToString`
             // error byte-for-byte:
@@ -1353,10 +1375,35 @@ void primTypeOf(EvalState &, Value * args, Value & out)
     out = mkStringValueOwned(t);
 }
 
-void primStringLength(EvalState &, Value * args, Value & out)
+void primStringLength(EvalState & state, Value * args, Value & out)
 {
-    if (!args[0].isString()) typeError("stringLength", "string");
-    out.mkInt(static_cast<int64_t>(std::strlen(args[0].asString())));
+    // #740 (2026-08-06): TW's prim_stringLength (libexpr/primops.cc:4913)
+    // COERCES its argument via coerceToString (eval.hh defaults:
+    // coerceMore=false, copyToStore=true) and returns `s->size()` — so a
+    // PATH is copied to /nix/store and its store-path length returned
+    // (e.g. 47), a derivation/attrset resolves via __toString/outPath,
+    // and int/float/bool/null/list THROW `cannot coerce <type> to a
+    // string`.  Pre-fix v3 hard-threw `typeError` on every non-string,
+    // diverging from TW on paths/derivations.  Keep the bare-string fast
+    // path; route everything else through the coercer with the same
+    // flags TW uses.
+    //
+    // A5 note: v3 strings are NUL-terminated `char*` buffers with no
+    // separate length (mkStringValueOwned → allocChars(size+1), asString()
+    // → const char*), so `strlen` is v3's canonical byte length — the
+    // representation cannot hold an embedded NUL to truncate at.  The
+    // coerced std::string likewise has no NULs (store paths), so `.size()`
+    // agrees.  (TW can store embedded-NUL strings and uses byte size; that
+    // is a representation-level v3 limitation orthogonal to stringLength.)
+    if (args[0].isString()) {
+        out.mkInt(static_cast<int64_t>(std::strlen(args[0].asString())));
+        return;
+    }
+    std::vector<std::string> ctx;  // stringLength drops context (TW discards it)
+    std::string s = toStringCoerceCtx(state, args[0], ctx,
+                                      /*copyPathsToStore=*/true,
+                                      /*coerceMore=*/false);
+    out.mkInt(static_cast<int64_t>(s.size()));
 }
 
 void primAdd(EvalState &, Value * args, Value & out)
@@ -1555,8 +1602,18 @@ void primConcatStringsSep(EvalState & state, Value * args, Value & out)
         // env / firefox / lutok / etc. to fall back to the v3
         // fake-store path.  Reuse toStringCoerceCtx to match TW.
         if (!el.isString()) {
+            // #740 (2026-08-06): match TW's prim_concatStringsSep
+            // (libexpr/primops.cc:5287) — it coerces each element with
+            // coerceToString using the eval.hh DEFAULTS (copyToStore=TRUE,
+            // coerceMore=FALSE).  So a raw Path element is copied to
+            // /nix/store (store path + Opaque context entry, NOT the
+            // source path); and an int/float/bool/null/list THROWS
+            // `cannot coerce <type> to a string`.  Pre-fix v3 passed
+            // copyPathsToStore=false + the implicit coerceMore=true, so it
+            // emitted SOURCE paths with no context (wrong drvPath, silently)
+            // and fail-open-coerced ints/lists.
             std::string coerced = toStringCoerceCtx(state, el, ctx,
-                /*copyPathsToStore=*/false);
+                /*copyPathsToStore=*/true, /*coerceMore=*/false);
             result += coerced;
             continue;
         }
@@ -1587,11 +1644,19 @@ void primSubstring(EvalState & state, Value * args, Value & out)
         throw std::runtime_error("negative start position in 'substring'");
 
     // C-23 (CODEBASE_REVIEW_2026-06-11): TW's prim_substring COERCES the 3rd
-    // arg (coerceToString, copyToStore=false), so a path / derivation / attrset
-    // with outPath/__toString is accepted (not just a bare string), with its
-    // string context propagated.  The common bare-string case keeps its fast
-    // path (and side-table context forwarding below); a coercible non-string is
-    // coerced via toStringCoerceCtx.
+    // arg (coerceToString, libexpr/primops.cc:4886), so a path / derivation /
+    // attrset with outPath/__toString is accepted (not just a bare string),
+    // with its string context propagated.  The common bare-string case keeps
+    // its fast path (and side-table context forwarding below); a coercible
+    // non-string is coerced via toStringCoerceCtx.
+    //
+    // #740 (2026-08-06): TW passes the eval.hh DEFAULTS to coerceToString —
+    // copyToStore=TRUE and coerceMore=FALSE.  (The earlier comment here
+    // claimed "copyToStore=false"; that was FACTUALLY WRONG — prim_substring
+    // uses NO explicit flags, so both defaults apply.)  Consequences matched
+    // below: a raw Path arg is copied to /nix/store (store path + Opaque
+    // context), NOT returned as the source path; and int/float/bool/null/list
+    // THROW `cannot coerce <type> to a string` instead of fail-open coercing.
     std::string srcStorage;
     std::string_view src;
     std::vector<std::string> coercedCtx;
@@ -1601,7 +1666,8 @@ void primSubstring(EvalState & state, Value * args, Value & out)
         strCtxKey = args[2].asString();
     } else {
         srcStorage = toStringCoerceCtx(state, args[2], coercedCtx,
-                                       /*copyPathsToStore=*/false);
+                                       /*copyPathsToStore=*/true,
+                                       /*coerceMore=*/false);
         src = srcStorage;
     }
 

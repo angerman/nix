@@ -137,6 +137,7 @@ SUITES+=( "derivation-parity|drvPath byte-equal vs TW|$TEST_DIR/derivation-parit
 SUITES+=( "flake-sourceinfo-parity|callFlake sourceInfo byte-equal vs TW (non-git + git)|NIX=$NIX $TEST_DIR/run-flake-sourceinfo-parity.sh" )
 SUITES+=( "fetcher-parity|native fetchGit/fetchTree byte-equal vs TW|NIX=$NIX $TEST_DIR/run-fetcher-parity.sh" )
 SUITES+=( "readdir-import-coerce-parity|readDir/import attrset (recursive outPath/__toString) coercion byte-equal vs TW|NIX=$NIX $TEST_DIR/run-readdir-import-coerce-parity.sh" )
+SUITES+=( "coerce-parity|#740 concatStringsSep/substring/stringLength coerceMore=false+copyToStore=true byte-equal vs TW (paths→store+context; int/bool/null/list/float throw identical msg)|NIX=$NIX $TEST_DIR/run-coerce-parity-tests.sh" )
 SUITES+=( "chain-bindings-parity|Lever A ChainBindings pure-refactor (chain-off == chain-on)|NIX=$NIX $TEST_DIR/run-chain-bindings-parity.sh" )
 SUITES+=( "ws1-realise-parity|WS-1 C1-C6 hashFile/readFileType/findFile/pathExists/scopedImport realise arg context (build unbuilt IFD output) byte-equal vs TW; C4 failed-build must not become false|NIX=$NIX $TEST_DIR/run-ws1-realise-parity-tests.sh" )
 SUITES+=( "lint-ifd-realise-coverage|WS-1 H4: every read-class IFD-probe primop realises its argument (source lint guarding the C1/C2 regression)|$TEST_DIR/lint-ifd-realise-coverage.sh" )
