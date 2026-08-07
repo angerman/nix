@@ -4469,6 +4469,31 @@ static int testBruteScanScalarClassifier()
     // ValuePair is all-Value — never scalar.
     check("Pair@0 left",               bruteScanSlotIsScalar(ct(CellType::Pair), 0),  false);
     check("Pair@16 third",             bruteScanSlotIsScalar(ct(CellType::Pair), 16), false);
+    // Defect #3 (2026-08): the Bindings MapAttrs aux Value at &entries[size] is a
+    // POINTER slot.  Its offset is 16 + 16*size, so (off-16)%16==0 — the entry
+    // rule would misclassify it as an entry's scalar {SymbolId,PosIdx32} half.
+    // Only the cell base (kind+size) disambiguates it.
+    {
+        constexpr uint32_t N = 3;
+        alignas(Bindings) unsigned char buf[
+            sizeof(Bindings) + std::size_t(N) * sizeof(Bindings::Entry) + sizeof(Value)] = {};
+        Bindings * b = reinterpret_cast<Bindings *>(buf);
+        b->kind = static_cast<uint8_t>(Bindings::Kind::MapAttrs);
+        b->size = N;
+        const std::size_t auxOff = sizeof(Bindings) + std::size_t(N) * sizeof(Bindings::Entry);
+        // With the base present, the aux is correctly a POINTER (not scalar).
+        check("Bindings MapAttrs aux (base) ptr",
+              bruteScanSlotIsScalar(ct(CellType::Bindings), auxOff, b), false);
+        // Entry name/value halves still classify correctly when a base is given.
+        check("Bindings MapAttrs e0 name (base) scalar",
+              bruteScanSlotIsScalar(ct(CellType::Bindings), 16, b), true);
+        check("Bindings MapAttrs e0 value (base) ptr",
+              bruteScanSlotIsScalar(ct(CellType::Bindings), 24, b), false);
+        // WITHOUT the base (pre-fix behaviour) the aux offset looks like an entry
+        // name half → misclassified scalar.  Documents why the base is required.
+        check("Bindings MapAttrs aux (no base) mislabels scalar",
+              bruteScanSlotIsScalar(ct(CellType::Bindings), auxOff), true);
+    }
     if (rc == 0)
         std::fprintf(stderr,
             "testBruteScanScalarClassifier: OK (scalar/pointer slot classification)\n");

@@ -1269,25 +1269,16 @@ void postScavengeAudit(const Nursery & n, const VMState & vm)
 } // namespace
 
 // #34 (2026-07-06): scalar-slot classifier for the BRUTE raw-word scan.  See
-// gc.hh for the rationale.  Offsets track the CURRENT cell layouts (Bindings
-// header 16B post-P1a; Closure header 32B post-P1b) — update on any change.
-bool bruteScanSlotIsScalar(uint8_t cellType, size_t off) noexcept
+// gc.hh for the rationale.  2026-08 (gc-layout Step 2): the per-CellType offset
+// rules now live ONCE in the layout manifest (gc_layout.hh, derived from
+// sizeof/offsetof), so they auto-track any header/stride change (Bindings header
+// 16B post-P1a; Closure header 24B post-upvalEnv-retirement — was mis-stated as
+// "32B" here, defect #4, fixed) instead of drifting from the real layout.  This
+// thunk forwards to the manifest; passing `base` lets the manifest fix defect #3
+// (the MapAttrs aux Value at &entries[size] is a POINTER, not scalar).
+bool bruteScanSlotIsScalar(uint8_t cellType, size_t off, const void * base) noexcept
 {
-    switch (static_cast<CellType>(cellType)) {
-    case CellType::Bindings:
-        // header 16B: [0,8)=kind/size SCALAR; parent@[8,16) is a pointer.
-        // entry 16B: [+0,+8)={SymbolId,PosIdx32} SCALAR; value@[+8,+16) is a Value.
-        return (off < 8) || (off >= 16 && ((off - 16) % 16) < 8);
-    // Closure header 24 B: desc@0 + capturedWiths@8 (ptrs) + {nUpvalues,_pad}@16
-    // (scalar) + upvalues[] FAM @24.  (upvalEnv@16 retired 2026-08 — header 32→24.)
-    case CellType::Closure: return (off >= 16 && off < 24);  // {nUpvalues,_pad}
-    case CellType::Thunk:   return (off < 8);                // {state,hasWithsSlot,nUpvalues,forces}
-    case CellType::List:    return (off < 8);                // {size,_pad}
-    case CellType::None: case CellType::Value:
-    case CellType::Pair: case CellType::Chars:
-        return false;  // Pair/Value: all-Value slots; Chars/None: opaque
-    }
-    return false;
+    return gclayout::slotIsScalar(static_cast<CellType>(cellType), off, base);
 }
 
 namespace {
@@ -1348,11 +1339,14 @@ void postScavengeBruteScan(
                 // high-32 matches a PosIdx and low-32 lands in the SymbolId range;
                 // AUDIT precise-walk is CLEAN, so it is NOT a real missed root).
                 // A pointer never lives in a scalar slot, so skipping cannot hide
-                // a real missed root; the AUDIT deep-walk remains the precise
-                // reachability check.  Offsets track the CURRENT cell layouts
-                // (update on any header change — e.g. P1a Bindings 24->16B, P1b
-                // Closure 40->32B).
-                if (bruteScanSlotIsScalar(r->type, off)) {
+                // a real missed root; the AUDIT deep-walk + manifest tripwire
+                // remain the precise reachability checks.  Offset rules live in
+                // the layout manifest (gc_layout.hh).  Pass the cell base (r->lo)
+                // so the classifier can tell the Bindings MapAttrs aux Value
+                // (a POINTER at &entries[size]) from an entry's scalar name/pos
+                // half at the same (off-16)%16==0 (defect #3 fix, 2026-08).
+                if (bruteScanSlotIsScalar(r->type, off,
+                        reinterpret_cast<const void *>(r->lo))) {
                     ++hitsScalarFalsePos; continue;
                 }
                 if (hitsLive < cap) {

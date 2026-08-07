@@ -49,11 +49,20 @@ struct Value;
 /// a scalar word's 64-bit value can coincidentally land in the nursery's
 /// ASLR-varying address range (a ~0.07%/run false-positive → the "brute-audit"
 /// flake, RCA 2026-07-06), but a pointer never lives in a scalar slot, so
-/// skipping cannot hide a real missed root (the AUDIT deep-walk stays the
-/// precise reachability check).  Offsets encode the CURRENT cell layouts and
-/// MUST be updated on any header change (e.g. P1a Bindings 24->16B, P1b Closure
-/// 40->32B).  Unit-tested in test/smoke.cc to guard against layout drift.
-bool bruteScanSlotIsScalar(uint8_t cellType, size_t off) noexcept;
+/// skipping cannot hide a real missed root (the AUDIT deep-walk + manifest
+/// tripwire stay the precise reachability checks).
+///
+/// 2026-08 (gc-layout Step 2): the offset rules are now SOURCED from the single
+/// layout manifest — this thunk forwards to `gclayout::slotIsScalar` — so they
+/// auto-track any header/stride change instead of needing hand updates.
+///
+/// `base` (the cell start, OPTIONAL) is only needed to identify the Bindings
+/// MapAttrs aux Value: a POINTER slot at &entries[size] whose offset, modulo the
+/// entry stride, otherwise looks like an entry's scalar name/pos half (defect #3,
+/// fixed here).  When `base==nullptr` the pure-offset rules apply — correct for
+/// Sorted/Chain Bindings and every other CellType.  Unit-tested in
+/// test/smoke.cc, and the manifest's static_asserts guard against layout drift.
+bool bruteScanSlotIsScalar(uint8_t cellType, size_t off, const void * base = nullptr) noexcept;
 
 /// #705 (2026-05-21): expose v3_call_flake's `g_cachedCallFlake`
 /// closureValue as a scavenger root.  The cached closure (produced
