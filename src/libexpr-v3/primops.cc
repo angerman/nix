@@ -3963,9 +3963,37 @@ void primHashFile(EvalState & state, Value * args, Value & out)
     // The path arg may legitimately carry context (e.g. a CA path), so
     // do not require NoCtx there.
     requireNoStringContext(state, args[0], "hashFile");
-    if (!(args[1].isString() || args[1].isPath()))
-        throw std::runtime_error(expectedTypeButFound("a string", args[1]));
+    // TW parses the algo BEFORE touching the path arg (prim_hashFile does
+    // forceStringNoCtx + parseHashAlgo, THEN realisePath(args[1])), so an
+    // unknown-algo error must win over any path coercion/force.  Keep the
+    // parse ahead of the coercion below to preserve that ordering.
     auto algo = parseHashAlgo(args[0].asString());
+    // TW-coerce-parity (2026-08-07): TW's prim_hashFile
+    // (libexpr/primops.cc:2466) hands args[1] to `realisePath` →
+    // `coerceToPath`, which accepts a path, a derivation (outPath), or an
+    // attrset with `__toString` — coercing via `coerceToString(coerceMore=
+    // false, copyToStore=false)`.  It is NOT restricted to a bare string/
+    // path.  Pre-fix v3 hard-threw `expected a string but found a set` on
+    // `hashFile "sha256" { __toString = ...; }`, diverging from TW (which
+    // coerces → realises/BUILDS → hashes).  Coerce the non-string/non-path
+    // case to a SOURCE-path string (copyToStore=false, matching
+    // coerceToPath's coerceToString flags) + forward its context, then run
+    // the SAME realise path below so a derivation outPath BUILDS (IFD) and
+    // its real output is hashed.  A non-coercible value (int/float/bool/
+    // null/list, or a bare set with neither __toString nor outPath) THROWS
+    // `cannot coerce <type> to a string: <value>` from the shared coercer —
+    // byte-identical to TW.
+    Value pathArg = args[1];
+    if (!(args[1].isString() || args[1].isPath())) {
+        std::vector<std::string> coercedCtx;
+        std::string cs = toStringCoerceCtx(state, args[1], coercedCtx,
+                                           /*copyPathsToStore=*/false,
+                                           /*coerceMore=*/false);
+        Value sv = mkStringValueOwned(cs);
+        if (!coercedCtx.empty())
+            setStringContextEntries(sv.asString(), std::move(coercedCtx));
+        pathArg = sv;
+    }
     // WS-1 C1: match TW's prim_hashFile (libexpr/primops.cc:2474) — realise
     // the arg's context so `hashFile "${drv}/f"` BUILDS the derivation and
     // hashes its real output, instead of hashing stale on-disk content or
@@ -3975,11 +4003,11 @@ void primHashFile(EvalState & state, Value * args, Value & out)
     std::string hex;
     if (state.nixEvalState) {
         auto & ns = *state.nixEvalState;
-        auto sp = v3RealisePathArg(ns, args[1]);
+        auto sp = v3RealisePathArg(ns, pathArg);
         hex = nix::hashString(algo, sp.readFile()).to_string(nix::HashFormat::Base16, false);
     } else {
-        std::string path = args[1].isString() ? std::string(args[1].asString())
-                                              : std::string(args[1].asPath());
+        std::string path = pathArg.isString() ? std::string(pathArg.asString())
+                                              : std::string(pathArg.asPath());
         // #693 — TW raises `path 'X' does not exist` for missing files.
         if (!std::filesystem::exists(path))
             throw std::runtime_error("path '" + path + "' does not exist");
@@ -4119,6 +4147,24 @@ void primReadFile(EvalState & state, Value * args, Value & out)
 {
     std::string path;
     bool hadCtx = false;  // WS-2 V2: context-bearing read → potential IFD build
+    // TW-coerce-parity (2026-08-07): TW's prim_readFile
+    // (libexpr/primops.cc:2237) hands its arg straight to `realisePath` →
+    // `coerceToPath`, which accepts a path, a derivation (outPath), or an
+    // attrset with `__toString` — coercing via `coerceToString(coerceMore=
+    // false, copyToStore=false)`.  It is NOT restricted to a bare string/
+    // path.  Pre-fix v3 hard-threw `v3 primop readFile: expected string or
+    // path` on `{ __toString = ...; }` and on `readFile (import <drv>)` (an
+    // IFD idiom), diverging from TW (which coerces → realises/BUILDS →
+    // reads).  Coerce the non-string/non-path case to a SOURCE-path string
+    // (copyToStore=false, matching coerceToPath's coerceToString flags) +
+    // forward its context, then feed the synthetic string through the SAME
+    // realise path below (v3RealisePathArg → realisePath → coerceToPath), so
+    // a derivation outPath BUILDS exactly as TW does.  A non-coercible value
+    // (int/float/bool/null/list, or a bare set with neither __toString nor
+    // outPath) THROWS `cannot coerce <type> to a string: <value>` from the
+    // shared coercer — byte-identical to TW.
+    Value coercedVal;         // owns the synthetic string for the coerced case
+    bool coerced = false;
     if (args[0].isString()) {
         // #741 Phase 4 measurement: ctx-bearing readFile path goes
         // through realisePath below (the TW-wired branch), which
@@ -4131,7 +4177,23 @@ void primReadFile(EvalState & state, Value * args, Value & out)
         path = args[0].asString();
     }
     else if (args[0].isPath()) path = args[0].asPath();
-    else typeError("readFile", "string or path");
+    else {
+        std::vector<std::string> coercedCtx;
+        std::string cs = toStringCoerceCtx(state, args[0], coercedCtx,
+                                           /*copyPathsToStore=*/false,
+                                           /*coerceMore=*/false);
+        if (!coercedCtx.empty()) {
+            // context present (e.g. a derivation outPath's Built entry) →
+            // potential IFD build, timed/traced by v3RealisePathArg below.
+            ++allocStats().ifdProbeWithCtx[kIfdReadFile];
+            hadCtx = true;
+        }
+        coercedVal = mkStringValueOwned(cs);
+        if (!coercedCtx.empty())
+            setStringContextEntries(coercedVal.asString(), std::move(coercedCtx));
+        path = cs;
+        coerced = true;
+    }
 
     // REVIEW §1.7-style routing: when a TW EvalState is wired, defer
     // path realisation to it so pure-eval / restricted-eval mode rules
@@ -4140,27 +4202,40 @@ void primReadFile(EvalState & state, Value * args, Value & out)
     std::string content;
     if (state.nixEvalState) {
         auto & ns = *state.nixEvalState;
-        // C-7(e) (CODEBASE_REVIEW_2026-06-11): route through realisePath and
-        // let its errors propagate verbatim (mirrors primReadDir at the
-        // `catch (...) { throw; }` sites below).  The former catch(...) fell
-        // back to a plain ifstream on ANY realisation failure — which MASKS
-        // IFD *build* failures: it either reads stale on-disk content or
-        // reports a misleading "does not exist", instead of surfacing the
-        // actual build error.  realisePath already yields TW-matching
-        // "path '<p>' does not exist" errors for genuinely-missing paths, and
-        // rethrows RestrictedPathError like TW's prim_readFile.
-        nix::Value tw;
-        if (args[0].isString()) tw.mkString(path, ns.mem);
-        else                    tw.mkPath(nix::SourcePath(ns.rootFS, nix::CanonPath(path)), ns.mem);
-        // WS-2 V2: only time context-bearing reads (potential IFD build).
-        std::optional<IfdRealiseTimer> _ifdT;
-        if (hadCtx) _ifdT.emplace();
-        // Phase-1 IFD trace (NIX_V3_IFD_TRACE); OFF path unchanged.
-        std::optional<ifdtrace::RealiseScope> _ifdTrace;
-        if (__builtin_expect(hadCtx && ifdtrace::enabled(), 0))
-            _ifdTrace.emplace(kIfdReadFile, path);
-        auto sp = ns.realisePath(nix::noPos, tw);
-        content = sp.readFile();
+        if (coerced) {
+            // Coerced (derivation / __toString) arg: route the synthetic
+            // string (carrying the coercion's context) through the shared
+            // realiser, which forwards the context AND owns the IFD timer/
+            // trace — so an un-realised outPath BUILDS exactly as TW's
+            // realisePath does, then read the realised path.  Reset `path`
+            // to the realised store path for the store-ref attribution below
+            // (TW scans refs on the realised path, not the coerced string).
+            auto sp = v3RealisePathArg(ns, coercedVal);
+            content = sp.readFile();
+            path = sp.path.abs();
+        } else {
+            // C-7(e) (CODEBASE_REVIEW_2026-06-11): route through realisePath and
+            // let its errors propagate verbatim (mirrors primReadDir at the
+            // `catch (...) { throw; }` sites below).  The former catch(...) fell
+            // back to a plain ifstream on ANY realisation failure — which MASKS
+            // IFD *build* failures: it either reads stale on-disk content or
+            // reports a misleading "does not exist", instead of surfacing the
+            // actual build error.  realisePath already yields TW-matching
+            // "path '<p>' does not exist" errors for genuinely-missing paths, and
+            // rethrows RestrictedPathError like TW's prim_readFile.
+            nix::Value tw;
+            if (args[0].isString()) tw.mkString(path, ns.mem);
+            else                    tw.mkPath(nix::SourcePath(ns.rootFS, nix::CanonPath(path)), ns.mem);
+            // WS-2 V2: only time context-bearing reads (potential IFD build).
+            std::optional<IfdRealiseTimer> _ifdT;
+            if (hadCtx) _ifdT.emplace();
+            // Phase-1 IFD trace (NIX_V3_IFD_TRACE); OFF path unchanged.
+            std::optional<ifdtrace::RealiseScope> _ifdTrace;
+            if (__builtin_expect(hadCtx && ifdtrace::enabled(), 0))
+                _ifdTrace.emplace(kIfdReadFile, path);
+            auto sp = ns.realisePath(nix::noPos, tw);
+            content = sp.readFile();
+        }
     } else {
         std::ifstream f(path);
         if (!f) throw std::runtime_error("v3 primop readFile: cannot open " + path);

@@ -3,7 +3,7 @@
 # Two families:
 #   #740          — concatStringsSep / substring / stringLength (A*/S* below)
 #   2026-08-07    — baseNameOf / dirOf / pathExists / readFileType / toJSON /
-#                   `nix eval --raw` (B1-B6 below)
+#                   `nix eval --raw` (B1-B6) + readFile / hashFile (B7-B8) below
 #
 # Four CONFIRMED tree-walker-parity bugs in v3's string primops, all now
 # fixed to match TW's `coerceToString` (eval.hh defaults for these three
@@ -93,6 +93,9 @@ echo x > "$D/bin/f"
 echo y > "$D/sbin/f"
 P1="$D/bin"     # path literals below are UNQUOTED → Nix path values
 P2="$D/sbin"
+# A regular file with known content for readFile / hashFile (B7/B8).
+printf 'coerce-parity-readfile\n' > "$D/data.txt"
+F1="$D/data.txt"
 
 # =====================================================================
 # POSITIVE — raw Path elements copy to /nix/store (byte-identical store
@@ -168,15 +171,19 @@ check_err_raw() {  # label expr
 
 # =====================================================================
 # TW-coerce-parity (2026-08-07) — a SECOND family of coercion divergences.
-# Six builtins that in TW COERCE their argument (baseNameOf/dirOf via
-# coerceToString; pathExists/readFileType via realisePath->coerceToPath;
-# toJSON via printValueAsJSON's tryAttrsToString/outPath; `nix eval --raw`
-# via coerceToString) but where v3 hard-threw `expected string or path` /
-# `cannot coerce a set` / demanded an already-`Tag::String` result / mis-
-# handled outPath+__toString in JSON.  Each fixed to match TW byte-for-byte
-# with that builtin's exact coerce flags.  Bug numbers as reported:
-#   1 baseNameOf   2 dirOf   3 pathExists
-#   4 readFileType 5 toJSON  6 `nix eval --raw`
+# Eight builtins that in TW COERCE their argument (baseNameOf/dirOf via
+# coerceToString; pathExists/readFileType/readFile/hashFile via realisePath
+# ->coerceToPath; toJSON via printValueAsJSON's tryAttrsToString/outPath;
+# `nix eval --raw` via coerceToString) but where v3 hard-threw `expected
+# string or path` / `cannot coerce a set` / `expected a string but found a
+# set` / demanded an already-`Tag::String` result / mis-handled outPath+
+# __toString in JSON.  Each fixed to match TW byte-for-byte with that
+# builtin's exact coerce flags.  Bug numbers as reported:
+#   1 baseNameOf   2 dirOf   3 pathExists   4 readFileType
+#   5 toJSON       6 `nix eval --raw`
+# A later pass (readFile/hashFile — the same class, MISSED by this sweep's
+# "readFile already coerces" code-reading error) appends B7/B8:
+#   7 readFile     8 hashFile
 # =====================================================================
 
 # --- 1 baseNameOf: TW coerces (coerceMore=false, copyToStore=false),
@@ -249,11 +256,46 @@ check "B6 --raw plain string (control)" \
   eval --raw --impure --expr '"hello"'
 check_err_raw "B6 --raw int (throw)" "42"
 
+# --- 7 readFile: TW's prim_readFile hands its arg to realisePath->
+#     coerceToPath, accepting __toString / outPath / a derivation (IFD:
+#     coerces to outPath, BUILDS, reads).  Pre-fix v3 hard-threw
+#     `v3 primop readFile: expected string or path`.  int/bare-set THROW.
+#     (The IFD-derivation build path is exercised in the empirical repro,
+#     not here — this suite is deliberately offline, no nixpkgs/build; a
+#     __toString/outPath pointing at a plain file reaches the same coerce
+#     code and stays fast.)
+check "B7 readFile __toString" \
+  eval --impure --expr "builtins.readFile { __toString = self: \"$F1\"; }"
+check "B7 readFile outPath" \
+  eval --impure --expr "builtins.readFile { outPath = \"$F1\"; }"
+check "B7 readFile plain string (control)" \
+  eval --impure --expr "builtins.readFile \"$F1\""
+check "B7 readFile plain path (control)" \
+  eval --impure --expr "builtins.readFile $F1"
+check_err "B7 readFile int (throw)"      "builtins.readFile 42"
+check_err "B7 readFile bare set (throw)" "builtins.readFile { a = 1; }"
+
+# --- 8 hashFile: TW's prim_hashFile parses the algo, then hands args[1]
+#     to realisePath->coerceToPath (same coerce range as readFile).  Pre-
+#     fix v3 hard-threw `expected a string but found a set` on the path
+#     arg.  __toString / outPath / string / path all hash the same file;
+#     int/bare-set THROW `cannot coerce`.
+check "B8 hashFile __toString" \
+  eval --impure --expr "builtins.hashFile \"sha256\" { __toString = self: \"$F1\"; }"
+check "B8 hashFile outPath" \
+  eval --impure --expr "builtins.hashFile \"sha256\" { outPath = \"$F1\"; }"
+check "B8 hashFile plain string (control)" \
+  eval --impure --expr "builtins.hashFile \"sha256\" \"$F1\""
+check "B8 hashFile plain path (control)" \
+  eval --impure --expr "builtins.hashFile \"sha256\" $F1"
+check_err "B8 hashFile int (throw)"      "builtins.hashFile \"sha256\" 42"
+check_err "B8 hashFile bare set (throw)" "builtins.hashFile \"sha256\" { a = 1; }"
+
 rm -rf "$D"
 
 # ---------------------------------------------------------------------
 echo
-echo "=== string-coercion parity (concatStringsSep/substring/stringLength + baseNameOf/dirOf/pathExists/readFileType/toJSON/--raw) ==="
+echo "=== string-coercion parity (concatStringsSep/substring/stringLength + baseNameOf/dirOf/pathExists/readFileType/toJSON/--raw/readFile/hashFile) ==="
 echo "  passing: $pass"
 echo "  failing: $fail"
 if (( fail > 0 )); then
