@@ -63,6 +63,7 @@
 /// Input Output Group.  SPDX-License-Identifier: Apache-2.0
 
 #include "v3/ir.hh"
+#include "v3/ir_util.hh"
 
 #include <cstdlib>
 #include <unordered_map>
@@ -322,28 +323,7 @@ BlockId cloneSubBlock(Module & m, BlockId srcBid,
     return newBid;
 }
 
-// ---------------------------------------------------------------------------
-// Same-block VarRef chase: resolve a VarId through VarRef aliases
-// inside one block.  Returns the underlying Expr*, or nullptr if the
-// chain leads outside the block.
-// ---------------------------------------------------------------------------
-
-const Expr * chaseInBlock(VarId v,
-                          const std::unordered_map<VarId, const Expr *> & defs)
-{
-    size_t hops = 0;
-    while (hops++ < defs.size() + 1) {
-        auto it = defs.find(v);
-        if (it == defs.end()) return nullptr;
-        const Expr * e = it->second;
-        if (const auto * vr = std::get_if<VarRef>(e)) {
-            v = vr->var;
-            continue;
-        }
-        return e;
-    }
-    return nullptr;
-}
+// chaseInBlock() is shared across opt_*.cc passes — see v3/ir_util.hh.
 
 // (P-11: mapBlockDefs removed — betaReduce now builds its defs map from a
 // by-value snapshot of the block's bindings, since cloneSubBlock can realloc

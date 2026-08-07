@@ -51,6 +51,7 @@
 /// Input Output Group.  SPDX-License-Identifier: Apache-2.0
 
 #include "v3/ir.hh"
+#include "v3/ir_util.hh"
 
 #include <algorithm>
 #include <cstdio>
@@ -164,22 +165,7 @@ bool remapExprVars(Expr & e, const std::unordered_map<VarId, VarId> & sub)
     }, e);
 }
 
-const Expr * chaseInBlock(VarId v,
-                          const std::unordered_map<VarId, const Expr *> & defs)
-{
-    size_t hops = 0;
-    while (hops++ < defs.size() + 1) {
-        auto it = defs.find(v);
-        if (it == defs.end()) return nullptr;
-        const Expr * e = it->second;
-        if (const auto * vr = std::get_if<VarRef>(e)) {
-            v = vr->var;
-            continue;
-        }
-        return e;
-    }
-    return nullptr;
-}
+// chaseInBlock() is shared across opt_*.cc passes — see v3/ir_util.hh.
 
 // Variant that returns BOTH the VarId at which the resolution
 // stopped (i.e. the actual definer of the underlying expression)
@@ -211,14 +197,7 @@ ResolveResult chaseInBlockResolved(
     return {kInvalid, nullptr};
 }
 
-std::unordered_map<VarId, const Expr *> mapBlockDefs(const Block & b)
-{
-    std::unordered_map<VarId, const Expr *> defs;
-    defs.reserve(b.bindings.size());
-    for (const auto & bd : b.bindings)
-        defs.emplace(bd.var, &bd.expr);
-    return defs;
-}
+// mapBlockDefs() is shared across opt_*.cc passes — see v3/ir_util.hh.
 
 struct UseCounter {
     std::unordered_map<VarId, uint32_t> count;

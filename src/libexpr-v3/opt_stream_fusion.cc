@@ -25,6 +25,7 @@
 
 #include "v3/ir.hh"
 #include "v3/ir_dump.hh"
+#include "v3/ir_util.hh"
 #include "v3/primop.hh"
 
 #include <cstdlib>
@@ -37,36 +38,8 @@ namespace nix::v3::ir {
 
 namespace {
 
-// ---------------------------------------------------------------------------
-// Same-block VarRef chase — local utility identical to opt_beta_reduce.cc
-// and opt_primop_fold.cc.  Returns the resolved Expr* or nullptr.
-// ---------------------------------------------------------------------------
-
-const Expr * chaseInBlock(VarId v,
-                          const std::unordered_map<VarId, const Expr *> & defs)
-{
-    size_t hops = 0;
-    while (hops++ < defs.size() + 1) {
-        auto it = defs.find(v);
-        if (it == defs.end()) return nullptr;
-        const Expr * e = it->second;
-        if (const auto * vr = std::get_if<VarRef>(e)) {
-            v = vr->var;
-            continue;
-        }
-        return e;
-    }
-    return nullptr;
-}
-
-std::unordered_map<VarId, const Expr *> mapBlockDefs(const Block & b)
-{
-    std::unordered_map<VarId, const Expr *> defs;
-    defs.reserve(b.bindings.size());
-    for (const auto & bd : b.bindings)
-        defs.emplace(bd.var, &bd.expr);
-    return defs;
-}
+// chaseInBlock() and mapBlockDefs() are shared across opt_*.cc passes —
+// see v3/ir_util.hh.
 
 // Recognise a "primop call with N args" at VarId `v`, accepting both:
 //   - The canonical PrimOpCall(p, [args]) shape  (opt_primop_fuse output)

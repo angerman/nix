@@ -37,6 +37,7 @@
 /// SPDX-License-Identifier: Apache-2.0
 
 #include "v3/ir.hh"
+#include "v3/ir_util.hh"
 
 #include <cstdio>
 #include <cstdlib>
@@ -49,24 +50,7 @@ namespace nix::v3::ir {
 
 namespace {
 
-/// Same-block VarRef chase — a tiny per-pass-local helper (a shared
-/// header for the handful of passes that use it is a deferrable cleanup).
-const Expr * chaseInBlock(VarId v,
-                          const std::unordered_map<VarId, const Expr *> & defs)
-{
-    size_t hops = 0;
-    while (hops++ < defs.size() + 1) {
-        auto it = defs.find(v);
-        if (it == defs.end()) return nullptr;
-        const Expr * e = it->second;
-        if (const auto * vr = std::get_if<VarRef>(e)) {
-            v = vr->var;
-            continue;
-        }
-        return e;
-    }
-    return nullptr;
-}
+// chaseInBlock() is shared across opt_*.cc passes — see v3/ir_util.hh.
 
 /// Try to resolve `v` to a literal boolean via same-block defs.
 /// Returns std::nullopt when cond is not a known literal.
