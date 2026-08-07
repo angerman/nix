@@ -180,6 +180,7 @@ if [[ "$mode" == "core" || "$mode" == "full" || "$mode" == "brute" ]]; then
   SUITES+=( "replacestrings-barrier|Q1.3 §1.3 replaceStrings force-check-store order (valid+error correctness + audit)|$TEST_DIR/run-replacestrings-barrier-tests.sh" )
   SUITES+=( "primimport-eval-error|P1.3 §2.3 disk-hit catch scoped to deserialize (erroring warm import runs once, error propagates)|NIX=$NIX $TEST_DIR/run-primimport-eval-error-tests.sh" )
   SUITES+=( "value-equal|P3.4 §3.5 valueEqual scalar fast path + general equality-engine parity vs TW|NIX=$NIX $TEST_DIR/run-value-equal-tests.sh" )
+  SUITES+=( "arith-compare-parity|div INT64_MIN/-1 overflow (primop+operator) / floor+ceil out-of-range float / catAttrs non-attrs throw / lessThan+sort skip equal non-orderable list elements / head+tail type-check-first — all byte-parity vs TW|NIX=$NIX $TEST_DIR/run-arith-compare-parity-tests.sh" )
   SUITES+=( "formals-error|P3.2 §3.1 formals-validation error parity (unexpected/missing/non-set) + valid-formals vs TW|NIX=$NIX $TEST_DIR/run-formals-error-tests.sh" )
   SUITES+=( "attrs-init-cache|P3.3 §3.4 warm-disk-cache OP_ATTRS_INIT round-trip (non-rec attrset import; guards the reverted pre-sort lever)|$TEST_DIR/run-attrs-init-cache-roundtrip-tests.sh" )
   SUITES+=( "applied-cache|LEVER-1 applied-import result cache (CU-key collision + distinct-args + insns-collapse + throw-not-cached)|NIX=$NIX $TEST_DIR/run-applied-cache-tests.sh" )
@@ -206,6 +207,7 @@ if [[ "$mode" == "full" ]]; then
   already_added[run-primsort-barrier-tests.sh]=1  # in core
   already_added[run-primimport-eval-error-tests.sh]=1  # in core
   already_added[run-value-equal-tests.sh]=1  # in core
+  already_added[run-arith-compare-parity-tests.sh]=1  # in core
   already_added[run-formals-error-tests.sh]=1  # in core
   already_added[run-attrs-init-cache-roundtrip-tests.sh]=1  # in core
   already_added[run-applied-cache-tests.sh]=1  # in core

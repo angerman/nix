@@ -780,8 +780,13 @@ void primLength(EvalState &, Value * args, Value & out)
 void primHead(EvalState &, Value * args, Value & out)
 {
     const Value & v = args[0];
-    // #678 — match TW phrasing (libexpr/primops.cc:3892).
-    if (!v.isList() || !v.asList() || v.asList()->size == 0)
+    // #678 — match TW phrasing (libexpr/primops.cc:3892).  TW type-checks
+    // FIRST via forceList (`expected a list but found <T>: <v>`) and only
+    // then checks emptiness.  Pre-fix v3 conflated the two, reporting a
+    // non-list (e.g. `head 42`) as `called on an empty list`.
+    if (!v.isList())
+        throw std::runtime_error(expectedTypeButFound("a list", v));
+    if (!v.asList() || v.asList()->size == 0)
         throw std::runtime_error("'builtins.head' called on an empty list");
     out = v.asList()->elems[0];
 }
@@ -789,8 +794,11 @@ void primHead(EvalState &, Value * args, Value & out)
 void primTail(EvalState &, Value * args, Value & out)
 {
     const Value & v = args[0];
-    // #678 — match TW phrasing (libexpr/primops.cc:3919).
-    if (!v.isList() || !v.asList() || v.asList()->size == 0)
+    // #678 — match TW phrasing (libexpr/primops.cc:3919).  Type-check FIRST
+    // (see primHead); a non-list is a type error, not an empty list.
+    if (!v.isList())
+        throw std::runtime_error(expectedTypeButFound("a list", v));
+    if (!v.asList() || v.asList()->size == 0)
         throw std::runtime_error("'builtins.tail' called on an empty list");
     uint32_t n = v.asList()->size;
     ListVec * out_l = Alloc::allocList(n - 1);
@@ -1502,6 +1510,16 @@ void primDiv(EvalState &, Value * args, Value & out)
     // could mask divide-by-zero bugs in nixpkgs builders.
     if (a.isInt() && b.isInt()) {
         if (b.asInt() == 0) throw std::runtime_error("division by zero");
+        // INT64_MIN / -1 wraps around (mathematical result is INT64_MAX + 1)
+        // and raises SIGFPE on x86_64.  TW's prim_div guards this via
+        // checked division and raises `integer overflow in dividing %1% / %2%`
+        // (libexpr/primops.cc:4720).  Pre-fix v3's primop silently wrapped to
+        // INT64_MIN — a semantic divergence AND a crash risk on x86_64.
+        if (a.asInt() == std::numeric_limits<int64_t>::min() && b.asInt() == -1)
+            throw std::runtime_error(
+                "integer overflow in dividing "
+                + std::to_string(a.asInt()) + " / "
+                + std::to_string(b.asInt()));
         out.mkInt(a.asInt() / b.asInt());
     } else if (a.isFloat() && b.isFloat()) {
         if (b.asFloat() == 0.0) throw std::runtime_error("division by zero");
@@ -2565,7 +2583,15 @@ void primCatAttrs(EvalState & state, Value * args, Value & out)
     if (lst) {
         for (uint32_t i = 0; i < lst->size; ++i) {
             Value el = forceValue(*state.vm, lst->elems[i]);
-            if (!el.isAttrs() || !el.asAttrs()) continue;
+            // TW calls forceAttrs on every element (libexpr/primops.cc
+            // prim_catAttrs) and raises `expected a set but found <T>: <v>`
+            // on a non-attrset — it does NOT fail-open by skipping.  Pre-fix
+            // v3 silently dropped non-attrset elements, masking type errors.
+            // A genuine empty attrset `{}` has isAttrs() but a null asAttrs();
+            // it is a valid set (TW finds no attr) and must NOT throw.
+            if (!el.isAttrs())
+                throw std::runtime_error(expectedTypeButFound("a set", el));
+            if (!el.asAttrs()) continue;
             const Value * v = el.asAttrs()->lookup(k);
             if (v) kept.push_back(*v);
         }
@@ -9119,17 +9145,37 @@ void primBitXor(EvalState &, Value * args, Value & out)
 }
 
 /// floor / ceil for floats.
+// #NNN — TW's floor/ceil reject floats outside [INT64_MIN, INT64_MAX) rather
+// than clamping via the cast: `NixFloat argument %1% is not in the range of
+// NixInt` (libexpr/primops.cc prim_floor/prim_ceil).  `int_min` is a power of
+// two so the NixInt→NixFloat cast is exact; the valid window mirrors TW's
+// `rounded >= int_min && rounded < -int_min` i.e. [-2^63, 2^63).  Pre-fix v3
+// let `static_cast<int64_t>` clamp e.g. `floor 1.0e300` to INT64_MAX silently.
+static void floorCeilRangeCheck(double rounded, double orig)
+{
+    constexpr double int_min = static_cast<double>(std::numeric_limits<int64_t>::min());
+    if (!(rounded >= int_min && rounded < -int_min)) {
+        std::ostringstream os;
+        os << orig;
+        throw std::runtime_error(
+            "NixFloat argument " + os.str() + " is not in the range of NixInt");
+    }
+}
 void primFloor(EvalState &, Value * args, Value & out)
 {
     if (args[0].isInt())   { out = args[0]; return; }
     if (!args[0].isFloat()) typeError("floor", "float or int");
-    out.mkInt(static_cast<int64_t>(std::floor(args[0].asFloat())));
+    double r = std::floor(args[0].asFloat());
+    floorCeilRangeCheck(r, args[0].asFloat());
+    out.mkInt(static_cast<int64_t>(r));
 }
 void primCeil(EvalState &, Value * args, Value & out)
 {
     if (args[0].isInt())   { out = args[0]; return; }
     if (!args[0].isFloat()) typeError("ceil", "float or int");
-    out.mkInt(static_cast<int64_t>(std::ceil(args[0].asFloat())));
+    double r = std::ceil(args[0].asFloat());
+    floorCeilRangeCheck(r, args[0].asFloat());
+    out.mkInt(static_cast<int64_t>(r));
 }
 
 /// stringLength has a 1-arg version; stringToInt would be nice but
@@ -9211,8 +9257,18 @@ static bool valueLessHelper(VMState & vm, const Value & a, const Value & b)
         for (uint32_t i = 0; i < n; ++i) {
             Value ai = forceValue(vm, a.asList()->elems[i]);
             Value bi = forceValue(vm, b.asList()->elems[i]);
-            if (valueLessHelper(vm, ai, bi)) return true;
-            if (valueLessHelper(vm, bi, ai)) return false;
+            // TW's CompareValues (libexpr/primops.cc:915) skips value-EQUAL
+            // elements via eqValues and only ORDERS the first unequal pair.
+            // Ordering equal-but-non-orderable elements (two `{}`, two equal
+            // records) would fall into the typeError below, which TW never
+            // reaches for equal elements.  Pre-fix v3 compared every pair, so
+            // `builtins.lessThan [ {} ] [ {} 1 ]` (and `sort`/`genericClosure`
+            // over lists of records with equal leading elements) failed-closed
+            // with "expected comparable types" instead of yielding the
+            // length-tiebreak result.  Only a genuinely-UNEQUAL non-orderable
+            // pair now raises — matching TW.
+            if (valueEqual(vm, ai, bi)) continue;
+            return valueLessHelper(vm, ai, bi);
         }
         return na < nb;
     }

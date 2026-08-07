@@ -1002,8 +1002,18 @@ inline bool valueLess(VMState & vm, const Value & a, const Value & b)
                 Value fb = forceValue(vm, bi);
                 cellWrite(&bi, fb, nullptr);
             }
-            if (valueLess(vm, ai, bi)) return true;
-            if (valueLess(vm, bi, ai)) return false;
+            // TW's CompareValues (libexpr/primops.cc:915) skips value-EQUAL
+            // elements via eqValues, then ORDERS the first unequal pair —
+            // returning `compare(a[i], b[i])`.  Ordering equal-but-non-
+            // orderable elements (two `{}` / two equal records) would fall
+            // into the "cannot compare" branch below; TW never reaches it
+            // for equal elements.  Pre-fix v3 called valueLess on every pair,
+            // so `[ {} ] < [ {} 1 ]` failed-closed instead of yielding true
+            // (the real-world trigger is sort/genericClosure over lists of
+            // records with equal-comparing leading elements).  Only a
+            // genuinely-UNEQUAL non-orderable pair now raises — matching TW.
+            if (valueEqual(vm, ai, bi)) continue;
+            return valueLess(vm, ai, bi);
         }
         return na < nb;
     }
@@ -3601,9 +3611,16 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             if (lhs.isInt() && rhs.isInt()) {
                 if (rhs.asInt() == 0) throw std::runtime_error("division by zero");
                 // INT64_MIN / -1 wraps around (mathematical result is
-                // INT64_MAX + 1).  Match tree-walker by raising.
+                // INT64_MAX + 1).  The `/` operator desugars to builtins.div
+                // in TW (parser.y: `expr_op '/' expr_op` → ExprCall s.div), so
+                // TW raises prim_div's `integer overflow in dividing %1% / %2%`
+                // (libexpr/primops.cc:4720) for the operator too — match its
+                // full message body, not a bare "integer overflow".
                 if (lhs.asInt() == std::numeric_limits<int64_t>::min() && rhs.asInt() == -1)
-                    throw std::runtime_error("integer overflow");
+                    throw std::runtime_error(
+                        "integer overflow in dividing "
+                        + std::to_string(lhs.asInt()) + " / "
+                        + std::to_string(rhs.asInt()));
                 r.mkInt(lhs.asInt() / rhs.asInt());
             } else if (lhs.isFloat() && rhs.isFloat()) {
                 if (rhs.asFloat() == 0.0) throw std::runtime_error("division by zero");
