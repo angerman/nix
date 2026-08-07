@@ -19,6 +19,7 @@
 #include "v3/live_trace.hh"     // flushPeriodicLiveTraceCsv (self-gated, default-on)
 #include "v3/par_trace.hh"      // parallel-potential (work/span) trace instrument
 #include "v3/forcerate_trace.hh" // per-creation-site force-rate histogram instrument
+#include "v3/ifd_trace.hh"       // per-site IFD tracing (Phase-1 routing instrument)
 #include "v3/dedup_survey.hh"   // #772 surveyCUBytecodeDedup (outer-CU survey)
 #include "v3/bytecode.hh"       // CompilationUnit + ifdProbeKindName (IFD summary)
 #include "v3/cu_registry.hh"    // allRegisteredCus (COMPILE-WASTE spike walk)
@@ -73,6 +74,24 @@ struct CompileWasteDepthGuard {
     CompileWasteDepthGuard()  noexcept { ++g_compileWasteDepth; }
     ~CompileWasteDepthGuard() noexcept { --g_compileWasteDepth; }
     bool outermost() const noexcept { return g_compileWasteDepth == 1; }
+};
+
+// Phase-1 IFD trace (NIX_V3_IFD_TRACE) end-of-eval report guard.  Unlike the
+// other trace dumps (called on the normal-return path only), IFD realises can
+// FAIL — a failed IFD build throws and unwinds the eval — and we still want the
+// structural record (the realise WAS reached; the OP_IFD_PROBE / withCtx
+// counters already fired).  An RAII guard fires the report at the OUTERMOST
+// runRootExprModule on BOTH normal return and exception unwind, so a
+// sandbox-unbuildable IFD still yields its trace.  Self-gates internally (no-op
+// unless NIX_V3_IFD_TRACE and ≥1 realise recorded).  Delete with the
+// instrument once the Phase-1 GO-2 / GO-3 / KILL verdict is recorded.
+thread_local int g_ifdTraceDepth = 0;
+struct IfdTraceReportGuard {
+    IfdTraceReportGuard()  noexcept { ++g_ifdTraceDepth; }
+    ~IfdTraceReportGuard() {
+        if (--g_ifdTraceDepth == 0)
+            nix::v3::ifdtrace::dumpReport();
+    }
 };
 
 // Cross-reference per-funcId emitted bytecode BYTES (rt.compileWaste, set at
@@ -215,6 +234,9 @@ RootResult runRootExprModule(nix::EvalState & state, ir::Module module)
 {
     // COMPILE-WASTE spike: fire the eval-end report only at the outermost call.
     CompileWasteDepthGuard compileWasteGuard;
+    // Phase-1 IFD trace: fire the per-realise report at the outermost eval, on
+    // normal return OR exception unwind (a failed IFD build throws).
+    IfdTraceReportGuard ifdTraceGuard;
 
     // Idempotent: register the builtin primop table on first call.
     // Safe to call per-invocation — the underlying registry is global
@@ -418,6 +440,10 @@ RootResult runRootExprModule(nix::EvalState & state, ir::Module module)
     // cheap-eagerness / optimistic-eval measure-first gate. Same placement
     // rationale + self-gate + retirement rule as partrace above.
     nix::v3::forcerate::dumpReport();
+    // NOTE: the Phase-1 IFD trace report (NIX_V3_IFD_TRACE) is emitted by the
+    // IfdTraceReportGuard RAII at the top of this function, NOT here — it must
+    // fire on the exception-unwind path too (a failed IFD build throws), which
+    // this normal-return point would miss.  See the guard above.
 
     // NIX_VM_STATS=1: dump alloc counters at completion.  Lets us
     // attribute alloc explosions to thunks vs closures vs Bindings

@@ -95,6 +95,7 @@
 #include "v3/serialize.hh"
 #include "v3/disk_cache.hh"
 #include "v3/cache_probe.hh"  // #827 / A3 per-call-site cache-hook
+#include "v3/ifd_trace.hh"    // Phase-1 per-site IFD tracing (NIX_V3_IFD_TRACE)
 #include "v3/ir.hh"
 #include "v3/ir_dump.hh"  // R1 trigger trace: V3_DBG_DUMP_IR_PATH
 #include "v3/bytecode.hh"
@@ -398,7 +399,8 @@ static void setStringContext(const char * buf, const nix::NixStringContext & ctx
 /// v3-eval has no store and cannot realise.
 static nix::SourcePath v3RealisePathArg(
     nix::EvalState & ns, const Value & arg,
-    std::optional<nix::SymlinkResolution> symRes = nix::SymlinkResolution::Full)
+    std::optional<nix::SymlinkResolution> symRes = nix::SymlinkResolution::Full,
+    uint8_t ifdKind = kIfdReadFile)
 {
     nix::Value tw;
     bool hadCtx = false;
@@ -419,6 +421,14 @@ static nix::SourcePath v3RealisePathArg(
     // source-path realisation (which never builds).
     std::optional<IfdRealiseTimer> _ifdT;
     if (hadCtx) _ifdT.emplace();
+    // Phase-1 IFD trace (NIX_V3_IFD_TRACE): per-realise site/arg/wall/nesting.
+    // Only the context-bearing realise is a build candidate; emplace (copying
+    // the arg) only when the gate is on so the OFF path is byte-for-byte
+    // unchanged.  See ifd_trace.hh.
+    std::optional<ifdtrace::RealiseScope> _ifdTrace;
+    if (__builtin_expect(hadCtx && ifdtrace::enabled(), 0))
+        _ifdTrace.emplace(ifdKind,
+            arg.isString() ? std::string(arg.asString()) : std::string(arg.asPath()));
     return ns.realisePath(nix::noPos, tw, symRes);
 }
 
@@ -3279,7 +3289,7 @@ void primFindFile(EvalState & state, Value * args, Value & out)
                     // common literal-path case stays cheap.
                     auto * ctxEntries = lookupStringContextEntries(f.asString());
                     if (ctxEntries && !ctxEntries->empty())
-                        p = v3RealisePathArg(*state.nixEvalState, f, std::nullopt).path.abs();
+                        p = v3RealisePathArg(*state.nixEvalState, f, std::nullopt, kIfdFindFile).path.abs();
                     else
                         p = f.asString();
                 }
@@ -3618,7 +3628,7 @@ void primPathExists(EvalState & state, Value * args, Value & out)
             // `pathExists "${drv}/f"` over an un-realised output BUILDS the
             // derivation — the prior 3-arg mkString dropped context, so no
             // build fired and the answer was decided by a stale on-disk lstat.
-            auto path = v3RealisePathArg(ns, pathArg, symRes);
+            auto path = v3RealisePathArg(ns, pathArg, symRes, kIfdPathExists);
             auto st = path.maybeLstat();
             bool exists = st && (!mustBeDir || st->type == nix::SourceAccessor::tDirectory);
             out = exists ? Value::vTrue : Value::vFalse;
@@ -4145,6 +4155,10 @@ void primReadFile(EvalState & state, Value * args, Value & out)
         // WS-2 V2: only time context-bearing reads (potential IFD build).
         std::optional<IfdRealiseTimer> _ifdT;
         if (hadCtx) _ifdT.emplace();
+        // Phase-1 IFD trace (NIX_V3_IFD_TRACE); OFF path unchanged.
+        std::optional<ifdtrace::RealiseScope> _ifdTrace;
+        if (__builtin_expect(hadCtx && ifdtrace::enabled(), 0))
+            _ifdTrace.emplace(kIfdReadFile, path);
         auto sp = ns.realisePath(nix::noPos, tw);
         content = sp.readFile();
     } else {
@@ -4218,6 +4232,10 @@ void primReadDir(EvalState & state, Value * args, Value & out)
             tw->mkString(args[0].asString(), twCtx, ns.mem);
             try {
                 IfdRealiseTimer _ifdT;  // WS-2 V2: account realise wall-time
+                // Phase-1 IFD trace (NIX_V3_IFD_TRACE); OFF path unchanged.
+                std::optional<ifdtrace::RealiseScope> _ifdTrace;
+                if (__builtin_expect(ifdtrace::enabled(), 0))
+                    _ifdTrace.emplace(kIfdReadDir, std::string(args[0].asString()));
                 auto resolved = ns.realisePath(nix::noPos, *tw);
                 path = resolved.path.abs();
             } catch (...) {
@@ -4257,6 +4275,10 @@ void primReadDir(EvalState & state, Value * args, Value & out)
             toStringCoerceCtx(state, args[0], rctx, /*copyPathsToStore=*/false);
         try {
             IfdRealiseTimer _ifdT;  // WS-2 V2: account realise wall-time
+            // Phase-1 IFD trace (NIX_V3_IFD_TRACE); OFF path unchanged.
+            std::optional<ifdtrace::RealiseScope> _ifdTrace;
+            if (__builtin_expect(ifdtrace::enabled(), 0))
+                _ifdTrace.emplace(kIfdReadDir, coerced);
             path = ffi::realisePath(ns, coerced, rctx);
         } catch (...) {
             throw;  // surface TW's error verbatim
@@ -4413,7 +4435,7 @@ void primReadFileType(EvalState & state, Value * args, Value & out)
     const char * t;
     if (state.nixEvalState) {
         auto & ns = *state.nixEvalState;
-        auto sp = v3RealisePathArg(ns, pathArg, std::nullopt);
+        auto sp = v3RealisePathArg(ns, pathArg, std::nullopt, kIfdReadFileType);
         // lstat() throws "does not exist" for a missing path (TW parity).
         // if/else (not switch) — the build uses -Werror=switch-enum, and
         // only these three map to named types (mirrors TW fileTypeToString,
@@ -6760,6 +6782,10 @@ void primImport(EvalState & state, Value * args, Value & out)
             }
             try {
                 IfdRealiseTimer _ifdT;  // WS-2 V2: account realise wall-time
+                // Phase-1 IFD trace (NIX_V3_IFD_TRACE); OFF path unchanged.
+                std::optional<ifdtrace::RealiseScope> _ifdTrace;
+                if (__builtin_expect(ifdtrace::enabled(), 0))
+                    _ifdTrace.emplace(kIfdImport, std::string(args[0].asString()));
                 auto resolved = ns.realisePath(nix::noPos, *tw);
                 path = resolved.path.abs();
             } catch (...) {
@@ -6806,6 +6832,10 @@ void primImport(EvalState & state, Value * args, Value & out)
             toStringCoerceCtx(state, args[0], ictx, /*copyPathsToStore=*/false);
         try {
             IfdRealiseTimer _ifdT;  // WS-2 V2: account realise wall-time
+            // Phase-1 IFD trace (NIX_V3_IFD_TRACE); OFF path unchanged.
+            std::optional<ifdtrace::RealiseScope> _ifdTrace;
+            if (__builtin_expect(ifdtrace::enabled(), 0))
+                _ifdTrace.emplace(kIfdImport, coerced);
             path = ffi::realisePath(ns, coerced, ictx);
         } catch (...) {
             // Surface TW's error verbatim (build failures, missing
@@ -8626,7 +8656,7 @@ void primScopedImport(EvalState & state, Value * args, Value & out)
     // `scopedImport scope "${drv}/f"` BUILDS the derivation instead of reading
     // a raw, un-built path.  Prior code built the SourcePath straight from the
     // coerced string and never realised — same class as C1/C2/C4.
-    nix::SourcePath sp = v3RealisePathArg(ns, args[1], std::nullopt);
+    nix::SourcePath sp = v3RealisePathArg(ns, args[1], std::nullopt, kIfdImport);
     // Resolve path through symlinks + maybe append default.nix.
     sp = nix::resolveExprPath(sp);
 

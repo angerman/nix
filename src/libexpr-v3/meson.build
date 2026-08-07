@@ -157,6 +157,13 @@ lib_sources = files(
   # _2026-07-07 §2).  Byte-id neutral (counters only).  Delete once the
   # cheap-eagerness / optimistic-eval GO/NO-GO is decided.
   'forcerate_trace.cc',
+  # Per-site IFD (import-from-derivation) tracing instrument
+  # (NIX_V3_IFD_TRACE): the Phase-1 falsifier for the IFD frontier
+  # (lode/PROGRESSION_PLAN_2026-08-07.md §3).  Per-realise site / arg /
+  # wall-time / cache-build proxy / independence-nesting-depth.  Byte-id
+  # neutral (reads/counts only).  Delete once the Phase-1 IFD routing verdict
+  # (GO-2 / GO-3 / KILL) is recorded.
+  'ifd_trace.cc',
   # Stage 5 of precise-root foundation: RAII GcRoot helper + thread-local
   # registry for C++-stack roots.  See lode/GC_PRECISE_ROOT_FOUNDATION_
   # 2026-05-27.md.  Forward-looking infrastructure for Stage 6 production.
