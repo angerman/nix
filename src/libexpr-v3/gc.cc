@@ -1430,6 +1430,56 @@ void postScavengeBruteScan(
             "(unreachable-from-v3) tenured objects — arena-bloat, "
             "not a missed root\n", hitsDead);
     }
+
+    // gc-layout Step 3 (2026-08): MANIFEST CROSS-CHECK TRIPWIRE.  Independently
+    // of the raw-word scan above (which relies on the scalar classifier), walk
+    // every live tenured object through the layout manifest's child-slot
+    // enumerator and assert that NO manifest-listed pointer slot still holds a
+    // nursery pointer.  A hit means a HOT walker (W1 scavenger) forgot to forward
+    // a manifest field — a precisely-located missed-root use-after-free.  We
+    // ABORT deterministically with holder-type + offset, rather than let the
+    // stale pointer surface as a silent UAF later.  This is strictly more precise
+    // than the raw-word scan: it reads only genuine pointer slots (no scalar
+    // false-positives) and does NOT depend on the offset-based scalar classifier,
+    // so it catches a miss even in a slot the classifier would wrongly skip.
+    auto isYoung = [&n](const void * p) { return n.contains(p); };
+    // Self-test hook (default-off): prove the tripwire FIRES end-to-end.  Builds
+    // a synthetic Closure whose capturedWiths points into the live nursery and
+    // runs the tripwire on it; it must detect the residual young pointer and
+    // abort exactly as a real missed-forward would.  RETIREMENT: this hook lives
+    // and dies with the tripwire — remove it if the tripwire is ever removed.  It
+    // exists only to demonstrate the tripwire is not vacuous; the permanent,
+    // gate-free regression guard is smoke.cc testTripwireDetectsDrift.
+    static const bool s_tripwireSelftest =
+        std::getenv("V3_DBG_TRIPWIRE_SELFTEST") != nullptr;
+    if (__builtin_expect(s_tripwireSelftest, 0)) {
+        alignas(Closure) unsigned char selfBuf[sizeof(Closure)] = {};
+        Closure * sc = reinterpret_cast<Closure *>(selfBuf);
+        sc->capturedWiths = reinterpret_cast<ListVec *>(n.youngLo());
+        gclayout::TripwireHit h =
+            gclayout::scanChildSlotsForYoung(CellType::Closure, sc, isYoung);
+        std::fprintf(stderr,
+            "v3 SCAVENGE TRIPWIRE SELFTEST: synthetic Closure capturedWiths@+%zu "
+            "-> %p %s in nursery\n",
+            h.off, h.ptr, h.hit ? "IS" : "is NOT");
+        std::fflush(stderr);
+        if (h.hit) std::abort();  // designed-to-fire: proves the tripwire aborts
+    }
+    for (const auto & r : liveRanges) {
+        gclayout::TripwireHit h = gclayout::scanChildSlotsForYoung(
+            static_cast<CellType>(r.type),
+            reinterpret_cast<void *>(r.lo), isYoung);
+        if (h.hit) {
+            std::fprintf(stderr,
+                "v3 SCAVENGE TRIPWIRE: live %s @ %p holds residual nursery %s "
+                "@+%zu -> %p (manifest cross-check: a hot walker missed "
+                "forwarding this field — missed-root UAF)\n",
+                typeName(r.type), reinterpret_cast<void *>(r.lo),
+                h.kind, h.off, h.ptr);
+            std::fflush(stderr);
+            std::abort();
+        }
+    }
     std::fflush(stderr);
 }
 

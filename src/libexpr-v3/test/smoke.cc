@@ -26,6 +26,7 @@
 #include "v3/serialize.hh"
 #include "v3/disk_cache.hh"
 #include "v3/gc.hh"
+#include "v3/gc_layout.hh"  // manifest child-slot enumerator + tripwire (Step 3 test)
 
 #include <algorithm>
 #include <cassert>
@@ -4500,6 +4501,150 @@ static int testBruteScanScalarClassifier()
     return rc;
 }
 
+// gc-layout Step 3 NEGATIVE TEST — prove the manifest cross-check tripwire
+// actually FIRES on injected drift (a "hot walker forgot to forward a field"),
+// and stays silent on a clean object.  Without a proven-firing tripwire the
+// whole Step-3 apparatus would be vacuous.  Drives the SAME detection function
+// (gclayout::scanChildSlotsForYoung) the production post-scavenge tripwire uses,
+// but with a sentinel-address "isYoung" predicate so no live nursery is needed.
+// Covers every manifest slot KIND (Value / ListVec* / Bindings* / cell) across
+// every heap object type, so a future layout change that dropped a slot from the
+// enumerator would flip a case here.
+static int testTripwireDetectsDrift()
+{
+    using nix::v3::gclayout::scanChildSlotsForYoung;
+    using nix::v3::gclayout::TripwireHit;
+    int rc = 0;
+    auto expect = [&](const char * what, bool got, bool want) {
+        if (got != want) {
+            std::fprintf(stderr,
+                "testTripwireDetectsDrift: %s expected %d got %d\n",
+                what, (int)want, (int)got);
+            rc = 1;
+        }
+    };
+    // A non-null sentinel standing in for "a residual nursery pointer".  Fits the
+    // 48-bit NaN-box payload so a Value can carry it via mkAttrs (asRaw()==S).
+    void * const S = reinterpret_cast<void *>(uintptr_t(0x0000'1234'5678ULL));
+    auto isYoung = [&](const void * p) { return p == S; };
+    auto isNone  = [&](const void *)   { return false; };
+    // Helper to build a pointer-tagged Value whose asRaw() == S.
+    auto ptrVal = [&]() { Value v; v.mkAttrs(reinterpret_cast<Bindings *>(S)); return v; };
+
+    // Closure: capturedWiths (ListVec*) drift @8 + an upvalue (Value) drift @24.
+    {
+        alignas(Closure) unsigned char buf[sizeof(Closure) + sizeof(Value)] = {};
+        Closure * c = reinterpret_cast<Closure *>(buf);
+        c->capturedWiths = reinterpret_cast<ListVec *>(S);
+        c->nUpvalues = 1;
+        c->upvalues[0] = ptrVal();
+        TripwireHit h = scanChildSlotsForYoung(CellType::Closure, c, isYoung);
+        expect("Closure capturedWiths drift detected", h.hit, true);
+        expect("Closure drift offset==8", h.off == offsetof(Closure, capturedWiths), true);
+        // Clean capturedWiths, dirty upvalue only -> hit at upvalue offset 24.
+        c->capturedWiths = nullptr;
+        TripwireHit h2 = scanChildSlotsForYoung(CellType::Closure, c, isYoung);
+        expect("Closure upvalue drift detected", h2.hit, true);
+        expect("Closure upvalue offset==sizeof(Closure)", h2.off == sizeof(Closure), true);
+        // Fully clean -> no hit.
+        c->upvalues[0].mkNull();
+        expect("Closure clean -> no hit",
+               scanChildSlotsForYoung(CellType::Closure, c, isYoung).hit, false);
+    }
+    // Thunk (Suspended): cell (Value*) drift @8; then a tail upvalue drift @24.
+    {
+        alignas(Thunk) unsigned char buf[sizeof(Thunk) + sizeof(Value)] = {};
+        Thunk * t = reinterpret_cast<Thunk *>(buf);
+        t->state = ThunkState::Suspended;
+        t->hasWithsSlot = 0;
+        t->nUpvalues = 1;
+        t->cell = reinterpret_cast<Value *>(S);
+        t->tail[0].mkNull();
+        TripwireHit h = scanChildSlotsForYoung(CellType::Thunk, t, isYoung);
+        expect("Thunk cell drift detected", h.hit, true);
+        expect("Thunk cell offset==8", h.off == offsetof(Thunk, cell), true);
+        // Clean cell, dirty tail upvalue -> hit at tail offset 24.
+        t->cell = nullptr;
+        t->tail[0] = ptrVal();
+        TripwireHit h2 = scanChildSlotsForYoung(CellType::Thunk, t, isYoung);
+        expect("Thunk tail-upvalue drift detected", h2.hit, true);
+        expect("Thunk tail offset==sizeof(Thunk)", h2.off == sizeof(Thunk), true);
+        t->tail[0].mkNull();
+        expect("Thunk clean -> no hit",
+               scanChildSlotsForYoung(CellType::Thunk, t, isYoung).hit, false);
+    }
+    // Bindings (Sorted): entry value (Value) drift @ 16+0+8 = 24.
+    {
+        alignas(Bindings) unsigned char buf[sizeof(Bindings) + sizeof(Bindings::Entry)] = {};
+        Bindings * b = reinterpret_cast<Bindings *>(buf);
+        b->kind = static_cast<uint8_t>(Bindings::Kind::Sorted);
+        b->size = 1;
+        b->entries[0].value = ptrVal();
+        TripwireHit h = scanChildSlotsForYoung(CellType::Bindings, b, isYoung);
+        expect("Bindings entry-value drift detected", h.hit, true);
+        expect("Bindings entry-value offset==24",
+               h.off == sizeof(Bindings) + offsetof(Bindings::Entry, value), true);
+        b->entries[0].value.mkNull();
+        expect("Bindings clean -> no hit",
+               scanChildSlotsForYoung(CellType::Bindings, b, isYoung).hit, false);
+    }
+    // Bindings (Chain): parent (Bindings*) drift @8 — proves the raw parent slot
+    // is enumerated as a pointer child.
+    {
+        alignas(Bindings) unsigned char buf[sizeof(Bindings)] = {};
+        Bindings * b = reinterpret_cast<Bindings *>(buf);
+        b->kind = static_cast<uint8_t>(Bindings::Kind::Chain);
+        b->size = 0;
+        b->parent = reinterpret_cast<const Bindings *>(S);
+        TripwireHit h = scanChildSlotsForYoung(CellType::Bindings, b, isYoung);
+        expect("Bindings parent drift detected", h.hit, true);
+        expect("Bindings parent offset==8", h.off == offsetof(Bindings, parent), true);
+    }
+    // Bindings (MapAttrs): aux Value drift @ &entries[size] — proves the aux slot
+    // (the defect-#3 slot) is enumerated by the manifest.
+    {
+        alignas(Bindings) unsigned char buf[sizeof(Bindings) + sizeof(Value)] = {};
+        Bindings * b = reinterpret_cast<Bindings *>(buf);
+        b->kind = static_cast<uint8_t>(Bindings::Kind::MapAttrs);
+        b->size = 0;
+        *b->mapAttrsAux() = ptrVal();
+        TripwireHit h = scanChildSlotsForYoung(CellType::Bindings, b, isYoung);
+        expect("Bindings MapAttrs-aux drift detected", h.hit, true);
+        expect("Bindings MapAttrs-aux offset==sizeof(Bindings)",
+               h.off == sizeof(Bindings), true);
+    }
+    // ListVec: elem (Value) drift @8.
+    {
+        alignas(ListVec) unsigned char buf[sizeof(ListVec) + sizeof(Value)] = {};
+        ListVec * l = reinterpret_cast<ListVec *>(buf);
+        l->size = 1;
+        l->elems[0] = ptrVal();
+        TripwireHit h = scanChildSlotsForYoung(CellType::List, l, isYoung);
+        expect("ListVec elem drift detected", h.hit, true);
+        expect("ListVec elem offset==8", h.off == sizeof(ListVec), true);
+        l->elems[0].mkNull();
+        expect("ListVec clean -> no hit",
+               scanChildSlotsForYoung(CellType::List, l, isYoung).hit, false);
+    }
+    // ValuePair: all four slots are Values — drift the `third` slot @24.
+    {
+        ValuePair p{};
+        p.left.mkNull(); p.right.mkNull(); p.evaluated.mkNull();
+        p.third = ptrVal();
+        TripwireHit h = scanChildSlotsForYoung(CellType::Pair, &p, isYoung);
+        expect("ValuePair third drift detected", h.hit, true);
+        expect("ValuePair third offset==24", h.off == offsetof(ValuePair, third), true);
+        // A clean object with an unrelated non-young pointer -> no hit.
+        expect("ValuePair no false-fire under isNone",
+               scanChildSlotsForYoung(CellType::Pair, &p, isNone).hit, false);
+    }
+    if (rc == 0)
+        std::fprintf(stderr,
+            "testTripwireDetectsDrift: OK (manifest tripwire fires on injected "
+            "drift for every slot kind; silent when clean)\n");
+    return rc;
+}
+
 int main()
 {
     registerBuiltinPrimOps();
@@ -4606,6 +4751,7 @@ int main()
     // #34 — post-scavenge BRUTE scalar-slot classifier (guards the false-
     // positive fix + cell-layout drift).
     rc |= testBruteScanScalarClassifier();
+    rc |= testTripwireDetectsDrift();
 
     auto & st = allocStats();
     std::fprintf(stderr,
