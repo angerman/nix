@@ -104,6 +104,19 @@ namespace nix::v3 {
 /// after scavenge.
 void walkImportCacheRoots(const std::function<void(Value &)> & visit);
 
+/// TW-coerce-parity (2026-08-07): coerce a v3 Value to a string using the
+/// exact flags TW's `nix eval --raw` uses — `coerceToString` with the
+/// eval.hh DEFAULTS (coerceMore=false, copyToStore=true).  So a bare
+/// string is returned as-is; a path is copied to /nix/store and its store
+/// path returned; a derivation / `__toString` / `outPath` attrset
+/// resolves; and int/float/bool/null/list THROW `cannot coerce <type> to
+/// a string`.  Exposed for the v3-direct `--raw` CLI path
+/// (src/nix/eval.cc), which previously demanded an already-`Tag::String`
+/// value and threw on paths.  String context is discarded (raw output
+/// writes bytes only), but the path→store copy still happens as a side
+/// effect exactly as in TW.  `nixState` supplies the store for that copy.
+std::string coerceValueToRawString(VMState & vm, nix::EvalState * nixState, Value v);
+
 /// LEVER-1 applied-import cache PROBE (NIX_V3_APPLIED_CACHE=probe): print the
 /// cumulative would-cache counters.  Self-gates on probe mode + non-zero
 /// counts; called from run.cc at end-of-root-eval (the atexit variant loses

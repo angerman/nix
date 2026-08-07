@@ -1264,6 +1264,32 @@ static std::string toStringCoerce(EvalState & state, Value v)
     return toStringCoerceCtx(state, v, dropCtx);
 }
 
+} // anonymous namespace (closed so coerceValueToRawString has external linkage)
+
+/// TW-coerce-parity (2026-08-07): public entry point for the v3-direct
+/// `nix eval --raw` CLI path.  TW's `--raw` handler (src/nix/eval.cc:389)
+/// writes `*coerceToString(noPos, *v, ctx, "...")` — i.e. coerceToString
+/// with the eval.hh DEFAULTS (coerceMore=false, copyToStore=true).  Reuse
+/// the same coercer the string primops use, with those flags, so a path is
+/// copied to the store (store-path text returned), a derivation / outPath /
+/// __toString attrset resolves, and int/float/bool/null/list throw the
+/// byte-identical `cannot coerce <type> to a string`.  Context is dropped
+/// (raw output is bytes only); the path→store copy is a real side effect,
+/// matching TW.  Declared in v3/primop.hh.  (`toStringCoerceCtx` has
+/// internal linkage but is visible throughout this translation unit, so an
+/// external-linkage caller here can reach it.)
+std::string coerceValueToRawString(VMState & vm, nix::EvalState * nixState, Value v)
+{
+    EvalState st;
+    st.vm = &vm;
+    st.nixEvalState = nixState;
+    std::vector<std::string> dropCtx;
+    return toStringCoerceCtx(st, v, dropCtx, /*copyPathsToStore=*/true,
+                             /*coerceMore=*/false);
+}
+
+namespace { // reopen the file-local anonymous namespace
+
 void primToString(EvalState & state, Value * args, Value & out)
 {
     // foldl lever (2026-06-16): small-non-negative-int toString cache.  The

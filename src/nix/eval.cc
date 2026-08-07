@@ -188,18 +188,21 @@ static bool runV3DirectEval(
     // Render.  Same dispatch as the TW path: --raw → string-coerce,
     // --json → toJsonValue, default → printNixValue.
     if (raw) {
-        // String-coerce: deep-force, demand a Tag::String.  No context
-        // tracking here (we'd need to lift coerceToString into v3 for
-        // full parity; that's Phase 2 work).  For now, accept only
-        // already-string values.
-        nix::evalTrace::mark("eval.cc:169 forceDeep(--raw)");
-        r = v3::forceDeep(vm, r);
-        if (r.tag() != v3::Tag::String) {
-            state.error<EvalError>(
-                "v3-direct --raw: result is not a string (tag=%1%)",
-                (int)r.tag()).debugThrow();
-        }
-        std::string_view sv = r.asString() ? r.asString() : "";
+        // TW-coerce-parity (2026-08-07): TW's `nix eval --raw` coerces the
+        // result via `coerceToString(noPos, *v, ctx, "...")` — eval.hh
+        // DEFAULTS (coerceMore=false, copyToStore=true) — see the TW branch
+        // at eval.cc:389.  So a bare string prints as-is; a PATH is copied
+        // to /nix/store and its store path printed (e.g. `nix eval --raw
+        // --expr ./src` → `/nix/store/<hash>-src`); a derivation / outPath /
+        // __toString attrset resolves; and int/float/bool/null/list throw
+        // `cannot coerce <type> to a string`.  Pre-fix v3 deep-forced and
+        // then DEMANDED a `Tag::String`, throwing `result is not a string`
+        // on every path/derivation.  `coerceValueToRawString` runs the same
+        // coercer the string primops use with TW's exact flags (it forces
+        // internally, exactly as coerceToString does — no upfront forceDeep,
+        // which would over-force siblings TW never touches).
+        nix::evalTrace::mark("eval.cc:169 coerce(--raw)");
+        std::string sv = v3::coerceValueToRawString(vm, &state, r);
         std::cout.write(sv.data(), (std::streamsize)sv.size());
     } else if (json) {
         // #675: toJsonValue now lazy-forces internally + short-circuits

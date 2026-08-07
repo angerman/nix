@@ -2,8 +2,8 @@
 # String-coercion parity — TW vs v3-direct byte-equality regression guard.
 # Two families:
 #   #740          — concatStringsSep / substring / stringLength (A*/S* below)
-#   2026-08-07    — baseNameOf / dirOf / pathExists / readFileType (B1-B4)
-#                   + toJSON (B5); `nix eval --raw` (B6) appended by a follow-up
+#   2026-08-07    — baseNameOf / dirOf / pathExists / readFileType / toJSON /
+#                   `nix eval --raw` (B1-B6 below)
 #
 # Four CONFIRMED tree-walker-parity bugs in v3's string primops, all now
 # fixed to match TW's `coerceToString` (eval.hh defaults for these three
@@ -149,15 +149,34 @@ check_err "A3 stringLength bool"       "builtins.stringLength true"
 check_err "A3 stringLength null"       "builtins.stringLength null"
 check_err "A3 stringLength list"       "builtins.stringLength [ 1 2 ]"
 
+# Negative for `nix eval --raw` specifically: the throw needs --raw (without
+# it, `nix eval 42` just prints 42, so check_err's non-raw eval wouldn't fire).
+check_err_raw() {  # label expr
+  local label="$1" expr="$2" twerr v3err twmsg v3msg
+  twerr=$("$NIX" "${EXF[@]}" eval --raw --impure --expr "$expr" 2>&1 >/dev/null)
+  v3err=$(NIX_V3_DIRECT_EVAL=1 NIX_V3_REQUIRE=1 NIX_V3_MAX_WALL_TIME=60s \
+        "$NIX" "${EXF[@]}" eval --raw --impure --expr "$expr" 2>&1 >/dev/null)
+  twmsg=$(printf '%s\n' "$twerr" | grep -o 'cannot coerce .* to a string:.*' | head -1)
+  v3msg=$(printf '%s\n' "$v3err" | grep -o 'cannot coerce .* to a string:.*' | head -1)
+  if [[ -n "$twmsg" && "$twmsg" == "$v3msg" ]]; then
+    pass=$((pass + 1))
+  else
+    fail=$((fail + 1))
+    failed+=("$label (TWmsg=[$twmsg] v3msg=[$v3msg])")
+  fi
+}
+
 # =====================================================================
 # TW-coerce-parity (2026-08-07) — a SECOND family of coercion divergences.
-# Builtins that in TW COERCE their argument (baseNameOf/dirOf via
-# coerceToString; pathExists/readFileType via realisePath->coerceToPath)
-# but where v3 hard-threw `expected string or path` / `cannot coerce a
-# set`.  Each fixed to match TW byte-for-byte with that builtin's exact
-# coerce flags.  Bug numbers as reported: 1 baseNameOf, 2 dirOf,
-# 3 pathExists, 4 readFileType.  (5 toJSON + 6 `nix eval --raw` land in
-# the following commits, with their own B5/B6 checks appended here.)
+# Six builtins that in TW COERCE their argument (baseNameOf/dirOf via
+# coerceToString; pathExists/readFileType via realisePath->coerceToPath;
+# toJSON via printValueAsJSON's tryAttrsToString/outPath; `nix eval --raw`
+# via coerceToString) but where v3 hard-threw `expected string or path` /
+# `cannot coerce a set` / demanded an already-`Tag::String` result / mis-
+# handled outPath+__toString in JSON.  Each fixed to match TW byte-for-byte
+# with that builtin's exact coerce flags.  Bug numbers as reported:
+#   1 baseNameOf   2 dirOf   3 pathExists
+#   4 readFileType 5 toJSON  6 `nix eval --raw`
 # =====================================================================
 
 # --- 1 baseNameOf: TW coerces (coerceMore=false, copyToStore=false),
@@ -220,11 +239,21 @@ check "B5 toJSON ordinary attrs (control)" \
   eval --impure --expr 'builtins.toJSON { a = 1; b = [ 2 3 ]; }'
 check_err "B5 toJSON __toString=int (throw)" 'builtins.toJSON { __toString = self: 42; }'
 
+# --- 6 `nix eval --raw`: TW coerces (coerceMore=false, copyToStore=TRUE) —
+#     a PATH is COPIED to /nix/store; __toString/outPath resolve; int THROWS.
+check "B6 --raw path (store path + hash)" \
+  eval --raw --impure --expr "$P1"
+check "B6 --raw __toString attrset" \
+  eval --raw --impure --expr '{ __toString = self: "raw-out"; }'
+check "B6 --raw plain string (control)" \
+  eval --raw --impure --expr '"hello"'
+check_err_raw "B6 --raw int (throw)" "42"
+
 rm -rf "$D"
 
 # ---------------------------------------------------------------------
 echo
-echo "=== string-coercion parity (concatStringsSep/substring/stringLength + baseNameOf/dirOf/pathExists/readFileType/toJSON) ==="
+echo "=== string-coercion parity (concatStringsSep/substring/stringLength + baseNameOf/dirOf/pathExists/readFileType/toJSON/--raw) ==="
 echo "  passing: $pass"
 echo "  failing: $fail"
 if (( fail > 0 )); then
