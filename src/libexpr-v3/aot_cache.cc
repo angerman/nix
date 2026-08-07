@@ -40,7 +40,6 @@ constexpr size_t kEntrySize  = 56;       // key + tbl + pad + off + len
 struct Reader {
     // Atomic flags so concurrent lookups can early-exit without
     // taking the mutex.
-    std::atomic<bool> initStarted{false};
     std::atomic<bool> ready{false};
     std::atomic<bool> enabled{false};
 
@@ -388,11 +387,6 @@ lookup(const disk_cache::CacheKey & key, TableId table) noexcept
     }
     ++st.misses;
     return std::nullopt;
-}
-
-Stats & stats() noexcept
-{
-    return mutableStats();
 }
 
 } // namespace nix::v3::aot_cache

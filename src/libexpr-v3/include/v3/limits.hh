@@ -127,9 +127,4 @@ constexpr uint32_t kPollInterval = 10000;
 /// appropriate typed exception when ANY cap is exceeded.
 void checkLimits();
 
-/// Force a check immediately — used by the OOM handler path which
-/// runs OUTSIDE the dispatch loop and needs to signal cleanly.
-/// Sets the OOM atomic; the next checkLimits() call will throw.
-void signalOutOfMemory();
-
 } // namespace nix::v3

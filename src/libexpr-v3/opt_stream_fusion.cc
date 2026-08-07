@@ -83,11 +83,6 @@ std::unordered_map<VarId, const Expr *> mapBlockDefs(const Block & b)
 struct PrimopCallShape {
     const PrimOp * primop = nullptr;
     std::vector<VarId> args;
-    // The "outermost" VarId at which the call is rooted — for the
-    // PrimOpCall form, this is the binding's `var`; for the App-chain
-    // form, it's the VarId of the saturated-call App binding.  Used
-    // by the use-once safety check.
-    VarId rootVar = kInvalid;
 };
 
 // Pass `m` by reference because MkThunk recognition needs to walk
@@ -193,7 +188,6 @@ std::optional<PrimopCallShape> recogniseCall(
         PrimopCallShape r;
         r.primop = pc->primop;
         r.args = pc->args;
-        r.rootVar = v;
         return r;
     }
 
@@ -215,7 +209,6 @@ std::optional<PrimopCallShape> recogniseCall(
             PrimopCallShape r;
             r.primop = lp->primop;
             r.args.assign(argsReversed.rbegin(), argsReversed.rend());
-            r.rootVar = v;
             return r;
         }
         return std::nullopt;

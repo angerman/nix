@@ -168,7 +168,6 @@ inline bool canLowerV3(const nix::v3::ast::Node * n)
 
 struct LowererV3 {
     ir::Module m = ir::makeModule();
-    const nix::SymbolTable & symbols;  // unused (names are inline in the v3 AST)
     nix::PosTable * positions = nullptr;            // for attr/formal positions
     std::optional<nix::PosTable::Origin> posOrigin; // the source's registered origin
     /// TW's bare base-env global names (twBaseEnvGlobals).  A free name
@@ -270,7 +269,9 @@ struct LowererV3 {
         return out;
     }
 
-    explicit LowererV3(const nix::SymbolTable & symbols) : symbols(symbols) {}
+    // The SymbolTable arg is retained for call-site/API symmetry with
+    // lowerV3Ast but is unused — names are inline in the v3 AST.
+    explicit LowererV3(const nix::SymbolTable & /*symbols*/) {}
 
     ir::VarId addBinding(ir::Expr e)
     {

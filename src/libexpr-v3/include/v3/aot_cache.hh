@@ -87,7 +87,6 @@ struct Stats {
     uint32_t entries     = 0;
     bool     enabled     = false;
 };
-Stats & stats() noexcept;
 
 /// Best-effort eager init.  Returns true on success, false if env
 /// var unset or init failed.  Most callers don't need to call this

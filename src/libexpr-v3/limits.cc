@@ -648,11 +648,6 @@ void initLimits()
                        || (st.maxWallTime.count() > 0);
 }
 
-void signalOutOfMemory()
-{
-    state().oomFlag.store(true, std::memory_order_release);
-}
-
 void checkLimits()
 {
     auto & st = state();

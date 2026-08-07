@@ -6636,8 +6636,6 @@ inline std::pair<int64_t, int64_t> importStat(const std::string & path)
     return {mtimeNs, (int64_t)st.st_size};
 }
 
-} // anonymous namespace (closed so codegenGateFingerprint has external linkage)
-
 /// T-1 (CODEBASE_REVIEW_2026-06-11): deterministic fingerprint of the env gates
 /// that change EMITTED BYTECODE.  The CU disk-cache key keys only on
 /// (path, content, schema); a bisect run with e.g. NIX_V3_RAW_FORMALS=1 would
@@ -6649,11 +6647,8 @@ inline std::pair<int64_t, int64_t> importStat(const std::string & path)
 /// are unchanged.  Keep this list in sync with the getenv() reads in emit.cc /
 /// opt_*.cc / cli/lower_v3.hh / ir.cc / run.cc (test/lint-cache-coherence.sh
 /// Rule 3 enforces).
-/// The imported-CU disk-cache key in `primImport` (below) is the sole consumer.
-/// The external linkage (and the `primop.hh` declaration) is a remnant of the
-/// A1 (2026-07-06) top-level cache whose comment here once claimed run.cc also
-/// read it — it does NOT: run.cc has no reference to this function.  The
-/// linkage is harmless and left in place.
+/// The imported-CU disk-cache key in `primImport` (below) is the sole consumer,
+/// so this lives inside the file's anonymous namespace (internal linkage).
 const std::string & codegenGateFingerprint()
 {
     static const std::string fp = []() {
@@ -6682,8 +6677,6 @@ const std::string & codegenGateFingerprint()
     }();
     return fp;
 }
-
-namespace {  // reopen: restore file-local linkage for the helpers below
 
 /// builtins.import path -- read the file at `path`, parse, lower, run.
 /// Returns the resulting v3 Value.  Requires state.nixEvalState to be

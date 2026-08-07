@@ -10788,8 +10788,9 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
         // `if isFunction m then ... else import m` to import.  Peek
         // through Bridge thunks for the TW ValueType.  Cheap; only
         // fires on the Bridge case.
-        // (TW_VALUE_ERADICATION F4, 2026-06-02): no Bridge thunks → always fallback.
-        #define V3_BRIDGE_PEEK_OR(v, twTypePred, fallback) (fallback)
+        // (TW_VALUE_ERADICATION F4, 2026-06-02): there are no Bridge thunks
+        // any more, so each is-predicate tests the WHNF v3 Value directly —
+        // the old V3_BRIDGE_PEEK_OR TW-type peek was a no-op stub and is gone.
         // A8: iterative force.  On non-WHNF top, rewind ip, set
         // CFF_FORCE_RETRY, and goto op_force_slow — the opcode re-enters
         // with WHNF on top.  No C-recursion through forceValue.
@@ -10817,28 +10818,18 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 push(vm, (predExpr) ? Value::vTrue : Value::vFalse); \
                 break; \
             }
-        V3_IS_OP(OP_IS_NULL,
-            V3_BRIDGE_PEEK_OR(v, tt == ffi::TwType::Null,    v.isNull()))
-        V3_IS_OP(OP_IS_BOOL,
-            V3_BRIDGE_PEEK_OR(v, tt == ffi::TwType::Bool,    v.isBool()))
-        V3_IS_OP(OP_IS_INT,
-            V3_BRIDGE_PEEK_OR(v, tt == ffi::TwType::Int,     v.isInt()))
-        V3_IS_OP(OP_IS_FLOAT,
-            V3_BRIDGE_PEEK_OR(v, tt == ffi::TwType::Float,   v.isFloat()))
-        V3_IS_OP(OP_IS_STRING,
-            V3_BRIDGE_PEEK_OR(v, tt == ffi::TwType::String,  v.isString()))
-        V3_IS_OP(OP_IS_PATH,
-            V3_BRIDGE_PEEK_OR(v, tt == ffi::TwType::Path,    v.isPath()))
-        V3_IS_OP(OP_IS_LIST,
-            V3_BRIDGE_PEEK_OR(v, tt == ffi::TwType::List,    v.isList()))
-        V3_IS_OP(OP_IS_ATTRS,
-            V3_BRIDGE_PEEK_OR(v, tt == ffi::TwType::Attrs,   v.isAttrs()))
+        V3_IS_OP(OP_IS_NULL,   v.isNull())
+        V3_IS_OP(OP_IS_BOOL,   v.isBool())
+        V3_IS_OP(OP_IS_INT,    v.isInt())
+        V3_IS_OP(OP_IS_FLOAT,  v.isFloat())
+        V3_IS_OP(OP_IS_STRING, v.isString())
+        V3_IS_OP(OP_IS_PATH,   v.isPath())
+        V3_IS_OP(OP_IS_LIST,   v.isList())
+        V3_IS_OP(OP_IS_ATTRS,  v.isAttrs())
         V3_IS_OP(OP_IS_FUNCTION,
-            V3_BRIDGE_PEEK_OR(v, tt == ffi::TwType::Function,
                 v.isClosure() || v.isPrimOp() || v.tag() == Tag::PrimOpApp
-                || isUnderappliedClosurePap(v)))
+                || isUnderappliedClosurePap(v))
         #undef V3_IS_OP
-        #undef V3_BRIDGE_PEEK_OR
 
         case OP_HEAD: {
             // Mirror primHead in primops.cc:272-278.

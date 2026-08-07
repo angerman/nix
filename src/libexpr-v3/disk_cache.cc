@@ -398,8 +398,8 @@ std::optional<std::string> lookup(const CacheKey & key)
     // NIX_V3_AOT_CACHE_FILE is set.
     if (auto sv = aot_cache::lookup(key, aot_cache::TBL_CU)) {
         // Hit — increment the existing disk_cache stats so users
-        // see this as a cache hit (the AOT cache has its own
-        // sub-stats via aot_cache::stats() for the breakdown).
+        // see this as a cache hit (the AOT cache keeps its own
+        // internal sub-stats for the breakdown).
         st.lookups++;
         st.hits++;
         return std::string(*sv);

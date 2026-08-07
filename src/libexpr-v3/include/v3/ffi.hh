@@ -140,16 +140,6 @@ nix::PosTable &          positions(nix::EvalState & state);
 // already-expensive TW operation, so the out-of-line call is noise.
 // -------------------------------------------------------------------------
 
-/// v3-owned mirror of `nix::ValueType` so a consumer can branch on a TW
-/// value's type without naming `nix::ValueType` / the `nix::n*` enumerators
-/// (which live in value.hh).  `Other` covers invalid / external / unknown.
-enum class TwType { Null, Bool, Int, Float, String, Path, List, Attrs, Function, Thunk, External, Other };
-
-/// Type of a (possibly-unforced) TW value, via `Value::type<true>()` so an
-/// invalid/blackholed cell maps to `Thunk` rather than asserting.  Cold —
-/// only the v3↔TW bridge inspects TW value types.
-TwType valueType(const nix::Value * v);
-
 /// `state.allocValue()` — a heap TW value cell (the bridge needs a stable
 /// heap address TW updates in place; see vm.cc #484).  Cold/bridge only.
 nix::Value * allocValue(nix::EvalState & state);
@@ -415,17 +405,6 @@ FetchUrlResult addPathFull(nix::EvalState & state,
 /// `emitTreeAttrs`-equivalent field reads (emptyRevFallback = false,
 /// forceDirty per node).  THE flake-loading FFI leaf.
 LockedFlakeInfo readLockedFlake(nix::EvalState & state, const void * lockedFlakePtr);
-
-/// builtins.path's store fetch: `fetchToStore(path.resolveSymlinks(), name,
-/// method)` under DryRun (when `readOnly`) else Copy, with no path filter
-/// (the v3 caller bails to the bridge when a filter is present).  Returns
-/// the resulting StorePath.  Keeps `fetchToStore` + `FetchMode` in ffi.cc.
-/// Cold (FFI leaf: store).
-nix::StorePath pathFetchToStore(nix::EvalState & state,
-                                const nix::SourcePath & path,
-                                const std::string & name,
-                                const nix::ContentAddressMethod & method,
-                                bool readOnly);
 
 /// builtins.toFile's store add: under `readOnly` compute the path via
 /// `makeFixedOutputPathFromCA(TextInfo{sha256(contents), refs})`, else

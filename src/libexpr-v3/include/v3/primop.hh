@@ -141,13 +141,6 @@ void appliedCacheNoteTryKey(bool hashable) noexcept;
 /// drift).  Expected 0; regression-tested.
 void appliedCacheNoteTryKeyException() noexcept;
 
-/// T-1 (CODEBASE_REVIEW_2026-06-11): the codegen/optimizer env-gate fingerprint
-/// (EMPTY in production; non-empty iff a NIX_V3_* codegen gate is set) — folded
-/// into the CU disk-cache key + the applied-import cache key so a differently-
-/// compiled binary never serves a differently-compiled result.  Defined in
-/// primops.cc (kGates list there; test/lint-cache-coherence.sh keeps it in sync).
-const std::string & codegenGateFingerprint();
-
 /// SHADOW mode (#16a) support: non-mutating entry peek + compare accounting.
 bool appliedCacheLookupPeek(const std::string & key, Value & out) noexcept;
 void appliedCacheNoteShadowCompare(bool ok, uint64_t comparedNodes) noexcept;
@@ -206,35 +199,6 @@ void importCachePrintFieldBreakdown() noexcept;
 ///
 /// Reports stats under NIX_VM_STATS=1.
 void clearPostEvalGlobalRoots() noexcept;
-
-
-
-
-
-/// STG-14a (#509/#515): direct v3-side dispatch for a TW lambda whose
-/// body has been pre-lowered to v3 IR (i.e. lambda.fun is in
-/// v3SubExprCache).  Used by vm.cc OP_CALL Bridge handler to bypass
-/// `v3ToTreeWalkerPublic(arg)` -- which today forces a v3
-/// Tag::Slot/Tag::Thunk arg eagerly, the throw site of the
-/// nixpkgs hello.name STG_KEEP_HOOKS cycle (STG-12).
-///
-/// Mirrors v3CallFunctionEntry's gates + dispatch (cache lookup,
-/// closure-result refusal, prepHookUpvaluesAndWiths) but takes the
-/// arg as a v3 Value directly -- no TW round-trip, no eager force.
-/// Each captured TW upvalue is wrapped as a v3 Bridge thunk lazily,
-/// preserving the discipline that bodies force individual
-/// captures only when actually needed.
-///
-/// Return:
-///   true  -- body ran in v3; v3Out holds the result (still a v3 Value).
-///   false -- funTw doesn't qualify; caller falls back to TW-bridge.
-///
-/// On BlackholeError from the body, the exception propagates
-/// (caller catches via existing recovery, e.g. fallbackExpr).
-bool tryDispatchTWLambdaInV3(nix::EvalState & state,
-                              nix::Value & funTw,
-                              Value v3Arg,
-                              Value & v3Out);
 
 /// REVIEW_2026-05-06b PR4: `clearBridgeTables()` removed.  The function
 /// existed for "long-running daemon" cleanup but had zero callers --

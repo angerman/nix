@@ -46,7 +46,7 @@
 #include "nix/store/path-references.hh"    // PathRefScanSink (storeRefsContextFor)
 #include "nix/store/derived-path.hh"       // SingleDerivedPath (outputOf)
 #include "nix/store/content-address.hh"    // ContentAddressMethod / TextInfo
-#include "nix/fetchers/fetch-to-store.hh"  // fetchToStore / FetchMode (pathFetchToStore)
+#include "nix/fetchers/fetch-to-store.hh"  // fetchToStore / FetchMode
 #include "nix/util/serialise.hh"           // StringSource / FileSerialisationMethod (addTextToStore)
 #include "nix/fetchers/fetchers.hh"        // fetchers::Input getters (readLockedFlake)
 #include "nix/fetchers/registry.hh"        // lookupInRegistries (fetchTree)
@@ -101,28 +101,7 @@ void setTreeWalkerBuiltin(nix::EvalState & state, const std::string & name, nix:
 const nix::SymbolTable & symbols(nix::EvalState & state) { return state.symbols; }
 nix::PosTable &          positions(nix::EvalState & state) { return state.positions; }
 
-// --- TW value-graph probe + bridge round-trip (audit Phase 2/3) ---------
-
-TwType valueType(const nix::Value * v)
-{
-    // type<true>(): an invalid/blackholed cell maps to nThunk instead of
-    // asserting — matches the `type<true>()` call sites we replaced in vm.cc.
-    switch (v->type<true>()) {
-        case nix::nNull:     return TwType::Null;
-        case nix::nBool:     return TwType::Bool;
-        case nix::nInt:      return TwType::Int;
-        case nix::nFloat:    return TwType::Float;
-        case nix::nString:   return TwType::String;
-        case nix::nPath:     return TwType::Path;
-        case nix::nList:     return TwType::List;
-        case nix::nAttrs:    return TwType::Attrs;
-        case nix::nFunction: return TwType::Function;
-        case nix::nThunk:    return TwType::Thunk;
-        case nix::nExternal: return TwType::External;
-        case nix::nFailed:   return TwType::Other;  // evaluation-failed sentinel
-    }
-    return TwType::Other;  // unreachable; satisfies the non-void contract.
-}
+// --- TW bridge round-trip (audit Phase 2/3) -----------------------------
 
 nix::Value * allocValue(nix::EvalState & state)
 {
@@ -779,23 +758,6 @@ LockedFlakeInfo readLockedFlake(nix::EvalState & state, const void * lockedFlake
         out.nodes.push_back(std::move(n));
     }
     return out;
-}
-
-nix::StorePath pathFetchToStore(nix::EvalState & state,
-                                const nix::SourcePath & path,
-                                const std::string & name,
-                                const nix::ContentAddressMethod & method,
-                                bool readOnly)
-{
-    return nix::fetchToStore(
-        state.fetchSettings,
-        *state.store,
-        path.resolveSymlinks(),
-        readOnly ? nix::FetchMode::DryRun : nix::FetchMode::Copy,
-        name,
-        method,
-        nullptr,
-        state.repair);
 }
 
 FetchUrlResult addTextToStore(nix::EvalState & state, const std::string & name,
