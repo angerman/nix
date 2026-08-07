@@ -46,6 +46,10 @@ pass=0; fail=0; failed=()
 v3eval() { NIX_V3_DIRECT_EVAL=1 "$V3" --expr "$1" 2>/dev/null | tail -1; }
 tweval()  { env -u NIX_V3_DIRECT_EVAL "$NIX" eval --expr "$1" 2>/dev/null; }
 v3err()  { NIX_V3_DIRECT_EVAL=1 "$V3" --expr "$1" 2>&1 >/dev/null || true; }
+# nix (v3-direct) path — exercises the OP_* opcodes (head/tail/length/div), which
+# can diverge from the primop path v3-eval takes (this caught OP_HEAD/OP_TAIL
+# message drift on 2026-08-07 that the v3-eval-only checks missed).
+nixv3err() { NIX_V3_DIRECT_EVAL=1 env -u NIX_V3_REQUIRE "$NIX" eval --expr "$1" 2>&1 >/dev/null || true; }
 twerr()  { env -u NIX_V3_DIRECT_EVAL "$NIX" eval --expr "$1" 2>&1 >/dev/null || true; }
 
 # ---- NEGATIVE: error fragment must appear in BOTH v3 + TW stderr ----------
@@ -71,9 +75,11 @@ neg=(
 )
 for row in "${neg[@]}"; do
   expr="${row%%@@@*}"; frag="${row##*@@@}"
-  v3=$(v3err "$expr"); tw=$(twerr "$expr")
-  if [[ "$v3" == *"$frag"* && "$tw" == *"$frag"* ]]; then pass=$((pass+1))
-  else fail=$((fail+1)); failed+=("NEG [$expr] want[$frag] v3[$(printf '%s' "$v3"|head -c 110)] tw[$(printf '%s' "$tw"|head -c 110)]"); fi
+  v3=$(v3err "$expr"); nv3=$(nixv3err "$expr"); tw=$(twerr "$expr")
+  # require the fragment on BOTH v3 front-ends (v3-eval primop path AND the nix
+  # OP_* opcode path) plus TW, so opcode-vs-primop message drift can't slip through.
+  if [[ "$v3" == *"$frag"* && "$nv3" == *"$frag"* && "$tw" == *"$frag"* ]]; then pass=$((pass+1))
+  else fail=$((fail+1)); failed+=("NEG [$expr] want[$frag] v3[$(printf '%s' "$v3"|head -c 80)] nix[$(printf '%s' "$nv3"|head -c 80)] tw[$(printf '%s' "$tw"|head -c 80)]"); fi
 done
 
 # ---- POSITIVE: value byte-identical on v3 + TW ----------------------------

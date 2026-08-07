@@ -1132,6 +1132,33 @@ inline bool isTrueValue(const Value & v)
     throw std::runtime_error(msg);
 }
 
+/// TW's forceList error `expected a list but found <type>: <value>`
+/// (libexpr/eval.cc:1444 family).  Shared by OP_LENGTH/OP_HEAD/OP_TAIL so the
+/// type-error phrasing can't drift between them (#678/#680/#691).  Cold path
+/// (only off the `!isList()` branch); if/else to avoid -Wswitch-enum, matching
+/// throwNonBooleanCondition's style.
+[[noreturn]] static void throwExpectedList(const Value & v)
+{
+    const char * art = "a";
+    const char * name = "value";
+    Tag t = v.tag();
+    if (t == Tag::Int)         { art = "an"; name = "integer"; }
+    else if (t == Tag::Float)  { art = "a";  name = "float"; }
+    else if (t == Tag::Bool)   { art = "a";  name = "Boolean"; }
+    else if (t == Tag::Null)   { art = "";   name = "null"; }
+    else if (t == Tag::String) { art = "a";  name = "string"; }
+    else if (t == Tag::Path)   { art = "a";  name = "path"; }
+    else if (t == Tag::Attrs)  { art = "a";  name = "set"; }
+    else if (t == Tag::Closure || t == Tag::PrimOp || t == Tag::PrimOpApp)
+                               { art = "a";  name = "function"; }
+    std::string msg = "expected a list but found ";
+    if (*art) { msg += art; msg += ' '; }
+    msg += name;
+    msg += ": ";
+    msg += valueRepr(v);
+    throw std::runtime_error(msg);
+}
+
 // requireNoStringContextRuntime + coerceToString + the MergeBindingsSite enum's
 // s_* env-gate knobs + mergeBindings (attrset `//` merge) moved to vm_values.cc
 // (step 4 of the vm.cc split).  MergeBindingsSite is declared in
@@ -10827,13 +10854,14 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 }
             }
             Value v = pop(vm);
-            // #678 — match TW phrasing (libexpr/primops.cc:3892).
-            // TW distinguishes "not a list" (type error) from "empty
-            // list" (call-with-empty error); v3 collapses both into a
-            // single runtime_error.  For now match the empty-list
-            // message exactly (the more common case); type-mismatch
-            // falls under the same string.
-            if (!v.isList() || !v.asList() || v.asList()->size == 0)
+            // #678 — match TW: type-check FIRST (a non-list is a type error,
+            // `expected a list but found <T>: <v>`), only THEN the empty-list
+            // check.  Pre-fix v3 conflated both into "called on an empty list"
+            // (this OP_HEAD opcode is the path `nix eval` takes; primHead in
+            // primops.cc was already fixed — they must agree).
+            if (!v.isList())
+                throwExpectedList(v);
+            if (!v.asList() || v.asList()->size == 0)
                 throw std::runtime_error(
                     "'builtins.head' called on an empty list");
             push(vm, v.asList()->elems[0]);
@@ -10854,8 +10882,11 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
                 }
             }
             Value v = pop(vm);
-            // #678 — match TW phrasing (libexpr/primops.cc:3919).
-            if (!v.isList() || !v.asList() || v.asList()->size == 0)
+            // #678 — match TW: type-check FIRST, then the empty-list check
+            // (mirror OP_HEAD / primTail).
+            if (!v.isList())
+                throwExpectedList(v);
+            if (!v.asList() || v.asList()->size == 0)
                 throw std::runtime_error(
                     "'builtins.tail' called on an empty list");
             uint32_t n = v.asList()->size;
@@ -10890,27 +10921,8 @@ Value dispatchLoop(VMState & vm, size_t exitDepth, bool reuseScope = false)
             // strings as a "bonus" — silent semantic divergence.
             // TW's forceList raises `expected a list but found a
             // <type>: <value>` (libexpr/eval.cc:1444 family).
-            if (!v.isList()) {
-                const char * art = "a";
-                const char * name = "value";
-                Tag t = v.tag();
-                if (t == Tag::Int)        { art = "an"; name = "integer"; }
-                else if (t == Tag::Float) { art = "a";  name = "float"; }
-                else if (t == Tag::Bool)  { art = "a";  name = "Boolean"; }
-                else if (t == Tag::Null)  { art = "";   name = "null"; }
-                else if (t == Tag::String){ art = "a";  name = "string"; }
-                else if (t == Tag::Path)  { art = "a";  name = "path"; }
-                else if (t == Tag::Attrs) { art = "a";  name = "set"; }
-                else if (t == Tag::Closure || t == Tag::PrimOp || t == Tag::PrimOpApp)
-                                          { art = "a";  name = "function"; }
-                std::string msg = "expected a list but found ";
-                if (*art) { msg += art; msg += ' '; }
-                msg += name;
-                // #691 — append `: <value>` matching TW.
-                msg += ": ";
-                msg += valueRepr(v);
-                throw std::runtime_error(msg);
-            }
+            if (!v.isList())
+                throwExpectedList(v);   // #680/#691 — shared with OP_HEAD/OP_TAIL
             Value r; r.mkInt(v.asList() ? v.asList()->size : 0);
             push(vm, r);
             break;
