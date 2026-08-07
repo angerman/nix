@@ -780,6 +780,22 @@ struct CompilationUnit
         /// memo hook reads it as an O(1) "is an import CU" test.  In-memory only,
         /// NOT serialized.  Was `CompilationUnit::fromImportCU`.
         bool fromImportCU = false;
+
+        /// COMPILE-WASTE spike (2026-08-07, TEMPORARY): per-funcId compile-waste
+        /// attribution, indexed by IR FuncId (parallel to CU::lambdas).  Populated
+        /// at emit() ONLY when NIX_V3_COMPILE_WASTE is set; left EMPTY otherwise so
+        /// the flag-off path is byte-for-byte unchanged (behavior-neutral).  NOT
+        /// serialized and NOT borrowed (per-process, like the counters above) — the
+        /// measure runs cache-off so emit always repopulates it.  `isAttrBody`
+        /// mirrors ir::Function::isAttrBodyThunk; `codeBytes` is the emitted
+        /// bytecode size of the function.  Read once at eval-end to bucket
+        /// attr-body bytes by {alloc+forced}/{alloc,never-forced}/{never-alloc}
+        /// against rt.lambdaState.  Remove with the instrument (Rule 0).
+        struct CompileWaste {
+            uint8_t  isAttrBody = 0;
+            uint32_t codeBytes  = 0;
+        };
+        std::vector<CompileWaste> compileWaste;
     };
     mutable Runtime rt;
 

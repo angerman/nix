@@ -176,6 +176,17 @@ struct VMState
 namespace ir { struct Module; }
 CompilationUnit compile(const ir::Module & m);
 
+/// COMPILE-WASTE spike (2026-08-07, TEMPORARY): true iff NIX_V3_COMPILE_WASTE is
+/// set — emit then records per-funcId bytecode BYTES + attr-body tags into
+/// `CompilationUnit::rt.compileWaste`, and the eval-end report is emitted.  Off
+/// by default → emit path byte-for-byte unchanged.  Remove with the instrument
+/// (Rule 0: the deferred-per-attr-compilation go/no-go it sizes).
+bool compileWasteActive() noexcept;
+/// Total emitted bytecode bytes across EVERY compile() this process (all CUs,
+/// including any never instantiated).  The cold-compile-cost denominator for
+/// the wasted-compile fraction.  Zero unless compileWasteActive().
+uint64_t compileWasteTotalEmittedBytes() noexcept;
+
 /// Run the top-level CU's entry until OP_HALT, returning the final value.
 Value run(const CompilationUnit & cu);
 

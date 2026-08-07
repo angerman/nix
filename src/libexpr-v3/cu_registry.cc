@@ -87,6 +87,18 @@ void registerCuLambdaRange(const CompilationUnit * cu) noexcept
     detail::tl_cuCu = nullptr;
 }
 
+std::vector<const CompilationUnit *> allRegisteredCus()
+{
+    // COMPILE-WASTE spike: snapshot the sorted interval registry's CUs.  One
+    // entry per distinct CU that created a closure/thunk this eval.  Cold (once
+    // at eval-end); no hot-path impact.
+    std::vector<const CompilationUnit *> out;
+    out.reserve(tl_intervals.size());
+    for (const auto & iv : tl_intervals)
+        out.push_back(iv.cu);
+    return out;
+}
+
 const CompilationUnit *
 lookupCuForDescSlow(const LambdaDescriptor * desc) noexcept
 {

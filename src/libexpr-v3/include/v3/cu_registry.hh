@@ -40,6 +40,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 
 namespace nix::v3 {
 
@@ -57,6 +58,12 @@ void registerCuLambdaRange(const CompilationUnit * cu) noexcept;
 /// thread-local last-hit cache, and return the owning CU (or nullptr if `desc`
 /// is not in any registered range — matching the old null `desc->cu`).
 const CompilationUnit * lookupCuForDescSlow(const LambdaDescriptor * desc) noexcept;
+
+/// COMPILE-WASTE spike (2026-08-07): enumerate every CU registered on this
+/// thread (i.e. every CU that created at least one closure/thunk during this
+/// eval).  COLD — walked exactly once at eval-end by the NIX_V3_COMPILE_WASTE
+/// report; NOT on any hot path.  Remove with the instrument (Rule 0).
+std::vector<const CompilationUnit *> allRegisteredCus();
 
 namespace detail {
 // Thread-local last-hit interval cache (address range + its CU).  `tl_cuLo` is

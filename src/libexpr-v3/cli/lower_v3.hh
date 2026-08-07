@@ -736,13 +736,17 @@ struct LowererV3 {
     /// Wrap `e` in a thunk Function (lowered in the CURRENT scopes, so it
     /// captures outer vars as upvalues — emit computes them).  Mirrors
     /// lower.cc::thunkify.
-    ir::VarId thunkify(const nix::v3::ast::Node * e)
+    /// `attrBody` (COMPILE-WASTE spike): tag the MINTED thunk Function as a
+    /// let/attrset value body — only the OUTER thunk this call creates (its
+    /// fid is captured before lowerExpr, so nested sub-thunks stay untagged).
+    ir::VarId thunkify(const nix::v3::ast::Node * e, bool attrBody = false)
     {
         m.functions.emplace_back();
         ir::FuncId fid = static_cast<ir::FuncId>(m.functions.size() - 1);
         auto eb = m.freshBlock();
         m.functions[fid].entryBlock = eb;
         m.functions[fid].name = "<thunk>";
+        m.functions[fid].isAttrBodyThunk = attrBody;  // COMPILE-WASTE spike
         blockStack.push_back(eb);
         setReturn(lowerExpr(e));
         blockStack.pop_back();
@@ -801,26 +805,30 @@ struct LowererV3 {
         }
     }
 
-    ir::VarId thunkifyForAttr(const nix::v3::ast::Node * e)
+    ir::VarId thunkifyForAttr(const nix::v3::ast::Node * e, bool attrBody = false)
     {
         // LEVER-1 step 2b: eager const-literal lowering is unconditional (the
         // NIX_V3_NO_CONST_EAGER opt-out, which restored the old leaf-only
         // isTrivialForValue predicate, was retired).
         const bool eager = isConstEagerLiteral(e, 0);
-        return eager ? lowerExpr(e) : thunkify(e);
+        // COMPILE-WASTE spike: an eager const literal mints NO thunk (compiled
+        // inline in the parent, always materialized), so it is never part of
+        // the deferred-compile population — `attrBody` only tags the thunk case.
+        return eager ? lowerExpr(e) : thunkify(e, attrBody);
     }
 
     /// Thunk whose body is built by `bodyBuilder()` (returns the body
     /// VarId) — for synthetic bodies not backed by a v3 AST node (e.g.
     /// an `inherit (e) name` → AttrSelect(sharedSrc, name)).
     template<class F>
-    ir::VarId thunkifyIR(F bodyBuilder)
+    ir::VarId thunkifyIR(F bodyBuilder, bool attrBody = false)
     {
         m.functions.emplace_back();
         ir::FuncId fid = static_cast<ir::FuncId>(m.functions.size() - 1);
         auto eb = m.freshBlock();
         m.functions[fid].entryBlock = eb;
         m.functions[fid].name = "<thunk>";
+        m.functions[fid].isAttrBodyThunk = attrBody;  // COMPILE-WASTE spike
         blockStack.push_back(eb);
         setReturn(bodyBuilder());
         blockStack.pop_back();
@@ -859,6 +867,7 @@ struct LowererV3 {
             auto heb = m.freshBlock();
             m.functions[hfid].entryBlock = heb;
             m.functions[hfid].name = "<inherit-from>";
+            m.functions[hfid].isAttrBodyThunk = true;  // COMPILE-WASTE spike
             blockStack.push_back(heb);
             scopes.push_back(recScope);
             setReturn(lowerExpr(at->inheritFromExprs[idx]));
@@ -886,6 +895,7 @@ struct LowererV3 {
             auto eb = m.freshBlock();
             m.functions[fid].entryBlock = eb;
             m.functions[fid].name = d->name;
+            m.functions[fid].isAttrBodyThunk = true;  // COMPILE-WASTE spike (let/rec binding body)
             fids.push_back(fid);
             blockStack.push_back(eb);
             if (d->kind == nix::v3::ast::Attrs::AttrKind::Inherited) {
@@ -1121,6 +1131,7 @@ struct LowererV3 {
                             ir::BlockId eb = m.freshBlock();
                             m.functions[fid].entryBlock = eb;
                             m.functions[fid].name = bs[i]->name;
+                            m.functions[fid].isAttrBodyThunk = true;  // COMPILE-WASTE spike (DAG-demoted let binding)
                             m.functions[fid].nWithTargets =
                                 static_cast<uint16_t>(lws.size());
                             blockStack.push_back(eb);
@@ -1186,7 +1197,7 @@ struct LowererV3 {
             dyn.dynamics.reserve(at->dynamicAttrs.size());
             for (auto & da : at->dynamicAttrs) {
                 ir::VarId nameV = forceVal(lowerExpr(da.nameExpr));
-                ir::VarId valV  = thunkifyForAttr(da.valueExpr);
+                ir::VarId valV  = thunkifyForAttr(da.valueExpr, /*attrBody=*/true);
                 dyn.dynamics.push_back({nameV, valV, /*pos*/ 0});
             }
             scopes.pop_back();
@@ -1210,16 +1221,16 @@ struct LowererV3 {
         namespace a = nix::v3::ast;
         if (d.kind == a::Attrs::AttrKind::Inherited)
             return resolvesViaWith(d.name)
-                ? thunkifyIR([&] { return lowerVarByName(d.name); })
+                ? thunkifyIR([&] { return lowerVarByName(d.name); }, /*attrBody=*/true)
                 : lowerVarByName(d.name);
         if (d.kind == a::Attrs::AttrKind::InheritedFrom) {
             ir::SymbolId sym = m.internSymbol(d.name);
             ir::VarId src = srcVars[d.fromIdx];
             return thunkifyIR([&] {
                 return addBinding(ir::AttrSelect{addBinding(ir::VarRef{src}), sym});
-            });
+            }, /*attrBody=*/true);
         }
-        return thunkifyForAttr(d.value);  // Plain
+        return thunkifyForAttr(d.value, /*attrBody=*/true);  // Plain
     }
 
     /// Phase 3a/4c: attrset.  rec → lowerLetRec (handles rec + dynamics);
@@ -1249,7 +1260,7 @@ struct LowererV3 {
             dyn.dynamics.reserve(e->dynamicAttrs.size());
             for (auto & da : e->dynamicAttrs) {
                 ir::VarId nameV = forceVal(lowerExpr(da.nameExpr));  // string (or null → drop)
-                ir::VarId valV  = thunkifyForAttr(da.valueExpr);     // lazy
+                ir::VarId valV  = thunkifyForAttr(da.valueExpr, /*attrBody=*/true); // lazy
                 dyn.dynamics.push_back({nameV, valV, /*pos*/ 0});
             }
             return addBinding(std::move(dyn));

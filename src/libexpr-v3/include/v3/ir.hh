@@ -526,6 +526,21 @@ struct Function {
     bool                isOrDefault = false;
     bool                isInheritWrapper = false;
 
+    /// COMPILE-WASTE spike (2026-08-07, TEMPORARY instrument): true for a
+    /// Function that is the deferred VALUE BODY of a `let`/attrset binding
+    /// (`{ a = <expr>; }` / `let a = <expr>; in …` / `inherit`/`inherit (e)`
+    /// — the per-attr thunk bodies).  NOT set for call-arg / list-element
+    /// thunks (they share thunkifyForAttr but are a different population),
+    /// nor for eager const-literal attr values (compiled inline, no thunk).
+    /// Read at emit() under NIX_V3_COMPILE_WASTE to attribute emitted
+    /// bytecode BYTES to the "per-attr deferred-compile" population, then
+    /// cross-referenced with per-funcId alloc/force counts to size the
+    /// never-forced (wasted-compile) fraction — the falsifier for
+    /// "deferred per-attribute compilation".  Purely diagnostic; the value
+    /// is not serialized (the measure runs cache-off) and gates nothing.
+    /// Remove with the instrument once the go/no-go is decided (Rule 0).
+    bool                isAttrBodyThunk = false;
+
     /// Free vars referenced by the body block (and recursively by any
     /// sub-blocks / nested functions reachable from the body), in the
     /// order they appear as upvalues at runtime.  Populated by

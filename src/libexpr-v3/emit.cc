@@ -27,8 +27,10 @@
 #include "v3/vm.hh"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <set>
 #include <stdexcept>
@@ -45,6 +47,14 @@
 /// linear scan is fine.
 
 namespace nix::v3 {
+
+// COMPILE-WASTE spike (2026-08-07, TEMPORARY instrument) — file-scope so both
+// the anon-namespace Emitter (emitFunction records bytes here) and the
+// nix::v3 accessors below can see them.  See the block above compile() +
+// vm.hh's compileWasteActive() for the full Rule-0 retirement criterion.
+static const bool g_compileWaste =
+    std::getenv("NIX_V3_COMPILE_WASTE") != nullptr;
+static std::atomic<uint64_t> g_compileWasteTotalBytes{0};
 
 namespace {
 
@@ -2606,6 +2616,24 @@ struct Emitter
 
         unit.lambdaCodeOffsets[fid] = codeStart;
 
+        // COMPILE-WASTE spike: record this function's emitted bytecode SIZE +
+        // its attr-body tag, keyed by funcId, into the per-process side table.
+        // Gated (empty when the flag is off → behavior-neutral).  `codeStart`
+        // is this function's first instruction and `unit.code.size()` is one
+        // past its last (functions are emitted contiguously, one per call), so
+        // the delta is exactly this function's instruction count.
+        if (__builtin_expect(g_compileWaste, 0)) {
+            const uint32_t codeBytes = static_cast<uint32_t>(
+                (unit.code.size() - codeStart) * sizeof(Instruction));
+            if (unit.rt.compileWaste.size() <= fid)
+                unit.rt.compileWaste.resize(fid + 1);
+            unit.rt.compileWaste[fid].isAttrBody =
+                f.isAttrBodyThunk ? 1 : 0;
+            unit.rt.compileWaste[fid].codeBytes = codeBytes;
+            g_compileWasteTotalBytes.fetch_add(codeBytes,
+                                               std::memory_order_relaxed);
+        }
+
         ctx = nullptr;
 
         if (fid == 0)
@@ -2644,6 +2672,27 @@ struct Emitter
 };
 
 } // namespace
+
+// COMPILE-WASTE spike (2026-08-07, TEMPORARY instrument): sizes the prize for
+// "deferred per-attribute compilation".  v3 compiles eagerly + whole-module, so
+// every attr/let value body is lowered+emitted at import time even though most
+// attrs of a big machine-generated attrset (hackage-packages.nix / all-packages
+// .nix) are never selected → their bytecode is wasted work.  Under
+// NIX_V3_COMPILE_WASTE, emitFunction records each function's emitted BYTE size +
+// its attr-body tag into CompilationUnit::rt.compileWaste, and run.cc's eval-end
+// report cross-references per-funcId alloc/force counts to compute the
+// never-forced (wasted) fraction.  Off by default → the emit path is
+// byte-for-byte unchanged.
+// RETIREMENT CRITERION (Rule 0 / repo rule 4): remove the g_compileWaste gate
+// (defined at file scope above), the rt.compileWaste side table,
+// ir::Function::isAttrBodyThunk, allRegisteredCus(), and the run.cc report the
+// moment the deferred-per-attr-compilation go/no-go is recorded — this
+// instrument exists only to decide that one question.
+bool compileWasteActive() noexcept { return g_compileWaste; }
+uint64_t compileWasteTotalEmittedBytes() noexcept
+{
+    return g_compileWasteTotalBytes.load(std::memory_order_relaxed);
+}
 
 CompilationUnit compile(const ir::Module & m)
 {

@@ -104,6 +104,7 @@ rule3_allowlist=(
   "NIX_V3_DBG_STRICTNESS_VERBOSE" # dump: per-Function strictArgs report
   "NIX_V3_FREE_LIST_STATS"        # dump: end-of-eval free-list stats (run.cc; post-eval, codegen bit-identical)
   "NIX_V3_STRINGS_ATTR"           # dump: end-of-eval allocChars attribution (run.cc; post-eval, codegen bit-identical)
+  "NIX_V3_COMPILE_WASTE"          # dump: emit records per-func bytecode BYTES into non-serialized rt.compileWaste + eval-end wasted-compile report; unit.code (emitted opcodes) is UNTOUCHED → codegen bit-identical (TEMPORARY spike; verified firefox.drvPath byte-identical flag ON vs OFF)
 )
 
 # run_rule3 PRIMOPS CODEGEN_DIR -> prints violations; returns 0 clean,

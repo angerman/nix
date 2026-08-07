@@ -21,6 +21,7 @@
 #include "v3/forcerate_trace.hh" // per-creation-site force-rate histogram instrument
 #include "v3/dedup_survey.hh"   // #772 surveyCUBytecodeDedup (outer-CU survey)
 #include "v3/bytecode.hh"       // CompilationUnit + ifdProbeKindName (IFD summary)
+#include "v3/cu_registry.hh"    // allRegisteredCus (COMPILE-WASTE spike walk)
 #include "v3/limits.hh"
 
 #include "v3/ffi.hh"  // ffi::symbols/positions + EvalState fwd — no direct eval.hh
@@ -54,8 +55,94 @@ bool keepLibAlive()
 // runRootExprFromString): the top-level result cache v1 shadow stats dump,
 // called from runRootExprModule's end-of-eval stats region below.
 
+// ---------------------------------------------------------------------------
+// COMPILE-WASTE spike (2026-08-07, TEMPORARY instrument) — see emit.cc's
+// g_compileWaste comment + Rule-0 retirement criterion.  Sizes the prize for
+// "deferred per-attribute compilation": what fraction of emitted attr/let
+// value-body bytecode belongs to a thunk that is NEVER forced (so a lazy
+// per-attr compiler would never have compiled it).
+// ---------------------------------------------------------------------------
+namespace {
+
+// Re-entrancy depth so the report fires exactly once, at the OUTERMOST
+// runRootExprModule (the bytecode-primop install path + any re-entrant compile
+// each call this recursively; only the top-level eval should print).
+thread_local int g_compileWasteDepth = 0;
+struct CompileWasteDepthGuard {
+    CompileWasteDepthGuard()  noexcept { ++g_compileWasteDepth; }
+    ~CompileWasteDepthGuard() noexcept { --g_compileWasteDepth; }
+    bool outermost() const noexcept { return g_compileWasteDepth == 1; }
+};
+
+// Cross-reference per-funcId emitted bytecode BYTES (rt.compileWaste, set at
+// emit) with per-funcId alloc/force counts (rt.lambdaState, bumped at runtime)
+// across every CU that ran this eval, and print the wasted-compile fraction.
+// COLD — called once at eval-end.
+void dumpCompileWasteReport()
+{
+    uint64_t walkedTotal = 0, attrBodyBytes = 0;
+    uint64_t abForced = 0, abAllocNeverForced = 0, abNeverAlloc = 0;
+    uint64_t abForcedN = 0, abAllocNeverForcedN = 0, abNeverAllocN = 0;
+    uint64_t nCUs = 0, nFuncs = 0, nAttrFuncs = 0;
+
+    for (const CompilationUnit * cu : allRegisteredCus()) {
+        if (!cu) continue;
+        ++nCUs;
+        const auto & cw = cu->rt.compileWaste;
+        const size_t nf = cu->lambdas.size();
+        for (size_t fid = 0; fid < nf; ++fid) {
+            if (fid >= cw.size()) continue;  // not emitted under the flag
+            const uint32_t bytes = cw[fid].codeBytes;
+            walkedTotal += bytes;
+            ++nFuncs;
+            if (!cw[fid].isAttrBody) continue;
+            attrBodyBytes += bytes;
+            ++nAttrFuncs;
+            const auto ls = cu->lambdaStateAt(fid);
+            if (ls.allocCount == 0)      { abNeverAlloc       += bytes; ++abNeverAllocN; }
+            else if (ls.forceCount == 0) { abAllocNeverForced += bytes; ++abAllocNeverForcedN; }
+            else                         { abForced           += bytes; ++abForcedN; }
+        }
+    }
+
+    const uint64_t wasted      = abNeverAlloc + abAllocNeverForced;   // attr-body, never forced
+    const uint64_t globalTotal = compileWasteTotalEmittedBytes();     // ALL compiles (cold-compile cost)
+    auto pct = [](uint64_t a, uint64_t b) {
+        return b ? 100.0 * double(a) / double(b) : 0.0;
+    };
+
+    std::fprintf(stderr,
+        "\nv3 COMPILE-WASTE (NIX_V3_COMPILE_WASTE) — deferred-per-attr-compile prize\n"
+        "  CUs walked=%llu  functions=%llu  attr-body-thunk functions=%llu\n"
+        "  total emitted bytecode:    %10llu B  (all compile() calls = cold-compile cost)\n"
+        "  walked emitted bytecode:   %10llu B  (functions in CUs that ran)\n"
+        "  attr-body-thunk bytecode:  %10llu B  (%.1f%% of total)\n"
+        "    allocated + forced:      %10llu B  (n=%llu)\n"
+        "    allocated, NEVER forced: %10llu B  (n=%llu)\n"
+        "    NEVER allocated:         %10llu B  (n=%llu)\n"
+        "  WASTED (attr-body never forced): %llu B\n"
+        "    = %.1f%% of total emitted bytecode   [FALSIFIER metric]\n"
+        "    = %.1f%% of attr-body-thunk bytecode\n",
+        (unsigned long long) nCUs, (unsigned long long) nFuncs,
+        (unsigned long long) nAttrFuncs,
+        (unsigned long long) globalTotal,
+        (unsigned long long) walkedTotal,
+        (unsigned long long) attrBodyBytes, pct(attrBodyBytes, globalTotal),
+        (unsigned long long) abForced, (unsigned long long) abForcedN,
+        (unsigned long long) abAllocNeverForced, (unsigned long long) abAllocNeverForcedN,
+        (unsigned long long) abNeverAlloc, (unsigned long long) abNeverAllocN,
+        (unsigned long long) wasted,
+        pct(wasted, globalTotal),
+        pct(wasted, attrBodyBytes));
+}
+
+} // namespace
+
 RootResult runRootExprModule(nix::EvalState & state, ir::Module module)
 {
+    // COMPILE-WASTE spike: fire the eval-end report only at the outermost call.
+    CompileWasteDepthGuard compileWasteGuard;
+
     // Idempotent: register the builtin primop table on first call.
     // Safe to call per-invocation — the underlying registry is global
     // and de-duplicates by name.  The registration cost is constant
@@ -266,6 +353,12 @@ RootResult runRootExprModule(nix::EvalState & state, ir::Module module)
         std::getenv("NIX_VM_STATS") != nullptr;
     if (__builtin_expect(s_dumpStats, 0))
         dumpVmStats(snaps);
+
+    // COMPILE-WASTE spike: at the OUTERMOST eval only, report the fraction of
+    // emitted attr/let value-body bytecode whose thunk was never forced.
+    if (__builtin_expect(compileWasteActive(), 0) && compileWasteGuard.outermost())
+        dumpCompileWasteReport();
+
     return out;
 }
 

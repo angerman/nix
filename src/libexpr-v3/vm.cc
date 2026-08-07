@@ -548,7 +548,13 @@ inline void dump()
 inline bool dbgForceStatsActive() noexcept
 {
     static const bool s_active = [] {
-        return std::getenv("V3_DBG_ALLOC_DUMP") || std::getenv("V3_DBG_FORCES")
+        // COMPILE-WASTE spike (2026-08-07, TEMPORARY): the per-funcId
+        // allocCount/forceCount this gate guards ARE the wasted-compile
+        // instrument's alloc-vs-force signal.  Retire this disjunct with the
+        // instrument (Rule 0 — deferred-per-attr-compilation go/no-go).  Cold:
+        // this lambda runs once (static const bool s_active) — lint:allow-getenv
+        return std::getenv("NIX_V3_COMPILE_WASTE")  // lint:allow-getenv (cold: static-const init)
+            || std::getenv("V3_DBG_ALLOC_DUMP") || std::getenv("V3_DBG_FORCES")
             || std::getenv("V3_DBG_FORCE_NAME") || std::getenv("V3_DBG_FORCE_POS")
             || std::getenv("NIX_VM_STATS");
     }();
