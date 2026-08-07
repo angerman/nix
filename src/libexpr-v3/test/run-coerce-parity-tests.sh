@@ -2,8 +2,8 @@
 # String-coercion parity — TW vs v3-direct byte-equality regression guard.
 # Two families:
 #   #740          — concatStringsSep / substring / stringLength (A*/S* below)
-#   2026-08-07    — baseNameOf / dirOf / pathExists / readFileType (B1-B4);
-#                   toJSON (B5) + `nix eval --raw` (B6) appended by follow-ups
+#   2026-08-07    — baseNameOf / dirOf / pathExists / readFileType (B1-B4)
+#                   + toJSON (B5); `nix eval --raw` (B6) appended by a follow-up
 #
 # Four CONFIRMED tree-walker-parity bugs in v3's string primops, all now
 # fixed to match TW's `coerceToString` (eval.hh defaults for these three
@@ -207,11 +207,24 @@ check "B4 readFileType plain string (control)" \
 check_err "B4 readFileType null (throw)" "builtins.readFileType null"
 check_err "B4 readFileType list (throw)" "builtins.readFileType [ 1 ]"
 
+# --- 5 toJSON: attrset with `outPath` serializes as its outPath value
+#     (recursed UNCONDITIONALLY: `{ outPath = 5; }` -> `5`); a `__toString`
+#     RESULT is coerced to a STRING (int result THROWS, not re-serialized).
+check "B5 toJSON outPath=5" \
+  eval --impure --expr 'builtins.toJSON { outPath = 5; }'
+check "B5 toJSON deriv-shape outPath string (control)" \
+  eval --impure --expr 'builtins.toJSON { type = "derivation"; outPath = "/nix/store/x"; }'
+check "B5 toJSON __toString->string (control)" \
+  eval --impure --expr 'builtins.toJSON { __toString = self: self.a; a = "foo"; }'
+check "B5 toJSON ordinary attrs (control)" \
+  eval --impure --expr 'builtins.toJSON { a = 1; b = [ 2 3 ]; }'
+check_err "B5 toJSON __toString=int (throw)" 'builtins.toJSON { __toString = self: 42; }'
+
 rm -rf "$D"
 
 # ---------------------------------------------------------------------
 echo
-echo "=== string-coercion parity (concatStringsSep/substring/stringLength + baseNameOf/dirOf/pathExists/readFileType) ==="
+echo "=== string-coercion parity (concatStringsSep/substring/stringLength + baseNameOf/dirOf/pathExists/readFileType/toJSON) ==="
 echo "  passing: $pass"
 echo "  failing: $fail"
 if (( fail > 0 )); then

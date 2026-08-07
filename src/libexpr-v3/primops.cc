@@ -8957,15 +8957,37 @@ nlohmann::json valueToJsonWithContext(
                 Value forced = forceValue(*state.vm, *fn);
                 Value s = callClosure(*state.vm, forced, v);
                 s = forceValue(*state.vm, s);
-                return valueToJsonWithContext(state, s, context);
+                // TW-coerce-parity (2026-08-07): TW's printValueAsJSON
+                // nAttrs case (libexpr/value-to-json.cc) uses
+                // `tryAttrsToString(pos, v, ctx, coerceMore=false,
+                // copyToStore=false)` — it calls `__toString` and then
+                // COERCES the RESULT to a STRING (not re-serialize it as
+                // JSON).  So `__toString = self: 42` THROWS `cannot
+                // coerce an integer to a string: 42`; pre-fix v3
+                // recursed valueToJsonWithContext and emitted `42` (a
+                // JSON number).  A path result stays a SOURCE path
+                // (copyToStore=false), unlike the general nPath case
+                // (copyToStore=true) — matching TW's tryAttrsToString.
+                // Forward the coercion's context tokens.
+                std::vector<std::string> tsCtx;
+                std::string coerced = toStringCoerceCtx(
+                    state, s, tsCtx, /*copyPathsToStore=*/false,
+                    /*coerceMore=*/false);
+                for (auto & e : tsCtx)
+                    v3InsertContextToken(context, e, "toJSON");
+                return json(coerced);
             }
             const auto & sym = drvStrictSymbols();
-            // outPath fallback for derivations.
+            // outPath fallback for derivations.  TW-coerce-parity
+            // (2026-08-07): TW recurses printValueAsJSON on the outPath
+            // value UNCONDITIONALLY (`if (auto i = attrs->get(outPath))
+            // return printValueAsJSON(*i->value, ...)`), so `{ outPath =
+            // 5; }` serializes as `5`.  Pre-fix v3 gated on
+            // isString()/isPath() and fell through to the generic object
+            // walk, emitting `{"outPath":5}`.  Recurse unconditionally.
             if (auto * op = v.asAttrs()->lookup(sym.outPath)) {
                 Value forced = forceValue(*state.vm, *op);
-                if (forced.isString() || forced.isPath()) {
-                    return valueToJsonWithContext(state, forced, context);
-                }
+                return valueToJsonWithContext(state, forced, context);
             }
         }
         json obj = json::object();
