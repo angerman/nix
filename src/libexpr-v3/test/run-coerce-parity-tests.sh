@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
-# String-coercion parity — concatStringsSep / substring / stringLength.
-# TW vs v3-direct byte-equality regression guard for #740.
+# String-coercion parity — TW vs v3-direct byte-equality regression guard.
+# Two families:
+#   #740          — concatStringsSep / substring / stringLength (A*/S* below)
+#   2026-08-07    — baseNameOf / dirOf / pathExists / readFileType (B1-B4);
+#                   toJSON (B5) + `nix eval --raw` (B6) appended by follow-ups
 #
 # Four CONFIRMED tree-walker-parity bugs in v3's string primops, all now
 # fixed to match TW's `coerceToString` (eval.hh defaults for these three
@@ -146,11 +149,69 @@ check_err "A3 stringLength bool"       "builtins.stringLength true"
 check_err "A3 stringLength null"       "builtins.stringLength null"
 check_err "A3 stringLength list"       "builtins.stringLength [ 1 2 ]"
 
+# =====================================================================
+# TW-coerce-parity (2026-08-07) — a SECOND family of coercion divergences.
+# Builtins that in TW COERCE their argument (baseNameOf/dirOf via
+# coerceToString; pathExists/readFileType via realisePath->coerceToPath)
+# but where v3 hard-threw `expected string or path` / `cannot coerce a
+# set`.  Each fixed to match TW byte-for-byte with that builtin's exact
+# coerce flags.  Bug numbers as reported: 1 baseNameOf, 2 dirOf,
+# 3 pathExists, 4 readFileType.  (5 toJSON + 6 `nix eval --raw` land in
+# the following commits, with their own B5/B6 checks appended here.)
+# =====================================================================
+
+# --- 1 baseNameOf: TW coerces (coerceMore=false, copyToStore=false),
+#     then legacyBaseNameOf.  __toString / outPath / string accepted;
+#     int/float/bool/null/list THROW.
+check "B1 baseNameOf __toString" \
+  eval --impure --expr 'builtins.baseNameOf { __toString = self: "/a/b/c"; }'
+check "B1 baseNameOf outPath" \
+  eval --impure --expr 'builtins.baseNameOf { outPath = "/a/b/leaf"; }'
+check "B1 baseNameOf plain string (control)" \
+  eval --impure --expr 'builtins.baseNameOf "/a/b/c"'
+check_err "B1 baseNameOf int (throw)"  "builtins.baseNameOf 42"
+check_err "B1 baseNameOf list (throw)" "builtins.baseNameOf [ 1 2 ]"
+
+# --- 2 dirOf: same coercion; a PATH arg still returns a PATH (unchanged),
+#     a coerced/string arg returns a STRING.
+check "B2 dirOf __toString" \
+  eval --impure --expr 'builtins.dirOf { __toString = self: "/a/b/c"; }'
+check "B2 dirOf outPath" \
+  eval --impure --expr 'builtins.dirOf { outPath = "/a/b/leaf"; }'
+check "B2 dirOf plain string (control)" \
+  eval --impure --expr 'builtins.dirOf "/a/b/c"'
+check_err "B2 dirOf float (throw)" "builtins.dirOf 3.5"
+check_err "B2 dirOf bool (throw)"  "builtins.dirOf true"
+
+# --- 3 pathExists: TW realisePath->coerceToPath accepts __toString/outPath;
+#     a bare set (no __toString/outPath) and int/etc THROW `cannot coerce`.
+check "B3 pathExists __toString existing dir" \
+  eval --impure --expr "builtins.pathExists { __toString = self: \"$D\"; }"
+check "B3 pathExists __toString missing path" \
+  eval --impure --expr "builtins.pathExists { __toString = self: \"$D/nope\"; }"
+check "B3 pathExists plain string (control)" \
+  eval --impure --expr "builtins.pathExists \"$D\""
+check_err "B3 pathExists int (throw)"      "builtins.pathExists 42"
+check_err "B3 pathExists bare set (throw)" "builtins.pathExists { a = 1; }"
+
+# --- 4 readFileType: TW realisePath->coerceToPath accepts __toString/outPath.
+#     Use /tmp (a path whose ancestors are not symlinks — readFileType's
+#     std::nullopt/lstat resolution errors on a symlinked ANCESTOR, which a
+#     mktemp dir under a symlinked /tmp would hit on both engines).  The
+#     result differs by OS (symlink on macOS, directory on Linux) but `check`
+#     compares TW==v3 on the SAME host, so it stays portable.
+check "B4 readFileType __toString /tmp" \
+  eval --impure --expr 'builtins.readFileType { __toString = self: "/tmp"; }'
+check "B4 readFileType plain string (control)" \
+  eval --impure --expr 'builtins.readFileType "/tmp"'
+check_err "B4 readFileType null (throw)" "builtins.readFileType null"
+check_err "B4 readFileType list (throw)" "builtins.readFileType [ 1 ]"
+
 rm -rf "$D"
 
 # ---------------------------------------------------------------------
 echo
-echo "=== string-coercion parity (concatStringsSep / substring / stringLength) ==="
+echo "=== string-coercion parity (concatStringsSep/substring/stringLength + baseNameOf/dirOf/pathExists/readFileType) ==="
 echo "  passing: $pass"
 echo "  failing: $fail"
 if (( fail > 0 )); then

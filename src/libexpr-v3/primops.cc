@@ -3398,17 +3398,35 @@ void primTraceVerbose(EvalState & state, Value * args, Value & out)
     primTrace(state, args, out);
 }
 
-void primBaseNameOf(EvalState &, Value * args, Value & out)
+void primBaseNameOf(EvalState & state, Value * args, Value & out)
 {
     // Mirrors tree-walker's legacyBaseNameOf: at most ONE trailing
     // slash is stripped, so `baseNameOf "a/"` is "a" but
     // `baseNameOf "a//"` is "" (a 10-year-old quirk that
     // `eval-okay-baseNameOf.nix` pins down).
+    //
+    // TW-coerce-parity (2026-08-07): TW's prim_baseNameOf
+    // (libexpr/primops.cc:2174) does NOT demand a bare string/path — it
+    // COERCES via `coerceToString(pos, arg, ctx, "...", coerceMore=false,
+    // copyToStore=false)` before applying legacyBaseNameOf.  So a
+    // derivation / attrset with __toString/outPath is accepted (Path
+    // kept as the SOURCE path — copyToStore=false, no store copy), and
+    // int/float/bool/null/list THROW `cannot coerce <type> to a string`.
+    // Pre-fix v3 hard-threw `expected string or path` on every
+    // non-string/non-path.  Route the coercible case through the shared
+    // coercer with TW's exact flags; keep the string/path fast paths.
+    std::string coerced;              // owns the bytes for the coerced case
     std::string_view s;
     bool inputIsString = args[0].isString();
+    std::vector<std::string> coercedCtx;
     if (inputIsString) s = args[0].asString();
     else if (args[0].isPath()) s = args[0].asPath();
-    else typeError("baseNameOf", "string or path");
+    else {
+        coerced = toStringCoerceCtx(state, args[0], coercedCtx,
+                                    /*copyPathsToStore=*/false,
+                                    /*coerceMore=*/false);
+        s = coerced;
+    }
     if (s.empty()) { out = mkStringValueOwned(""); return; }
     size_t last = s.size() - 1;
     if (s[last] == '/' && last > 0) last -= 1;
@@ -3420,22 +3438,38 @@ void primBaseNameOf(EvalState &, Value * args, Value & out)
     // interpolation of a derivation), TW propagates that context to
     // the output.  Without this, callers that derive a basename from
     // a store path lose the underlying drv reference.  Paths have no
-    // context to propagate.
+    // context to propagate; a coerced value forwards whatever context
+    // the coercion accumulated (e.g. an outPath's Built/Opaque entry).
     if (inputIsString) {
         if (auto * raw = lookupStringContextEntries(args[0].asString())) {
             std::vector<std::string> copy = *raw;
             setStringContextEntries(out.asString(), std::move(copy));
         }
+    } else if (!coercedCtx.empty()) {
+        setStringContextEntries(out.asString(), std::move(coercedCtx));
     }
 }
 
-void primDirOf(EvalState &, Value * args, Value & out)
+void primDirOf(EvalState & state, Value * args, Value & out)
 {
+    // TW-coerce-parity (2026-08-07): TW's prim_dirOf (libexpr/primops.cc:
+    // 2205) returns a PATH for a path arg (path.parent()), else COERCES
+    // via `coerceToString(coerceMore=false, copyToStore=false)` and
+    // returns a STRING.  So a derivation / attrset with __toString/outPath
+    // is accepted; int/float/bool/null/list THROW `cannot coerce <type>
+    // to a string`.  Pre-fix v3 hard-threw `expected string or path`.
     std::string s;
     bool isPathV = false;
+    bool coercedInput = false;
+    std::vector<std::string> coercedCtx;
     if (args[0].isString()) s = args[0].asString();
     else if (args[0].isPath()) { s = args[0].asPath(); isPathV = true; }
-    else typeError("dirOf", "string or path");
+    else {
+        s = toStringCoerceCtx(state, args[0], coercedCtx,
+                              /*copyPathsToStore=*/false,
+                              /*coerceMore=*/false);
+        coercedInput = true;
+    }
     auto pos = s.find_last_of('/');
     std::string dir = (pos == std::string::npos) ? "." :
                       (pos == 0) ? "/" : s.substr(0, pos);
@@ -3449,10 +3483,15 @@ void primDirOf(EvalState &, Value * args, Value & out)
     } else {
         out = mkStringValueOwned(dir);
         // #672 follow-up: propagate input string context (same
-        // reasoning as primBaseNameOf — Path inputs have no context).
-        if (auto * raw = lookupStringContextEntries(args[0].asString())) {
-            std::vector<std::string> copy = *raw;
-            setStringContextEntries(out.asString(), std::move(copy));
+        // reasoning as primBaseNameOf — Path inputs have no context; a
+        // coerced value forwards whatever context the coercion produced).
+        if (args[0].isString()) {
+            if (auto * raw = lookupStringContextEntries(args[0].asString())) {
+                std::vector<std::string> copy = *raw;
+                setStringContextEntries(out.asString(), std::move(copy));
+            }
+        } else if (coercedInput && !coercedCtx.empty()) {
+            setStringContextEntries(out.asString(), std::move(coercedCtx));
         }
     }
 }
@@ -3460,6 +3499,8 @@ void primDirOf(EvalState &, Value * args, Value & out)
 void primPathExists(EvalState & state, Value * args, Value & out)
 {
     std::string s;
+    Value pathArg = args[0];             // may be replaced by a coerced string
+    bool origIsString = args[0].isString();
     if (args[0].isString()) {
         // #741 Phase 4 measurement: path with non-empty context →
         // potential IFD (path may resolve to a derivation output).
@@ -3473,77 +3514,34 @@ void primPathExists(EvalState & state, Value * args, Value & out)
     }
     else if (args[0].isPath()) s = args[0].asPath();
     else {
-        // #692 — TW (libexpr/primops.cc:prim_pathExists) uses
-        // `state.coerceToString(..., coerceMore=false, copyToStore=false)`
-        // which produces `cannot coerce <type> to a string: <value>`
-        // for non-string/non-path args.  Mirror that exact text by
-        // delegating to the shared valueRepr-style format.
-        const char * art = "a"; const char * name = "value";
-        Tag t = args[0].tag();
-        if (t == Tag::Int)        { art = "an"; name = "integer"; }
-        else if (t == Tag::Float) { art = "a";  name = "float"; }
-        else if (t == Tag::Bool)  { art = "a";  name = "Boolean"; }
-        else if (t == Tag::Null)  { art = "";   name = "null"; }
-        else if (t == Tag::List)  { art = "a";  name = "list"; }
-        else if (t == Tag::Attrs) { art = "a";  name = "set"; }
-        else if (t == Tag::Closure || t == Tag::PrimOp || t == Tag::PrimOpApp)
-                                  { art = "a";  name = "function"; }
-        // Render the value using a small inline helper that mirrors
-        // TW's `ValuePrinter(state, v, errorPrintOptions)` for the
-        // common cases (small attrsets/lists rendered fully; large
-        // ones truncated).  Matches vm.cc:valueRepr behavior.
-        auto val = [&](const Value & v) -> std::string {
-            Tag tt = v.tag();
-            if (tt == Tag::Int)   return std::to_string(v.asInt());
-            if (tt == Tag::Float) { std::ostringstream os; os << v.asFloat(); return os.str(); }
-            if (tt == Tag::Bool)  return v.asInt() == 1 ? "true" : "false";
-            if (tt == Tag::Null)  return "null";
-            if (tt == Tag::List) {
-                if (!v.asList() || v.asList()->size == 0) return "[ ]";
-                // Truncated for brevity at one-level (no recursion to
-                // avoid pulling in vm.cc's valueRepr).
-                return "[ ... ]";
-            }
-            if (tt == Tag::Attrs) {
-                if (!v.asAttrs() || v.asAttrs()->size == 0) return "{ }";
-                // Render small attrsets fully matching TW.
-                auto * b = v.asAttrs();
-                const auto & symTab = ir::globalSymbolTable();
-                std::string out = "{ ";
-                uint32_t n = b->size;
-                uint32_t lim = n > 10 ? 10 : n;
-                for (uint32_t i = 0; i < lim; ++i) {
-                    uint32_t nameIdx = b->entries[i].name;
-                    std::string nm = (nameIdx < symTab.size())
-                        ? symTab[nameIdx] : std::string("<sym?>");
-                    out += nm;
-                    out += " = ";
-                    // One-level only — leaf scalars rendered; deeper
-                    // containers truncated to keep error message tight.
-                    const Value & e = b->entries[i].value;
-                    if (e.isInt())   out += std::to_string(e.asInt());
-                    else if (e.isString() && e.asString()) {
-                        out += "\""; out += e.asString(); out += "\"";
-                    }
-                    else if (e.isBool()) out += e.asInt() == 1 ? "true" : "false";
-                    else if (e.isNull()) out += "null";
-                    else if (e.isList())  out += "[ ... ]";
-                    else if (e.isAttrs()) out += "{ ... }";
-                    else                  out += "<...>";
-                    out += "; ";
-                }
-                if (n > lim) out += "...; ";
-                out += "}";
-                return out;
-            }
-            return "<value>";
-        }(args[0]);
-        std::string msg = "cannot coerce ";
-        if (*art) { msg += art; msg += ' '; }
-        msg += name;
-        msg += " to a string: ";
-        msg += val;
-        throw std::runtime_error(msg);
+        // TW-coerce-parity (2026-08-07): TW's prim_pathExists
+        // (libexpr/primops.cc:2121) passes its arg to `realisePath` →
+        // `coerceToPath`, which accepts a path value, a derivation
+        // (outPath), or an attrset with `__toString` — coercing via
+        // `coerceToString(coerceMore=false, copyToStore=false)`.  It is
+        // NOT restricted to a bare string/path.  Pre-fix v3 hard-threw
+        // `cannot coerce a set to a string` here for `{ __toString = ...
+        // }`, diverging from TW (which returns true/false after realise).
+        //
+        // Coerce to a SOURCE-path string (copyToStore=false, matching
+        // coerceToPath's coerceToString flags) + forward its context,
+        // then feed the synthetic string through the SAME realise path
+        // below (v3RealisePathArg builds the TW string Value and calls
+        // realisePath → coerceToPath → rootPath, exactly as TW does when
+        // it hands the already-coerced string to coerceToPath).  A
+        // non-coercible value (int/float/bool/null/list, or an attrset
+        // with neither __toString nor outPath) THROWS `cannot coerce
+        // <type> to a string: <value>` from the coercer — byte-identical
+        // to TW's coerceToString fall-through (the same wording the old
+        // hand-rolled block here reproduced, now unified on the shared
+        // coercer used by baseNameOf/dirOf/concatStringsSep/etc).
+        std::vector<std::string> coercedCtx;
+        s = toStringCoerceCtx(state, args[0], coercedCtx,
+                              /*copyPathsToStore=*/false, /*coerceMore=*/false);
+        Value sv = mkStringValueOwned(s);
+        if (!coercedCtx.empty())
+            setStringContextEntries(sv.asString(), std::move(coercedCtx));
+        pathArg = sv;
     }
 
     // REVIEW §1.7: route through nix::EvalState::realisePath when a TW
@@ -3554,9 +3552,12 @@ void primPathExists(EvalState & state, Value * args, Value & out)
     if (state.nixEvalState) {
         auto & ns = *state.nixEvalState;
         // mustBeDir mirrors tree-walker (primops.cc:2128) — trailing
-        // slash forces full symlink resolution + dir check.
+        // slash forces full symlink resolution + dir check.  TW gates
+        // this on `arg.type() == nString`, so a coerced attrset arg
+        // (origIsString=false) never sets mustBeDir even if the coerced
+        // text ends in `/` — match that.
         bool mustBeDir =
-            args[0].isString() && (s.ends_with("/") || s.ends_with("/."));
+            origIsString && (s.ends_with("/") || s.ends_with("/."));
         auto symRes = mustBeDir
             ? nix::SymlinkResolution::Full
             : nix::SymlinkResolution::Ancestors;
@@ -3565,7 +3566,7 @@ void primPathExists(EvalState & state, Value * args, Value & out)
             // `pathExists "${drv}/f"` over an un-realised output BUILDS the
             // derivation — the prior 3-arg mkString dropped context, so no
             // build fired and the answer was decided by a stale on-disk lstat.
-            auto path = v3RealisePathArg(ns, args[0], symRes);
+            auto path = v3RealisePathArg(ns, pathArg, symRes);
             auto st = path.maybeLstat();
             bool exists = st && (!mustBeDir || st->type == nix::SourceAccessor::tDirectory);
             out = exists ? Value::vTrue : Value::vFalse;
@@ -4330,8 +4331,27 @@ void primGroupBy(EvalState & state, Value * args, Value & out)
 
 void primReadFileType(EvalState & state, Value * args, Value & out)
 {
-    if (!(args[0].isString() || args[0].isPath()))
-        typeError("readFileType", "string or path");
+    // TW-coerce-parity (2026-08-07): TW's prim_readFileType
+    // (libexpr/primops.cc:2524) hands its arg to `realisePath` →
+    // `coerceToPath`, which accepts a path / derivation (outPath) /
+    // attrset-with-__toString (via coerceToString, coerceMore=false,
+    // copyToStore=false), NOT just a bare string/path.  Pre-fix v3
+    // hard-threw `expected string or path` on `{ __toString = ... }`.
+    // Coerce the non-string/non-path case to a SOURCE-path string +
+    // forward context, then run the SAME realise path below.  A
+    // non-coercible value THROWS `cannot coerce <type> to a string`
+    // via the shared coercer (byte-identical to TW's coerceToString).
+    Value pathArg = args[0];
+    if (!(args[0].isString() || args[0].isPath())) {
+        std::vector<std::string> coercedCtx;
+        std::string cs = toStringCoerceCtx(state, args[0], coercedCtx,
+                                           /*copyPathsToStore=*/false,
+                                           /*coerceMore=*/false);
+        Value sv = mkStringValueOwned(cs);
+        if (!coercedCtx.empty())
+            setStringContextEntries(sv.asString(), std::move(coercedCtx));
+        pathArg = sv;
+    }
     // WS-1 C2: match TW's prim_readFileType (libexpr/primops.cc:2526) —
     // realise the arg's context (std::nullopt = lstat shape, no symlink
     // resolution) so `readFileType "${drv}/f"` BUILDS the derivation instead
@@ -4341,7 +4361,7 @@ void primReadFileType(EvalState & state, Value * args, Value & out)
     const char * t;
     if (state.nixEvalState) {
         auto & ns = *state.nixEvalState;
-        auto sp = v3RealisePathArg(ns, args[0], std::nullopt);
+        auto sp = v3RealisePathArg(ns, pathArg, std::nullopt);
         // lstat() throws "does not exist" for a missing path (TW parity).
         // if/else (not switch) — the build uses -Werror=switch-enum, and
         // only these three map to named types (mirrors TW fileTypeToString,
@@ -4352,8 +4372,8 @@ void primReadFileType(EvalState & state, Value * args, Value & out)
         else if (ty == nix::SourceAccessor::tSymlink)   t = "symlink";
         else                                            t = "unknown";
     } else {
-        std::string path = args[0].isString() ? std::string(args[0].asString())
-                                              : std::string(args[0].asPath());
+        std::string path = pathArg.isString() ? std::string(pathArg.asString())
+                                              : std::string(pathArg.asPath());
         std::error_code ec;
         auto status = std::filesystem::symlink_status(path, ec);
         // #693 — match TW phrasing for missing-path errors.
