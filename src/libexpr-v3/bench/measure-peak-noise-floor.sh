@@ -18,8 +18,7 @@
 #   bench/measure-peak-noise-floor.sh <workload> <config> [N] [out.json]
 #
 # Workloads: hello.name | hello.drvPath | firefox.name | HNE
-# Configs:   gate-off | gate-on-reuse-off | gate-on-reuse-on |
-#            gate-on-reuse-on-stress
+# Configs:   gate-off | gate-off-cache-off
 #
 # Defaults: N=10, out=bench/noise-floor/<workload>-<config>.json
 #
@@ -60,7 +59,7 @@ if [[ -z "$WORKLOAD" || -z "$CONFIG" ]]; then
         echo
         echo "Usage: $0 <workload> <config> [N=10] [out.json]"
         echo "Workloads: hello.name | hello.drvPath | firefox.name | HNE"
-        echo "Configs:   gate-off | gate-on-reuse-off | gate-on-reuse-on | gate-on-reuse-on-stress"
+        echo "Configs:   gate-off | gate-off-cache-off"
     } >&2
     exit 2
 fi
@@ -188,15 +187,9 @@ case "$CONFIG" in
     gate-off)
         : # no extras
         ;;
-    gate-on-reuse-off)
-        GATE_ENV=(NIX_V3_MAJOR_GC=1)
-        ;;
-    gate-on-reuse-on)
-        GATE_ENV=(NIX_V3_MAJOR_GC=1 V3_DBG_FREELIST_REUSE=1)
-        ;;
-    gate-on-reuse-on-stress)
-        GATE_ENV=(NIX_V3_MAJOR_GC=1 V3_DBG_FREELIST_REUSE=1 V3_DBG_GC_STRESS=1000)
-        ;;
+    # NOTE: the former gate-on-reuse-{off,on,on-stress} arms drove the
+    # legacy per-op major GC via NIX_V3_MAJOR_GC=1, which is now hard-false
+    # (alloc.hh g_majorGcEnabled) — those arms were no-ops and were retired.
     gate-off-cache-off)
         # Day 2 of EXIT_GC_SPIRAL_PLAN: cache-eviction PoC.
         # Disables the v3 disk cache (SQLite-backed bytecode shadow
@@ -205,7 +198,7 @@ case "$CONFIG" in
         ;;
     *)
         echo "Error: unknown config '$CONFIG'" >&2
-        echo "Configs: gate-off | gate-on-reuse-off | gate-on-reuse-on | gate-on-reuse-on-stress | gate-off-cache-off" >&2
+        echo "Configs: gate-off | gate-off-cache-off" >&2
         exit 2
         ;;
 esac
