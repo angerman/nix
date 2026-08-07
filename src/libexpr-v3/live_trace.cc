@@ -336,7 +336,7 @@ private:
     void walkList(ListVec * l)
     {
         ++counts.lists;
-        counts.bytesLists += sizeof(ListVec) + sizeof(Value) * l->size;
+        counts.bytesLists += listScanSize(l);
         ChildVisitor v{*this};
         gclayout::enumerateListChildren(l, v);
     }
@@ -799,7 +799,7 @@ private:
     }
     void walkList(ListVec * l)
     {
-        account(sizeof(ListVec) + sizeof(Value) * l->size);
+        account(listScanSize(l));
         ChildVisitor v{*this};
         gclayout::enumerateListChildren(l, v);
     }
@@ -1099,7 +1099,7 @@ public:
         for (Bindings  * b : markedBindings_)
             credit(b, b->allocBytes());  // P1a: incl. MapAttrs aux tail
         for (ListVec   * l : markedLists_)
-            credit(l, sizeof(ListVec) + sizeof(Value) * l->size);
+            credit(l, listScanSize(l));
         for (ValuePair * p : markedPairs_)
             credit(p, sizeof(ValuePair));
         for (Value     * c : markedCells_)
@@ -1391,7 +1391,7 @@ private:
         for (Bindings * b : markedBindings_)
             markRange(b, b->allocBytes());  // P1a: incl. MapAttrs aux tail
         for (ListVec * l : markedLists_)
-            markRange(l, sizeof(ListVec) + sizeof(Value) * l->size);
+            markRange(l, listScanSize(l));
         for (ValuePair * p : markedPairs_)
             markRange(p, sizeof(ValuePair));
         for (Value * c : markedCells_)
@@ -1753,7 +1753,7 @@ void dumpV3LiveBlockProbe() noexcept
     for (Bindings * b : pr.markedBindingsPub())
         liveBytesApprox += b->allocBytes();  // P1a: incl. MapAttrs aux tail
     for (ListVec * l : pr.markedListsPub())
-        liveBytesApprox += sizeof(ListVec) + sizeof(Value) * l->size;
+        liveBytesApprox += listScanSize(l);
     for ([[maybe_unused]] ValuePair * p : pr.markedPairsPub())
         liveBytesApprox += sizeof(ValuePair);
     for ([[maybe_unused]] Value * c : pr.markedCellsPub())

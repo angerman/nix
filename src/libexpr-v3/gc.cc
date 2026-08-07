@@ -224,7 +224,15 @@ Closure * Scavenger::fwdClosure(Closure * c)
 /// pointer that the walker would need to forward.  Used as a fast-
 /// path predicate by `fwdThunk` (and analogous walks) to skip queuing
 /// already-WHNF Thunks whose evaluated payload is a leaf scalar.
-[[gnu::always_inline]] static inline bool isLeafTag(Tag tg) noexcept
+///
+/// gc-layout Step 5 note: this is exactly `!tagIsPointer(tg)` (value.hh) — the
+/// two switch tables partition the tags identically, and a compile-time
+/// static_assert cross-checks that below.  It is deliberately NOT folded to
+/// `return !tagIsPointer(tg);` because isLeafTag is inlined into the HOT
+/// scavenger fast path (fwdThunk / fwdPair) and this task's hard constraint is
+/// to leave the two hot walkers' codegen byte-identical.  The static_assert
+/// makes drift between the two a COMPILE error, which is the fold's real value.
+[[gnu::always_inline]] static constexpr bool isLeafTag(Tag tg) noexcept
 {
     switch (tg) {
     case Tag::Int:
@@ -250,6 +258,21 @@ Closure * Scavenger::fwdClosure(Closure * c)
     }
     return false;
 }
+
+// gc-layout Step 5: pin isLeafTag as exactly the negation of tagIsPointer, so
+// the two classifiers can never drift apart (a new Tag added to one but not the
+// other becomes a COMPILE error here).  This is the drift-elimination value of
+// the "fold onto tagIsPointer" without touching the hot walker's codegen.
+static_assert([]() constexpr {
+    constexpr Tag all[] = {
+        Tag::Uninitialized, Tag::Int, Tag::Float, Tag::Bool, Tag::Null,
+        Tag::String, Tag::Path, Tag::Attrs, Tag::List, Tag::Closure, Tag::Thunk,
+        Tag::PrimOp, Tag::PrimOpApp, Tag::App, Tag::Blackhole, Tag::External,
+        Tag::Slot, Tag::App3 };
+    for (Tag t : all)
+        if (isLeafTag(t) == tagIsPointer(t)) return false;  // must be opposites
+    return true;
+}(), "isLeafTag must be exactly !tagIsPointer for every Tag (gc-layout Step 5)");
 
 Thunk * Scavenger::fwdThunk(Thunk * t)
 {

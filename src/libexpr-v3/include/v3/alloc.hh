@@ -107,6 +107,16 @@ struct ListVec
     Value    elems[]; // FAM
 };
 
+/// Canonical scanned/copied byte size of a ListVec (header + inline elem FAM).
+/// The single source of truth for any size computation over a ListVec, mirroring
+/// closureScanSize / thunkScanSize / Bindings::allocBytes.  A ListVec has no
+/// optional tail, so this is exact.  (gc-layout Step 5: added to retire the
+/// hand-inlined `sizeof(ListVec) + sizeof(Value) * l->size` copies.)
+[[gnu::always_inline]] inline std::size_t listScanSize(const ListVec * l) noexcept
+{
+    return sizeof(ListVec) + sizeof(Value) * l->size;
+}
+
 // ---------------------------------------------------------------------------
 // Bindings — sorted (SymbolId, Value) pairs with binary search.
 //
