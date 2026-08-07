@@ -23,6 +23,7 @@
 #include "v3/alloc.hh"
 #include "v3/value.hh"
 #include "v3/closure.hh"
+#include "v3/gc_layout.hh"    // gc-layout Step 4: child-slot enumerator (manifest)
 #include "v3/vm.hh"           // activeVMStack()
 #include "v3/primop.hh"       // importCacheBytecodeBytes / CuCount / ResultCount
 #include "v3/disk_cache.hh"   // disk_cache::approxResidentBytes (BC-cache bucket)
@@ -220,6 +221,21 @@ private:
         worklist.push_back({p, k});
     }
 
+    /// gc-layout Step 4: adapts the shared child-slot enumerator
+    /// (gclayout::enumerateChildSlots) to LiveTracer's actions — Value slots go
+    /// through auditAndVisit (string/path/external tally + tag dispatch), raw
+    /// list/bindings children enqueue, and the Thunk cell is deref-walked with
+    /// the cellsWalked dedup.  Byte accounting + posHandle attribution stay in
+    /// the walk* methods; only the child-edge set is manifest-sourced.
+    struct ChildVisitor {
+        LiveTracer & self;
+        void value(Value & v, std::size_t)                  { self.auditAndVisit(v); }
+        void listChild(ListVec * l, std::size_t)            { self.enqueue(l, GK_LIST); }
+        void bindingsChild(const Bindings * b, std::size_t) { self.enqueue(const_cast<Bindings *>(b), GK_BINDINGS); }
+        void cellThrough(Value * c, std::size_t)
+        { if (c && self.cellsWalked.insert(c).second) self.auditAndVisit(*c); }
+    };
+
     /// Walk a Closure's outgoing edges.  Mirrors gc.cc Scavenger::
     /// walkClosure modulo the recordLiveTenured / forwarding calls
     /// (we just count + recurse).
@@ -228,11 +244,9 @@ private:
         ++counts.closures;
         counts.bytesClosures += sizeof(Closure)
                               + size_t(c->nUpvalues) * sizeof(Value);
-        if (c->capturedWiths)
-            enqueue(c->capturedWiths, GK_LIST);
-        // Upvalues live inline in the FAM.  (env-sharing retired 2026-08.)
-        for (uint16_t i = 0; i < c->nUpvalues; ++i)
-            auditAndVisit(c->upvalues[i]);
+        // Child slots (capturedWiths + inline upvalue FAM) from the manifest.
+        ChildVisitor v{*this};
+        gclayout::enumerateClosureChildren(c, v);
     }
 
     /// Walk a Thunk.  State-dependent: Suspended/Native/Blackhole have
@@ -258,31 +272,13 @@ private:
             ++e.thunksCount;
         }
 
-        // cell / shapeCell point INTO another allocation (Bindings
-        // entry, standalone cell).  We don't count them here; the
-        // owning Bindings is already counted (or will be) via its
-        // own enqueue.  But we DO walk through the cell content
-        // because it may reach objects not otherwise rooted.
-        if (t->cell && cellsWalked.insert(t->cell).second)
-            auditAndVisit(*t->cell);
-        // M-8: shapeCell walk removed with the field.
-
-        switch (t->state) {
-        case ThunkState::Suspended:
-        case ThunkState::Blackhole:
-            if (ListVec * w = thunkCapturedWiths(t))  // FP-2b: tail slot
-                enqueue(w, GK_LIST);
-            for (uint16_t i = 0; i < t->nUpvalues; ++i)
-                auditAndVisit(t->tail[i]);
-            break;
-        case ThunkState::Evaluated:
-            auditAndVisit(t->evaluated);
-            break;
-        case ThunkState::Native:
-            for (uint16_t i = 0; i < t->nUpvalues; ++i)
-                auditAndVisit(t->tail[i]);
-            break;
-        }
+        // Child slots — the cell (deref-walked with cellsWalked dedup, its
+        // owning allocation is counted via its own type), the state-selected
+        // tail upvalues / cached Evaluated value, and the optional capturedWiths
+        // — all enumerated from the manifest.  (M-8: shapeCell walk removed with
+        // the field.)
+        ChildVisitor v{*this};
+        gclayout::enumerateThunkChildren(t, v);
     }
 
     void walkBindings(Bindings * b)
@@ -329,34 +325,28 @@ private:
             e.bindingsBytes += bytes;
             ++e.bindingsCount;
         }
-        if (b->isMapAttrs())
-            auditAndVisit(*b->mapAttrsAux());
-        for (uint32_t i = 0; i < b->size; ++i)
-            auditAndVisit(b->entries[i].value);
-        // Chain bindings: walk parent.  Each segment of the chain
-        // contributes its own bytes (overlay-only `size`); the
-        // chain head sees overlay + parent transitively.  Sorted
-        // bindings always have parent == nullptr.
-        if (b->parent)
-            enqueue(const_cast<Bindings *>(b->parent), GK_BINDINGS);
+        // Child slots — MapAttrs aux (when present), each entry value, and the
+        // Chain parent — enumerated from the manifest.  (Each chain segment
+        // contributes its own overlay-only bytes; Sorted bindings have no
+        // parent.)
+        ChildVisitor v{*this};
+        gclayout::enumerateBindingsChildren(b, v);
     }
 
     void walkList(ListVec * l)
     {
         ++counts.lists;
         counts.bytesLists += sizeof(ListVec) + sizeof(Value) * l->size;
-        for (uint32_t i = 0; i < l->size; ++i)
-            auditAndVisit(l->elems[i]);
+        ChildVisitor v{*this};
+        gclayout::enumerateListChildren(l, v);
     }
 
     void walkPair(ValuePair * p)
     {
         ++counts.pairs;
         counts.bytesPairs += sizeof(ValuePair);
-        auditAndVisit(p->left);
-        auditAndVisit(p->right);
-        auditAndVisit(p->evaluated);
-        auditAndVisit(p->third);  // 2026-05-30 Tag::App3 arg2
+        ChildVisitor v{*this};
+        gclayout::enumeratePairChildren(p, v);  // left/right/evaluated/third
     }
 };
 
@@ -774,54 +764,50 @@ private:
 
     void account(size_t bytes) noexcept { bytesBy[cur_] += bytes; ++objsBy[cur_]; }
 
+    /// gc-layout Step 4: adapts the shared child-slot enumerator to
+    /// BucketTracer's actions — Value slots dispatch via visitValue, raw
+    /// list/bindings children enqueue, the Thunk cell is deref-walked with the
+    /// cells_ dedup.  Byte bucketing stays in the walk* methods.
+    struct ChildVisitor {
+        BucketTracer & self;
+        void value(Value & v, std::size_t)                  { self.visitValue(v); }
+        void listChild(ListVec * l, std::size_t)            { self.enqueue(l, GK_LIST); }
+        void bindingsChild(const Bindings * b, std::size_t) { self.enqueue(const_cast<Bindings *>(b), GK_BINDINGS); }
+        void cellThrough(Value * c, std::size_t)
+        { if (c && self.cells_.insert(c).second) self.visitValue(*c); }
+    };
+
     void walkClosure(Closure * c)
     {
         account(sizeof(Closure) + size_t(c->nUpvalues) * sizeof(Value));
-        if (c->capturedWiths) enqueue(c->capturedWiths, GK_LIST);
-        // Upvalues live inline in the FAM.  (env-sharing retired 2026-08.)
-        for (uint16_t i = 0; i < c->nUpvalues; ++i) visitValue(c->upvalues[i]);
+        ChildVisitor v{*this};
+        gclayout::enumerateClosureChildren(c, v);
     }
     void walkThunk(Thunk * t)
     {
         // Evaluated thunks dropped their tail; the rest keep nUpvalues.
-        const size_t bytes = thunkScanSize(t);  // FP-2b: incl. withs slot
-        account(bytes);
-        if (t->cell && cells_.insert(t->cell).second) visitValue(*t->cell);
+        account(thunkScanSize(t));  // FP-2b: incl. withs slot
         // M-8: shapeCell walk removed with the field.
-        switch (t->state) {
-        case ThunkState::Suspended:
-        case ThunkState::Blackhole:
-            if (ListVec * w = thunkCapturedWiths(t)) enqueue(w, GK_LIST);  // FP-2b: tail slot
-            for (uint16_t i = 0; i < t->nUpvalues; ++i) visitValue(t->tail[i]);
-            break;
-        case ThunkState::Evaluated:
-            visitValue(t->evaluated);
-            break;
-        case ThunkState::Native:
-            for (uint16_t i = 0; i < t->nUpvalues; ++i) visitValue(t->tail[i]);
-            break;
-        }
+        ChildVisitor v{*this};
+        gclayout::enumerateThunkChildren(t, v);
     }
     void walkBindings(Bindings * b)
     {
         account(b->allocBytes());  // P1a: incl. MapAttrs aux tail
-        if (b->isMapAttrs())
-            visitValue(*b->mapAttrsAux());
-        for (uint32_t i = 0; i < b->size; ++i) visitValue(b->entries[i].value);
-        if (b->parent) enqueue(const_cast<Bindings *>(b->parent), GK_BINDINGS);
+        ChildVisitor v{*this};
+        gclayout::enumerateBindingsChildren(b, v);
     }
     void walkList(ListVec * l)
     {
         account(sizeof(ListVec) + sizeof(Value) * l->size);
-        for (uint32_t i = 0; i < l->size; ++i) visitValue(l->elems[i]);
+        ChildVisitor v{*this};
+        gclayout::enumerateListChildren(l, v);
     }
     void walkPair(ValuePair * p)
     {
         account(sizeof(ValuePair));
-        visitValue(p->left);
-        visitValue(p->right);
-        visitValue(p->evaluated);
-        visitValue(p->third);  // Tag::App3 arg2 (2026-05-30)
+        ChildVisitor v{*this};
+        gclayout::enumeratePairChildren(p, v);  // left/right/evaluated/third
     }
 };
 

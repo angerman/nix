@@ -889,6 +889,22 @@ void Scavenger::run()
 // #705 post-scavenge audit (gated via V3_DBG_NURSERY_AUDIT=1).
 // Walks DEEP from the scavenger's roots and asserts no nursery
 // pointer remains anywhere reachable.  Localizes a missed-root.
+//
+// gc-layout Step 4 note (2026-08): the auditor's child-slot set corresponds to
+// the layout manifest (gc_layout.hh), but it is DELIBERATELY kept hand-written
+// rather than routed through gclayout::enumerateChildSlots — for two reasons:
+//   (1) INDEPENDENCE: the auditor is the reachable-graph oracle that must be
+//       able to DISAGREE with the manifest, so a bug in the manifest enumerator
+//       (a dropped slot) cannot silently propagate here and mask itself.  The
+//       manifest-based cross-check is the separate post-scavenge tripwire; the
+//       auditor stays an independent second opinion.
+//   (2) The auditor recurses INLINE (no worklist) and handles capturedWiths
+//       asymmetrically (a Closure's with-list elements are walked here; a
+//       Thunk's are covered transitively via the scavenger's list queueing) and
+//       carries rich per-entry/per-elem diagnostic strings — none of which map
+//       onto a uniform manifest callback without a behaviour change.
+// A layout reshape is still caught: the manifest's static_asserts fire in this
+// TU (gc.cc includes gc_layout.hh), forcing a review of every walker + here.
 namespace {
 
 struct Auditor {
