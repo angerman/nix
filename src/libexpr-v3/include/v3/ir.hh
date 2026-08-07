@@ -541,6 +541,27 @@ struct Function {
     /// Remove with the instrument once the go/no-go is decided (Rule 0).
     bool                isAttrBodyThunk = false;
 
+    /// COMPILE-WASTE spike (2026-08-07, metric-scope extension): FuncId of the
+    /// TOP-LEVEL attr/let value-body thunk whose value-SUBTREE emission created
+    /// this Function (emit-time ownership) — self for that top-level thunk, and
+    /// -1 for the module skeleton (root fn + the outer `{args}: self: …`
+    /// lambdas that carry no enclosing top-level attr).  Set during lowering by
+    /// LowererV3's `curOwnerAttr_` owner stack: the FIRST attr-body thunk minted
+    /// while no owner is active becomes the owner, and EVERY Function minted
+    /// while lowering its subtree (its value body + every nested lambda /
+    /// formal-wrapper / nested attr body it reaches) inherits it.  Set
+    /// UNCONDITIONALLY (like isAttrBodyThunk) so the emitted ir::Module is
+    /// byte-identical with the flag ON vs OFF; it is READ only at emit() under
+    /// NIX_V3_COMPILE_WASTE to attribute a never-forced top-level attr's WHOLE
+    /// compiled subtree as wasted (closes the metric-scope gap where nested
+    /// per-package `({mkDerivation,…}: …)` lambda bytecode — the bulk of
+    /// hackage-packages.nix — was bucketed as non-attr-body and under-counted).
+    /// Single-owner by construction (each Function is minted once, under one
+    /// active owner), so the "conservative if shared across owners" rule is
+    /// trivially met.  Not serialized; gates nothing.  Remove with the
+    /// instrument once the go/no-go is decided (Rule 0).
+    int32_t             ownerAttrId = -1;
+
     /// Free vars referenced by the body block (and recursively by any
     /// sub-blocks / nested functions reachable from the body), in the
     /// order they appear as upvalues at runtime.  Populated by

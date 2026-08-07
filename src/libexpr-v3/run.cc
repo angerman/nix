@@ -40,6 +40,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <unordered_map>  // COMPILE-WASTE spike: per-owner subtree aggregation
 
 namespace nix::v3 {
 
@@ -134,6 +135,78 @@ void dumpCompileWasteReport()
         (unsigned long long) wasted,
         pct(wasted, globalTotal),
         pct(wasted, attrBodyBytes));
+
+    // -----------------------------------------------------------------------
+    // NEW METRIC (metric-scope extension, 2026-08-07): TOP-LEVEL ATTR SUBTREE
+    // ownership.  The committed metric above tags ONLY each attr's own
+    // value-body thunk; it buckets the nested per-package
+    // `({mkDerivation,…}: …)` lambda (where hackage-packages.nix's compiled
+    // weight actually lives) as non-attr-body and so UNDER-counts the prize.
+    // A real deferred-per-attr compiler skips a never-forced top-level attr's
+    // ENTIRE compiled subtree: its value body AND every function emitted
+    // underneath it that nothing else reaches.  Here we sum, per top-level
+    // owner (ir::Function::ownerAttrId, propagated at emit), the bytecode of
+    // ALL functions it owns, and call the owner WASTED iff its value-body thunk
+    // was never forced (forceCount==0 — covers both never-allocated and
+    // allocated-but-never-forced).  Ownership is SINGLE by construction (each
+    // Function is minted exactly once, under exactly one active owner), so the
+    // "attribute conservatively if shared across owners" rule is trivially met
+    // — no function is charged to two owners.  `noOwnerBytes` = the module
+    // skeleton (root fn + the outer `{args}: self: …` lambdas) PLUS any
+    // optimizer-synthesised function that carries no owner tag (e.g.
+    // genList-unroll element thunks); those are conservatively counted as NOT
+    // wasted, so NEW-WASTED is a sound lower bound.
+    uint64_t newWasted = 0, ownedTotalBytes = 0, noOwnerBytes = 0;
+    uint64_t nOwners = 0, nOwnersWasted = 0;
+    uint64_t nwNeverAlloc = 0, nwAllocNeverForced = 0;
+    for (const CompilationUnit * cu : allRegisteredCus()) {
+        if (!cu) continue;
+        const auto & cw = cu->rt.compileWaste;
+        const size_t nf = cu->lambdas.size();
+        std::unordered_map<int32_t, uint64_t> ownerBytes;  // owner fid → Σ bytes
+        for (size_t fid = 0; fid < nf; ++fid) {
+            if (fid >= cw.size()) continue;
+            const uint32_t bytes = cw[fid].codeBytes;
+            const int32_t owner  = cw[fid].ownerAttrId;
+            if (owner < 0) { noOwnerBytes += bytes; continue; }
+            ownerBytes[owner] += bytes;
+        }
+        for (const auto & kv : ownerBytes) {
+            const int32_t owner = kv.first;
+            const uint64_t bytes = kv.second;
+            ownedTotalBytes += bytes;
+            ++nOwners;
+            const auto ls = cu->lambdaStateAt(static_cast<size_t>(owner));
+            if (ls.forceCount == 0) {           // top-level attr never forced
+                newWasted += bytes;
+                ++nOwnersWasted;
+                if (ls.allocCount == 0) nwNeverAlloc       += bytes;
+                else                    nwAllocNeverForced += bytes;
+            }
+        }
+    }
+
+    std::fprintf(stderr,
+        "  --- metric-scope extension: TOP-LEVEL ATTR SUBTREE ownership ---\n"
+        "  top-level attr owners=%llu  (never-forced=%llu)\n"
+        "  owned bytecode:            %10llu B  (%.1f%% of total)\n"
+        "  no-owner (skeleton/opt):   %10llu B  (%.1f%% of total; never counted wasted)\n"
+        "  NEW-WASTED (subtree of never-forced top-level attrs): %llu B\n"
+        "    incl. never-allocated owners:      %10llu B\n"
+        "    incl. allocated-but-never-forced:  %10llu B\n"
+        "    = %.1f%% of total emitted bytecode   [NEW FALSIFIER metric]\n"
+        "    = %.1f%% of owned bytecode\n"
+        "  OLD (attr-body-thunk only) vs NEW (full subtree): %.1f%% -> %.1f%% of total\n",
+        (unsigned long long) nOwners, (unsigned long long) nOwnersWasted,
+        (unsigned long long) ownedTotalBytes, pct(ownedTotalBytes, globalTotal),
+        (unsigned long long) noOwnerBytes,    pct(noOwnerBytes, globalTotal),
+        (unsigned long long) newWasted,
+        (unsigned long long) nwNeverAlloc,
+        (unsigned long long) nwAllocNeverForced,
+        pct(newWasted, globalTotal),
+        pct(newWasted, ownedTotalBytes),
+        pct(wasted, globalTotal),
+        pct(newWasted, globalTotal));
 }
 
 } // namespace

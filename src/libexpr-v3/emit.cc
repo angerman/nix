@@ -2630,6 +2630,12 @@ struct Emitter
             unit.rt.compileWaste[fid].isAttrBody =
                 f.isAttrBodyThunk ? 1 : 0;
             unit.rt.compileWaste[fid].codeBytes = codeBytes;
+            // COMPILE-WASTE spike (metric-scope extension): the top-level attr
+            // whose value-subtree emission created this function (self for the
+            // top-level thunk; -1 for module skeleton).  Lets run.cc attribute a
+            // never-forced top-level attr's WHOLE subtree (value body + nested
+            // package lambda) as wasted, not just its own thunk body.
+            unit.rt.compileWaste[fid].ownerAttrId = f.ownerAttrId;
             g_compileWasteTotalBytes.fetch_add(codeBytes,
                                                std::memory_order_relaxed);
         }
@@ -2684,10 +2690,11 @@ struct Emitter
 // never-forced (wasted) fraction.  Off by default → the emit path is
 // byte-for-byte unchanged.
 // RETIREMENT CRITERION (Rule 0 / repo rule 4): remove the g_compileWaste gate
-// (defined at file scope above), the rt.compileWaste side table,
-// ir::Function::isAttrBodyThunk, allRegisteredCus(), and the run.cc report the
-// moment the deferred-per-attr-compilation go/no-go is recorded — this
-// instrument exists only to decide that one question.
+// (defined at file scope above), the rt.compileWaste side table (incl. its
+// ownerAttrId field), ir::Function::isAttrBodyThunk + ir::Function::ownerAttrId
+// (+ LowererV3::curOwnerAttr_ / CwOwnerGuard), allRegisteredCus(), and the
+// run.cc report the moment the deferred-per-attr-compilation go/no-go is
+// recorded — this instrument exists only to decide that one question.
 bool compileWasteActive() noexcept { return g_compileWaste; }
 uint64_t compileWasteTotalEmittedBytes() noexcept
 {

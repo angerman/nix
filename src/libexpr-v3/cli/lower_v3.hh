@@ -179,6 +179,40 @@ struct LowererV3 {
     const std::set<std::string> * baseEnvNames = nullptr;
     std::vector<ir::BlockId> blockStack;
 
+    // -----------------------------------------------------------------------
+    // COMPILE-WASTE spike (2026-08-07, metric-scope extension) — emit-time
+    // top-level-attr ownership.  `curOwnerAttr_` is the FuncId of the top-level
+    // attr/let value-body thunk currently being lowered (-1 = none active, i.e.
+    // module skeleton).  When an attr-body thunk is minted while NO owner is
+    // active it BECOMES the owner for the whole recursive lowering of its body,
+    // so every nested Function (the per-package `({mkDerivation,…}: …)` lambda,
+    // its formal wrappers, nested attr bodies) is attributed to it.  Maintained
+    // UNCONDITIONALLY (like ir::Function::isAttrBodyThunk) so the ir::Module is
+    // byte-identical flag ON vs OFF; only emit()+run.cc READ ownerAttrId, gated.
+    // Remove with the instrument once the deferred-per-attr go/no-go is decided
+    // (Rule 0).
+    int32_t curOwnerAttr_ = -1;
+
+    /// Scoped owner establishment for one minted Function `fid`.  Tags
+    /// `functions[fid].ownerAttrId = curOwnerAttr_`; if `attrBody` and no owner
+    /// is active, promotes `fid` to the current owner for the guard's lifetime
+    /// (which MUST enclose the recursive lowering of the thunk body).  Restores
+    /// the previous owner on destruction (exception-safe — lowering may throw).
+    struct CwOwnerGuard {
+        LowererV3 * self;
+        int32_t prev;
+        explicit CwOwnerGuard(LowererV3 * s, ir::FuncId fid, bool attrBody)
+            : self(s), prev(s->curOwnerAttr_)
+        {
+            if (attrBody && self->curOwnerAttr_ < 0)
+                self->curOwnerAttr_ = static_cast<int32_t>(fid);
+            self->m.functions[fid].ownerAttrId = self->curOwnerAttr_;
+        }
+        ~CwOwnerGuard() { self->curOwnerAttr_ = prev; }
+        CwOwnerGuard(const CwOwnerGuard &) = delete;
+        CwOwnerGuard & operator=(const CwOwnerGuard &) = delete;
+    };
+
     /// Is `name` a TW base-env primop (resolvable as a bare global)?
     /// Mirrors lower.cc's reliance on bindVars: a name is a base-env
     /// primop iff it's a registered primop AND (when the TW base-env set
@@ -500,6 +534,11 @@ struct LowererV3 {
         m.functions[fid].paramVar   = param;
         m.functions[fid].argName    = lam->arg.empty() ? ir::kInvalidSymbol : m.internSymbol(lam->arg);
         m.functions[fid].name       = lam->arg.empty() ? "<formals>" : lam->arg;
+        // COMPILE-WASTE spike: a lambda is not itself a top-level attr owner,
+        // but it (and its formal wrappers + body) inherit the active owner —
+        // this is the nested `({mkDerivation,…}: …)` package lambda whose
+        // bytecode the metric-scope extension attributes to its package.
+        CwOwnerGuard cwLam(this, fid, /*attrBody=*/false);
 
         if (!lam->hasFormals) {
             Scope inner;
@@ -597,6 +636,9 @@ struct LowererV3 {
             m.functions[tfid].entryBlock = teb;
             m.functions[tfid].name = f->name;
             m.functions[tfid].isFormalWrapper = true;  // P2.1 step-0 measure
+            // COMPILE-WASTE spike: formal wrapper inherits the active owner
+            // (part of the enclosing lambda's / package's subtree).
+            CwOwnerGuard cwFw(this, tfid, /*attrBody=*/false);
             // P2.1-a: a no-default formal wrapper is `param.X` — raw-bindable
             // (plain arg) via the OP_RAW_FORMAL prefix.  Defaults keep the wrapper
             // (their body has an else-branch that must stay deferred).
@@ -747,6 +789,9 @@ struct LowererV3 {
         m.functions[fid].entryBlock = eb;
         m.functions[fid].name = "<thunk>";
         m.functions[fid].isAttrBodyThunk = attrBody;  // COMPILE-WASTE spike
+        // COMPILE-WASTE spike: an attr-body thunk minted with no active owner
+        // becomes the top-level owner for its whole recursive subtree.
+        CwOwnerGuard cwThunk(this, fid, /*attrBody=*/attrBody);
         blockStack.push_back(eb);
         setReturn(lowerExpr(e));
         blockStack.pop_back();
@@ -829,6 +874,7 @@ struct LowererV3 {
         m.functions[fid].entryBlock = eb;
         m.functions[fid].name = "<thunk>";
         m.functions[fid].isAttrBodyThunk = attrBody;  // COMPILE-WASTE spike
+        CwOwnerGuard cwThunkIR(this, fid, /*attrBody=*/attrBody);  // COMPILE-WASTE spike
         blockStack.push_back(eb);
         setReturn(bodyBuilder());
         blockStack.pop_back();
@@ -868,6 +914,7 @@ struct LowererV3 {
             m.functions[hfid].entryBlock = heb;
             m.functions[hfid].name = "<inherit-from>";
             m.functions[hfid].isAttrBodyThunk = true;  // COMPILE-WASTE spike
+            CwOwnerGuard cwInhFrom(this, hfid, /*attrBody=*/true);  // COMPILE-WASTE spike
             blockStack.push_back(heb);
             scopes.push_back(recScope);
             setReturn(lowerExpr(at->inheritFromExprs[idx]));
@@ -896,6 +943,9 @@ struct LowererV3 {
             m.functions[fid].entryBlock = eb;
             m.functions[fid].name = d->name;
             m.functions[fid].isAttrBodyThunk = true;  // COMPILE-WASTE spike (let/rec binding body)
+            // COMPILE-WASTE spike: a top-level let/rec binding body is an owner
+            // (each becomes its own top-level attr when no owner is active).
+            CwOwnerGuard cwLetBind(this, fid, /*attrBody=*/true);
             fids.push_back(fid);
             blockStack.push_back(eb);
             if (d->kind == nix::v3::ast::Attrs::AttrKind::Inherited) {
@@ -1134,6 +1184,9 @@ struct LowererV3 {
                             m.functions[fid].isAttrBodyThunk = true;  // COMPILE-WASTE spike (DAG-demoted let binding)
                             m.functions[fid].nWithTargets =
                                 static_cast<uint16_t>(lws.size());
+                            // COMPILE-WASTE spike: DAG-demoted let binding body
+                            // is an owner (same as the letrec-entry path above).
+                            CwOwnerGuard cwDagBind(this, fid, /*attrBody=*/true);
                             blockStack.push_back(eb);
                             scopes.push_back(plainScope);  // deps so far
                             setReturn(lowerExpr(bs[i]->value));

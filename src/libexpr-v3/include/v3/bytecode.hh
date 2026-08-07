@@ -794,6 +794,14 @@ struct CompilationUnit
         struct CompileWaste {
             uint8_t  isAttrBody = 0;
             uint32_t codeBytes  = 0;
+            /// Metric-scope extension (2026-08-07): FuncId of the top-level
+            /// attr/let value body whose subtree emission created this function
+            /// (mirrors ir::Function::ownerAttrId; self for the top-level thunk,
+            /// -1 for module skeleton).  Lets the eval-end report bucket a whole
+            /// never-forced top-level attr's compiled subtree (value body +
+            /// nested lambdas) as wasted — the number a real deferred-per-attr
+            /// compiler would skip.  Remove with the instrument (Rule 0).
+            int32_t  ownerAttrId = -1;
         };
         std::vector<CompileWaste> compileWaste;
     };
