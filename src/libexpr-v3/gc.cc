@@ -38,6 +38,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "v3/gc.hh"
+#include "v3/gc_layout.hh"  // GC object child-pointer layout manifest (static_asserts + enumerator)
 #include "v3/nursery.hh"
 #include "v3/alloc.hh"
 #include "v3/bytecode.hh"  // #705: AttrSelectIC roots
