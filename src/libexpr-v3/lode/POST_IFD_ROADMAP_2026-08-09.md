@@ -57,9 +57,20 @@ SPDX-License-Identifier: Apache-2.0
 - **WS-D fuzzer** 🟢 GO + real bug shipped (`a2b335a68`): directed v2 caught + fixed
   `zipAttrsWith` fail-open (`--brute` 42/42). Framework productionization (minimizer +
   fixture-emit + nej `NIX_V3_PARITY_SHADOW` monitor) = recorded follow-on (touches nej).
-- **WS-C zygote** 🟢 K2 PASS → GO; build SPEC'd (`a23849fef`). Build = nej worker-lifecycle
-  restructure (Topology B) + AOT deploy wiring; gate = `--brute` under the forked pool
-  (faithful on Linux/farm). Touches nej + deploy → needs OK before push.
+- **WS-C zygote** 🔴 **KILL (nej-layer) + documented** — built + 1-worker-proven, ≥2-worker KILL.
+  Phase-1 K2 PASS (`a23849fef`: base CPU 34-46%; per-child private <70% fresh). BUILT: Topology-B
+  zygote committed local (nix-eval-jobs 2.34.1-v3 `bf0b1ae`, behind default-off `NIX_V3_ZYGOTE`;
+  worker() split buildWarmState+runWorkerLoop; main warm-parent pre-fork before collector threads;
+  GC_atfork; cold respawn; OFF-path byte-identical). GATE (darwin, HNE): OFF==baseline 9 drvPaths;
+  **1-worker PASS** (base-evaluated-ONCE = the zygote prize, drvPaths byte-identical, 0 GC/nursery-
+  audit → mechanism + GC-safety proven); **≥2-worker (the deploy-relevant pool) = HANG = KILL** —
+  forked children block in `v3::ffi::fetchTree` on the INHERITED shared daemon store socket +
+  fetcher SQLite (classic fork-unsafe I/O; NOT a GC/zygote bug). Hits WS-C's own "fork failure"
+  KILL criterion. **No nej-only fix** (nix's Pool/RemoteStore have no fork guard, `EvalState::store`
+  is const, `shutdownConnections` is global, `max-connection-age 0` still hangs). REVIVAL LEVER
+  (DEFERRED, out of scope — nix-internals + farm): a nix-side per-child reopen-store+caches
+  post-fork hook, then the faithful Linux `--brute`-under-forked-pool gate + AOT deploy wiring.
+  Nothing pushed.
 - **WS-B incremental eval** 🔴 KILL: measured capture-free pure fraction <1% (hello 0.77%,
   HNE-aggregate 0.05%) — the hashable set = imports, ALREADY memoized by shipped LEVER-1 +
   import/bytecode caches; the 99%+ unhashable callPackage flood is the cost bulk and is
