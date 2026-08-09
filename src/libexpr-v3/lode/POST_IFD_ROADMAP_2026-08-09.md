@@ -46,3 +46,27 @@ WS-0 → then WS-C (build) ∥ WS-IFD-SOLVE (farm A/B) ∥ WS-D (v2 spike) → W
 
 Copyright (c) 2026 Moritz Angermann <moritz.angermann@iohk.io>, Input Output Group.
 SPDX-License-Identifier: Apache-2.0
+
+---
+
+## GATE VERDICTS (2026-08-09) — all four workstreams
+
+- **WS-0 durability** ✅ DONE (`1b3cb51a8`).
+- **WS-IFD-SOLVE** 🔴 KILL (pipeline) + DEFER (moonshot) (`e651dfb2c`): truncate-index already
+  wired; freeze = reuse subsumed by warm store; floor = cabal Modular solver (24.6s).
+- **WS-D fuzzer** 🟢 GO + real bug shipped (`a2b335a68`): directed v2 caught + fixed
+  `zipAttrsWith` fail-open (`--brute` 42/42). Framework productionization (minimizer +
+  fixture-emit + nej `NIX_V3_PARITY_SHADOW` monitor) = recorded follow-on (touches nej).
+- **WS-C zygote** 🟢 K2 PASS → GO; build SPEC'd (`a23849fef`). Build = nej worker-lifecycle
+  restructure (Topology B) + AOT deploy wiring; gate = `--brute` under the forked pool
+  (faithful on Linux/farm). Touches nej + deploy → needs OK before push.
+- **WS-B incremental eval** 🔴 KILL: measured capture-free pure fraction <1% (hello 0.77%,
+  HNE-aggregate 0.05%) — the hashable set = imports, ALREADY memoized by shipped LEVER-1 +
+  import/bytecode caches; the 99%+ unhashable callPackage flood is the cost bulk and is
+  structurally un-keyable. Marginal cross-process prize beyond shipped caches = negligible.
+  (Cost-weighting inferred: hashable=imports=already-cached; not separately instrumented.
+  Zero-false-drvPath already guaranteed by LEVER-1's shadow-compare, keyExceptionBail=0.)
+
+**Analysis/gate phase COMPLETE for all four.** Remaining = the nej-touching BUILDS (WS-C
+restructure; WS-D framework's nej monitor), which per the discipline ("no push without OK")
++ the Linux-farm gate need explicit go-ahead.
