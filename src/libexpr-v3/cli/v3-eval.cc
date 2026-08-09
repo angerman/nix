@@ -105,20 +105,46 @@ using nix::v3::forceDeep;
 using nix::v3::printNixValue;
 using nix::v3::toJsonValue;
 
+#if defined(__APPLE__)
+#include <mach/mach.h>   // WS-C K2 (2026-08-09): task_info(TASK_VM_INFO) darwin smaps fallback
+#endif
+
 // WS-5 (2026-07-16): read a summed field (kB) from /proc/self/smaps_rollup.
-// Linux-only; returns -1 if unavailable. Used by --cow-fork to measure how
-// much of a warmed parent a forked child actually shares (Shared_Clean) vs
-// re-dirties (Private_Dirty) — the parallel-eval-density question.
+// Returns -1 if unavailable. Used by --cow-fork to measure how much of a warmed
+// parent a forked child actually shares (Shared_Clean) vs re-dirties
+// (Private_Dirty) — the parallel-eval-density question.
+//
+// WS-C K2 (2026-08-09): darwin has no smaps_rollup. Fall back to mach
+// task_info(TASK_VM_INFO): `phys_footprint` = the process's own dirty +
+// compressed pages (CoW-clean pages still shared with the parent are NOT
+// counted until dirtied) — the closest analogue to Linux Private_Dirty, i.e.
+// exactly the per-child PRIVATE cost the K2 gate needs (measured as a pre/post
+// fork delta so absolute-accounting quirks cancel). `resident_size` = Rss.
+// Shared_Clean has no simple per-process rollup on darwin → -1 (n/a).
 static long smapsRollupKB(const char * field)
 {
     std::ifstream f("/proc/self/smaps_rollup");
-    if (!f) return -1;
-    std::string line;
-    size_t flen = std::strlen(field);
-    while (std::getline(f, line)) {
-        if (line.size() > flen && line.compare(0, flen, field) == 0 && line[flen] == ':')
-            return std::strtol(line.c_str() + flen + 1, nullptr, 10);
+    if (f) {
+        std::string line;
+        size_t flen = std::strlen(field);
+        while (std::getline(f, line)) {
+            if (line.size() > flen && line.compare(0, flen, field) == 0 && line[flen] == ':')
+                return std::strtol(line.c_str() + flen + 1, nullptr, 10);
+        }
+        return -1;
     }
+#if defined(__APPLE__)
+    task_vm_info_data_t vmInfo;
+    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO,
+                  reinterpret_cast<task_info_t>(&vmInfo), &count) == KERN_SUCCESS) {
+        if (std::strcmp(field, "Private_Dirty") == 0)
+            return static_cast<long>(vmInfo.phys_footprint / 1024);
+        if (std::strcmp(field, "Rss") == 0)
+            return static_cast<long>(vmInfo.resident_size / 1024);
+        return -1;  // Shared_Clean etc.: not available on darwin
+    }
+#endif
     return -1;
 }
 
