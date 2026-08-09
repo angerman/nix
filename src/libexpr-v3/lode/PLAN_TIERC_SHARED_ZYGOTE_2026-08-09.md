@@ -175,3 +175,44 @@ A clean KILL here is a deliverable: it would confirm "Lever 1 (bytecode mmap) is
 
 **nix-eval-jobs:** `src/nix-eval-jobs.cc` (main/collector/Proc/queue/GC_DONT_GC), `src/worker.cc` (per-worker EvalState, v3 engage, processJobRequest, descendAttrPath).
 **v3 (`src/libexpr-v3/`):** `CLAUDE.md` §0 (nursery/Phase-D/Boehm constraint), `cli/v3-eval.cc` (`--fork-worker`/`--cow-fork`/`GC_atfork`), `aot_cache.cc` (mmap reader + WS5-B2 seeding), `include/v3/bytecode.hh` (CompilationUnit + `Runtime rt`), `include/v3/closure.hh` (LambdaDescriptor + WS5-D1 note), `include/v3/gc_layout.hh` (layout manifest / GC-walk scope), `include/v3/nursery.hh` (per-thread moving nursery + Boehm root), `include/v3/alloc.hh` (Arena calloc/mmap + NOROOT + thread_local), `barrier.cc` (thread_local roots + compile-time Phase-D), `include/v3/serialize.hh` (schema 23 + the two caches), `include/v3/disk_cache.hh` (SQLite CU + EvalResults + borrow), `primops.cc` (ImportCache struct + root walk), `vm_applied_cache.cc` (desc+args memo key), `lode/WS5_COW_BASELINE_2026-07-16.md`, `lode/WS5_D2_INPLACE_AOT_DESIGN_2026-07-16.md`, `lode/WS5_COMPLETE_2026-07-16.md`, `lode/CI_INTEGRATION_DESIGN_2026-07-17.md`.
+
+---
+
+## WS-C BUILD SPEC + status (2026-08-09, post-K2 GO)
+
+**Gates passed:** K1 (CPU) base = 34–46% of warm per-worker wall; K2 (RAM) per-child
+private = job-incremental closure, base CoW-shared, <70% of fresh (coreutils ~1.6%, git
+~51%; the memoization-re-dirty hypothesis was REFUTED by the coreutils control). git-noted
+on `0ee094bf9` (nixpkgs proxy — getFlake not wired in v3-eval; ratio is architecture-driven
+so it transfers to haskell.nix: sibling components ≈ coreutils tiny-private, cross-project ≈
+git larger-private).
+
+**SCOPE CORRECTION:** Lever-2 (zygote) is NOT "mostly wiring" — it is a nej worker-lifecycle
+restructure. nej today: `main` spawns N collector *threads* (nix-eval-jobs.cc:658-664); each
+thread lazily forks a worker *process* (`Proc`/`startProcess`, :120-151) that builds its OWN
+EvalState and evaluates the flake from scratch. `GC_DONT_GC=1` (:592) — the zygote's GC-safety
+key (Boehm never moves/frees, so CoW pages are stable).
+
+**Topology B build steps (resumable):**
+1. In nej `main`, AFTER flake setup but BEFORE spawning collector threads (:658): eval the
+   common base (flake outputs + haskell.nix machinery) once in the single-threaded parent to
+   warm the EvalState (CU cache, descriptors, import-cache value graph).
+2. `nix::v3::forceScavenge()` to drain the nursery into the (non-moving, stable-address)
+   tenured arena — so nothing young/movable crosses the fork.
+3. Adopt v3-eval's fork hardening (cli/v3-eval.cc:376 `GC_set_handle_fork(-1)` +
+   GC_atfork_prepare/parent/child brackets around the fork).
+4. **Pre-fork the N worker processes here, in the single-threaded parent** (NOT lazily inside
+   the collector threads — fork-from-multithreaded is unsafe). Each worker inherits the warm
+   EvalState CoW and REUSES it (skip the per-worker base re-eval + re-parse/re-lower).
+5. Then spawn the parent's N collector threads to pipe attrPaths to the pre-forked workers
+   (the existing collector/queue protocol is unchanged downstream).
+6. Wire Lever-1 (AOT deploy): build the AOT segment per pin, set `NIX_V3_AOT_CACHE_FILE` in
+   the deploy so workers mmap the shared read-only bytecode (WS-5, 105 MB Shared_Clean).
+
+**GATE (mandatory):** full `--brute` + firefox drvPath byte-identical UNDER the forked pool.
+KILL: fork drvPath divergence unfixable (K3). **Faithful gate = LINUX** (the deploy platform;
+smaps + fork semantics). Touches the nej repo + deploy infra → per discipline needs OK before
+any push; the fork-pool gate wants the farm.
+
+**STATUS: specified + de-risked; implementation NOT started** (fork-safety-critical nej
+surgery + Linux-farm gate). This is the remaining WS-C deliverable.
