@@ -70,6 +70,9 @@ pos=(
   # forced genList / mapAttrs elements (avoid the lazy-thunk printer).
   'builtins.elemAt (builtins.genList (x: x*x) 5) 3@@@9'
   'builtins.concatStringsSep "," (builtins.attrValues (builtins.mapAttrs (n: v: n) {b=1;a=2;c=3;}))@@@"a,b,c"'
+  # zipAttrsWith over valid sets (incl a valid EMPTY set {} which contributes nothing).
+  'builtins.length (builtins.attrNames (builtins.zipAttrsWith (n: vs: vs) [{a=1;} {a=2;b=3;}]))@@@2'
+  'builtins.length (builtins.attrNames (builtins.zipAttrsWith (n: vs: vs) [{a=1;} {}]))@@@1'
   'builtins.concatStringsSep "," (map toString (builtins.attrValues {b=2;a=1;c=3;}))@@@"1,2,3"'
   # compareVersions; toJSON int-vs-float; strict foldl; list concat length.
   'builtins.compareVersions "1.0" "1.0.1"@@@-1'
@@ -95,6 +98,10 @@ neg=(
   'builtins.substring (-1) 3 "hello"@@@negative start position'
   'builtins.seq (throw "boom") 2@@@boom'
   'builtins.replaceStrings ["a"] [] "abc"@@@arguments passed to builtins.replaceStrings have different lengths'
+  # zipAttrsWith must forceAttrs each element — non-attrset throws (WS-D fuzzer 2026-08-09),
+  # not fail-open by skipping (v3 pre-fix returned {} / dropped the element).
+  'builtins.zipAttrsWith (n: vs: vs) [1]@@@expected a set but found an integer: 1'
+  'builtins.zipAttrsWith (n: vs: vs) [{a=1;} 2]@@@expected a set but found an integer: 2'
 )
 for row in "${neg[@]}"; do
   expr="${row%%@@@*}"; frag="${row##*@@@}"

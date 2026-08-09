@@ -3343,7 +3343,17 @@ void primZipAttrsWith(EvalState & state, Value * args, Value & out)
     if (lst) {
         for (uint32_t i = 0; i < lst->size; ++i) {
             Value attrs = forceValue(*state.vm, lst->elems[i]);
-            if (!attrs.isAttrs() || !attrs.asAttrs()) continue;
+            // TW-parity (WS-D fuzzer, 2026-08-09): tree-walker's zipAttrsWith
+            // calls forceAttrs on EVERY element and raises `expected a set but
+            // found <T>: <v>` on a non-attrset — it does NOT fail-open by
+            // silently skipping (same class as the primCatAttrs fix above; the
+            // directed fuzzer's class-parity oracle caught v3 returning `{}` /
+            // dropping elements where TW throws).  A valid empty set `{}` has
+            // isAttrs() but a null asAttrs() and contributes nothing — it must
+            // NOT throw.
+            if (!attrs.isAttrs())
+                throw std::runtime_error(expectedTypeButFound("a set", attrs));
+            if (!attrs.asAttrs()) continue;
             const Bindings * ab = attrs.asAttrs();
             ab->forEach([&](const Bindings::Entry & en) {
                 byName[en.name].push_back(en.value);
